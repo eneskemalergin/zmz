@@ -3,6 +3,83 @@
 const std = @import("std");
 const base64 = @import("z_mzml").base64;
 const zlib = @import("z_mzml").zlib;
+const arrays = @import("z_mzml").arrays;
+
+test "[integration] - [array pipelines]: decodes independent primitive and SLOF envelopes" {
+    var transport: [128]u8 = undefined;
+    var transformed: [128]u8 = undefined;
+    const scratch: arrays.Scratch = .{ .transport = &transport, .transformed = &transformed };
+    var output: [3]f64 = undefined;
+    // Python struct.pack('<ddd', 1.0, -0.0, inf), then standard Base64.
+    const plain = "AAAAAAAA8D8AAAAAAAAAgAAAAAAAAPB/";
+    try arrays.decode(f64, &output, plain, .none, scratch, .{});
+    try std.testing.expectEqual(@as(f64, 1), output[0]);
+    try std.testing.expectEqual(@as(u64, 0x8000000000000000), @as(u64, @bitCast(output[1])));
+    try std.testing.expectEqual(std.math.inf(f64), output[2]);
+    var encoded: [128]u8 = undefined;
+    try std.testing.expectEqualStrings(plain, try arrays.encode(f64, &encoded, &output, .{}, scratch, null));
+    try std.testing.expectError(error.DecodedSizeMismatch, arrays.decode(f64, output[0..2], plain, .none, scratch, .{}));
+    try std.testing.expectError(error.LimitExceeded, arrays.decode(f64, &output, plain, .none, scratch, .{ .array_bytes = 23 }));
+    // Frozen Numpress SLOF vector, wrapped by Python zlib and Base64.
+    try arrays.decode(f64, &output, "eJxzWO/AAAFXuSpUARP4Aqw=", .slof_zlib, scratch, .{});
+    for ([_]f64{ 0, 1, 10 }, output) |expected, actual|
+        try std.testing.expectApproxEqAbs(expected, actual, (expected + 1) * 0.00013);
+}
+
+test "[property] - [array pipelines]: preserves every primitive bit including exceptional floats" {
+    var transport: [2048]u8 = undefined;
+    var transformed: [2048]u8 = undefined;
+    const scratch: arrays.Scratch = .{ .transport = &transport, .transformed = &transformed };
+    var encoded: [4096]u8 = undefined;
+    var compressor = try zlib.Compressor.init(std.testing.allocator, .default);
+    defer compressor.deinit();
+    inline for (.{ f32, f64, i32, i64 }) |T| {
+        const Bits = @Int(.unsigned, @bitSizeOf(T));
+        var values: [64]T = undefined;
+        var output: [64]T = undefined;
+        for (&values, 0..) |*value, bit| {
+            value.* = @bitCast(@as(Bits, 1) << @intCast(bit % @bitSizeOf(T)));
+        }
+        values[0] = @bitCast(@as(Bits, std.math.maxInt(Bits)));
+        inline for (.{ arrays.Pipeline.none, .zlib }) |pipeline| {
+            const wire = try arrays.encode(T, &encoded, &values, .{ .pipeline = pipeline }, scratch, &compressor);
+            try arrays.decode(T, &output, wire, pipeline, scratch, .{});
+            try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&values), std.mem.sliceAsBytes(&output));
+        }
+    }
+}
+
+test "[integration] - [array pipelines]: composes all Numpress modes with optional zlib" {
+    var transport: [256]u8 = undefined;
+    var transformed: [256]u8 = undefined;
+    const scratch: arrays.Scratch = .{ .transport = &transport, .transformed = &transformed };
+    var encoded: [512]u8 = undefined;
+    var output: [4]f64 = undefined;
+    const values = [_]f64{ 0, 1, 10, 100 };
+    var compressor = try zlib.Compressor.init(std.testing.allocator, .default);
+    defer compressor.deinit();
+    inline for (.{
+        arrays.Pipeline.linear, .pic, .slof, .linear_zlib, .pic_zlib, .slof_zlib,
+    }) |pipeline| {
+        const fixed_point: ?f64 = switch (pipeline) {
+            .pic, .pic_zlib => null,
+            else => 4000,
+        };
+        const wire = try arrays.encode(f64, &encoded, &values, .{
+            .pipeline = pipeline,
+            .fixed_point = fixed_point,
+        }, scratch, &compressor);
+        try arrays.decode(f64, &output, wire, pipeline, scratch, .{});
+        for (values, output) |expected, actual|
+            try std.testing.expectApproxEqAbs(expected, actual, (expected + 1) * 0.00013);
+    }
+    try std.testing.expectError(error.MissingFixedPoint, arrays.encode(f64, &encoded, &values, .{ .pipeline = .linear }, scratch, null));
+    try std.testing.expectError(error.UnexpectedFixedPoint, arrays.encode(f64, &encoded, &values, .{ .fixed_point = 1 }, scratch, null));
+    try std.testing.expectError(error.MissingCompressor, arrays.encode(f64, &encoded, &values, .{ .pipeline = .zlib }, scratch, null));
+    try std.testing.expectError(error.OverlappingBuffers, arrays.encode(f64, &transport, &values, .{}, scratch, null));
+    var floats: [4]f32 = undefined;
+    try std.testing.expectError(error.TypeMismatch, arrays.decode(f32, &floats, "", .pic, scratch, .{}));
+}
 
 test "[unit] - [zlib]: decodes independent stored and fixed Huffman streams" {
     // RFC 1950 wrapper around a stored DEFLATE block containing ASCII abc.
