@@ -7,6 +7,7 @@ const NumpressSlofMathBackend = enum { bundled, glibc_vector };
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const xml = b.dependency("z_xml", .{ .target = target, .optimize = optimize });
     const numpress_slof_math_backend = b.option(
         NumpressSlofMathBackend,
         "numpress_slof_math_backend",
@@ -19,6 +20,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = if (numpress_slof_math_backend == .glibc_vector) true else null,
     });
     const numpress_options = b.addOptions();
+    mzml.addImport("z_xml", xml.module("z_xml"));
     numpress_options.addOption(
         []const u8,
         "slof_math_backend",

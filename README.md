@@ -1,9 +1,11 @@
 # z-mzml
 
-A small, high-performance Zig library for reading, writing, and working with mzML files.
+A Zig library for reading, writing, and working with mzML files, under development.
 
 Status: early development. The public API is not stable.
 
-The first public module is a production Zig-native implementation of the established MS-Numpress transforms.
+The package currently exposes CV parameter helpers, MS-Numpress, Base64, zlib, and binary-array codec composition. The default build uses Zig 0.16 without C dependencies.
 
-The mzML reader and writer are waiting for z-xml to mature enough to become a core dependency.
+Whole-file mzML reading and writing are not implemented yet. The public import is `@import("z_mzml")`; its exports are in [src/root.zig](src/root.zig).
+
+Run the self-contained checks with `zig build test --summary all` and `zig build test -Doptimize=ReleaseFast --summary all`.

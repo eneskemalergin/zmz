@@ -3,12 +3,13 @@
     .version = "0.0.0",
     .fingerprint = 0xa5452ddff19c0172,
     .minimum_zig_version = "0.16.0",
-    .dependencies = .{},
+    .dependencies = .{ .z_xml = .{ .path = "vendor/z-xml" } },
     .paths = .{
         "build.zig",
         "build.zig.zon",
         "src",
         "tests",
+        "vendor",
         "README.md",
     },
 }
