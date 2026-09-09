@@ -13,8 +13,14 @@ test "[unit] - [CV identity]: keeps exact accessions and optional numeric local 
     try std.testing.expect(!accession.eql(.{ .raw = "ms:00123" }));
     for ([_][]const u8{ "", "MS", ":1", "MS:" }) |raw|
         try std.testing.expectEqual(null, (cv.Accession{ .raw = raw }).curie());
-    try std.testing.expectEqual(@as(?u8, null), try (cv.Accession{ .raw = "X:abc" }).curie().?.numericLocal(u8));
-    try std.testing.expectError(error.Overflow, (cv.Accession{ .raw = "X:256" }).curie().?.numericLocal(u8));
+    try std.testing.expectEqual(
+        @as(?u8, null),
+        try (cv.Accession{ .raw = "X:abc" }).curie().?.numericLocal(u8),
+    );
+    try std.testing.expectError(
+        error.Overflow,
+        (cv.Accession{ .raw = "X:256" }).curie().?.numericLocal(u8),
+    );
 }
 
 test "[unit] - [CV lookup]: expands at the reference position without overriding repetition" {
@@ -35,7 +41,10 @@ test "[unit] - [CV lookup]: expands at the reference position without overriding
     try std.testing.expectEqual(null, try iterator.next());
     try std.testing.expectEqual(null, try iterator.next());
     try std.testing.expectEqual(.repeated, try cv.findOne(&entries, &groups, accession));
-    try std.testing.expectEqual(.missing, try cv.findOne(&entries, &groups, .{ .raw = "X:absent" }));
+    try std.testing.expectEqual(
+        .missing,
+        try cv.findOne(&entries, &groups, .{ .raw = "X:absent" }),
+    );
     const unique = try cv.findOne(&group_entries, &.{}, accession);
     try std.testing.expectEqualStrings("group", unique.one.value.?);
 }
@@ -44,9 +53,15 @@ test "[failure] - [CV expansion]: bounds missing duplicate and nested references
     const entries = [_]cv.Entry{.{ .group_ref = "g" }};
     const group: cv.Group = .{ .id = "g", .entries = &.{} };
     try std.testing.expectError(error.MissingGroup, cv.findOne(&entries, &.{}, .{ .raw = "MS:1" }));
-    try std.testing.expectError(error.DuplicateGroup, cv.findOne(&entries, &.{ group, group }, .{ .raw = "MS:1" }));
+    try std.testing.expectError(
+        error.DuplicateGroup,
+        cv.findOne(&entries, &.{ group, group }, .{ .raw = "MS:1" }),
+    );
     const nested: cv.Group = .{ .id = "g", .entries = &entries };
-    try std.testing.expectError(error.NestedGroup, cv.findOne(&entries, &.{nested}, .{ .raw = "MS:1" }));
+    try std.testing.expectError(
+        error.NestedGroup,
+        cv.findOne(&entries, &.{nested}, .{ .raw = "MS:1" }),
+    );
     var iterator: cv.EffectiveIterator = .{
         .entries = &entries,
         .groups = &.{group},

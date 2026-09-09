@@ -97,14 +97,27 @@ test "[edge] - [base64]: enforces independent bounds and destination ownership" 
         .significant_bytes = 4,
         .decoded_bytes = 1,
     });
-    try std.testing.expectError(error.LimitExceeded, base64.decode(&output, " Zg== ", .{ .text_bytes = 5 }));
-    try std.testing.expectError(error.LimitExceeded, base64.decode(&output, "Zg==", .{ .significant_bytes = 3 }));
-    try std.testing.expectError(error.LimitExceeded, base64.decode(&output, "Zg==", .{ .decoded_bytes = 0 }));
+    try std.testing.expectError(
+        error.LimitExceeded,
+        base64.decode(&output, " Zg== ", .{ .text_bytes = 5 }),
+    );
+    try std.testing.expectError(
+        error.LimitExceeded,
+        base64.decode(&output, "Zg==", .{ .significant_bytes = 3 }),
+    );
+    try std.testing.expectError(
+        error.LimitExceeded,
+        base64.decode(&output, "Zg==", .{ .decoded_bytes = 0 }),
+    );
     try std.testing.expectError(error.OutputTooSmall, base64.decode(output[0..0], "Zg==", .{}));
     try std.testing.expectError(error.OutputTooSmall, base64.encode(output[0..3], "f"));
     try std.testing.expectError(error.OverlappingBuffers, base64.encode(&output, output[0..1]));
     try std.testing.expectError(error.OverlappingBuffers, base64.decode(&output, &output, .{}));
     try std.testing.expectError(error.LengthOverflow, base64.encodedSize(std.math.maxInt(usize)));
+}
+
+test "[failure] - [base64]: rejects reuse after finish" {
+    var output: [4]u8 = undefined;
     var decoder = base64.Decoder.init(&output, .{});
     _ = try decoder.finish();
     try std.testing.expectError(error.AlreadyFinished, decoder.finish());
@@ -125,7 +138,11 @@ test "[property] - [base64]: preserves all one-byte and two-byte inputs" {
         if (number < 256) {
             const short = try base64.encode(&encoded, input[0..1]);
             const short_counts = try base64.decode(&decoded, short, .{});
-            try std.testing.expectEqualSlices(u8, input[0..1], decoded[0..short_counts.decoded_bytes]);
+            try std.testing.expectEqualSlices(
+                u8,
+                input[0..1],
+                decoded[0..short_counts.decoded_bytes],
+            );
         }
     }
 }
@@ -140,6 +157,12 @@ test "[unit] - [zlib]: decodes independent stored and fixed Huffman streams" {
     var output: [16]u8 = undefined;
     try std.testing.expectEqualStrings("abc", try zlib.decompress(&output, stored));
     try std.testing.expectEqualStrings("hello", try zlib.decompress(&output, fixed));
+}
+
+test "[failure] - [zlib]: rejects truncation corruption trailing input and aliasing" {
+    const stored = "\x78\x01\x01\x03\x00\xfc\xffabc\x02\x4d\x01\x27";
+    var output: [16]u8 = undefined;
+
     for (0..stored.len) |end| {
         try std.testing.expectError(error.TruncatedInput, zlib.decompress(&output, stored[0..end]));
     }
@@ -166,8 +189,15 @@ test "[property] - [zlib]: reuses compression storage after success and capacity
         defer compressor.deinit();
         for ([_]usize{ 0, 1, 31, 32768, source.len }) |len| {
             const wire = try compressor.compress(&compressed, source[0..len]);
-            try std.testing.expectEqualSlices(u8, source[0..len], try zlib.decompress(decoded[0..len], wire));
-            try std.testing.expectError(error.OutputTooSmall, compressor.compress(compressed[0..0], source[0..len]));
+            try std.testing.expectEqualSlices(
+                u8,
+                source[0..len],
+                try zlib.decompress(decoded[0..len], wire),
+            );
+            try std.testing.expectError(
+                error.OutputTooSmall,
+                compressor.compress(compressed[0..0], source[0..len]),
+            );
         }
     }
 }
@@ -236,7 +266,11 @@ test "[property] - [array pipelines]: preserves single-bit patterns zeros and al
         inline for (.{ arrays.Pipeline.none, .zlib }) |pipeline| {
             const wire = try arrays.encode(T, &encoded, &values, .{ .pipeline = pipeline }, scratch, &compressor);
             try arrays.decode(T, &output, wire, pipeline, scratch, .{});
-            try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&values), std.mem.sliceAsBytes(&output));
+            try std.testing.expectEqualSlices(
+                u8,
+                std.mem.sliceAsBytes(&values),
+                std.mem.sliceAsBytes(&output),
+            );
         }
     }
 }
@@ -281,12 +315,27 @@ test "[integration] - [array options]: rejects invalid configuration and aliasin
     var encoded: [128]u8 = undefined;
     const values = [_]f64{1};
 
-    try std.testing.expectError(error.MissingFixedPoint, arrays.encode(f64, &encoded, &values, .{ .pipeline = .linear }, scratch, null));
-    try std.testing.expectError(error.UnexpectedFixedPoint, arrays.encode(f64, &encoded, &values, .{ .fixed_point = 1 }, scratch, null));
-    try std.testing.expectError(error.MissingCompressor, arrays.encode(f64, &encoded, &values, .{ .pipeline = .zlib }, scratch, null));
-    try std.testing.expectError(error.OverlappingBuffers, arrays.encode(f64, &transport, &values, .{}, scratch, null));
+    try std.testing.expectError(
+        error.MissingFixedPoint,
+        arrays.encode(f64, &encoded, &values, .{ .pipeline = .linear }, scratch, null),
+    );
+    try std.testing.expectError(
+        error.UnexpectedFixedPoint,
+        arrays.encode(f64, &encoded, &values, .{ .fixed_point = 1 }, scratch, null),
+    );
+    try std.testing.expectError(
+        error.MissingCompressor,
+        arrays.encode(f64, &encoded, &values, .{ .pipeline = .zlib }, scratch, null),
+    );
+    try std.testing.expectError(
+        error.OverlappingBuffers,
+        arrays.encode(f64, &transport, &values, .{}, scratch, null),
+    );
     var floats: [4]f32 = undefined;
-    try std.testing.expectError(error.TypeMismatch, arrays.decode(f32, &floats, "", .pic, scratch, .{}));
+    try std.testing.expectError(
+        error.TypeMismatch,
+        arrays.decode(f32, &floats, "", .pic, scratch, .{}),
+    );
 }
 
 test "[integration] - [array limits]: rejects short scratch and mismatched counts" {
