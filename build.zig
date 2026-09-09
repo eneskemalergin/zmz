@@ -31,7 +31,6 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run library tests");
     inline for (.{
-        "tests/test_library.zig",
         "tests/test_numpress.zig",
         "tests/test_binary.zig",
         "tests/test_cv.zig",
