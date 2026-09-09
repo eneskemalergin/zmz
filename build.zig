@@ -30,7 +30,12 @@ pub fn build(b: *std.Build) void {
     }
 
     const test_step = b.step("test", "Run library tests");
-    inline for (.{ "tests/test_library.zig", "tests/test_numpress.zig", "tests/test_binary.zig" }) |test_root| {
+    inline for (.{
+        "tests/test_library.zig",
+        "tests/test_numpress.zig",
+        "tests/test_binary.zig",
+        "tests/test_cv.zig",
+    }) |test_root| {
         const library_tests = b.addTest(.{
             .root_module = b.createModule(.{
                 .root_source_file = b.path(test_root),
