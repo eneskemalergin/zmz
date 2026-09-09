@@ -11,3 +11,6 @@ pub const base64 = @import("binary/base64.zig");
 
 /// Encodes and checks independent zlib streams without a C dependency.
 pub const zlib = @import("binary/zlib.zig");
+
+/// Composes established binary-array pipelines using caller-owned buffers.
+pub const arrays = @import("binary/arrays.zig");
