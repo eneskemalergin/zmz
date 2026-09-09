@@ -2,6 +2,58 @@
 
 const std = @import("std");
 const base64 = @import("z_mzml").base64;
+const zlib = @import("z_mzml").zlib;
+
+test "[unit] - [zlib]: decodes independent stored and fixed Huffman streams" {
+    // RFC 1950 wrapper around a stored DEFLATE block containing ASCII abc.
+    const stored = "\x78\x01\x01\x03\x00\xfc\xffabc\x02\x4d\x01\x27";
+    // Python zlib.compress(b"hello") produced this fixed-Huffman stream.
+    const fixed = "\x78\x9c\xcb\x48\xcd\xc9\xc9\x07\x00\x06\x2c\x02\x15";
+    var output: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("abc", try zlib.decompress(&output, stored));
+    try std.testing.expectEqualStrings("hello", try zlib.decompress(&output, fixed));
+    for (0..stored.len) |end| {
+        try std.testing.expectError(error.TruncatedInput, zlib.decompress(&output, stored[0..end]));
+    }
+    try std.testing.expectError(error.OutputTooSmall, zlib.decompress(output[0..2], stored));
+    try std.testing.expectError(error.TrailingInput, zlib.decompress(&output, stored ++ "x"));
+    try std.testing.expectError(error.TrailingInput, zlib.decompress(&output, stored ++ stored));
+    var corrupt = stored.*;
+    corrupt[corrupt.len - 1] ^= 1;
+    try std.testing.expectError(error.ChecksumMismatch, zlib.decompress(&output, &corrupt));
+    corrupt[0] = 0;
+    try std.testing.expectError(error.InvalidData, zlib.decompress(&output, &corrupt));
+    try std.testing.expectError(error.UnsupportedDictionary, zlib.decompress(&output, "\x78\x20"));
+    try std.testing.expectError(error.OverlappingBuffers, zlib.decompress(&corrupt, &corrupt));
+}
+
+test "[property] - [zlib]: reuses compression storage after success and capacity failure" {
+    var source: [70_000]u8 = undefined;
+    var random = std.Random.DefaultPrng.init(127);
+    random.random().bytes(&source);
+    var compressed: [72_000]u8 = undefined;
+    var decoded: [source.len]u8 = undefined;
+    inline for (.{ zlib.Level.fastest, .default, .best }) |level| {
+        var compressor = try zlib.Compressor.init(std.testing.allocator, level);
+        defer compressor.deinit();
+        for ([_]usize{ 0, 1, 31, 32768, source.len }) |len| {
+            const wire = try compressor.compress(&compressed, source[0..len]);
+            try std.testing.expectEqualSlices(u8, source[0..len], try zlib.decompress(decoded[0..len], wire));
+            try std.testing.expectError(error.OutputTooSmall, compressor.compress(compressed[0..0], source[0..len]));
+        }
+    }
+}
+
+test "[failure] - [zlib]: releases partially allocated compression storage" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocateCompressor, .{});
+}
+
+fn allocateCompressor(allocator: std.mem.Allocator) !void {
+    var compressor = try zlib.Compressor.init(allocator, .default);
+    defer compressor.deinit();
+    var output: [64]u8 = undefined;
+    _ = try compressor.compress(&output, "abc");
+}
 
 test "[property] - [base64]: matches RFC 4648 vectors across every text split" {
     const cases = .{
