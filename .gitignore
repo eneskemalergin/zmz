@@ -1,5 +1,6 @@
 # Zig build artifacts
 zig-out/
+zig-pkg/
 zig-cache/
 .zig-cache/
 
@@ -19,8 +20,6 @@ __pycache__/
 
 # Ignored folders (dev only)
 tmp/
-temp/
-data/
 plan/
-review/
+vendor/
 experiments/
