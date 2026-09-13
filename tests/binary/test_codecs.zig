@@ -57,6 +57,7 @@ test "[property] - [base64]: matches RFC 4648 vectors across every text split" {
             try std.testing.expectEqualStrings(case[0], output[0..counts.decoded_bytes]);
             try std.testing.expectEqual(case[1].len, counts.significant_bytes);
             try std.testing.expectEqual(len, counts.text_bytes);
+            try std.testing.expectEqualDeep(counts, try base64.validate(spaced[0..len], .{}));
         }
     }
 }
@@ -75,6 +76,7 @@ test "[failure] - [base64]: rejects malformed tails and remains failed" {
         .{ "Zm9v\x0b", error.InvalidCharacter },
     };
     inline for (cases) |case| {
+        try std.testing.expectError(case[1], base64.validate(case[0], .{}));
         for (0..case[0].len + 1) |split| {
             var output: [32]u8 = undefined;
             var decoder = base64.Decoder.init(&output, .{});
@@ -147,6 +149,98 @@ test "[property] - [base64]: preserves all one-byte and two-byte inputs" {
     }
 }
 
+test "[property] - [base64]: bulk input matches quartet decoding at errors limits and fragment splits" {
+    var source: [384]u8 = undefined;
+    var random = std.Random.DefaultPrng.init(std.testing.random_seed);
+    random.random().bytes(&source);
+    var encoded: [512]u8 = undefined;
+    const text = try base64.encode(&encoded, &source);
+    for (0..source.len + 1) |len| {
+        var buffer: [512]u8 = undefined;
+        const short = try base64.encode(&buffer, source[0..len]);
+        for ([_]usize{ 0, 1, 3, 31, 32, 33, 255, 256, 257, short.len }) |split| {
+            if (split > short.len) continue;
+            var output: [384]u8 = undefined;
+            var decoder = base64.Decoder.init(&output, .{});
+            try decoder.update(short[0..split]);
+            try decoder.update(short[split..]);
+            const counts = try decoder.finish();
+            try std.testing.expectEqualSlices(u8, source[0..len], output[0..counts.decoded_bytes]);
+            try std.testing.expectEqualDeep(counts, try base64.validate(short, .{}));
+        }
+    }
+    for (0..text.len) |position| {
+        for ([_]u8{ '=', ' ', '\t', '\r', '\n', '!', 0x80 }) |replacement| {
+            var changed = encoded;
+            changed[position] = replacement;
+            try compareBase64Updates(&changed, .{}, source.len);
+        }
+        try compareBase64Updates(text, .{ .significant_bytes = position }, source.len);
+        if (position <= source.len) {
+            try compareBase64Updates(text, .{ .decoded_bytes = position }, source.len);
+            try compareBase64Updates(text, .{}, position);
+        }
+    }
+    for ([_]usize{ 1, 3, 4, 7, 31, 32, 63, 64, 65, 75, 76, 77, 255, 256, 257 }) |width| {
+        for ([_][]const u8{ "\n", "\r\n", " \t" }) |whitespace| {
+            var wrapped: [1536]u8 = undefined;
+            var used: usize = 0;
+            for (text, 0..) |byte, i| {
+                if (i != 0 and i % width == 0) {
+                    @memcpy(wrapped[used..][0..whitespace.len], whitespace);
+                    used += whitespace.len;
+                }
+                wrapped[used] = byte;
+                used += 1;
+            }
+            try compareBase64Updates(wrapped[0..used], .{}, source.len);
+            for ([_]usize{ 1, width - 1, width, width + 1, 31, 32, 33, 255, 256, 257, used }) |split| {
+                if (split > used) continue;
+                var output: [384]u8 = undefined;
+                var decoder = base64.Decoder.init(&output, .{});
+                try decoder.update(wrapped[0..split]);
+                try decoder.update(wrapped[split..used]);
+                const counts = try decoder.finish();
+                try std.testing.expectEqualSlices(u8, &source, &output);
+                try std.testing.expectEqualDeep(counts, try base64.validate(wrapped[0..used], .{}));
+            }
+            for ([_]usize{ width - 1, width, width + whitespace.len, used - 1 }) |position| {
+                for ([_]u8{ '=', '!', 0x80 }) |replacement| {
+                    var changed = wrapped;
+                    changed[position] = replacement;
+                    try compareBase64Updates(changed[0..used], .{}, source.len);
+                }
+            }
+            for ([_]usize{ 0, 1, 3, 31, 32, 33, 191, 192, 193, 383, 384 }) |limit| {
+                try compareBase64Updates(wrapped[0..used], .{ .significant_bytes = limit }, source.len);
+                try compareBase64Updates(wrapped[0..used], .{ .decoded_bytes = limit }, source.len);
+                try compareBase64Updates(wrapped[0..used], .{}, limit);
+            }
+        }
+    }
+}
+
+fn compareBase64Updates(text: []const u8, limits: base64.Limits, capacity: usize) !void {
+    var bulk_output: [384]u8 = undefined;
+    var scalar_output: [384]u8 = undefined;
+    var bulk = base64.Decoder.init(bulk_output[0..capacity], limits);
+    var scalar = base64.Decoder.init(scalar_output[0..capacity], limits);
+    const bulk_error: ?base64.Error = result: {
+        bulk.update(text) catch |err| break :result err;
+        _ = bulk.finish() catch |err| break :result err;
+        break :result null;
+    };
+    const scalar_error: ?base64.Error = result: {
+        for (text) |byte| scalar.update(&.{byte}) catch |err| break :result err;
+        _ = scalar.finish() catch |err| break :result err;
+        break :result null;
+    };
+    try std.testing.expectEqual(scalar_error, bulk_error);
+    try std.testing.expectEqualDeep(scalar.counts, bulk.counts);
+    try std.testing.expectEqual(scalar.error_offset, bulk.error_offset);
+    if (bulk_error == null) try std.testing.expectEqualSlices(u8, scalar_output[0..scalar.counts.decoded_bytes], bulk_output[0..bulk.counts.decoded_bytes]);
+}
+
 // --- Zlib ---
 
 test "[unit] - [zlib]: decodes independent stored and fixed Huffman streams" {
@@ -206,6 +300,72 @@ test "[failure] - [zlib]: releases partially allocated compression storage" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, allocateCompressor, .{});
 }
 
+test "[property] - [zlib]: matches valid streaming output and bounds corrupt or truncated streams" {
+    var compressor = try zlib.Compressor.init(std.testing.allocator, .default);
+    defer compressor.deinit();
+    var random = std.Random.DefaultPrng.init(std.testing.random_seed);
+    var source: [2048]u8 = undefined;
+    var compressed: [4096]u8 = undefined;
+    var reference: [4096]u8 = undefined;
+    var actual: [4096]u8 = undefined;
+    for (0..4) |shape| {
+        random.random().bytes(&source);
+        for (&source, 0..) |*byte, index| byte.* = switch (shape) {
+            0 => byte.*,
+            1 => @intCast(index % 3),
+            2 => if (index % 100 < 99) 'a' else byte.*,
+            else => byte.* & 15,
+        };
+        const wire = try compressor.compress(&compressed, &source);
+        try std.testing.expectEqualSlices(u8, &source, try decompressReference(&reference, wire));
+        try std.testing.expectEqualSlices(u8, &source, try zlib.decompress(&actual, wire));
+        for (0..wire.len) |position| {
+            const original = wire[position];
+            for ([_]u8{ 0, 1, 0x80, 0xff }) |mask| {
+                wire[position] = original ^ mask;
+                const observed = zlib.decompress(&actual, wire);
+                // Zig 0.16's streaming decoder can panic on malformed short-bit tails.
+                // Use it for complete successful streams, not as an error reference.
+                if (observed) |bytes| {
+                    try std.testing.expectEqualSlices(u8, try decompressReference(&reference, wire), bytes);
+                } else |failure| switch (failure) {
+                    error.InvalidData,
+                    error.TruncatedInput,
+                    error.ChecksumMismatch,
+                    error.TrailingInput,
+                    error.UnsupportedDictionary,
+                    error.OutputTooSmall,
+                    => {},
+                    else => return failure,
+                }
+            }
+            wire[position] = original;
+            try std.testing.expectError(error.TruncatedInput, zlib.decompress(&actual, wire[0..position]));
+        }
+    }
+}
+
+fn decompressReference(output: []u8, source: []const u8) zlib.Error![]u8 {
+    if (source.len < 2) return error.TruncatedInput;
+    const header = std.mem.readInt(u16, source[0..2], .big);
+    if (source[0] & 15 != 8 or source[0] >> 4 > 7 or header % 31 != 0) return error.InvalidData;
+    if (source[1] & 32 != 0) return error.UnsupportedDictionary;
+    var input = std.Io.Reader.fixed(source);
+    var destination = std.Io.Writer.fixed(output);
+    var decoder: std.compress.flate.Decompress = .init(&input, .zlib, &.{});
+    _ = decoder.reader.streamRemaining(&destination) catch |failure| switch (failure) {
+        error.WriteFailed => return error.OutputTooSmall,
+        error.ReadFailed => {
+            if (decoder.err) |cause| if (cause == error.EndOfStream) return error.TruncatedInput;
+            return error.InvalidData;
+        },
+    };
+    if (input.seek != source.len) return error.TrailingInput;
+    const result = destination.buffered();
+    if (std.hash.Adler32.hash(result) != decoder.container_metadata.zlib.adler) return error.ChecksumMismatch;
+    return result;
+}
+
 // --- Array composition ---
 
 test "[integration] - [primitive wire]: matches fixed little-endian Base64 vectors" {
@@ -225,7 +385,7 @@ test "[integration] - [primitive wire]: matches fixed little-endian Base64 vecto
         const T = case[0];
         const expected = case[1];
         var output: [expected.len]T = undefined;
-        try arrays.decode(T, &output, case[2], .none, scratch, .{});
+        try arrays.decode(T, &output, case[2], .none, .{ .transport = &.{}, .transformed = &.{} }, .{});
         try std.testing.expectEqualSlices(
             u8,
             std.mem.sliceAsBytes(&expected),
@@ -233,6 +393,18 @@ test "[integration] - [primitive wire]: matches fixed little-endian Base64 vecto
         );
         const wire = try arrays.encode(T, &encoded, &expected, .{}, scratch, null);
         try std.testing.expectEqualStrings(case[2], wire);
+        const prepared = try arrays.encodeWire(T, &expected, .{}, .{ .transport = &.{}, .transformed = &transformed }, null);
+        try std.testing.expectEqualStrings(case[2], try base64.encode(&encoded, prepared));
+        if (@import("builtin").cpu.arch.endian() == .little) {
+            const borrowed = try arrays.encodeWire(T, &expected, .{}, .{ .transport = &.{}, .transformed = &.{} }, null);
+            try std.testing.expectEqual(@intFromPtr(expected[0..].ptr), @intFromPtr(borrowed.ptr));
+        }
+        // A zlib envelope can decode into typed output without transformed scratch.
+        var compressor = try zlib.Compressor.init(std.testing.allocator, .default);
+        defer compressor.deinit();
+        const compressed = try arrays.encode(T, &encoded, &expected, .{ .pipeline = .zlib }, scratch, &compressor);
+        try arrays.decode(T, &output, compressed, .zlib, .{ .transport = &transport, .transformed = &.{} }, .{});
+        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&expected), std.mem.sliceAsBytes(&output));
     }
 }
 
@@ -295,6 +467,12 @@ test "[integration] - [array pipelines]: composes all Numpress modes with option
             .pipeline = pipeline,
             .fixed_point = fixed_point,
         }, scratch, &compressor);
+        const prepared = try arrays.encodeWire(f64, &values, .{
+            .pipeline = pipeline,
+            .fixed_point = fixed_point,
+        }, scratch, &compressor);
+        var encoded_wire: [512]u8 = undefined;
+        try std.testing.expectEqualStrings(wire, try base64.encode(&encoded_wire, prepared));
         try arrays.decode(f64, &output, wire, pipeline, scratch, .{});
         switch (pipeline) {
             .pic, .pic_zlib => try std.testing.expectEqualSlices(f64, &.{ 0, 1, 11, 100 }, &output),
@@ -361,6 +539,23 @@ test "[integration] - [array limits]: rejects short scratch and mismatched count
         error.LimitExceeded,
         arrays.decode(f64, &output, plain, .none, scratch, .{ .array_bytes = 23 }),
     );
+}
+
+test "[integration] - [uncompressed arrays]: checks complete text and exact size without scratch" {
+    const scratch: arrays.Scratch = .{ .transport = &.{}, .transformed = &.{} };
+    var output: [2]i32 = undefined;
+    try arrays.decode(i32, output[0..1], " B\tAMC\rAQ==\n", .none, scratch, .{});
+    try std.testing.expectEqual(@as(i32, 0x01020304), output[0]);
+    try arrays.decode(i32, output[0..0], " \n", .none, scratch, .{});
+    try std.testing.expectError(error.DecodedSizeMismatch, arrays.decode(i32, &output, "BAMCAQ==", .none, scratch, .{}));
+    try std.testing.expectError(error.DecodedSizeMismatch, arrays.decode(i32, output[0..0], "BAMCAQ==", .none, scratch, .{}));
+    try std.testing.expectError(error.DecodedSizeMismatch, arrays.decode(i32, output[0..1], "BAMCAQAAAAAA", .none, scratch, .{}));
+    try std.testing.expectError(error.InvalidCharacter, arrays.decode(i32, output[0..1], "BAMCAQAAAAAA!", .none, scratch, .{}));
+    try std.testing.expectError(error.TruncatedInput, arrays.decode(i32, output[0..1], "BAMCAQAAAAAAA", .none, scratch, .{}));
+    try std.testing.expectError(error.NonCanonicalTail, arrays.decode(i32, output[0..1], "BAMCAQAAAAAABR==", .none, scratch, .{}));
+    try std.testing.expectError(error.LimitExceeded, arrays.decode(i32, output[0..1], "BAMCAQAAAAAA", .none, scratch, .{ .base64_text = .{ .decoded_bytes = 5 } }));
+    try std.testing.expectError(error.OverlappingBuffers, arrays.decode(i32, &output, std.mem.sliceAsBytes(&output), .none, scratch, .{}));
+    try std.testing.expectError(error.OverlappingBuffers, arrays.decode(i32, &output, "BAMCAQ==", .none, .{ .transport = std.mem.sliceAsBytes(&output), .transformed = &.{} }, .{}));
 }
 
 test "[integration] - [empty arrays]: round trips every established pipeline" {
