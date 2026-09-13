@@ -1,0 +1,544 @@
+//! Builds explicit, validated record indexes over stable bytes or a borrowed regular file.
+//!
+//! Rebuilding parses the file once; checksum verification makes another byte pass.
+//! Explicit embedded-index opening reads the header and trailer without a full scan.
+//! Lookups use saved ancestor opening tags and read one
+//! record span; they never rebuild or scan preceding records. Keep the source unchanged.
+
+const std = @import("std");
+const model = @import("model.zig");
+const cv = @import("../cv/source.zig");
+const owned = @import("owned.zig");
+const reader_bridge = @import("internal/indexed_reader_bridge.zig");
+const PublicStreamReader = @import("stream_reader.zig").StreamReader;
+const StreamReader = reader_bridge.Reader;
+const xml = @import("../xml/mzml_adapter.zig");
+const schema = @import("schema.zig");
+
+const IndexedReader = @This();
+
+/// Borrowed immutable bytes or a regular-file handle kept open by the caller.
+pub const Source = union(enum) {
+    bytes: []const u8,
+    file: struct { handle: std.Io.File, io: std.Io },
+};
+
+/// Rebuild and verify_embedded scan every record. open_embedded checks the trailer
+/// and each fetched target, but does not check unread records or hash the document.
+pub const Policy = enum { rebuild, verify_embedded, open_embedded };
+
+/// Bounds index storage separately from parser and returned record storage.
+pub const Options = struct {
+    policy: Policy = .verify_embedded,
+    max_records: usize = 1_000_000,
+    index_bytes: usize = 256 * 1024 * 1024,
+    /// Maximum raw XML record span read by a lookup, separate from retained-node limits.
+    record_span_bytes: usize = 256 * 1024 * 1024,
+    /// Bounded backward search for indexListOffset when opening an embedded index.
+    tail_bytes: usize = 64 * 1024,
+    /// Applies to returned records and open_embedded headers. Full scans and trailers
+    /// remain checked regardless of reader.checks; index integrity checks are unchanged.
+    reader: PublicStreamReader.Options = .{},
+};
+
+/// Physical span and source identity, borrowed from this index. With open_embedded,
+/// end is an upper bound at the next target or trailer, not the record's closing tag.
+pub const Entry = struct { kind: model.Kind, id: []const u8, index: usize, start: u64, end: u64 };
+
+/// Source, parser, checksum, and target failures remain distinct.
+pub const Error = PublicStreamReader.Error || owned.Error || std.Io.File.StatError || std.Io.File.ReadPositionalError || error{
+    MissingIndex,
+    InvalidIndex,
+    ChecksumMismatch,
+    DuplicateId,
+    AmbiguousId,
+    StaleSource,
+    UnsupportedSource,
+    TruncatedSource,
+};
+
+allocator: std.mem.Allocator,
+arena: std.heap.ArenaAllocator,
+source: Source,
+options: Options,
+size: u64,
+stamp: ?std.Io.File.Stat = null,
+remaining: usize,
+entries: std.ArrayList(Entry) = .empty,
+ids: [2]std.StringHashMapUnmanaged(usize) = .{ .empty, .empty },
+metadata: ?owned.Header = null,
+contexts: [2]?FragmentAncestors = .{ null, null },
+counts: [2]usize = .{ 0, 0 },
+lookup_reader: ?StreamReader = null,
+
+/// Builds an index under the selected policy, retaining metadata but not payloads.
+/// verify_embedded checks every target, complete coverage, indexListOffset, and SHA-1.
+/// open_embedded cannot be combined with reader.validation, which requires EOF.
+/// No automatic fallback occurs. Release with deinit; do not copy the returned owner.
+pub fn build(allocator: std.mem.Allocator, source: Source, options: Options) Error!IndexedReader {
+    if (options.reader.checks == .minimal and options.reader.validation != null) return error.InvalidOptions;
+    if (options.policy == .open_embedded and (options.reader.validation != null or options.tail_bytes == 0))
+        return error.InvalidOptions;
+    const stamp = switch (source) {
+        .bytes => null,
+        .file => |file| try file.handle.stat(file.io),
+    };
+    if (stamp) |stat| if (stat.kind != .file) return error.UnsupportedSource;
+    var self: IndexedReader = .{
+        .allocator = allocator,
+        .arena = .init(allocator),
+        .source = source,
+        .options = options,
+        .size = if (stamp) |stat| stat.size else source.bytes.len,
+        .stamp = stamp,
+        .remaining = options.index_bytes,
+    };
+    errdefer self.deinit();
+    var buffer: [64 * 1024]u8 = undefined;
+    var fixed = std.Io.Reader.fixed(if (source == .bytes) source.bytes else &.{});
+    var file_reader: std.Io.File.Reader = undefined;
+    const input = switch (source) {
+        .bytes => &fixed,
+        .file => |file| blk: {
+            file_reader = file.handle.reader(file.io, &buffer);
+            file_reader.mode = .positional_simple;
+            break :blk &file_reader.interface;
+        },
+    };
+    var reader_options = options.reader;
+    if (options.policy != .open_embedded) reader_options.checks = .checked;
+    reader_options.payload = .skip;
+    reader_options.check_counts = true;
+    reader_options.retain_index = options.policy == .verify_embedded;
+    var reader = try StreamReader.init(allocator, input, reader_options);
+    defer reader.deinit();
+    const source_header = try reader.readHeader();
+    if (options.policy != .rebuild and !source_header.indexed) return error.MissingIndex;
+    if (options.policy == .open_embedded) {
+        try self.openEmbedded(&reader);
+        self.metadata = try owned.Header.init(allocator, source_header.*, .{ .bytes = options.reader.limits.header_bytes });
+        try self.checkSource();
+        return self;
+    }
+    var ordinals = [_]usize{ 0, 0 };
+    while (try reader.nextRecord()) |record| {
+        if (self.entries.items.len == options.max_records) return error.LimitExceeded;
+        const k = kindIndex(record.node.kind);
+        if (record.index != ordinals[k]) return error.InvalidIndex;
+        ordinals[k] += 1;
+        if (record.node.start_offset >= record.node.end_offset or record.node.end_offset > self.size)
+            return error.InvalidIndex;
+        if (self.contexts[k] == null) self.contexts[k] = try self.captureAncestors(&reader, k);
+        try self.charge(@sizeOf(Entry) + @sizeOf(usize) * 4);
+        const id = try self.copy(record.id);
+        const entry = try self.ids[k].getOrPut(allocator, id);
+        if (entry.found_existing) return error.DuplicateId;
+        entry.value_ptr.* = self.entries.items.len;
+        try self.entries.ensureUnusedCapacity(allocator, 1);
+        self.entries.appendAssumeCapacity(.{ .kind = record.node.kind, .id = id, .index = record.index, .start = record.node.start_offset, .end = record.node.end_offset });
+    }
+    if (options.policy == .verify_embedded) try self.verifyTrailer(reader_bridge.indexTrailer(&reader).*);
+    self.counts = ordinals;
+    self.metadata = try owned.Header.init(allocator, source_header.*, .{ .bytes = options.reader.limits.header_bytes });
+    try self.checkSource();
+    return self;
+}
+
+/// Releases index and metadata storage, not the borrowed source or returned owned records.
+pub fn deinit(self: *IndexedReader) void {
+    if (self.lookup_reader) |*reader| reader.deinit();
+    if (self.metadata) |*metadata| metadata.deinit();
+    self.entries.deinit(self.allocator);
+    for (&self.ids) |*ids| ids.deinit(self.allocator);
+    self.arena.deinit();
+    self.* = undefined;
+}
+
+/// Returns metadata until deinit. Observed counts remain zero with open_embedded;
+/// its counts come from the index, not a complete traversal of the record lists.
+pub fn header(self: *const IndexedReader) *const model.Header {
+    return &self.metadata.?.value;
+}
+
+/// Finds an exact ID and returns an independent record owner, or null when absent.
+/// Returns AmbiguousId when both a spectrum and a chromatogram use this ID.
+/// Lookups reuse parser storage and must not run concurrently on this reader.
+pub fn byId(self: *IndexedReader, allocator: std.mem.Allocator, id: []const u8) Error!?owned.Record {
+    try self.checkSource();
+    const spectrum = self.ids[0].get(id);
+    const chromatogram = self.ids[1].get(id);
+    if (spectrum != null and chromatogram != null) return error.AmbiguousId;
+    const position = spectrum orelse chromatogram orelse return null;
+    return try self.readEntry(allocator, self.entries.items[position]);
+}
+
+/// Looks up a zero-based ordinal within spectra or chromatograms; other kinds fail.
+pub fn at(self: *IndexedReader, allocator: std.mem.Allocator, kind: model.Kind, ordinal: usize) Error!?owned.Record {
+    if (kind != .spectrum and kind != .chromatogram) return error.InvalidIndex;
+    try self.checkSource();
+    if (ordinal >= self.counts[kindIndex(kind)]) return null;
+    return try self.readEntry(allocator, self.entries.items[ordinal + if (kind == .spectrum) @as(usize, 0) else self.counts[0]]);
+}
+
+fn readEntry(self: *IndexedReader, allocator: std.mem.Allocator, entry: Entry) Error!owned.Record {
+    try self.checkSource();
+    const context = self.contexts[kindIndex(entry.kind)].?;
+    const length = std.math.cast(usize, entry.end - entry.start) orelse return error.LimitExceeded;
+    if (length > self.options.record_span_bytes) return error.LimitExceeded;
+    const prefix_end = std.math.add(usize, context.prefix.len, length) catch return error.LimitExceeded;
+    const total = std.math.add(usize, prefix_end, context.suffix.len) catch return error.LimitExceeded;
+    const bytes = try allocator.alloc(u8, total);
+    defer allocator.free(bytes);
+    @memcpy(bytes[0..context.prefix.len], context.prefix);
+    try self.readAt(bytes[context.prefix.len..prefix_end], entry.start);
+    @memcpy(bytes[prefix_end..], context.suffix);
+    if (self.lookup_reader == null) {
+        var input = std.Io.Reader.fixed(&.{});
+        self.lookup_reader = try StreamReader.init(self.allocator, &input, self.options.reader);
+        reader_bridge.resetFragmentParser(&self.lookup_reader.?);
+    }
+    var record = try reader_bridge.readFragment(&self.lookup_reader.?, allocator, bytes, context.ancestors, entry.start, context.prefix.len, self.options.policy != .open_embedded);
+    errdefer record.deinit();
+    if (record.value.node.kind != entry.kind or !std.mem.eql(u8, record.value.id, entry.id) or
+        record.value.index != entry.index or record.value.node.start_offset != entry.start or
+        record.value.node.end_offset > entry.end or
+        (self.options.policy != .open_embedded and record.value.node.end_offset != entry.end)) return error.InvalidIndex;
+    try self.checkSource();
+    return record;
+}
+
+fn checkSource(self: *const IndexedReader) Error!void {
+    if (self.source == .file) {
+        const file = self.source.file;
+        const current = try file.handle.stat(file.io);
+        const original = self.stamp.?;
+        if (current.size != original.size or current.inode != original.inode or
+            !std.meta.eql(current.mtime, original.mtime)) return error.StaleSource;
+    }
+}
+
+fn openEmbedded(self: *IndexedReader, reader: *StreamReader) Error!void {
+    const scopes = reader_bridge.scopes(reader);
+    const prefix_len = std.math.cast(usize, scopes[0].end) orelse return error.LimitExceeded;
+    if (prefix_len > self.options.reader.limits.header_bytes) return error.LimitExceeded;
+    const prefix = try self.allocator.alloc(u8, prefix_len);
+    defer self.allocator.free(prefix);
+    try self.readAt(prefix, 0);
+    const endian = try self.encoding();
+    const tail_len: usize = @intCast(@min(self.size, self.options.tail_bytes));
+    const tail = try self.allocator.alloc(u8, tail_len);
+    defer self.allocator.free(tail);
+    const tail_start = self.size - tail.len;
+    try self.readAt(tail, tail_start);
+    var search_end = tail.len;
+    var index_start: ?u64 = null;
+    var trailer_options = self.options.reader;
+    trailer_options.checks = .checked;
+    trailer_options.check_counts = true;
+    trailer_options.limits.header_bytes = self.options.index_bytes;
+    trailer_options.limits.list_entries = @max(1, self.options.max_records);
+    trailer_options.limits.nodes = std.math.add(usize, self.options.max_records, 5) catch return error.LimitExceeded;
+    while (offsetTag(tail[0..search_end], endian)) |start| {
+        search_end = start;
+        const physical_start = tail_start + start;
+        if (physical_start < prefix_len) continue;
+        const length = std.math.add(usize, prefix_len, tail.len - start) catch return error.LimitExceeded;
+        const bytes = try self.allocator.alloc(u8, length);
+        defer self.allocator.free(bytes);
+        @memcpy(bytes[0..prefix_len], prefix);
+        @memcpy(bytes[prefix_len..], tail[start..]);
+        var parsed = reader_bridge.parseFooter(self.allocator, bytes, trailer_options, physical_start, prefix_len) catch |err| switch (err) {
+            error.OutOfMemory, error.LimitExceeded => return err,
+            else => continue,
+        };
+        defer parsed.arena.deinit();
+        index_start = cv.parseInteger(u64, parsed.nodes[0].text) catch continue;
+        break;
+    }
+    const start = index_start orelse return error.MissingIndex;
+    const final_scope = scopes[scopes.len - 1];
+    if (start < final_scope.end or start >= self.size or start > std.math.maxInt(i64) or
+        (endian != null and start % 2 != 0)) return error.InvalidIndex;
+    const trailer_len = std.math.cast(usize, self.size - start) orelse return error.LimitExceeded;
+    if (trailer_len > self.options.index_bytes) return error.LimitExceeded;
+    const bytes_len = std.math.add(usize, prefix_len, trailer_len) catch return error.LimitExceeded;
+    const bytes = try self.allocator.alloc(u8, bytes_len);
+    defer self.allocator.free(bytes);
+    @memcpy(bytes[0..prefix_len], prefix);
+    try self.readAt(bytes[prefix_len..], start);
+    try self.readEmbeddedEntries(bytes, start, prefix_len, final_scope.end, endian);
+    for (self.entries.items, 0..) |*entry, i| {
+        if (i + 1 < self.entries.items.len) entry.end = self.entries.items[i + 1].start;
+        if (entry.start >= entry.end) return error.InvalidIndex;
+    }
+    if (reader_bridge.listScope(reader, 0) != null) self.contexts[0] = try self.captureAncestors(reader, 0);
+    if (reader_bridge.listScope(reader, 1) != null) self.contexts[1] = try self.captureAncestors(reader, 1);
+    if (self.counts[1] != 0 and self.contexts[1] == null) {
+        if (self.counts[0] == 0) {
+            try reader_bridge.finishEmptySpectrumList(reader);
+        } else {
+            const last = self.entries.items[self.counts[0] - 1];
+            const context = self.contexts[0] orelse return error.InvalidIndex;
+            const span = std.math.cast(usize, last.end - last.start) orelse return error.LimitExceeded;
+            if (span > self.options.record_span_bytes) return error.LimitExceeded;
+            const fragment_len = std.math.add(usize, context.prefix.len, span) catch return error.LimitExceeded;
+            const fragment = try self.allocator.alloc(u8, fragment_len);
+            defer self.allocator.free(fragment);
+            @memcpy(fragment[0..context.prefix.len], context.prefix);
+            try self.readAt(fragment[context.prefix.len..], last.start);
+            var input = std.Io.Reader.fixed(fragment);
+            try reader_bridge.resumeFollowingList(reader, &input, context.ancestors, last.start, context.prefix.len);
+        }
+        self.contexts[1] = try self.captureAncestors(reader, 1);
+    }
+    const source_header = reader_bridge.header(reader);
+    for ([_]?model.RecordList{ source_header.spectrum_list, source_header.chromatogram_list }, 0..) |list, k| {
+        if (list) |value| {
+            if (value.declared_count != self.counts[k]) return error.InvalidIndex;
+            if (self.counts[k] != 0) {
+                const first = self.entries.items[if (k == 0) 0 else self.counts[0]];
+                if (first.start < reader_bridge.listScope(reader, k).?.end) return error.InvalidIndex;
+            }
+        } else if (self.counts[k] != 0) return error.InvalidIndex;
+    }
+}
+
+fn readEmbeddedEntries(self: *IndexedReader, bytes: []const u8, index_start: u64, prefix_len: usize, minimum: u64, endian: ?std.builtin.Endian) Error!void {
+    var input = std.Io.Reader.fixed(bytes);
+    const limits = self.options.reader.limits;
+    var cursor = try xml.Cursor.init(self.allocator, &input, limits.depth, limits.attributes, limits.attribute_bytes, true);
+    defer cursor.deinit();
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(self.allocator);
+    try cursor.advance(false);
+    _ = try indexStart(&cursor, .indexed_mzml, false);
+    try cursor.advance(false);
+    const list = try indexStart(&cursor, .index_list, true);
+    if (cursor.current.?.span.start != prefix_len) return error.InvalidIndex;
+    const declared = try cv.parseInteger(usize, list.attribute(null, "count").?.value);
+    var seen = [_]bool{ false, false };
+    var indexes: usize = 0;
+    try cursor.advance(false);
+    while ((cursor.current orelse return error.UnexpectedEnd).data == .start_element) {
+        const index = try indexStart(&cursor, .index, true);
+        const name = index.attribute(null, "name").?.value;
+        const kind: model.Kind = if (std.mem.eql(u8, name, "spectrum")) .spectrum else if (std.mem.eql(u8, name, "chromatogram")) .chromatogram else return error.InvalidIndex;
+        const k = kindIndex(kind);
+        if (seen[k]) return error.InvalidIndex;
+        seen[k] = true;
+        indexes += 1;
+        var previous: u64 = 0;
+        try cursor.advance(false);
+        while ((cursor.current orelse return error.UnexpectedEnd).data == .start_element) {
+            const offset = try indexStart(&cursor, .offset, true);
+            if (self.entries.items.len == self.options.max_records) return error.LimitExceeded;
+            try self.charge(@sizeOf(Entry) + @sizeOf(usize) * 4);
+            const id = try self.copy(offset.attribute(null, "idRef").?.value);
+            const target = try cv.parseInteger(u64, try self.indexText(&cursor, &text, .offset));
+            if (target <= previous or target >= index_start or target < minimum or
+                (endian != null and target % 2 != 0) or target > std.math.maxInt(i64)) return error.InvalidIndex;
+            previous = target;
+            const entry = try self.ids[k].getOrPut(self.allocator, id);
+            if (entry.found_existing) return error.DuplicateId;
+            entry.value_ptr.* = self.entries.items.len;
+            try self.entries.append(self.allocator, .{ .kind = kind, .id = id, .index = self.counts[k], .start = target, .end = index_start });
+            self.counts[k] += 1;
+        }
+        try indexEnd(&cursor, .index);
+    }
+    if (indexes == 0) return error.InvalidStructure;
+    if (declared != indexes) return error.CountMismatch;
+    try indexEnd(&cursor, .index_list);
+    _ = try indexStart(&cursor, .index_list_offset, true);
+    if (try cv.parseInteger(u64, try self.indexText(&cursor, &text, .index_list_offset)) != index_start) return error.InvalidIndex;
+    _ = try indexStart(&cursor, .file_checksum, true);
+    _ = try checksum(.{ .kind = .file_checksum, .text = try self.indexText(&cursor, &text, .file_checksum) });
+    try indexEnd(&cursor, .indexed_mzml);
+    if (cursor.current != null) return error.InvalidStructure;
+    // Each kind is already ordered. Rotate only when the two index elements are reversed.
+    if (self.counts[0] != 0 and self.counts[1] != 0 and self.entries.items[0].kind == .chromatogram)
+        std.mem.rotate(Entry, self.entries.items, self.counts[1]);
+    for (self.entries.items, 0..) |entry, i| self.ids[kindIndex(entry.kind)].getPtr(entry.id).?.* = i;
+}
+
+fn indexStart(cursor: *const xml.Cursor, kind: model.Kind, attributes: bool) Error!xml.Start {
+    const event = cursor.current orelse return error.UnexpectedEnd;
+    if (event.data != .start_element or !event.data.start_element.name.eql(xml.NAMESPACE, kind.xmlName())) return error.InvalidStructure;
+    const start = event.data.start_element;
+    if (attributes) {
+        const required = schema.requiredAttributes(kind);
+        const optional = schema.optionalAttributes(kind);
+        var names = std.mem.tokenizeScalar(u8, required, ' ');
+        while (names.next()) |name| if (start.attribute(null, name) == null) return error.MissingAttribute;
+        for (start.attributes) |attribute| {
+            const name = attribute.name.expanded.?;
+            if (name.namespace_uri) |uri| {
+                if (!std.mem.eql(u8, uri, xml.XSI) or !std.mem.eql(u8, name.local, "schemaLocation")) return error.UnknownAttribute;
+            } else if (!schema.contains(required, name.local) and !schema.contains(optional, name.local)) return error.UnknownAttribute;
+        }
+    }
+    return start;
+}
+
+fn indexEnd(cursor: *xml.Cursor, kind: model.Kind) Error!void {
+    const event = cursor.current orelse return error.UnexpectedEnd;
+    if (event.data != .end_element or !event.data.end_element.name.eql(xml.NAMESPACE, kind.xmlName())) return error.InvalidStructure;
+    try cursor.advance(false);
+}
+
+fn indexText(self: *const IndexedReader, cursor: *xml.Cursor, text: *std.ArrayList(u8), kind: model.Kind) Error![]const u8 {
+    text.clearRetainingCapacity();
+    try cursor.advance(true);
+    while (cursor.current) |event| {
+        if (event.data != .text) break;
+        const fragment = event.data.text.bytes;
+        if (fragment.len > self.options.reader.limits.binary_text_bytes -| text.items.len) return error.LimitExceeded;
+        try text.appendSlice(self.allocator, fragment);
+        try cursor.advance(true);
+    }
+    try indexEnd(cursor, kind);
+    return text.items;
+}
+
+fn checksum(node: model.Node) Error![20]u8 {
+    const text = std.mem.trim(u8, node.text orelse return error.InvalidIndex, " \t\r\n");
+    if (text.len != 40) return error.InvalidIndex;
+    var result: [20]u8 = undefined;
+    _ = std.fmt.hexToBytes(&result, text) catch return error.InvalidIndex;
+    return result;
+}
+
+// This only finds candidates. The XML cursor parses the candidate and complete trailer.
+fn offsetTag(bytes: []const u8, endian: ?std.builtin.Endian) ?usize {
+    const name = "indexListOffset";
+    var encoded: [name.len * 2]u8 = undefined;
+    const width: usize = if (endian != null) 2 else 1;
+    const needle = if (endian) |order| blk: {
+        for (name, 0..) |byte, i| std.mem.writeInt(u16, encoded[i * 2 ..][0..2], byte, order);
+        break :blk encoded[0..];
+    } else name;
+    var end = bytes.len;
+    while (std.mem.lastIndexOf(u8, bytes[0..end], needle)) |position| {
+        end = position;
+        if (position < width) continue;
+        var before = position - width;
+        const preceding = codeUnit(bytes, before, endian);
+        if (preceding == '<') return before;
+        if (preceding != ':') continue;
+        while (before >= width) {
+            before -= width;
+            const unit = codeUnit(bytes, before, endian);
+            if (unit == '<') return before;
+            if (unit == '/' or unit == '>' or unit <= ' ') break;
+        }
+    }
+    return null;
+}
+
+fn codeUnit(bytes: []const u8, start: usize, endian: ?std.builtin.Endian) u16 {
+    return if (endian) |order| std.mem.readInt(u16, bytes[start..][0..2], order) else bytes[start];
+}
+
+fn encoding(self: *const IndexedReader) Error!?std.builtin.Endian {
+    var signature: [4]u8 = @splat(0);
+    try self.readAt(signature[0..@intCast(@min(4, self.size))], 0);
+    return if (signature[0] == 0xff or (signature[0] == '<' and signature[1] == 0)) .little else if (signature[0] == 0xfe or (signature[0] == 0 and signature[1] == '<')) .big else null;
+}
+
+fn verifyTrailer(self: *IndexedReader, trailer: [3]model.Node) Error!void {
+    if (try cv.parseInteger(u64, trailer[1].text) != trailer[0].start_offset) return error.InvalidIndex;
+    var seen: [2]bool = .{ false, false };
+    var total: usize = 0;
+    for (trailer[0].children) |index| {
+        const name = index.attribute("name").?;
+        const kind: model.Kind = if (std.mem.eql(u8, name, "spectrum")) .spectrum else if (std.mem.eql(u8, name, "chromatogram")) .chromatogram else return error.InvalidIndex;
+        const k = kindIndex(kind);
+        if (seen[k]) return error.InvalidIndex;
+        seen[k] = true;
+        var previous: u64 = 0;
+        for (index.children) |offset| {
+            const target = try cv.parseInteger(u64, offset.text);
+            if (target == 0 or target <= previous or target >= trailer[0].start_offset) return error.InvalidIndex;
+            previous = target;
+            const position = self.ids[k].get(offset.attribute("idRef").?) orelse return error.InvalidIndex;
+            const entry = self.entries.items[position];
+            if (entry.kind != kind or entry.start != target) return error.InvalidIndex;
+            total += 1;
+        }
+    }
+    if (total != self.entries.items.len) return error.InvalidIndex;
+    const expected = try checksum(trailer[2]);
+    var hash = std.crypto.hash.Sha1.init(.{});
+    var buffer: [64 * 1024]u8 = undefined;
+    var offset: u64 = 0;
+    while (offset < trailer[2].content_offset) {
+        const length: usize = @intCast(@min(buffer.len, trailer[2].content_offset - offset));
+        try self.readAt(buffer[0..length], offset);
+        hash.update(buffer[0..length]);
+        offset += length;
+    }
+    if (!std.mem.eql(u8, &hash.finalResult(), &expected)) return error.ChecksumMismatch;
+}
+
+fn captureAncestors(self: *IndexedReader, reader: *StreamReader, k: usize) Error!FragmentAncestors {
+    const current_scopes = reader_bridge.scopes(reader);
+    var scopes: [4]reader_bridge.Scope = undefined;
+    @memcpy(scopes[0..current_scopes.len], current_scopes);
+    scopes[0].start = 0;
+    scopes[current_scopes.len] = reader_bridge.listScope(reader, k).?;
+    const count = current_scopes.len + 1;
+    var length: usize = 0;
+    for (scopes[0..count]) |scope| length = std.math.add(usize, length, std.math.cast(usize, scope.end - scope.start) orelse return error.LimitExceeded) catch return error.LimitExceeded;
+    const prefix = try self.alloc(length);
+    var position: usize = 0;
+    for (scopes[0..count]) |scope| {
+        const size: usize = @intCast(scope.end - scope.start);
+        try self.readAt(prefix[position..][0..size], scope.start);
+        position += size;
+    }
+    var suffix: std.Io.Writer.Allocating = .init(self.allocator);
+    defer suffix.deinit();
+    for (0..count) |i| suffix.writer.print("</{s}>", .{scopes[count - i - 1].name}) catch return error.OutOfMemory;
+    const endian = try self.encoding();
+    if (endian) |order| {
+        const units = std.unicode.utf8ToUtf16LeAlloc(self.allocator, suffix.written()) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidUtf8 => return error.InvalidXml,
+        };
+        defer self.allocator.free(units);
+        const encoded = try self.alloc(units.len * 2);
+        for (units, 0..) |unit, i| std.mem.writeInt(u16, encoded[i * 2 ..][0..2], std.mem.littleToNative(u16, unit), order);
+        return .{ .prefix = prefix, .suffix = encoded, .ancestors = count };
+    }
+    return .{ .prefix = prefix, .suffix = try self.copy(suffix.written()), .ancestors = count };
+}
+
+fn readAt(self: *const IndexedReader, output: []u8, offset: u64) Error!void {
+    if (offset > self.size or output.len > self.size - offset) return error.TruncatedSource;
+    switch (self.source) {
+        .bytes => |bytes| @memcpy(output, bytes[@intCast(offset)..][0..output.len]),
+        .file => |file| if (try file.handle.readPositionalAll(file.io, output, offset) != output.len) return error.TruncatedSource,
+    }
+}
+
+fn charge(self: *IndexedReader, bytes: usize) Error!void {
+    if (bytes > self.remaining) return error.LimitExceeded;
+    self.remaining -= bytes;
+}
+
+fn alloc(self: *IndexedReader, bytes: usize) Error![]u8 {
+    try self.charge(bytes);
+    return self.arena.allocator().alloc(u8, bytes);
+}
+
+fn copy(self: *IndexedReader, bytes: []const u8) Error![]const u8 {
+    const result = try self.alloc(bytes.len);
+    @memcpy(result, bytes);
+    return result;
+}
+
+fn kindIndex(kind: model.Kind) usize {
+    return if (kind == .spectrum) 0 else 1;
+}
+
+const FragmentAncestors = struct { prefix: []const u8, suffix: []const u8, ancestors: usize };
