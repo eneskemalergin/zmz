@@ -1,11 +1,65 @@
-# z-mzml
+<!-- markdownlint-disable MD033 MD041 -->
 
-A Zig library for reading, writing, and working with mzML files, under development.
+<h1 align="center">zmz</h1>
 
-Status: early development. The public API is not stable.
+<p align="center">
+  <strong>A Zig mass-spectrometry data library, starting with mzML.</strong>
+</p>
 
-The package currently exposes CV parameter helpers, MS-Numpress, Base64, zlib, and binary-array codec composition. The default build uses Zig 0.16 without C dependencies.
+<p align="center">
+  <a href="#what-zmz-is"><img src="https://img.shields.io/badge/first%20format-mzML-0066CC?style=flat-square" alt="First format: mzML"></a>
+  <a href="https://ziglang.org/download/"><img src="https://img.shields.io/badge/Zig-0.16.0-F7A41D?style=flat-square&amp;logo=zig&amp;logoColor=white" alt="Zig 0.16.0"></a>
+  <a href="#direction"><img src="https://img.shields.io/badge/status-early%20development-C17D10?style=flat-square" alt="Status: early development"></a>
+  <a href="#license"><img src="https://img.shields.io/badge/license-not%20selected-94a3b8?style=flat-square" alt="License: not selected"></a>
+</p>
 
-Whole-file mzML reading and writing are not implemented yet. The public import is `@import("z_mzml")`; its exports are in [src/root.zig](src/root.zig).
+<!-- markdownlint-enable MD041 -->
 
-Run the self-contained checks with `zig build test --summary all` and `zig build test -Doptimize=ReleaseFast --summary all`.
+---
+
+`zmz` is a Zig library for mass-spectrometry data, inspired by [`mzdata`](https://github.com/mobiusklein/mzdata), a Rust library and data model for reading several mass-spectrometry file formats. It starts as the mzML dependency for my other Zig projects. The near-term work stays focused on mzML while leaving room for more mass-spectrometry file formats later.
+
+## What zmz is
+
+The first version brings the pieces needed for mzML into one package:
+
+- forward and indexed reading for sequential workflows and targeted record access;
+- plain and indexed writing for generated or transformed files;
+- checked metadata construction and document/reference validation;
+- records and metadata that callers can retain beyond the next read;
+- binary-array decoding and encoding with Base64, zlib, and MS-Numpress;
+- scientific metadata and controlled-vocabulary access.
+
+The public API is still taking shape. The package currently imports as `z_mzml`; the package rename will follow the project rename.
+
+## Direction
+
+The near-term design aims for:
+
+- a small, fast reader and writer for large mzML files;
+- clear rules for borrowed data, retained data, and who frees allocated memory;
+- an XML engine focused on the forms required by mzML;
+- separate modules for additional mass-spectrometry file formats if the project grows in that direction;
+- deeper schema, profile, vocabulary, and binary-payload validation;
+- release builds that stay fast and small without unnecessary runtime dependencies.
+
+The project stays centered on mzML for the foreseeable future. Once that work is stable, it can follow the example set by `mzdata` and add readers for other mass-spectrometry file formats. Format-specific types should stay in their own modules, while shared XML, binary, and common data types remain reusable.
+
+## Start
+
+Use Zig 0.16.0. Run the library checks with:
+
+```sh
+zig build test --summary all
+zig build test -Doptimize=ReleaseFast --summary all
+```
+
+The public entry point is [`src/root.zig`](src/root.zig). Vocabulary resources and their source notices are described in [`vocabularies/README.md`](vocabularies/README.md).
+
+## License
+
+The project license has not been selected yet. The bundled vocabulary resources retain their source terms and attribution requirements; see [`vocabularies/README.md`](vocabularies/README.md).
+
+---
+
+<p align="center"><sub>Built in Zig for practical mass-spectrometry data work.</sub></p>
