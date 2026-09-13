@@ -54,6 +54,14 @@ pub fn decode(output: []u8, source: []const u8, limits: Limits) Error!Counts {
     return decoder.finish();
 }
 
+/// Checks the same lexical rules and limits as decode without allocating or writing output.
+pub fn validate(source: []const u8, limits: Limits) Error!Counts {
+    var decoder = Decoder.init(&.{}, limits);
+    decoder.discard_output = true;
+    try decoder.update(source);
+    return decoder.finish();
+}
+
 /// A bounded decoder borrowing its destination until finish or abandonment.
 /// Input slices need remain alive only during update and must not overlap the destination.
 /// Failures are sticky; counters and partially written output are not a successful result.
@@ -66,6 +74,7 @@ pub const Decoder = struct {
     padded: bool = false,
     finished: bool = false,
     failed: bool = false,
+    discard_output: bool = false,
     /// Offset in concatenated logical text, not the physical XML source.
     error_offset: ?usize = null,
 
@@ -83,7 +92,15 @@ pub const Decoder = struct {
         const total = std.math.add(usize, self.counts.text_bytes, text.len) catch
             return error.LengthOverflow;
         if (total > self.limits.text_bytes) return error.LimitExceeded;
-        for (text) |byte| {
+        var index: usize = 0;
+        while (index < text.len) {
+            const consumed = self.decodeRun(text[index..]);
+            if (consumed != 0) {
+                index += consumed;
+                continue;
+            }
+            const byte = text[index];
+            index += 1;
             const offset = self.counts.text_bytes;
             self.counts.text_bytes += 1;
             if (isWhitespace(byte)) continue;
@@ -98,6 +115,31 @@ pub const Decoder = struct {
             if (self.quartet_len == 4) try self.flushQuartet();
         }
         self.error_offset = null;
+    }
+
+    fn decodeRun(self: *Decoder, text: []const u8) usize {
+        if (self.quartet_len != 0 or self.padded or text.len < 32) return 0;
+        var length: usize = @min(text.len, 256) / 4 * 4;
+        if (text[length - 1] == '=') length -= 4;
+        var decoded: usize = length / 4 * 3;
+        if (length > self.limits.significant_bytes -| self.counts.significant_bytes or
+            decoded > self.limits.decoded_bytes -| self.counts.decoded_bytes) return 0;
+        var discarded: [192]u8 = undefined;
+        const output = if (self.discard_output) discarded[0..decoded] else blk: {
+            if (decoded > self.output.len -| self.counts.decoded_bytes) return 0;
+            break :blk self.output[self.counts.decoded_bytes..][0..decoded];
+        };
+        // A failed attempt leaves counters unchanged. The quartet path owns whitespace,
+        // padding, limits, and exact diagnostics, including errors after partial progress.
+        std.base64.standard_no_pad.Decoder.decode(output, text[0..length]) catch {
+            length = @call(.never_inline, decodePrefix, .{ output, text[0..length] });
+            if (length == 0) return 0;
+            decoded = length / 4 * 3;
+        };
+        self.counts.text_bytes += length;
+        self.counts.significant_bytes += length;
+        self.counts.decoded_bytes += decoded;
+        return length;
     }
 
     /// Checks the final quartet and returns counts once. Does not free the destination.
@@ -131,16 +173,26 @@ pub const Decoder = struct {
         const end = std.math.add(usize, self.counts.decoded_bytes, count) catch
             return error.LengthOverflow;
         if (end > self.limits.decoded_bytes) return error.LimitExceeded;
-        if (end > self.output.len) return error.OutputTooSmall;
-        const destination = self.output[self.counts.decoded_bytes..end];
-        destination[0] = a << 2 | b >> 4;
-        if (count >= 2) destination[1] = b << 4 | c.? >> 2;
-        if (count == 3) destination[2] = c.? << 6 | d.?;
+        if (!self.discard_output) {
+            if (end > self.output.len) return error.OutputTooSmall;
+            const destination = self.output[self.counts.decoded_bytes..end];
+            destination[0] = a << 2 | b >> 4;
+            if (count >= 2) destination[1] = b << 4 | c.? >> 2;
+            if (count == 3) destination[2] = c.? << 6 | d.?;
+        }
         self.counts.decoded_bytes = end;
         self.quartet_len = 0;
         self.padded = count != 3;
     }
 };
+
+fn decodePrefix(output: []u8, text: []const u8) usize {
+    const stop = std.mem.findAny(u8, text, " \t\r\n") orelse return 0;
+    const length = stop / 4 * 4;
+    if (length == 0) return 0;
+    std.base64.standard_no_pad.Decoder.decode(output[0 .. length / 4 * 3], text[0..length]) catch return 0;
+    return length;
+}
 
 fn alphabet(byte: u8) ?u8 {
     return switch (byte) {

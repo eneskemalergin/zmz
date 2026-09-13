@@ -6,13 +6,17 @@ const std = @import("std");
 const base64 = @import("base64.zig");
 const zlib = @import("zlib.zig");
 const numpress = @import("numpress.zig");
+const encoding = @import("encoding.zig");
 
 /// Established array pipelines, named in encoding order before the Base64 envelope.
-pub const Pipeline = enum { none, zlib, linear, pic, slof, linear_zlib, pic_zlib, slof_zlib };
+pub const Pipeline = encoding.Pipeline;
 
 /// Caller-owned disjoint scratch buffers. Neither buffer aliases input or output.
-/// Transport holds Base64-decoded bytes; transformed holds uncompressed wire bytes.
-/// Encoding uses transformed for primitive or Numpress bytes and transport only for zlib.
+/// Uncompressed decode needs neither slice. Otherwise transport holds Base64-decoded bytes.
+/// Decode needs transformed only for
+/// Numpress-plus-zlib; primitive zlib expands directly into the typed destination.
+/// Encoding uses transformed for Numpress or big-endian primitive conversion, and transport
+/// only for zlib. Little-endian primitive encoding borrows the values' bytes directly.
 pub const Scratch = struct {
     transport: []u8,
     transformed: []u8,
@@ -56,15 +60,23 @@ pub fn decode(
         return error.LengthOverflow;
     if (array_bytes > limits.array_bytes) return error.LimitExceeded;
     if (transform(pipeline) != .none and T != f64) return error.TypeMismatch;
-    const counts = try base64.decode(scratch.transport, source, limits.base64_text);
-    var wire: []const u8 = scratch.transport[0..counts.decoded_bytes];
+    const destination = if (pipeline == .none) std.mem.sliceAsBytes(output) else scratch.transport;
+    const counts = base64.decode(destination, source, limits.base64_text) catch |err| {
+        if (pipeline != .none or err != error.OutputTooSmall) return err;
+        // Preserve lexical and limit failures that precede the final exact-size check.
+        _ = try base64.validate(source, limits.base64_text);
+        return error.DecodedSizeMismatch;
+    };
+    var wire: []const u8 = destination[0..counts.decoded_bytes];
     if (hasZlib(pipeline)) {
         const maximum = try wireBound(T, output.len, pipeline);
-        wire = try zlib.decompress(scratch.transformed[0..@min(maximum, scratch.transformed.len)], wire);
+        const inflated = if (transform(pipeline) == .none) std.mem.sliceAsBytes(output) else scratch.transformed[0..@min(maximum, scratch.transformed.len)];
+        wire = try zlib.decompress(inflated, wire);
     }
     switch (transform(pipeline)) {
         .none => {
             if (wire.len != array_bytes) return error.DecodedSizeMismatch;
+            if (@import("builtin").cpu.arch.endian() == .little) return;
             const Bits = @Int(.unsigned, @bitSizeOf(T));
             for (output, 0..) |*value, index| {
                 const offset = index * @sizeOf(T);
@@ -89,12 +101,33 @@ pub fn encode(
 ) Error![]u8 {
     checkType(T);
     try checkBuffers(output, std.mem.sliceAsBytes(values), scratch);
+    return base64.encode(output, try encodeWire(T, values, options, scratch, compressor));
+}
+
+/// Prepares primitive or Numpress bytes with optional zlib, without Base64 or allocation.
+/// The result borrows values on little-endian primitive paths without zlib; otherwise it
+/// borrows scratch until that buffer is reused. All supplied buffers must remain disjoint.
+/// A reusable compressor is required only for zlib pipelines.
+pub fn encodeWire(
+    comptime T: type,
+    values: []const T,
+    options: EncodeOptions,
+    scratch: Scratch,
+    compressor: ?*zlib.Compressor,
+) Error![]const u8 {
+    checkType(T);
+    try checkBuffers(&.{}, std.mem.sliceAsBytes(values), scratch);
     const selected = transform(options.pipeline);
     if (selected != .none and T != f64) return error.TypeMismatch;
     if (hasZlib(options.pipeline) and compressor == null) return error.MissingCompressor;
     if (selected == .linear or selected == .slof) {
         if (options.fixed_point == null) return error.MissingFixedPoint;
     } else if (options.fixed_point != null) return error.UnexpectedFixedPoint;
+
+    if (selected == .none and @import("builtin").cpu.arch.endian() == .little) {
+        const wire = std.mem.sliceAsBytes(values);
+        return if (hasZlib(options.pipeline)) try compressor.?.compress(scratch.transport, wire) else wire;
+    }
 
     const length = switch (selected) {
         .none => blk: {
@@ -122,7 +155,7 @@ pub fn encode(
     };
     var wire: []const u8 = scratch.transformed[0..length];
     if (hasZlib(options.pipeline)) wire = try compressor.?.compress(scratch.transport, wire);
-    return base64.encode(output, wire);
+    return wire;
 }
 
 /// Returns the primitive or Numpress wire capacity before optional zlib compression.

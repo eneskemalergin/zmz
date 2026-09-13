@@ -1,6 +1,7 @@
 //! Handles independent zlib array streams using only Zig's standard library.
 
 const std = @import("std");
+const inflate = @import("inflate.zig");
 
 /// Checked stream failures. Partial output is unspecified and never exceeds its buffer.
 pub const Error = error{
@@ -26,23 +27,13 @@ pub fn decompress(output: []u8, source: []const u8) Error![]u8 {
         return error.InvalidData;
     if (source[1] & 32 != 0) return error.UnsupportedDictionary;
 
-    var input = std.Io.Reader.fixed(source);
-    var destination = std.Io.Writer.fixed(output);
-    var decoder: std.compress.flate.Decompress = .init(&input, .zlib, &.{});
-    _ = decoder.reader.streamRemaining(&destination) catch |failure| switch (failure) {
-        error.WriteFailed => return error.OutputTooSmall,
-        error.ReadFailed => {
-            if (decoder.err) |cause| {
-                if (cause == error.EndOfStream) return error.TruncatedInput;
-            }
-            return error.InvalidData;
-        },
-    };
-    if (input.seek != source.len) return error.TrailingInput;
-    const result = destination.buffered();
-    if (std.hash.Adler32.hash(result) != decoder.container_metadata.zlib.adler)
+    const result = try inflate.decode(output, source[2..]);
+    const footer = result.consumed + 2;
+    if (source.len - footer < 4) return error.TruncatedInput;
+    if (source.len - footer != 4) return error.TrailingInput;
+    if (std.hash.Adler32.hash(result.bytes) != std.mem.readInt(u32, source[footer..][0..4], .big))
         return error.ChecksumMismatch;
-    return result;
+    return result.bytes;
 }
 
 /// Reusable compression storage with one owner. Do not copy a live instance.
