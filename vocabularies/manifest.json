@@ -1,0 +1,61 @@
+{
+  "format_version": 1,
+  "resources": [
+    {
+      "key": "psi-ms",
+      "version": "4.1.258",
+      "source_version": "4.1.258",
+      "namespace": "MS",
+      "full_name": "PSI-MS",
+      "uri": "http://purl.obolibrary.org/obo/ms/psi-ms.obo",
+      "repository": "https://github.com/HUPO-PSI/psi-ms-CV",
+      "commit": "6081b684002e06484e74774975bc056caaf8927f",
+      "path": "psi-ms.obo",
+      "retrieved": "2026-09-09",
+      "license": "CC-BY-4.0",
+      "attribution": "HUPO Proteomics Standards Initiative Mass Spectrometry Standards Working Group and Proteomics Informatics Working Group",
+      "sha256": "2346128b4ac445229f204f6edc225b81c4b4afa6846cf95968bde0b17bf8825d",
+      "artifact_version": 1,
+      "counts": {
+        "terms": 4114,
+        "native_terms": 3986,
+        "obsolete": 284,
+        "alternate_ids": 2,
+        "replacements": 19,
+        "considerations": 0,
+        "synonyms": 514,
+        "value_types": 1378,
+        "units": 327,
+        "binary_xrefs": 39
+      }
+    },
+    {
+      "key": "uo",
+      "version": "2026-07-31",
+      "source_version": "releases/2026-07-31",
+      "namespace": "UO",
+      "full_name": "Unit Ontology",
+      "uri": "https://raw.githubusercontent.com/bio-ontology-research-group/unit-ontology/c706cc712ae884d72642bb2b70f917e37511f269/uo.obo",
+      "repository": "https://github.com/bio-ontology-research-group/unit-ontology",
+      "commit": "c706cc712ae884d72642bb2b70f917e37511f269",
+      "path": "uo.obo",
+      "retrieved": "2026-09-09",
+      "license": "CC-BY-4.0",
+      "attribution": "Unit Ontology contributors, bio-ontology-research-group/unit-ontology",
+      "sha256": "6e77b0a59ab5eddf8296f88f3355dcec429b7391dfc001d778e0b2841251b6bf",
+      "artifact_version": 1,
+      "counts": {
+        "terms": 574,
+        "native_terms": 574,
+        "obsolete": 1,
+        "alternate_ids": 0,
+        "replacements": 1,
+        "considerations": 0,
+        "synonyms": 428,
+        "value_types": 0,
+        "units": 0,
+        "binary_xrefs": 0
+      }
+    }
+  ]
+}
