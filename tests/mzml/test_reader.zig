@@ -34,6 +34,9 @@ test "[regression] - [mzML array decoding]: reads empty producer arrays with zli
     var scratch: [32]u8 = undefined;
     const node = record.binaryArrays()[0];
     try mzml.model.decodeArray(f64, &.{}, node, 5, &.{}, .{ .transport = &scratch, .transformed = &.{} }, .{});
+    var typed_arrays = record.arrays(&.{});
+    const typed_array = (try typed_arrays.next()).?;
+    try typed_array.decode(f64, &.{}, .{ .transport = &scratch, .transformed = &.{} }, .{});
     try std.testing.expectError(error.LimitExceeded, mzml.model.decodeArray(f64, &.{}, node, 0, &.{}, .{ .transport = &scratch, .transformed = &.{} }, .{ .base64_text = .{ .text_bytes = 0 } }));
     var one: [1]f64 = undefined;
     var nonempty = node;
@@ -254,6 +257,29 @@ test "[integration] - [mzML reader]: retains hierarchy parameters and decodes gr
         .{ .transport = &transport, .transformed = &transformed },
         .{},
     ));
+    var typed_arrays = spectrum.arrays(header.groups);
+    const typed_array = (try typed_arrays.next()).?;
+    try std.testing.expectEqual(spectrum.binaryArrays()[0], typed_array.node);
+    try std.testing.expectEqual(mzml.model.Primitive.float64, typed_array.encoding.primitive);
+    try std.testing.expectEqual(mzml.arrays.Pipeline.none, typed_array.encoding.pipeline);
+    try std.testing.expectEqual(@as(usize, 1), typed_array.length);
+    try typed_array.decode(f64, &values, .{ .transport = &transport, .transformed = &transformed }, .{});
+    try std.testing.expectEqual(@as(f64, 1), values[0]);
+    var wrong_type: [1]i32 = undefined;
+    try std.testing.expectError(error.TypeMismatch, typed_array.decode(i32, &wrong_type, .{
+        .transport = &transport,
+        .transformed = &transformed,
+    }, .{}));
+    const second_typed_array = (try typed_arrays.next()).?;
+    try std.testing.expectEqual(@as(usize, 1), second_typed_array.length);
+    try std.testing.expectEqual(null, try typed_arrays.next());
+    var invalid_arrays = mzml.model.BinaryArrayIterator{
+        .nodes = &.{.{ .kind = .binary_data_array }},
+        .groups = &.{},
+        .default_length = 0,
+    };
+    try std.testing.expectError(error.MissingPrimitive, invalid_arrays.next());
+    try std.testing.expectError(error.MissingPrimitive, invalid_arrays.next());
     const chromatogram = (try reader.nextRecord()).?;
     try std.testing.expectEqual(.chromatogram, chromatogram.node.kind);
     try std.testing.expectEqualStrings("tic", chromatogram.id);

@@ -368,6 +368,18 @@ pub const Record = struct {
         return list.children;
     }
 
+    /// Returns typed array descriptors in source order without allocating.
+    /// Classification and array-length parsing happen once when each item is read.
+    /// Unknown roles remain available; unknown primitive or compression terms return an error.
+    /// The record nodes and groups must remain valid until iteration ends.
+    pub fn arrays(self: Record, groups: []const cv.Group) BinaryArrayIterator {
+        return .{
+            .nodes = self.binaryArrays(),
+            .groups = groups,
+            .default_length = self.default_array_length,
+        };
+    }
+
     /// Finds a unique array by exact role accession, including caller-defined roles.
     /// Repeated role parameters or matching arrays fail rather than discarding multiplicity.
     /// Other roles and unknown metadata remain available through binaryArrays.
@@ -393,6 +405,69 @@ pub const Encoding = encoding.Descriptor;
 /// Failures in declaration classification, before payload decoding.
 pub const EncodingError = encoding.Error;
 
+/// A source-preserving binary array with its reviewed wire descriptor and value count.
+/// The node and all of its slices remain borrowed from the current record or owned copy.
+pub const BinaryArray = struct {
+    node: Node,
+    encoding: Encoding,
+    length: usize,
+
+    /// Classifies one binary array and reads its explicit or record-default value count.
+    pub fn init(
+        node: Node,
+        default_length: usize,
+        groups: []const cv.Group,
+    ) (EncodingError || cv.ValueError)!BinaryArray {
+        return initWithEncoding(node, default_length, try arrayEncoding(node, groups));
+    }
+
+    /// Decodes the declared values into an exact-size caller-owned typed buffer.
+    /// The destination type must match the declared primitive; no conversion or allocation occurs.
+    pub fn decode(
+        self: BinaryArray,
+        comptime T: type,
+        output: []T,
+        scratch: arrays.Scratch,
+        limits: arrays.Limits,
+    ) (EncodingError || arrays.Error)!void {
+        if (self.encoding.primitive != primitiveFor(T)) return error.TypeMismatch;
+        if (self.length != output.len) return error.DecodedSizeMismatch;
+        const binary = self.node.child(.binary) orelse return error.PayloadNotRetained;
+        const text = binary.text orelse return error.PayloadNotRetained;
+        // Some producers omit the zlib stream for an empty array. Nonempty streams
+        // still pass through the codec, including its checksum and truncation checks.
+        if (self.length == 0 and self.encoding.pipeline == .zlib and std.mem.trim(u8, text, " \t\r\n").len == 0) {
+            try arrays.decode(T, output, text, .none, scratch, limits);
+            return;
+        }
+        try arrays.decode(T, output, text, self.encoding.pipeline, scratch, limits);
+    }
+};
+
+/// Iterates borrowed record arrays as typed descriptors without retaining new storage.
+/// The source nodes and groups must remain valid until iteration ends.
+pub const BinaryArrayIterator = struct {
+    nodes: []const Node,
+    groups: []const cv.Group,
+    default_length: usize,
+    position: usize = 0,
+    failed: ?BinaryArrayError = null,
+
+    /// Returns the next descriptor or null at the end. The first classification failure is sticky.
+    pub fn next(self: *BinaryArrayIterator) BinaryArrayError!?BinaryArray {
+        if (self.failed) |failure| return failure;
+        if (self.position == self.nodes.len) return null;
+        const node = self.nodes[self.position];
+        self.position += 1;
+        return BinaryArray.init(node, self.default_length, self.groups) catch |failure| {
+            self.failed = failure;
+            return failure;
+        };
+    }
+};
+
+const BinaryArrayError = EncodingError || cv.ValueError;
+
 /// Classifies reviewed wire terms without guessing defaults or resolving an ontology.
 pub fn arrayEncoding(node: Node, groups: []const cv.Group) EncodingError!Encoding {
     if (node.kind != .binary_data_array) return error.NotBinaryArray;
@@ -411,28 +486,27 @@ pub fn decodeArray(
     limits: arrays.Limits,
 ) (EncodingError || cv.ValueError || arrays.Error)!void {
     const declared_encoding = try arrayEncoding(node, groups);
-    const expected: Primitive = switch (T) {
+    if (declared_encoding.primitive != primitiveFor(T)) return error.TypeMismatch;
+    const array = try initWithEncoding(node, default_length, declared_encoding);
+    try array.decode(T, output, scratch, limits);
+}
+
+fn initWithEncoding(node: Node, default_length: usize, descriptor: Encoding) cv.ValueError!BinaryArray {
+    const length = if (node.attribute("arrayLength")) |value|
+        try cv.parseInteger(usize, value)
+    else
+        default_length;
+    return .{ .node = node, .encoding = descriptor, .length = length };
+}
+
+fn primitiveFor(comptime T: type) Primitive {
+    return switch (T) {
         f32 => .float32,
         f64 => .float64,
         i32 => .int32,
         i64 => .int64,
         else => @compileError("array destination must be f32, f64, i32, or i64"),
     };
-    if (declared_encoding.primitive != expected) return error.TypeMismatch;
-    const count = if (node.attribute("arrayLength")) |value|
-        try cv.parseInteger(usize, value)
-    else
-        default_length;
-    if (count != output.len) return error.DecodedSizeMismatch;
-    const binary = node.child(.binary) orelse return error.PayloadNotRetained;
-    const text = binary.text orelse return error.PayloadNotRetained;
-    // Some producers omit the zlib stream for an empty array. Nonempty streams
-    // still pass through the codec, including its checksum and truncation checks.
-    if (count == 0 and declared_encoding.pipeline == .zlib and std.mem.trim(u8, text, " \t\r\n").len == 0) {
-        try arrays.decode(T, output, text, .none, scratch, limits);
-        return;
-    }
-    try arrays.decode(T, output, text, declared_encoding.pipeline, scratch, limits);
 }
 
 fn listItems(node: Node, kind: Kind) []const Node {

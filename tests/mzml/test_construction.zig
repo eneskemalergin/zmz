@@ -25,16 +25,17 @@ test "[integration] - [mzML construction]: writes and decodes every declared pip
     var count: usize = 0;
     while (try reader.nextRecord()) |record| {
         try std.testing.expectEqual(@as(usize, 3), record.default_array_length);
-        for (record.binaryArrays()) |array| {
-            const encoding = try mzml.model.arrayEncoding(array, header.groups);
+        var typed_arrays = record.arrays(header.groups);
+        while (try typed_arrays.next()) |array| {
+            const encoding = array.encoding;
             try std.testing.expectEqual(@as(mzml.arrays.Pipeline, @enumFromInt(count % 8)), encoding.pipeline);
             var output: [3]f64 = undefined;
             var transport: [512]u8 = undefined;
             var transformed: [512]u8 = undefined;
-            try mzml.model.decodeArray(f64, &output, array, 3, header.groups, .{ .transport = &transport, .transformed = &transformed }, .{});
+            try array.decode(f64, &output, .{ .transport = &transport, .transformed = &transformed }, .{});
             for (output, [_]f64{ 1, 2, 3 }) |value, expected| try std.testing.expectApproxEqAbs(expected, value, 0.001);
             if (encoding.pipeline == .pic or encoding.pipeline == .pic_zlib) {
-                const counts = try mzml.base64.decode(&transport, array.child(.binary).?.text.?, .{});
+                const counts = try mzml.base64.decode(&transport, array.node.child(.binary).?.text.?, .{});
                 const wire = if (encoding.pipeline == .pic_zlib)
                     try mzml.zlib.decompress(&transformed, transport[0..counts.decoded_bytes])
                 else

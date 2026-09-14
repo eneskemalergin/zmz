@@ -75,13 +75,13 @@ fn validateFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Tot
         }
         totals.records += 1;
         try checkMetadata(record, header.groups, resolver, &totals);
-        for (record.binaryArrays()) |array| {
-            const encoding = try mzml.model.arrayEncoding(array, header.groups);
-            const values = switch (encoding.primitive) {
-                .float32 => try decodeArray(allocator, f32, array, record, header.*),
-                .float64 => try decodeArray(allocator, f64, array, record, header.*),
-                .int32 => try decodeArray(allocator, i32, array, record, header.*),
-                .int64 => try decodeArray(allocator, i64, array, record, header.*),
+        var arrays = record.arrays(header.groups);
+        while (try arrays.next()) |array| {
+            const values = switch (array.encoding.primitive) {
+                .float32 => try decodeArray(allocator, f32, array),
+                .float64 => try decodeArray(allocator, f64, array),
+                .int32 => try decodeArray(allocator, i32, array),
+                .int64 => try decodeArray(allocator, i64, array),
             };
             totals.values = std.math.add(usize, totals.values, values) catch return error.LimitExceeded;
             totals.arrays = std.math.add(usize, totals.arrays, 1) catch return error.LimitExceeded;
@@ -137,25 +137,21 @@ fn checkQuantity(number: ?mzml.model.Number, resolver: mzml.cv.Resolver, totals:
 fn decodeArray(
     allocator: std.mem.Allocator,
     comptime T: type,
-    node: mzml.model.Node,
-    record: mzml.model.Record,
-    header: mzml.model.Header,
+    array: mzml.model.BinaryArray,
 ) !usize {
-    const encoding = try mzml.model.arrayEncoding(node, header.groups);
-    const count = if (node.attribute("arrayLength")) |text|
-        try mzml.cv.parseInteger(usize, text)
-    else
-        record.default_array_length;
+    const binary = array.node.child(.binary) orelse return error.PayloadNotRetained;
+    const text = binary.text orelse return error.PayloadNotRetained;
+    const count = array.length;
     const limits: mzml.arrays.Limits = .{};
     const size = std.math.mul(usize, count, @sizeOf(T)) catch return error.LimitExceeded;
     if (size > limits.array_bytes) return error.LimitExceeded;
     const values = try allocator.alloc(T, count);
     defer allocator.free(values);
-    const transport = try allocator.alloc(u8, node.child(.binary).?.text.?.len);
+    const transport = try allocator.alloc(u8, text.len);
     defer allocator.free(transport);
-    const transformed = try allocator.alloc(u8, try mzml.arrays.wireBound(T, count, encoding.pipeline));
+    const transformed = try allocator.alloc(u8, try mzml.arrays.wireBound(T, count, array.encoding.pipeline));
     defer allocator.free(transformed);
-    try mzml.model.decodeArray(T, values, node, record.default_array_length, header.groups, .{
+    try array.decode(T, values, .{
         .transport = transport,
         .transformed = transformed,
     }, limits);
