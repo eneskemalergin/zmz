@@ -8,6 +8,8 @@
         "build.zig.zon",
         "src",
         "tests",
+        "tools",
+        "vocabularies",
         "README.md",
     },
 }
