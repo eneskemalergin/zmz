@@ -1,0 +1,17 @@
+[package]
+name = "mzml-peers"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "mzdata-peer"
+path = "src/bin/mzdata_peer.rs"
+
+[[bin]]
+name = "numpress-rs-peer"
+path = "src/bin/numpress_rs_peer.rs"
+
+[dependencies]
+mzdata = { version = "=0.66.7", default-features = false, features = ["mzml", "numpress", "miniz_oxide"] }
+numpress-rs = "=1.1.1"
