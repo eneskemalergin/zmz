@@ -51,6 +51,12 @@ const Range = struct {
     len: usize,
 };
 
+const NameRange = struct {
+    start: usize,
+    len: usize,
+    prefix_len: usize,
+};
+
 const Codepoint = struct {
     value: u21,
     start: u64,
@@ -401,7 +407,7 @@ const Source = struct {
 };
 
 const AttributeRange = struct {
-    name: Range,
+    name: NameRange,
     value: Range,
     namespace_declaration: bool,
 };
@@ -421,6 +427,7 @@ const NamespaceBinding = struct {
 const Frame = struct {
     name_start: usize,
     name_len: usize,
+    prefix_len: usize,
     binding_start: usize,
     namespace_bytes_start: usize,
     opening_end: u64,
@@ -747,6 +754,16 @@ pub const Cursor = struct {
 
     fn skipWhitespace(self: *Cursor) Error!void {
         while (true) {
+            if (try self.source.peekUtf8()) |bytes| {
+                var length: usize = 0;
+                while (length < bytes.len and isXmlWhitespace(bytes[length])) : (length += 1) {}
+                if (length != 0) {
+                    self.source.borrowed_len = length;
+                    try self.source.commitBorrowed();
+                }
+                if (length < bytes.len) return;
+                continue;
+            }
             const value = self.peekRequired() catch |err| return switch (err) {
                 error.InvalidXml => {},
                 else => err,
@@ -756,10 +773,10 @@ pub const Cursor = struct {
         }
     }
 
-    fn parseQName(self: *Cursor) Error!Range {
+    fn parseQName(self: *Cursor) Error!NameRange {
         const start = self.event_bytes.items.len;
         var have_character = false;
-        var colon_seen = false;
+        var prefix_len: usize = 0;
         var segment_start = true;
         while (true) {
             if (have_character and !segment_start) {
@@ -786,8 +803,8 @@ pub const Cursor = struct {
                 continue;
             }
             if (byte == ':') {
-                if (colon_seen or segment_start) return error.InvalidXml;
-                colon_seen = true;
+                if (prefix_len != 0 or segment_start) return error.InvalidXml;
+                prefix_len = self.event_bytes.items.len - start;
                 segment_start = true;
                 try self.appendEventByte(byte);
                 continue;
@@ -808,9 +825,7 @@ pub const Cursor = struct {
             }
             return error.InvalidXml;
         }
-        const raw = self.event_bytes.items[start..];
-        _ = try qnameParts(raw);
-        return .{ .start = start, .len = raw.len };
+        return .{ .start = start, .len = self.event_bytes.items.len - start, .prefix_len = prefix_len };
     }
 
     fn parseAttributeValue(self: *Cursor, quote: u21) Error!Range {
@@ -957,6 +972,7 @@ pub const Cursor = struct {
         self.frames[self.depth] = .{
             .name_start = frame_name_start,
             .name_len = name_range.len,
+            .prefix_len = name_range.prefix_len,
             .binding_start = binding_start,
             .namespace_bytes_start = namespace_bytes_start,
             .opening_end = self.source.position,
@@ -1033,28 +1049,30 @@ pub const Cursor = struct {
         return null;
     }
 
-    fn makeName(self: *const Cursor, range: Range, resolve: bool) Error!Name {
+    fn makeName(self: *const Cursor, range: NameRange, resolve: bool) Error!Name {
         const raw = self.event_bytes.items[range.start..][0..range.len];
-        const parts = try qnameParts(raw);
         if (!resolve) return .{ .raw = raw, .expanded = null };
-        const namespace_uri = self.resolveNamespace(parts.prefix);
-        if (parts.prefix != null and namespace_uri == null) return error.InvalidXml;
+        const prefix = if (range.prefix_len == 0) null else raw[0..range.prefix_len];
+        const local = if (range.prefix_len == 0) raw else raw[range.prefix_len + 1 ..];
+        const namespace_uri = self.resolveNamespace(prefix);
+        if (prefix != null and namespace_uri == null) return error.InvalidXml;
         return .{ .raw = raw, .expanded = .{
-            .prefix = parts.prefix,
-            .local = parts.local,
+            .prefix = prefix,
+            .local = local,
             .namespace_uri = namespace_uri,
         } };
     }
 
-    fn makeAttributeName(self: *const Cursor, range: Range) Error!Name {
+    fn makeAttributeName(self: *const Cursor, range: NameRange) Error!Name {
         const raw = self.event_bytes.items[range.start..][0..range.len];
-        const parts = try qnameParts(raw);
         if (!self.check_namespaces) return .{ .raw = raw, .expanded = null };
-        const namespace_uri = if (parts.prefix) |prefix| self.resolveNamespace(prefix) else null;
-        if (parts.prefix != null and namespace_uri == null) return error.InvalidXml;
+        const prefix = if (range.prefix_len == 0) null else raw[0..range.prefix_len];
+        const local = if (range.prefix_len == 0) raw else raw[range.prefix_len + 1 ..];
+        const namespace_uri = if (prefix) |value| self.resolveNamespace(value) else null;
+        if (prefix != null and namespace_uri == null) return error.InvalidXml;
         return .{ .raw = raw, .expanded = .{
-            .prefix = parts.prefix,
-            .local = parts.local,
+            .prefix = prefix,
+            .local = local,
             .namespace_uri = namespace_uri,
         } };
     }
@@ -1086,7 +1104,7 @@ pub const Cursor = struct {
         const frame = self.frames[self.depth - 1];
         self.event_bytes.clearRetainingCapacity();
         try self.event_bytes.appendSlice(self.allocator, self.open_names.items[frame.name_start..][0..frame.name_len]);
-        const name = try self.makeName(.{ .start = 0, .len = self.event_bytes.items.len }, self.check_namespaces);
+        const name = try self.makeName(.{ .start = 0, .len = self.event_bytes.items.len, .prefix_len = frame.prefix_len }, self.check_namespaces);
         self.pending_empty = false;
         self.depth -= 1;
         self.open_names.items.len = frame.name_start;
@@ -1752,6 +1770,74 @@ test "[unit] - [mzML XML cursor]: rejects malformed names, namespace declaration
         defer cursor.deinit();
         for (0..case[1]) |_| try cursor.advance(false);
         try std.testing.expectError(error.InvalidXml, cursor.advance(false));
+    }
+}
+
+test "[property] - [mzML XML cursor]: preserves qualified names and namespace restoration across refills" {
+    const root = "<m:mzML xmlns='" ++ NAMESPACE ++ "' xmlns:m='" ++ NAMESPACE ++ "' xmlns:a='urn:outer'>";
+    const first = "<m:child \r\n a:value \t= \r'one' />";
+    const second = "<child xmlns:a='urn:inner' a:value='two'>";
+    const closing = "</child \t>";
+    const last = "<m:child a:value='three'/>";
+    const source = root ++ first ++ second ++ closing ++ last ++ "</m:mzML>";
+    const Expected = struct { token: []const u8, raw: []const u8, prefix: ?[]const u8, local: []const u8, opening: bool };
+    const expected = [_]Expected{
+        .{ .token = root, .raw = "m:mzML", .prefix = "m", .local = "mzML", .opening = true },
+        .{ .token = first, .raw = "m:child", .prefix = "m", .local = "child", .opening = true },
+        .{ .token = "", .raw = "m:child", .prefix = "m", .local = "child", .opening = false },
+        .{ .token = second, .raw = "child", .prefix = null, .local = "child", .opening = true },
+        .{ .token = closing, .raw = "child", .prefix = null, .local = "child", .opening = false },
+        .{ .token = last, .raw = "m:child", .prefix = "m", .local = "child", .opening = true },
+        .{ .token = "", .raw = "m:child", .prefix = "m", .local = "child", .opening = false },
+        .{ .token = "</m:mzML>", .raw = "m:mzML", .prefix = "m", .local = "mzML", .opening = false },
+    };
+    var utf16: [source.len * 2 + 2]u8 = undefined;
+    var buffer: [source.len * 2 + 2]u8 = undefined;
+    for ([_]?std.builtin.Endian{ null, .little, .big }) |encoding| {
+        const bytes = if (encoding) |endian| blk: {
+            std.mem.writeInt(u16, utf16[0..2], 0xfeff, endian);
+            for (source, 0..) |byte, index| std.mem.writeInt(u16, utf16[2 + index * 2 ..][0..2], byte, endian);
+            break :blk utf16[0..];
+        } else source;
+        for ([_]usize{ 4, 7, 16, 31, 64, buffer.len }) |size| {
+            for ([_]bool{ false, true }) |checked| {
+                var input: std.testing.Reader = .init(buffer[0..size], &.{.{ .buffer = bytes }});
+                input.artificial_limit = .limited(size);
+                var cursor = try Cursor.init(std.testing.allocator, &input.interface, 64, 64, 1024, checked);
+                defer cursor.deinit();
+                var child: usize = 0;
+                const scale: u64 = if (encoding != null) 2 else 1;
+                var offset: u64 = if (encoding != null) 2 else 0;
+                for (expected) |item| {
+                    try cursor.advance(false);
+                    const event = cursor.current.?;
+                    try std.testing.expectEqual(item.opening, event.data == .start_element);
+                    const name = if (item.opening) event.data.start_element.name else event.data.end_element.name;
+                    try std.testing.expectEqualStrings(item.raw, name.raw);
+                    try std.testing.expectEqualStrings(item.local, localName(name));
+                    if (checked) {
+                        try std.testing.expectEqualDeep(item.prefix, name.expanded.?.prefix);
+                        try std.testing.expectEqualStrings(NAMESPACE, name.expanded.?.namespace_uri.?);
+                    } else try std.testing.expectEqual(null, name.expanded);
+                    try std.testing.expectEqual(offset, event.span.start);
+                    offset += item.token.len * scale;
+                    try std.testing.expectEqual(offset, event.span.end);
+                    if (item.opening and std.mem.eql(u8, item.local, "child")) {
+                        const attribute = event.data.start_element.attributes[0];
+                        try std.testing.expectEqualStrings("a:value", attribute.name.raw);
+                        try std.testing.expectEqualStrings(([_][]const u8{ "one", "two", "three" })[child], attribute.value);
+                        if (checked) {
+                            try std.testing.expectEqualStrings("a", attribute.name.expanded.?.prefix.?);
+                            try std.testing.expectEqualStrings("value", attribute.name.expanded.?.local);
+                            try std.testing.expectEqualStrings(if (child == 1) "urn:inner" else "urn:outer", attribute.name.expanded.?.namespace_uri.?);
+                        }
+                        child += 1;
+                    }
+                }
+                try cursor.advance(false);
+                try std.testing.expectEqual(null, cursor.current);
+            }
+        }
     }
 }
 
