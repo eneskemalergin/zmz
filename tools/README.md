@@ -80,19 +80,17 @@ The common fingerprint covers spectra and the two required mzML arrays. The mani
 Run the correctness comparison before timing a file:
 
 ```text
-tools/bench.sh compare tests/mzml/data/writer_raw_zlib.mzML
-tools/bench.sh benchmark tests/mzml/data/writer_raw_zlib.mzML
+tools/bench.sh compare FILE.mzML
+tools/bench.sh benchmark FILE.mzML
 tools/bench.sh numpress-compare
 tools/bench.sh numpress-benchmark
 ```
 
 `tools/bench.sh compare` runs the local enabled commands and compares the common summary fields, including chromatogram counts and the spectrum fingerprint. A peer that cannot decode a file is reported as unavailable for that input and is excluded from the comparison; that is not recorded as a correctness mismatch. The command exits `1` for a result mismatch, `2` when fewer than two peers can be compared, and `0` when all available peers agree. `tools/bench.sh benchmark` runs the common `fingerprint` command three times by default and prints tab-separated wall time, maximum resident memory, and exit status. The timing includes process startup, parsing, binary decoding, adapter normalization, and FNV hashing; it is not an isolated parser-throughput measurement. Set `RUNS=N` to change the run count. The command does not flush the operating-system page cache, pin CPUs, or claim cold-cache results, so record the host and cache state with any published benchmark.
 
-`tools/bench.sh numpress-compare` sends the vectors in `tests/numpress/vectors.tsv` through both standalone codec implementations, compares the emitted encoded bytes, and sends each implementation's bytes through the other decoder. It also compares decoded value fingerprints. `tools/bench.sh numpress-benchmark` times the same codec roundtrip for each algorithm. This is the Numpress-specific comparison; the mzML peer benchmark measures complete file-reader behavior.
+`tools/bench.sh numpress-compare` sends the local benchmark vectors through both standalone codec implementations, compares the emitted encoded bytes, and sends each implementation's bytes through the other decoder. It also compares decoded value fingerprints. `tools/bench.sh numpress-benchmark` times the same codec roundtrip for each algorithm. This is the Numpress-specific comparison; the mzML peer benchmark measures complete file-reader behavior.
 
 The benchmark harness reports measurements only. It does not define an acceptance threshold and does not replace correctness checks.
-
-For project changes, use the ignored local workbench at `tmp/bench/run.sh`. It checks the tracked mzML shape registry, runs the ReleaseSafe project tests and validator, records a source receipt, and only then permits Zebrac timing. It uses three warmups and exact measured counts from 15 to 25 based on input size. `tools/bench.sh` remains the direct peer and standalone Numpress comparison command.
 
 ## Local generated state
 
@@ -103,4 +101,4 @@ The installer owns these ignored paths:
 - `tools/venv/<peer>/`: isolated Python virtual environments containing the pinned wheels.
 - `tools/wrappers/target/`: Rust target output when built directly with Cargo.
 
-The tracked inputs are the manifest, version pins, installer, one benchmark runner, the peer launcher and adapter, four pinned Python requirement files, the Rust wrapper project and its `Cargo.lock`, the C++ wrapper source, and the Numpress vector file. Do not commit downloaded packages, virtual environments, source checkouts, binaries, or benchmark output.
+The tracked inputs are the manifest, version pins, installer, peer launcher and adapter, the direct peer and codec comparison command, four pinned Python requirement files, the Rust wrapper project and its `Cargo.lock`, and the C++ wrapper source. Do not commit downloaded packages, virtual environments, source checkouts, binaries, or benchmark output.

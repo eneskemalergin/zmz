@@ -6,6 +6,14 @@ const cv = @import("../cv/source.zig");
 pub const Primitive = enum { float32, float64, int32, int64 };
 pub const Pipeline = enum { none, zlib, linear, pic, slof, linear_zlib, pic_zlib, slof_zlib };
 
+/// Returns whether a pipeline changes numeric values into the Numpress wire format.
+pub fn isNumpress(pipeline: Pipeline) bool {
+    return switch (pipeline) {
+        .linear, .pic, .slof, .linear_zlib, .pic_zlib, .slof_zlib => true,
+        .none, .zlib => false,
+    };
+}
+
 pub const Term = struct { accession: []const u8, name: []const u8 };
 
 pub fn primitiveTerm(primitive: Primitive) Term {

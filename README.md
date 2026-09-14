@@ -56,6 +56,10 @@ zig build test -Doptimize=ReleaseFast --summary all
 
 The public entry point is [`src/root.zig`](src/root.zig). Vocabulary resources and their source notices are described in [`vocabularies/README.md`](vocabularies/README.md).
 
+## Peer readers and benchmarks
+
+The local mzML reader inventory, reproducible installer, C++ and Rust MS-Numpress peers, comparison commands, and benchmark commands are in [`tools/README.md`](tools/README.md). Install them with `tools/install.sh`; generated checkouts, virtual environments, caches, binaries, and benchmark output remain local and ignored.
+
 ## License
 
 The project license has not been selected yet. The bundled vocabulary resources retain their source terms and attribution requirements; see [`vocabularies/README.md`](vocabularies/README.md).

@@ -184,8 +184,20 @@ benchmark_readers() {
 
 vector_values() {
   local algorithm=$1
-  awk -v algorithm="$algorithm" '$1 == algorithm { print $2 }' \
-    "$REPO_DIR/tests/numpress/vectors.tsv"
+  local vector_file="$REPO_DIR/tmp/bench/numpress.tsv"
+  if [[ -f "$vector_file" ]]; then
+    awk -v algorithm="$algorithm" '$1 == algorithm { print $2 }' "$vector_file"
+    return
+  fi
+  case "$algorithm" in
+    linear) printf '%s\n' 100.0 100.1 100.2 100.3 100.4 100.5 100.6 100.7 ;;
+    pic) printf '%s\n' 0 1 2 3 4 5 6 7 8 9 10 ;;
+    slof) printf '%s\n' 0.01 0.1 1.0 10.0 100.0 1000.0 10000.0 100000.0 1000000.0 ;;
+    *)
+      echo "unknown Numpress algorithm: $algorithm" >&2
+      return 1
+      ;;
+  esac
 }
 
 compare_numpress() {

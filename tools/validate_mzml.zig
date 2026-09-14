@@ -47,13 +47,19 @@ const Totals = struct {
 fn validateFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Totals {
     const file = try std.Io.Dir.cwd().openFile(io, path, .{});
     defer file.close(io);
-    var index = try mzml.IndexedReader.build(allocator, .{ .file = .{ .handle = file, .io = io } }, .{ .policy = .rebuild });
+    var index = mzml.IndexedReader.build(allocator, .{ .file = .{ .handle = file, .io = io } }, .{ .policy = .rebuild }) catch |err| {
+        std.debug.print("index diagnostic: {s}\n", .{@errorName(err)});
+        return err;
+    };
     defer index.deinit();
     var buffer: [64 * 1024]u8 = undefined;
     var input = file.reader(io, &buffer);
     var reader = try mzml.StreamReader.init(allocator, &input.interface, .{ .validation = .{} });
     defer reader.deinit();
-    const header = try reader.readHeader();
+    const header = reader.readHeader() catch |err| {
+        reportReaderFailure(&reader, err);
+        return err;
+    };
     const cv_nodes = header.document.child(.cv_list).?.children;
     const declarations = try allocator.alloc(mzml.cv.Declaration, cv_nodes.len);
     defer allocator.free(declarations);
@@ -66,7 +72,12 @@ fn validateFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Tot
     const resolver = mzml.cv.Resolver.init(declarations);
     const count = index.entries.items.len;
     var totals: Totals = .{};
-    while (try reader.nextRecord()) |record| {
+    while (true) {
+        const next = reader.nextRecord() catch |err| {
+            reportReaderFailure(&reader, err);
+            return err;
+        };
+        const record = next orelse break;
         if (totals.records == 0 or totals.records == count / 2 or totals.records == count -| 1) {
             var found = (try index.at(allocator, record.node.kind, record.index)) orelse return error.MissingIndexedRecord;
             defer found.deinit();
@@ -77,11 +88,15 @@ fn validateFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Tot
         try checkMetadata(record, header.groups, resolver, &totals);
         var arrays = record.arrays(header.groups);
         while (try arrays.next()) |array| {
-            const values = switch (array.encoding.primitive) {
+            const values = switch (array.encoding.pipeline) {
+                .linear, .pic, .slof, .linear_zlib, .pic_zlib, .slof_zlib =>
+                    try decodeArray(allocator, f64, array),
+                .none, .zlib => switch (array.encoding.primitive) {
                 .float32 => try decodeArray(allocator, f32, array),
                 .float64 => try decodeArray(allocator, f64, array),
                 .int32 => try decodeArray(allocator, i32, array),
                 .int64 => try decodeArray(allocator, i64, array),
+                },
             };
             totals.values = std.math.add(usize, totals.values, values) catch return error.LimitExceeded;
             totals.arrays = std.math.add(usize, totals.arrays, 1) catch return error.LimitExceeded;
@@ -89,6 +104,22 @@ fn validateFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Tot
     }
     if (totals.records != count) return error.RecordCountMismatch;
     return totals;
+}
+
+fn reportReaderFailure(reader: *mzml.StreamReader, err: anyerror) void {
+    if (reader.diagnostic()) |diagnostic| {
+        if (diagnostic.element) |element| {
+            std.debug.print("diagnostic: {s} at byte {d}, element {s}\n", .{
+                @errorName(diagnostic.code), diagnostic.byte_offset, @tagName(element),
+            });
+        } else {
+            std.debug.print("diagnostic: {s} at byte {d}, element none\n", .{
+                @errorName(diagnostic.code), diagnostic.byte_offset,
+            });
+        }
+    } else {
+        std.debug.print("diagnostic: {s} without reader location\n", .{@errorName(err)});
+    }
 }
 
 fn checkMetadata(record: mzml.model.Record, groups: []const mzml.cv.Group, resolver: mzml.cv.Resolver, totals: *Totals) !void {

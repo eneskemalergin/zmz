@@ -94,6 +94,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "zmz", .module = zmz }},
         }),
     });
+    b.installArtifact(validation);
     const validate = b.addRunArtifact(validation);
     if (b.args) |args| validate.addArgs(args);
     b.step("validate", "Read, decode, and compare indexed lookups in explicit external files").dependOn(&validate.step);

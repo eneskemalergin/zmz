@@ -422,7 +422,8 @@ pub const BinaryArray = struct {
     }
 
     /// Decodes the declared values into an exact-size caller-owned typed buffer.
-    /// The destination type must match the declared primitive; no conversion or allocation occurs.
+    /// Ordinary arrays require the declared primitive. Numpress arrays decode into f64 because
+    /// Numpress does not carry a primitive-width wire representation.
     pub fn decode(
         self: BinaryArray,
         comptime T: type,
@@ -430,7 +431,9 @@ pub const BinaryArray = struct {
         scratch: arrays.Scratch,
         limits: arrays.Limits,
     ) (EncodingError || arrays.Error)!void {
-        if (self.encoding.primitive != primitiveFor(T)) return error.TypeMismatch;
+        if (encoding.isNumpress(self.encoding.pipeline)) {
+            if (T != f64) return error.TypeMismatch;
+        } else if (self.encoding.primitive != primitiveFor(T)) return error.TypeMismatch;
         if (self.length != output.len) return error.DecodedSizeMismatch;
         const binary = self.node.child(.binary) orelse return error.PayloadNotRetained;
         const text = binary.text orelse return error.PayloadNotRetained;
@@ -486,7 +489,9 @@ pub fn decodeArray(
     limits: arrays.Limits,
 ) (EncodingError || cv.ValueError || arrays.Error)!void {
     const declared_encoding = try arrayEncoding(node, groups);
-    if (declared_encoding.primitive != primitiveFor(T)) return error.TypeMismatch;
+    if (encoding.isNumpress(declared_encoding.pipeline)) {
+        if (T != f64) return error.TypeMismatch;
+    } else if (declared_encoding.primitive != primitiveFor(T)) return error.TypeMismatch;
     const array = try initWithEncoding(node, default_length, declared_encoding);
     try array.decode(T, output, scratch, limits);
 }
