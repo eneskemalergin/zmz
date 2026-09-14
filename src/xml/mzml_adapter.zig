@@ -185,6 +185,29 @@ fn isNameDelimiter(value: u21) bool {
     return isXmlWhitespace(value) or value == '/' or value == '>' or value == '=' or value == '?';
 }
 
+fn ordinaryTextRun(bytes: []const u8, limit: usize) usize {
+    const available = @min(bytes.len, limit);
+    const width = @min(32, std.simd.suggestVectorLength(u8) orelse 16);
+    const Vector = @Vector(width, u8);
+    var length: usize = 0;
+    while (available - length >= width) {
+        const run: Vector = bytes[length..][0..width].*;
+        const exceptional = (run < @as(Vector, @splat(0x20))) |
+            (run >= @as(Vector, @splat(0x80))) |
+            (run == @as(Vector, @splat('<'))) |
+            (run == @as(Vector, @splat('&'))) |
+            (run == @as(Vector, @splat(']')));
+        const ordinary: usize = if (std.simd.firstTrue(exceptional)) |lane| lane else width;
+        length += ordinary;
+        if (ordinary < width) break;
+    }
+    while (length < available) : (length += 1) {
+        const byte = bytes[length];
+        if (byte < 0x20 or byte >= 0x80 or byte == '<' or byte == '&' or byte == ']') break;
+    }
+    return length;
+}
+
 fn qnameParts(raw: []const u8) Error!struct { prefix: ?[]const u8, local: []const u8 } {
     const colon = std.mem.indexOfScalar(u8, raw, ':') orelse {
         if (raw.len == 0) return error.InvalidXml;
@@ -739,6 +762,19 @@ pub const Cursor = struct {
         var colon_seen = false;
         var segment_start = true;
         while (true) {
+            if (have_character and !segment_start) {
+                if (try self.source.peekUtf8()) |bytes| {
+                    const bound = @min(bytes.len, self.max_attribute_bytes -| self.event_bytes.items.len);
+                    var length: usize = 0;
+                    while (length < bound and isAsciiNameChar(bytes[length])) : (length += 1) {}
+                    if (length != 0) {
+                        try self.appendEventSlice(bytes[0..length]);
+                        self.source.borrowed_len = length;
+                        try self.source.commitBorrowed();
+                        continue;
+                    }
+                }
+            }
             const value = self.requiredCodepoint() catch |err| return err;
             if (value.value > 0x7F) return error.InvalidXml;
             const byte: u8 = @intCast(value.value);
@@ -780,6 +816,20 @@ pub const Cursor = struct {
     fn parseAttributeValue(self: *Cursor, quote: u21) Error!Range {
         const start = self.event_bytes.items.len;
         while (true) {
+            if (try self.source.peekUtf8()) |bytes| {
+                const bound = @min(bytes.len, self.max_attribute_bytes -| self.event_bytes.items.len);
+                var length: usize = 0;
+                while (length < bound) : (length += 1) {
+                    const byte = bytes[length];
+                    if (byte < 0x20 or byte >= 0x80 or byte == quote or byte == '&' or byte == '<') break;
+                }
+                if (length != 0) {
+                    try self.appendEventSlice(bytes[0..length]);
+                    self.source.borrowed_len = length;
+                    try self.source.commitBorrowed();
+                    continue;
+                }
+            }
             const value = self.requiredCodepoint() catch |err| return err;
             if (value.value == quote) break;
             if (value.value == '<') return error.InvalidXml;
@@ -788,6 +838,15 @@ pub const Cursor = struct {
                 continue;
             }
             if (value.value == '\r' or value.value == '\n' or value.value == '\t') {
+                if (value.value == '\r') {
+                    const next = self.source.peekCodepoint() catch |err| switch (err) {
+                        error.EndOfStream => null,
+                        else => return err,
+                    };
+                    if (next) |following| {
+                        if (following.value == '\n') _ = try self.requiredCodepoint();
+                    }
+                }
                 try self.appendEventByte(' ');
             } else {
                 try self.appendCodepoint(value.value);
@@ -1042,48 +1101,24 @@ pub const Cursor = struct {
 
     fn readTextEvent(self: *Cursor) ParserError!Event {
         if (self.in_cdata) return self.readCdataText();
-        if (self.source.encoding == .utf8) {
-            if (try self.readPlainUtf8Text()) |event| return event;
-        }
         return self.readScalarText();
-    }
-
-    fn readPlainUtf8Text(self: *Cursor) ParserError!?Event {
-        const bytes = try self.source.peekUtf8() orelse return null;
-        var length: usize = 0;
-        while (length < bytes.len and length < TEXT_CHUNK_BYTES) {
-            const byte = bytes[length];
-            if (byte == '<' or byte == '&' or byte == '\r') break;
-            if (byte < 0x80) {
-                if (!isXmlChar(byte)) return error.InvalidXml;
-                if (byte == ']') {
-                    if (self.normal_text_brackets < 2) self.normal_text_brackets += 1;
-                } else {
-                    if (byte == '>' and self.normal_text_brackets == 2) return error.InvalidXml;
-                    self.normal_text_brackets = 0;
-                }
-                length += 1;
-                continue;
-            }
-            const sequence_length: usize = std.unicode.utf8ByteSequenceLength(byte) catch return error.InvalidEncoding;
-            if (sequence_length > bytes.len - length or sequence_length > TEXT_CHUNK_BYTES - length) break;
-            const value = std.unicode.utf8Decode(bytes[length .. length + sequence_length]) catch return error.InvalidEncoding;
-            if (!isXmlChar(value)) return error.InvalidXml;
-            self.normal_text_brackets = 0;
-            length += sequence_length;
-        }
-        if (length == 0) return null;
-        self.source.borrowed_len = length;
-        const end = std.math.add(u64, self.source.position, @intCast(length)) catch return error.LimitExceeded;
-        return .{
-            .span = .{ .start = self.source.position, .end = end },
-            .data = .{ .text = .{ .bytes = bytes[0..length] } },
-        };
     }
 
     fn readScalarText(self: *Cursor) ParserError!Event {
         const start = self.source.currentOffset();
         while (self.text_bytes.items.len < TEXT_CHUNK_BYTES) {
+            if (self.normal_text_brackets == 0) {
+                if (try self.source.peekUtf8()) |bytes| {
+                    const length = ordinaryTextRun(bytes, TEXT_CHUNK_BYTES - self.text_bytes.items.len);
+                    if (length != 0) {
+                        // Keep logical text chunks unchanged across input refills.
+                        try self.text_bytes.appendSlice(self.allocator, bytes[0..length]);
+                        self.source.borrowed_len = length;
+                        try self.source.commitBorrowed();
+                        continue;
+                    }
+                }
+            }
             const value = self.source.peekCodepoint() catch |err| switch (err) {
                 error.EndOfStream => break,
                 else => return err,
@@ -1096,6 +1131,8 @@ pub const Cursor = struct {
                 self.normal_text_brackets = 0;
                 continue;
             }
+            const encoded_len = std.unicode.utf8CodepointSequenceLength(value.value) catch return error.InvalidXml;
+            if (value.value != '\r' and encoded_len > TEXT_CHUNK_BYTES - self.text_bytes.items.len) break;
             _ = try self.requiredCodepoint();
             if (value.value == ']') {
                 if (self.normal_text_brackets < 2) self.normal_text_brackets += 1;
@@ -1137,10 +1174,19 @@ pub const Cursor = struct {
     fn readCdataText(self: *Cursor) ParserError!Event {
         const start = self.source.currentOffset();
         while (self.text_bytes.items.len < TEXT_CHUNK_BYTES) {
-            const value = self.source.readCodepoint() catch |err| switch (err) {
+            const value = self.source.peekCodepoint() catch |err| switch (err) {
                 error.EndOfStream => return error.InvalidXml,
                 else => return err,
             };
+            const output_length = if (value.value == ']')
+                if (self.cdata_brackets == 2) @as(usize, 1) else 0
+            else if (value.value == '>' and self.cdata_brackets == 2)
+                0
+            else
+                (if (value.value == '\r') 1 else std.unicode.utf8CodepointSequenceLength(value.value) catch return error.InvalidXml) +
+                    @as(usize, self.cdata_brackets);
+            if (output_length > TEXT_CHUNK_BYTES - self.text_bytes.items.len) break;
+            _ = try self.source.readCodepoint();
             if (value.value == ']') {
                 if (self.cdata_brackets < 2) {
                     self.cdata_brackets += 1;
@@ -1753,6 +1799,51 @@ test "[unit] - [mzML XML cursor]: bounds borrowed ordinary text events" {
     try std.testing.expectEqual(@as(usize, 7), cursor.current.?.data.text.bytes.len);
     try cursor.advance(false);
     try std.testing.expectEqual(.end_element, std.meta.activeTag(cursor.current.?.data));
+}
+
+test "[regression] - [mzML XML cursor]: preserves text and attribute boundaries" {
+    const prefix = "<mzML xmlns='" ++ NAMESPACE ++ "' id='a\r\nb' ref='a&#xD;&#xA;b'>";
+    const suffix = "</mzML>";
+    const text_length = TEXT_CHUNK_BYTES - 1;
+    const source = try std.testing.allocator.alloc(u8, prefix.len + text_length + 2 + suffix.len);
+    defer std.testing.allocator.free(source);
+    @memcpy(source[0..prefix.len], prefix);
+    @memset(source[prefix.len..][0..text_length], 'A');
+    @memcpy(source[prefix.len + text_length ..][0..2], "\xC2\xB5");
+    @memcpy(source[prefix.len + text_length + 2 ..], suffix);
+
+    var input = std.Io.Reader.fixed(source);
+    var cursor = try Cursor.init(std.testing.allocator, &input, 64, 64, 1024, true);
+    defer cursor.deinit();
+    try cursor.advance(false);
+    const root = cursor.current.?.data.start_element;
+    try std.testing.expectEqualStrings("a b", root.attribute(null, "id").?.value);
+    try std.testing.expectEqualStrings("a\r\nb", root.attribute(null, "ref").?.value);
+    try cursor.advance(true);
+    try std.testing.expectEqual(text_length, cursor.current.?.data.text.bytes.len);
+    try cursor.advance(true);
+    try std.testing.expectEqualStrings("\xC2\xB5", cursor.current.?.data.text.bytes);
+}
+
+test "[regression] - [mzML XML cursor]: keeps CDATA codepoints within text chunks" {
+    const prefix = "<mzML xmlns='" ++ NAMESPACE ++ "'><![CDATA[";
+    const suffix = "]]></mzML>";
+    const text_length = TEXT_CHUNK_BYTES - 1;
+    const source = try std.testing.allocator.alloc(u8, prefix.len + text_length + 2 + suffix.len);
+    defer std.testing.allocator.free(source);
+    @memcpy(source[0..prefix.len], prefix);
+    @memset(source[prefix.len..][0..text_length], 'A');
+    @memcpy(source[prefix.len + text_length ..][0..2], "\xC2\xB5");
+    @memcpy(source[prefix.len + text_length + 2 ..], suffix);
+
+    var input = std.Io.Reader.fixed(source);
+    var cursor = try Cursor.init(std.testing.allocator, &input, 64, 64, 1024, true);
+    defer cursor.deinit();
+    try cursor.advance(false);
+    try cursor.advance(true);
+    try std.testing.expectEqual(text_length, cursor.current.?.data.text.bytes.len);
+    try cursor.advance(true);
+    try std.testing.expectEqualStrings("\xC2\xB5", cursor.current.?.data.text.bytes);
 }
 
 test "[unit] - [mzML XML writer]: emits escaped values and flushes empty text" {
