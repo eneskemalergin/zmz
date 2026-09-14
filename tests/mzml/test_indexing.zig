@@ -4,6 +4,62 @@ const std = @import("std");
 const mzml = @import("zmz").mzml;
 const support = @import("support.zig");
 
+test "[integration] - [mzML indexed selection]: selects only fetched arrays and restarts positions after failed lookups" {
+    const Selection = struct {
+        calls: usize = 0,
+        wrong_position: bool = false,
+
+        fn select(user_data: ?*anyopaque, position: usize, _: []const mzml.model.Attribute, _: []const mzml.cv.Entry) mzml.StreamReader.Payload {
+            const self: *@This() = @ptrCast(@alignCast(user_data.?));
+            self.wrong_position = self.wrong_position or position != self.calls % 2;
+            self.calls += 1;
+            return if (position == 0) .retain else .skip;
+        }
+    };
+    const allocator = std.testing.allocator;
+    const source = @embedFile("data/writer_indexed.mzML");
+    for (std.enums.values(mzml.IndexedReader.Policy)) |policy| {
+        for (std.enums.values(mzml.StreamReader.Checks)) |checks| {
+            var selection: Selection = .{};
+            var index = try mzml.IndexedReader.build(allocator, .{ .bytes = source }, .{
+                .policy = policy,
+                .reader = .{ .checks = checks, .array_selector = .{ .user_data = &selection, .select = Selection.select } },
+            });
+            defer index.deinit();
+            try std.testing.expectEqual(@as(usize, 0), selection.calls);
+            var first = (try index.at(allocator, .spectrum, 0)).?;
+            defer first.deinit();
+            var next = (try index.at(allocator, .chromatogram, 1)).?;
+            defer next.deinit();
+            for ([_]mzml.model.Record{ first.value, next.value }) |record| {
+                const arrays = record.binaryArrays();
+                try std.testing.expectEqual(@as(usize, 2), arrays.len);
+                try std.testing.expect(arrays[0].child(.binary).?.text != null);
+                try std.testing.expectEqual(null, arrays[1].child(.binary).?.text);
+            }
+            try std.testing.expectEqual(@as(usize, 4), selection.calls);
+            try std.testing.expect(!selection.wrong_position);
+        }
+    }
+    const malformed = try allocator.dupe(u8, source);
+    defer allocator.free(malformed);
+    const end = std.mem.indexOf(u8, malformed, "</spectrum>").?;
+    malformed[end + "</spectrum>".len - 2] = 'x';
+    var selection: Selection = .{};
+    var index = try mzml.IndexedReader.build(allocator, .{ .bytes = malformed }, .{
+        .policy = .open_embedded,
+        .reader = .{ .array_selector = .{ .user_data = &selection, .select = Selection.select } },
+    });
+    defer index.deinit();
+    try std.testing.expectError(error.InvalidXml, index.at(allocator, .spectrum, 0));
+    try std.testing.expectEqual(@as(usize, 2), selection.calls);
+    var next = (try index.at(allocator, .spectrum, 1)).?;
+    defer next.deinit();
+    try std.testing.expectEqual(@as(usize, 4), selection.calls);
+    try std.testing.expect(!selection.wrong_position);
+    try std.testing.expectEqual(null, next.value.binaryArrays()[1].child(.binary).?.text);
+}
+
 test "[integration] - [mzML index]: retains inherited namespaces and UTF-16 physical spans" {
     const prefixed = support.HEADER ++ "<spectrumList xmlns:p='http://psi.hupo.org/ms/mzml' count='1' defaultDataProcessingRef='dp'>" ++
         "<p:spectrum id='scan=1' index='0' defaultArrayLength='0'/>" ++ "</spectrumList></run></mzML>";

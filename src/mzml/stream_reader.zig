@@ -14,6 +14,8 @@ pub const StreamReader = struct {
     /// Retains or skips binary text without decoding it.
     pub const Payload = impl.Payload;
 
+    pub const ArraySelector = impl.ArraySelector;
+
     /// Selects full structural checks or the explicitly reduced reader checks.
     pub const Checks = impl.Checks;
 

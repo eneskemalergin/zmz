@@ -6,6 +6,52 @@ const mzml = zmz.mzml;
 const gates = @import("gates_test_support");
 const support = @import("support.zig");
 
+const Selection = struct {
+    mode: enum { second, named, group, all, none },
+    groups: []const mzml.cv.Group = &.{},
+    calls: usize = 0,
+    wrong_position: bool = false,
+    failure: ?mzml.model.LookupError = null,
+
+    fn select(user_data: ?*anyopaque, position: usize, attributes: []const mzml.model.Attribute, params: []const mzml.cv.Entry) mzml.StreamReader.Payload {
+        const self: *Selection = @ptrCast(@alignCast(user_data.?));
+        self.wrong_position = self.wrong_position or position != self.calls % 2;
+        self.calls += 1;
+        const node: mzml.model.Node = .{ .kind = .binary_data_array, .attributes = attributes, .params = params };
+        const keep = switch (self.mode) {
+            .second => position == 1,
+            .named, .group => blk: {
+                const accession = if (self.mode == .named) "X:unknown-role" else "MS:1000523";
+                const parameter = node.parameter(self.groups, .{ .raw = accession }) catch |err| {
+                    self.failure = err;
+                    return .retain;
+                } orelse break :blk false;
+                break :blk self.mode == .group or (std.mem.eql(u8, parameter.name.?, "future array") and parameter.value == null);
+            },
+            .all => true,
+            .none => false,
+        };
+        return if (keep) .retain else .skip;
+    }
+};
+
+fn selectSecond(_: ?*anyopaque, position: usize, _: []const mzml.model.Attribute, _: []const mzml.cv.Entry) mzml.StreamReader.Payload {
+    return if (position == 1) .retain else .skip;
+}
+
+fn expectSelectedNode(expected: mzml.model.Node, actual: mzml.model.Node) !void {
+    try std.testing.expectEqual(expected.kind, actual.kind);
+    try std.testing.expectEqualDeep(expected.attributes, actual.attributes);
+    try std.testing.expectEqualDeep(expected.params, actual.params);
+    try std.testing.expectEqual(expected.start_offset, actual.start_offset);
+    try std.testing.expectEqual(expected.content_offset, actual.content_offset);
+    try std.testing.expectEqual(expected.end_offset, actual.end_offset);
+    if (expected.kind != .binary or actual.text != null)
+        try std.testing.expectEqualDeep(expected.text, actual.text);
+    try std.testing.expectEqual(expected.children.len, actual.children.len);
+    for (expected.children, actual.children) |left, right| try expectSelectedNode(left, right);
+}
+
 test "[unit] - [package API]: exposes mzML through one namespace" {
     try std.testing.expect(@hasDecl(zmz, "mzml"));
     try std.testing.expect(!@hasDecl(zmz, "StreamReader"));
@@ -403,6 +449,183 @@ test "[edge] - [mzML reader]: skips payload storage without dropping array descr
     try std.testing.expectEqual(@as(usize, 2), descriptors.len);
     try std.testing.expectEqual(null, descriptors[0].child(.binary).?.text);
     while (try reader.nextRecord()) |_| {}
+}
+
+test "[integration] - [mzML array selection]: preserves metadata and decodes selected text across fragmented encodings" {
+    const document = try std.mem.replaceOwned(u8, std.testing.allocator, support.DOCUMENT, "arrayLength='1'><referenceableParamGroupRef ref='encoding'/>", "arrayLength='1'><referenceableParamGroupRef ref='encoding'/><cvParam cvRef='MS' accession='X:unknown-role' name='future array' value='other'/>");
+    defer std.testing.allocator.free(document);
+    const utf16 = try std.testing.allocator.alloc(u8, document.len * 2 + 2);
+    defer std.testing.allocator.free(utf16);
+    for (0..3) |encoding| {
+        const source = if (encoding == 0) document else blk: {
+            const endian: std.builtin.Endian = if (encoding == 1) .little else .big;
+            std.mem.writeInt(u16, utf16[0..2], 0xfeff, endian);
+            for (document, 0..) |byte, index|
+                std.mem.writeInt(u16, utf16[2 + index * 2 ..][0..2], byte, endian);
+            break :blk utf16;
+        };
+        for (std.enums.values(mzml.StreamReader.Checks)) |checks| {
+            for (std.enums.values(@FieldType(Selection, "mode"))) |mode| {
+                var selection: Selection = .{ .mode = mode };
+                var buffer: [7]u8 = undefined;
+                var input: std.testing.Reader = .init(&buffer, &.{.{ .buffer = source }});
+                input.artificial_limit = .limited(1);
+                var reader = try mzml.StreamReader.init(std.testing.allocator, &input.interface, .{
+                    .checks = checks,
+                    .array_selector = .{ .user_data = &selection, .select = Selection.select },
+                });
+                defer reader.deinit();
+                const header = try reader.readHeader();
+                selection.groups = header.groups;
+                try std.testing.expectEqual(@as(usize, 0), selection.calls);
+
+                var reference_input = std.Io.Reader.fixed(source);
+                var reference = try mzml.StreamReader.init(std.testing.allocator, &reference_input, .{ .checks = checks });
+                defer reference.deinit();
+                while (try reader.nextRecord()) |record| {
+                    const expected = (try reference.nextRecord()).?;
+                    try expectSelectedNode(expected.node, record.node);
+                    for (record.binaryArrays(), 0..) |array, position| {
+                        const keep = switch (mode) {
+                            .second => position == 1,
+                            .named => position == 0,
+                            .all, .group => true,
+                            .none => false,
+                        };
+                        const text = array.child(.binary).?.text;
+                        try std.testing.expectEqual(keep, text != null);
+                        var values: [1]f64 = undefined;
+                        var transport: [8]u8 = undefined;
+                        const descriptor = try mzml.model.BinaryArray.init(array, record.default_array_length, header.groups);
+                        const decoded = descriptor.decode(f64, &values, .{ .transport = &transport, .transformed = &.{} }, .{});
+                        if (keep) {
+                            try decoded;
+                            try std.testing.expectEqual(@as(f64, 1), values[0]);
+                        } else try std.testing.expectError(error.PayloadNotRetained, decoded);
+                    }
+                }
+                try std.testing.expectEqual(null, try reference.nextRecord());
+                try std.testing.expectEqualDeep((try reference.readHeader()).*, header.*);
+                try std.testing.expectEqual(@as(usize, 4), selection.calls);
+                try std.testing.expect(!selection.wrong_position);
+                try std.testing.expectEqual(null, selection.failure);
+            }
+        }
+    }
+}
+
+test "[failure] - [mzML array selection]: preserves skipped XML errors and checked length diagnostics" {
+    const cases = .{
+        .{ "<binary>AAAA", "<binary>\x01AAA", error.InvalidXml },
+        .{ "<binary>AAAA", "<binary>\xffAAA", error.InvalidEncoding },
+        .{ "encodedLength='12'", "encodedLength='11'", error.EncodedLengthMismatch },
+        .{ "<binary>AAAA", "<binary>&missing;AAA", error.InvalidXml },
+        .{ "</binary>", "</broken>", error.InvalidXml },
+    };
+    inline for (cases) |case| {
+        const source = try std.mem.replaceOwned(u8, std.testing.allocator, support.DOCUMENT, case[0], case[1]);
+        defer std.testing.allocator.free(source);
+        for (std.enums.values(mzml.StreamReader.Checks)) |checks| {
+            if (checks == .minimal and case[2] == error.EncodedLengthMismatch) {
+                try support.readAll(std.testing.allocator, source, .{ .checks = checks, .array_selector = .{ .select = selectSecond } });
+                continue;
+            }
+            var expected: ?mzml.StreamReader.Diagnostic = null;
+            for ([_]bool{ false, true }) |selected| {
+                var input = std.Io.Reader.fixed(source);
+                var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{
+                    .checks = checks,
+                    .array_selector = if (selected) .{ .select = selectSecond } else null,
+                });
+                defer reader.deinit();
+                try std.testing.expectError(case[2], reader.nextRecord());
+                if (expected) |diagnostic| {
+                    try std.testing.expectEqualDeep(diagnostic, reader.diagnostic().?);
+                } else expected = reader.diagnostic().?;
+                try std.testing.expectError(error.FailedState, reader.nextRecord());
+                try std.testing.expectEqualDeep(expected, reader.diagnostic());
+            }
+        }
+    }
+}
+
+test "[edge] - [mzML array selection]: keeps deferred errors and ignores selectors when all text is skipped" {
+    const repeated = try std.mem.replaceOwned(u8, std.testing.allocator, support.DOCUMENT, "<referenceableParamGroupRef ref='encoding'/>", "<referenceableParamGroupRef ref='encoding'/><cvParam cvRef='MS' accession='MS:1000514' name='m/z array'/>");
+    defer std.testing.allocator.free(repeated);
+    var input = std.Io.Reader.fixed(repeated);
+    var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{ .array_selector = .{ .select = selectSecond } });
+    defer reader.deinit();
+    const header = try reader.readHeader();
+    const record = (try reader.nextRecord()).?;
+    try std.testing.expectError(error.RepeatedArray, record.arrayByRole(header.groups, mzml.model.Terms.MZ_ARRAY));
+    while (try reader.nextRecord()) |_| {}
+
+    inline for (.{ "missing", "encoding" }) |group| {
+        const source = try std.mem.replaceOwned(u8, std.testing.allocator, support.DOCUMENT, "<referenceableParamGroupRef ref='encoding'/>", "<referenceableParamGroupRef ref='" ++ group ++ "'/><cvParam cvRef='MS' accession='X:future-codec' name='future codec'/>");
+        defer std.testing.allocator.free(source);
+        try support.readAll(std.testing.allocator, source, .{ .array_selector = .{ .select = selectSecond } });
+    }
+    inline for (.{ "MS:1000523", "MS:1000576" }) |accession| {
+        const source = try std.mem.replaceOwned(u8, std.testing.allocator, support.DOCUMENT, accession, "X:future-encoding");
+        defer std.testing.allocator.free(source);
+        try support.readAll(std.testing.allocator, source, .{ .array_selector = .{ .select = selectSecond } });
+    }
+    var selection: Selection = .{ .mode = .all };
+    try support.readAll(std.testing.allocator, support.DOCUMENT, .{
+        .payload = .skip,
+        .array_selector = .{ .user_data = &selection, .select = Selection.select },
+    });
+    try std.testing.expectEqual(@as(usize, 0), selection.calls);
+    try support.readAll(std.testing.allocator, support.REFERENCED_DOCUMENT, .{
+        .array_selector = .{ .select = selectSecond },
+    });
+}
+
+test "[edge] - [mzML array selection]: excludes skipped text from record storage and retains empty selections" {
+    var source: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer source.deinit();
+    try source.writer.writeAll(support.HEADER ++ "<spectrumList count='1' defaultDataProcessingRef='dp'>" ++
+        "<spectrum id='scan=1' index='0' defaultArrayLength='0'><binaryDataArrayList count='3'>" ++
+        "<binaryDataArray encodedLength='65537'><binary>");
+    try source.writer.splatByteAll('A', 65537);
+    try source.writer.writeAll("</binary></binaryDataArray>" ++
+        "<binaryDataArray encodedLength='0'><referenceableParamGroupRef ref='encoding'/><binary/></binaryDataArray>" ++
+        "<binaryDataArray encodedLength='0'><binary/></binaryDataArray>" ++
+        "</binaryDataArrayList></spectrum></spectrumList></run></mzML>");
+    const limits: mzml.StreamReader.Limits = .{ .record_bytes = 8192, .binary_text_bytes = 65537 };
+    try std.testing.expectError(error.LimitExceeded, support.readAll(std.testing.allocator, source.written(), .{ .limits = limits }));
+    for (std.enums.values(mzml.StreamReader.Checks)) |checks| {
+        var input = std.Io.Reader.fixed(source.written());
+        var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{
+            .limits = limits,
+            .checks = checks,
+            .array_selector = .{ .select = selectSecond },
+        });
+        defer reader.deinit();
+        const header = try reader.readHeader();
+        const record = (try reader.nextRecord()).?;
+        const arrays = record.binaryArrays();
+        try std.testing.expectEqual(@as(usize, 3), arrays.len);
+        try std.testing.expectEqual(null, arrays[0].child(.binary).?.text);
+        try std.testing.expectEqualStrings("", arrays[1].child(.binary).?.text.?);
+        try std.testing.expectEqual(null, arrays[2].child(.binary).?.text);
+        try mzml.model.decodeArray(f64, &.{}, arrays[1], 0, header.groups, .{ .transport = &.{}, .transformed = &.{} }, .{});
+        try std.testing.expectEqual(null, try reader.nextRecord());
+    }
+}
+
+test "[failure] - [mzML array selection]: releases allocations and bounds skipped text" {
+    for (std.enums.values(mzml.StreamReader.Checks)) |checks| {
+        const options: mzml.StreamReader.Options = .{ .checks = checks, .array_selector = .{ .select = selectSecond } };
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, support.readAll, .{ support.DOCUMENT, options });
+        var limited = options;
+        limited.limits.binary_text_bytes = 11;
+        try std.testing.expectError(error.LimitExceeded, support.readAll(std.testing.allocator, support.DOCUMENT, limited));
+        limited.limits.binary_text_bytes = 12;
+        try support.readAll(std.testing.allocator, support.DOCUMENT, limited);
+        limited.limits.record_bytes = 1;
+        try std.testing.expectError(error.LimitExceeded, support.readAll(std.testing.allocator, support.DOCUMENT, limited));
+    }
 }
 
 test "[failure] - [mzML reader]: releases partial allocations and enforces retention limits" {

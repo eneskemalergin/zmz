@@ -50,6 +50,15 @@ pub const Limits = struct {
 /// Retention does not decode arrays. Skip checks XML; checked mode also checks encodedLength.
 pub const Payload = enum { retain, skip };
 
+/// Chooses text retention after an array's leading parameters and before its binary text.
+/// The callback receives its zero-based array position within the record, source attributes,
+/// and unexpanded parameters. All slices borrow only for the call. Keep user_data valid
+/// while reading; it can hold header groups. Do not reenter the reader. Later checks can fail.
+pub const ArraySelector = struct {
+    user_data: ?*anyopaque = null,
+    select: *const fn (?*anyopaque, usize, []const model.Attribute, []const cv.Entry) Payload,
+};
+
 /// Checked is the default. Minimal preserves valid mzML metadata but skips namespace resolution,
 /// nested child cardinalities/order, parameter order and group-reference placement,
 /// numeric schema ranges, and length/count
@@ -62,6 +71,9 @@ pub const Checks = enum { checked, minimal };
 pub const Options = struct {
     limits: Limits = .{},
     payload: Payload = .retain,
+    /// Selects retained arrays without dropping metadata. Ignored when payload is skip.
+    /// Does not classify encodings or resolve parameters on the caller's behalf.
+    array_selector: ?ArraySelector = null,
     checks: Checks = .checked,
     /// False preserves mismatched source counts unless validation is enabled.
     /// Ignored in minimal mode, which skips count comparisons and nested cardinalities.
@@ -207,7 +219,7 @@ pub fn readFragment(self: *StreamReader, allocator: std.mem.Allocator, bytes: []
     }
     const kind_value = try self.kind();
     if (kind_value != .spectrum and kind_value != .chromatogram) return error.InvalidStructure;
-    var node = try self.parseNode(&self.record_store, 1, complete);
+    var node = try self.parseNode(&self.record_store, 1, complete, self.options.payload);
     if (complete) {
         for (0..ancestors) |_| {
             if ((self.cursor.current orelse return error.UnexpectedEnd).data != .end_element)
@@ -242,7 +254,7 @@ pub fn parseFooter(allocator: std.mem.Allocator, bytes: []const u8, options: Opt
     var nodes: [2]model.Node = .{ .{ .kind = .index_list_offset }, .{ .kind = .file_checksum } };
     for (&nodes) |*node| {
         if (try reader.kind() != node.kind) return error.InvalidStructure;
-        node.* = try reader.parseNode(&reader.header_store, 1, true);
+        node.* = try reader.parseNode(&reader.header_store, 1, true, reader.options.payload);
         try shiftOffsets(node, physical_start - prefix_length);
     }
     try reader.consumeEnd(.indexed_mzml, true);
@@ -331,7 +343,7 @@ fn readHeaderInner(self: *StreamReader) Error!void {
         const kind_value = try self.kind();
         try sequence.accept(kind_value);
         if (kind_value == .run) break;
-        try metadata.append(self.allocator, try self.parseNode(&self.header_store, 1, true));
+        try metadata.append(self.allocator, try self.parseNode(&self.header_store, 1, true, self.options.payload));
     }
     try sequence.finish();
     document.children = try self.header_store.copy(model.Node, metadata.items);
@@ -395,7 +407,7 @@ fn nextRecordInner(self: *StreamReader) Error!?model.Record {
         }
         const expected: model.Kind = if (list_kind == .spectrum_list) .spectrum else .chromatogram;
         if (try self.kind() != expected) return error.InvalidStructure;
-        const node = try self.parseNode(&self.record_store, 1, true);
+        const node = try self.parseNode(&self.record_store, 1, true, self.options.payload);
         if (self.validator) |*validator| try validator.record(node);
         list.observed_count = std.math.add(usize, list.observed_count, 1) catch
             return error.LimitExceeded;
@@ -413,7 +425,7 @@ fn nextRecordInner(self: *StreamReader) Error!?model.Record {
         inline for (.{ model.Kind.index_list, .index_list_offset, .file_checksum }, 0..) |expected, i| {
             if (try self.kind() != expected) return error.InvalidStructure;
             if (self.options.retain_index or self.options.validation != null) {
-                self.index_trailer[i] = try self.parseNode(&self.header_store, 1, true);
+                self.index_trailer[i] = try self.parseNode(&self.header_store, 1, true, self.options.payload);
             } else try self.cursor.skip();
         }
         try self.consumeEnd(.indexed_mzml, true);
@@ -471,7 +483,7 @@ fn startNode(self: *StreamReader, storage: *Storage, kind_value: model.Kind) Err
     return node;
 }
 
-fn parseNode(self: *StreamReader, storage: *Storage, depth: usize, advance_after: bool) Error!model.Node {
+fn parseNode(self: *StreamReader, storage: *Storage, depth: usize, advance_after: bool, payload: Payload) Error!model.Node {
     if (depth > self.options.limits.depth) return error.LimitExceeded;
     const kind_value = try self.kind();
     var node = try self.startNode(storage, kind_value);
@@ -487,13 +499,13 @@ fn parseNode(self: *StreamReader, storage: *Storage, depth: usize, advance_after
             text_size = std.math.add(usize, text_size, bytes.len) catch return error.LimitExceeded;
             if (text_size > self.options.limits.binary_text_bytes) return error.LimitExceeded;
             if (self.options.checks == .checked) significant += significantLength(bytes);
-            if (self.options.payload == .retain or kind_value != .binary) {
+            if (payload == .retain or kind_value != .binary) {
                 if (text_size > storage.limit -| storage.used) return error.LimitExceeded;
                 try text.appendSlice(storage.arena.allocator(), bytes);
             }
             try self.cursor.advance(true);
         }
-        if (self.options.payload == .retain or kind_value != .binary) {
+        if (payload == .retain or kind_value != .binary) {
             storage.used += text.items.len;
             node.text = text.items;
         }
@@ -502,6 +514,14 @@ fn parseNode(self: *StreamReader, storage: *Storage, depth: usize, advance_after
     } else {
         if (schema.hasParams(kind_value))
             node.params = try self.parseParams(storage, kind_value != .referenceable_param_group);
+        var child_payload = payload;
+        if (kind_value == .binary_data_array and storage == &self.record_store and self.options.payload == .retain) {
+            if (self.options.array_selector) |selector| {
+                const position = storage.arrays;
+                storage.arrays += 1;
+                child_payload = selector.select(selector.user_data, position, node.attributes, node.params);
+            }
+        }
         var sequence: schema.Sequence = .{ .rules = schema.children(kind_value) };
         const children_start = self.child_scratch.items.len;
         defer self.child_scratch.shrinkRetainingCapacity(children_start);
@@ -516,7 +536,7 @@ fn parseNode(self: *StreamReader, storage: *Storage, depth: usize, advance_after
             const child_kind = try self.kind();
             if (self.options.checks == .checked) try sequence.accept(child_kind);
             if (self.child_scratch.items.len - children_start == self.options.limits.list_entries) return error.LimitExceeded;
-            const child = try self.parseNode(storage, depth + 1, true);
+            const child = try self.parseNode(storage, depth + 1, true, child_payload);
             try self.child_scratch.append(self.allocator, child);
         }
         if (self.options.checks == .checked) try sequence.finish();
@@ -718,6 +738,7 @@ const Storage = struct {
     limit: usize,
     used: usize = 0,
     nodes: usize = 0,
+    arrays: usize = 0,
     last_binary_length: usize = 0,
 
     fn init(allocator: std.mem.Allocator, limit: usize) Storage {
@@ -728,6 +749,7 @@ const Storage = struct {
         _ = self.arena.reset(.retain_capacity);
         self.used = 0;
         self.nodes = 0;
+        self.arrays = 0;
     }
 
     fn alloc(self: *Storage, comptime T: type, count: usize) Error![]T {
