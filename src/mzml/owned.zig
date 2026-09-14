@@ -1,7 +1,7 @@
 //! Copies mzML records and header metadata into independently owned arenas.
 //!
 //! Owners must not be copied. Their views remain valid until deinit; cloning does not
-//! validate metadata or restore skipped payloads. Keep an owned header for group resolution.
+//! restore skipped payloads. Keep an owned header for group resolution.
 
 const std = @import("std");
 const cv = @import("../cv/source.zig");

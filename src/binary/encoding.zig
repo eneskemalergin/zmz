@@ -54,7 +54,7 @@ pub const Error = cv.ExpansionError || error{
 };
 
 /// Classifies only reviewed wire terms. It never selects a default for missing declarations.
-/// This does not resolve arbitrary ontology descendants or validate semantic placement.
+/// This does not resolve arbitrary ontology descendants.
 pub fn classify(params: []const cv.Entry, groups: []const cv.Group) Error!Descriptor {
     var primitive: ?Primitive = null;
     var pipeline: ?Pipeline = null;

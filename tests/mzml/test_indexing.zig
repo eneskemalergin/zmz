@@ -101,7 +101,7 @@ test "[integration] - [mzML index]: opens embedded targets without claiming full
     try support.constructFixture(std.testing.allocator, &sink, true, std.meta.tags(mzml.arrays.Pipeline), false);
     try support.checkOpenEmbedded(std.testing.allocator, sink.buffered());
     try std.testing.checkAllAllocationFailures(std.testing.allocator, support.checkOpenEmbedded, .{sink.buffered()});
-    try std.testing.expectError(error.InvalidOptions, mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = sink.buffered() }, .{ .policy = .open_embedded, .reader = .{ .validation = .{} } }));
+    try std.testing.expectError(error.InvalidOptions, mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = sink.buffered() }, .{ .policy = .open_embedded, .tail_bytes = 0 }));
     try std.testing.expectError(error.LimitExceeded, mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = sink.buffered() }, .{ .policy = .open_embedded, .max_records = 1 }));
     try std.testing.expectError(error.MissingIndex, mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = support.DOCUMENT }, .{ .policy = .open_embedded }));
     const checksum_start = std.mem.indexOf(u8, sink.buffered(), "<fileChecksum>").? + "<fileChecksum>".len;
@@ -193,7 +193,6 @@ test "[integration] - [mzML minimal checks]: retains index verification and reco
             defer minimal.deinit();
             try std.testing.expectEqualDeep(checked.value, minimal.value);
         }
-        try std.testing.expectError(error.InvalidOptions, mzml.IndexedReader.build(allocator, .{ .bytes = source }, .{ .policy = policy, .reader = .{ .checks = .minimal, .validation = .{} } }));
     }
     const bytes = try allocator.dupe(u8, source);
     defer allocator.free(bytes);

@@ -5,7 +5,6 @@ const cv = @import("../cv/source.zig");
 const model = @import("model.zig");
 const schema = @import("schema.zig");
 const xml = @import("../xml/mzml_adapter.zig");
-const Validator = @import("validator.zig");
 const base64 = @import("../binary/base64.zig");
 
 const Writer = @This();
@@ -14,7 +13,7 @@ const Writer = @This();
 pub const Limits = schema.Limits;
 
 /// Writer failures are sticky. No error permits treating partially written output as complete.
-pub const Error = xml.WriterError || cv.ValueError || schema.Error || Validator.Error || error{
+pub const Error = xml.WriterError || cv.ValueError || schema.Error || error{
     InvalidStructure,
     MissingAttribute,
     UnknownAttribute,
@@ -22,6 +21,7 @@ pub const Error = xml.WriterError || cv.ValueError || schema.Error || Validator.
     EncodedLengthMismatch,
     PayloadNotRetained,
     InvalidIndex,
+    InvalidState,
     UnsupportedVersion,
     LimitExceeded,
     FailedState,
@@ -32,8 +32,6 @@ pub const Error = xml.WriterError || cv.ValueError || schema.Error || Validator.
 engine: xml.Writer,
 allocator: std.mem.Allocator,
 limits: Limits,
-validation_limits: ?Validator.Limits = null,
-validator: ?Validator = null,
 phase: enum { initial, run, list, done } = .initial,
 failed: bool = false,
 sequence: schema.Sequence = .{ .rules = schema.children(.run) },
@@ -62,20 +60,8 @@ pub fn initIndexed(allocator: std.mem.Allocator, sink: *std.Io.Writer, limits: L
     return .{ .engine = try xml.Writer.init(allocator, &state.hashed.writer, .{}), .allocator = allocator, .limits = limits, .index_state = state };
 }
 
-/// Enables document conformance before writeHeader, for either plain or indexed output.
-/// Retains bounded IDs and forward references. Unresolved targets make finish fail.
-/// Does not resolve CV terms or validate compressed payloads. Default writing preserves source metadata.
-pub fn enableValidation(self: *Writer, limits: Validator.Limits) Error!void {
-    if (self.failed) return error.FailedState;
-    errdefer self.failed = true;
-    if (self.phase != .initial) return error.InvalidState;
-    try schema.checkLimits(limits.structure);
-    self.validation_limits = limits;
-}
-
 /// Releases XML writer storage without finishing or flushing output.
 pub fn deinit(self: *Writer) void {
-    if (self.validator) |*validator| validator.deinit();
     self.engine.deinit();
     if (self.index_state) |state| {
         state.entries.deinit(state.allocator);
@@ -93,7 +79,6 @@ pub fn writeHeader(self: *Writer, header: model.Header) Error!void {
     errdefer self.failed = true;
     if (self.phase != .initial) return error.InvalidState;
     try schema.checkHeader(header, self.limits);
-    if (self.validation_limits) |limits| self.validator = try Validator.init(self.allocator, header, limits);
     try self.engine.startDocument();
     if (self.index_state != null) {
         try self.engine.startElement("indexedmzML");
@@ -122,10 +107,6 @@ pub fn beginList(self: *Writer, kind: model.Kind, count: usize, processing_ref: 
     try self.sequence.accept(kind);
     var buffer: [32]u8 = undefined;
     const text = std.fmt.bufPrint(&buffer, "{d}", .{count}) catch return error.LimitExceeded;
-    if (self.validator) |*validator| try validator.beginList(.{ .kind = kind, .attributes = &.{
-        .{ .name = "count", .value = text },
-        .{ .name = "defaultDataProcessingRef", .value = processing_ref },
-    } });
     try self.engine.startElement(kind.xmlName());
     try self.engine.attribute("count", text);
     try self.engine.attribute("defaultDataProcessingRef", processing_ref);
@@ -145,7 +126,7 @@ pub fn writeRecord(self: *Writer, node: model.Node) Error!void {
 /// Writes prepared primitive, Numpress, or compressed bytes as canonical Base64 in array order.
 /// Existing binary text is ignored. Metadata, encodedLength, and array count must match.
 /// Bytes are borrowed until return, must not alias the sink buffer, and are not decompressed.
-/// Uses bounded temporary storage; list, index, validation, and failure rules match writeRecord.
+/// Uses bounded temporary storage; list, index, and failure rules match writeRecord.
 pub fn writeRecordWithArrays(self: *Writer, node: model.Node, wire_arrays: []const []const u8) Error!void {
     return self.writeRecordInner(node, true, wire_arrays);
 }
@@ -174,7 +155,6 @@ fn writeRecordInner(self: *Writer, node: model.Node, comptime replace_arrays: bo
     } else try schema.checkNode(node, self.limits);
     if (try cv.parseInteger(usize, node.attribute("index")) != self.written_count)
         return error.InvalidIndex;
-    if (self.validator) |*validator| try validator.record(node);
     if (self.index_state) |state| {
         try self.engine.text("");
         const offset = self.engine.byteOffset() orelse return error.LimitExceeded;
@@ -201,7 +181,6 @@ pub fn endList(self: *Writer) Error!void {
     errdefer self.failed = true;
     if (self.phase != .list) return error.InvalidState;
     if (self.written_count != self.expected_count) return error.CountMismatch;
-    if (self.validator) |*validator| try validator.endList();
     try self.engine.endElement();
     self.phase = .run;
 }
@@ -212,7 +191,6 @@ pub fn finish(self: *Writer) Error!void {
     errdefer self.failed = true;
     if (self.phase != .run) return error.InvalidState;
     try self.sequence.finish();
-    if (self.validator) |*validator| try validator.finish();
     try self.engine.endElement();
     try self.engine.endElement();
     if (self.index_state) |state| try self.writeIndex(state);

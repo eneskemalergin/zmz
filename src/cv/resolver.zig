@@ -1,8 +1,7 @@
 //! Resolves source parameters through document declarations without rewriting them.
 //!
 //! Inputs, resource tables, bindings, and returned views are borrowed. No operation
-//! performs I/O or allocates. This is vocabulary interpretation, not CV placement
-//! validation, codec selection, historical reconstruction, or unit conversion.
+//! performs I/O, allocates, selects codecs, reconstructs historical resources, or converts units.
 
 const std = @import("std");
 const cv = @import("source.zig");
@@ -74,8 +73,8 @@ pub const Parameter = struct {
 };
 
 /// A caller-selected numeric type with borrowed source and independent resolution results.
-/// This is not a validated or converted quantity; inspect parameter.unit_fields,
-/// parameter.unit, and parameter.unit_allowed before interpreting the numeric units.
+/// Inspect parameter.unit_fields, parameter.unit, and parameter.unit_allowed before
+/// interpreting the numeric units. The source value is not converted.
 pub fn Quantity(comptime T: type) type {
     if (@typeInfo(T) != .int and T != f32 and T != f64)
         @compileError("quantity requires an integer, f32, or f64");

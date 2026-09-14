@@ -195,7 +195,7 @@ pub const Node = struct {
     }
 
     /// Parses a unique floating parameter and retains its complete source parameter.
-    /// Units remain unresolved and unconverted; this is not semantic validation.
+    /// Units remain unresolved and unconverted.
     pub fn number(self: Node, groups: []const cv.Group, accession: cv.Accession) (LookupError || cv.ValueError)!?Number {
         const param = try self.parameter(groups, accession) orelse return null;
         return .{ .value = try cv.parseFloat(f64, param.value), .parameter = param };
@@ -263,7 +263,6 @@ pub const IsolationWindow = struct { target: ?Number, lower_offset: ?Number, upp
 
 /// Exact common PSI-MS accessions, not an ontology or an exhaustive list of valid terms.
 pub const Terms = struct {
-    /// Spectrum MS level; parse as an integer, with domain validation left to the caller.
     pub const MS_LEVEL: cv.Accession = .{ .raw = "MS:1000511" };
     /// Positive scan polarity, also used on chromatograms.
     pub const POSITIVE_SCAN: cv.Accession = .{ .raw = "MS:1000130" };
@@ -338,7 +337,7 @@ pub const Record = struct {
     }
 
     /// Reads centroid/profile flags without interpreting their absent or empty values.
-    /// Unknown terms stay in node.params. This helper does not validate CV placement.
+    /// Unknown terms stay in node.params.
     pub fn representation(self: Record, groups: []const cv.Group) MetadataError!?Representation {
         if (self.node.kind != .spectrum) return error.UnexpectedElement;
         const centroid = try exclusiveFlags(self.node, groups, Terms.CENTROID_SPECTRUM, Terms.PROFILE_SPECTRUM) orelse return null;

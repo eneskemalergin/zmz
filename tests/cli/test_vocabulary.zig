@@ -51,8 +51,8 @@ test "[cli] - [vocabulary scan]: reports unresolved source metadata without modi
     defer std.testing.allocator.free(result.stderr);
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
     try std.testing.expectEqualStrings("", result.stderr);
-    try std.testing.expectEqualStrings("{\"format_version\":1,\"kind\":\"declaration\",\"resource\":\"input.mzML\",\"accession\":\"MS\",\"before\":{\"id\":\"MS\",\"full_name\":\"PSI-MS\",\"uri\":\"urn:test\",\"version\":null},\"after\":{\"resource\":\"psi-ms\",\"used_version\":\"4.1.258\",\"version_relationship\":\"absent\"}}\n" ++
-        "{\"format_version\":1,\"kind\":\"scan\",\"resource\":\"\",\"accession\":\"input.mzML\",\"before\":null,\"after\":{\"records\":0,\"parameters\":1,\"resolved\":0,\"missing_references\":0,\"unknown_resources\":0,\"unknown_accessions\":1,\"stale_names\":0,\"obsolete\":0,\"units\":1,\"resolved_units\":0,\"partial_units\":1,\"disallowed_units\":0}}\n", result.stdout);
+    try std.testing.expectEqualStrings("{\"format_version\":2,\"kind\":\"declaration\",\"resource\":\"input.mzML\",\"accession\":\"MS\",\"before\":{\"id\":\"MS\",\"full_name\":\"PSI-MS\",\"uri\":\"urn:test\",\"version\":null},\"after\":{\"resource\":\"psi-ms\",\"used_version\":\"4.1.258\",\"version_relationship\":\"absent\"}}\n" ++
+        "{\"format_version\":2,\"kind\":\"scan\",\"resource\":\"\",\"accession\":\"input.mzML\",\"before\":null,\"after\":{\"records\":0,\"parameters\":1,\"resolved\":0,\"missing_references\":0,\"unknown_resources\":0,\"unknown_accessions\":1,\"stale_names\":0,\"obsolete\":0,\"units\":1,\"resolved_units\":0,\"partial_units\":1,\"disallowed_units\":0}}\n", result.stdout);
     var buffer: [2048]u8 = undefined;
     try std.testing.expectEqualStrings(xml, try dir.dir.readFile(std.testing.io, "input.mzML", &buffer));
 }

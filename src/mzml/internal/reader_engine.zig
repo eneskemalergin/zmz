@@ -6,7 +6,6 @@ const model = @import("../model.zig");
 const schema = @import("../schema.zig");
 const xml = @import("../../xml/mzml_adapter.zig");
 const owned = @import("../owned.zig");
-const Validator = @import("../validator.zig");
 
 const StreamReader = @This();
 
@@ -67,7 +66,6 @@ pub const ArraySelector = struct {
 /// other prefixed attributes fail. Unrecognized unprefixed node attributes remain retained.
 pub const Checks = enum { checked, minimal };
 
-/// Reader policy does not enable vocabulary validation, network access, or legacy grammars.
 pub const Options = struct {
     limits: Limits = .{},
     payload: Payload = .retain,
@@ -75,19 +73,15 @@ pub const Options = struct {
     /// Does not classify encodings or resolve parameters on the caller's behalf.
     array_selector: ?ArraySelector = null,
     checks: Checks = .checked,
-    /// False preserves mismatched source counts unless validation is enabled.
+    /// False preserves mismatched source counts.
     /// Ignored in minimal mode, which skips count comparisons and nested cardinalities.
     check_counts: bool = true,
-    /// Retains the index trailer for the public StreamReader.indexTrailer() accessor; document validation also retains it within header limits.
+    /// Retains the index trailer within header limits for StreamReader.indexTrailer().
     retain_index: bool = false,
-    /// Opt-in document conformance, including scoped IDs and references resolved at EOF.
-    /// Does not resolve CV terms, decode payloads, or verify an embedded checksum.
-    /// Cannot be combined with minimal checks.
-    validation: ?Validator.Limits = null,
 };
 
 /// Structural and resource failures, distinct from errors returned by explicit array decoding.
-pub const Error = xml.Error || cv.ValueError || Validator.Error || std.mem.Allocator.Error || error{
+pub const Error = xml.Error || cv.ValueError || std.mem.Allocator.Error || error{
     InvalidStructure,
     MissingAttribute,
     UnknownAttribute,
@@ -109,7 +103,6 @@ header: model.Header = undefined,
 header_ready: bool = false,
 done: bool = false,
 failure: ?Diagnostic = null,
-validator: ?Validator = null,
 active_list: ?model.Kind = null,
 run_sequence: schema.Sequence = .{ .rules = schema.children(.run) },
 current_kind: ?model.Kind = null,
@@ -127,12 +120,10 @@ pub const Scope = struct { start: u64, end: u64, name: []const u8 };
 /// Streaming input needs buffer capacity for peekGreedy(1); otherwise init returns InvalidOptions.
 /// Empty fixed readers are valid inputs and report malformed XML when read.
 pub fn init(allocator: std.mem.Allocator, input: *std.Io.Reader, options: Options) Error!StreamReader {
-    if (options.checks == .minimal and options.validation != null) return error.InvalidOptions;
     if (options.limits.depth == 0 or options.limits.depth > 64 or options.limits.nodes == 0 or
         options.limits.list_entries == 0) return error.InvalidOptions;
     if (input.buffer.len == 0 and input.vtable != std.Io.Reader.ending.vtable)
         return error.InvalidOptions;
-    if (options.validation) |limits| try schema.checkLimits(limits.structure);
     return .{
         .allocator = allocator,
         .cursor = try xml.Cursor.init(allocator, input, options.limits.depth, options.limits.attributes, options.limits.attribute_bytes, options.checks == .checked),
@@ -144,7 +135,6 @@ pub fn init(allocator: std.mem.Allocator, input: *std.Io.Reader, options: Option
 
 /// Releases parser, metadata, and record storage. Does not close or deinitialize input.
 pub fn deinit(self: *StreamReader) void {
-    if (self.validator) |*validator| validator.deinit();
     self.cursor.deinit();
     self.child_scratch.deinit(self.allocator);
     self.param_scratch.deinit(self.allocator);
@@ -267,7 +257,7 @@ pub fn parseFooter(allocator: std.mem.Allocator, bytes: []const u8, options: Opt
 /// Internal seek operation used to locate a chromatogram-list opening after the
 /// final indexed spectrum. The caller supplies original ancestors and source bytes.
 pub fn resumeFollowingList(self: *StreamReader, input: *std.Io.Reader, ancestors: usize, physical_start: u64, prefix_length: usize) Error!void {
-    if (self.validator != null or self.active_list != .spectrum_list or
+    if (self.active_list != .spectrum_list or
         ancestors != self.scope_count + 1 or physical_start < prefix_length) return error.InvalidOptions;
     const replacement = try xml.Cursor.init(self.allocator, input, self.options.limits.depth, self.options.limits.attributes, self.options.limits.attribute_bytes, self.options.checks == .checked);
     self.cursor.deinit();
@@ -290,7 +280,7 @@ pub fn resumeFollowingList(self: *StreamReader, input: *std.Io.Reader, ancestors
 
 /// Internal indexed-open operation for an empty spectrum list preceding chromatograms.
 pub fn finishEmptySpectrumList(self: *StreamReader) Error!void {
-    if (self.validator != null or self.active_list != .spectrum_list or
+    if (self.active_list != .spectrum_list or
         self.header.spectrum_list.?.declared_count != 0) return error.InvalidOptions;
     try self.consumeEnd(.spectrum_list, true);
     self.active_list = null;
@@ -306,12 +296,6 @@ fn shiftOffsets(node: *model.Node, delta: u64) Error!void {
 }
 
 fn fail(self: *StreamReader, err: Error) Error {
-    if (self.validator) |*validator| {
-        if (validator.diagnostic()) |failure| {
-            self.failure = .{ .code = err, .byte_offset = failure.byte_offset, .element = failure.element };
-            return err;
-        }
-    }
     self.failure = .{ .code = err, .byte_offset = self.cursor.offset, .element = self.current_kind };
     return err;
 }
@@ -321,9 +305,6 @@ fn readHeaderInner(self: *StreamReader) Error!void {
     var indexed = false;
     if (try self.kind() == .indexed_mzml) {
         indexed = true;
-        if (self.options.validation != null) {
-            _ = try self.copyAttributes(&self.header_store, self.cursor.current.?.data.start_element, "", "");
-        }
         self.scopes[self.scope_count] = try self.captureScope();
         self.scope_count += 1;
         try self.cursor.advance(false);
@@ -359,7 +340,6 @@ fn readHeaderInner(self: *StreamReader) Error!void {
         group.* = .{ .id = node.attribute("id").?, .entries = node.params };
     }
     self.header = .{ .document = document, .run = run, .groups = groups, .indexed = indexed };
-    if (self.options.validation) |limits| self.validator = try Validator.init(self.allocator, self.header, limits);
     self.header_ready = true;
     try self.openList();
 }
@@ -374,7 +354,6 @@ fn openListInner(self: *StreamReader, advance: bool) Error!void {
     const kind_value = try self.kind();
     try self.run_sequence.accept(kind_value);
     const node = try self.startNode(&self.header_store, kind_value);
-    if (self.validator) |*validator| try validator.beginList(node);
     const list: model.RecordList = .{
         .attributes = node.attributes,
         .declared_count = try cv.parseInteger(usize, node.attribute("count")),
@@ -399,7 +378,6 @@ fn nextRecordInner(self: *StreamReader) Error!?model.Record {
                 return error.InvalidStructure;
             if (self.options.checks == .checked and self.options.check_counts and list.observed_count != list.declared_count)
                 return error.CountMismatch;
-            if (self.validator) |*validator| try validator.endList();
             self.active_list = null;
             try self.cursor.advance(false);
             try self.openList();
@@ -408,7 +386,6 @@ fn nextRecordInner(self: *StreamReader) Error!?model.Record {
         const expected: model.Kind = if (list_kind == .spectrum_list) .spectrum else .chromatogram;
         if (try self.kind() != expected) return error.InvalidStructure;
         const node = try self.parseNode(&self.record_store, 1, true, self.options.payload);
-        if (self.validator) |*validator| try validator.record(node);
         list.observed_count = std.math.add(usize, list.observed_count, 1) catch
             return error.LimitExceeded;
         return .{
@@ -424,14 +401,13 @@ fn nextRecordInner(self: *StreamReader) Error!?model.Record {
     if (self.header.indexed) {
         inline for (.{ model.Kind.index_list, .index_list_offset, .file_checksum }, 0..) |expected, i| {
             if (try self.kind() != expected) return error.InvalidStructure;
-            if (self.options.retain_index or self.options.validation != null) {
+            if (self.options.retain_index) {
                 self.index_trailer[i] = try self.parseNode(&self.header_store, 1, true, self.options.payload);
             } else try self.cursor.skip();
         }
         try self.consumeEnd(.indexed_mzml, true);
     }
     if (self.cursor.current != null) return error.InvalidStructure;
-    if (self.validator) |*validator| try validator.finish();
     self.done = true;
     return null;
 }
@@ -541,7 +517,7 @@ fn parseNode(self: *StreamReader, storage: *Storage, depth: usize, advance_after
         }
         if (self.options.checks == .checked) try sequence.finish();
         self.current_kind = kind_value;
-        if (self.options.checks == .checked and (self.options.check_counts or self.options.validation != null)) {
+        if (self.options.checks == .checked and self.options.check_counts) {
             if (try node.declaredCount()) |count| {
                 if (count != self.child_scratch.items.len - children_start) return error.CountMismatch;
             }
@@ -553,9 +529,6 @@ fn parseNode(self: *StreamReader, storage: *Storage, depth: usize, advance_after
     }
     const end = self.cursor.current orelse return error.UnexpectedEnd;
     node.end_offset = end.span.end;
-    if (self.options.validation != null and
-        (kind_value == .index or kind_value == .offset or kind_value == .index_list_offset))
-        try schema.checkLexical(node);
     try self.consumeEnd(kind_value, advance_after);
     return node;
 }

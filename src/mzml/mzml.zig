@@ -24,9 +24,6 @@ pub const owned = @import("owned.zig");
 /// Constructs checked mzML metadata and encoded arrays.
 pub const Builder = @import("builder.zig");
 
-/// Checks mzML structure, metadata spellings, and references.
-pub const Validator = @import("validator.zig");
-
 /// Builds indexes and reads records from stable bytes or files.
 pub const IndexedReader = @import("indexed_reader.zig");
 

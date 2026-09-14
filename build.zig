@@ -12,7 +12,6 @@ const library_test_specs = [_]LibraryTest{
     .{ .root_source_file = "tests/binary/test_codecs.zig" },
     .{ .root_source_file = "tests/cv/test_cv.zig" },
     .{ .root_source_file = "tests/mzml/test_metadata.zig" },
-    .{ .root_source_file = "tests/mzml/test_validation.zig" },
     .{ .root_source_file = "tests/mzml/test_construction.zig" },
     .{ .root_source_file = "tests/mzml/test_indexing.zig" },
     .{ .root_source_file = "tests/mzml/test_ownership.zig" },
@@ -84,20 +83,21 @@ pub fn build(b: *std.Build) void {
     const package_tests = b.addTest(.{ .root_module = package_tests_module });
     test_step.dependOn(&b.addRunArtifact(package_tests).step);
 
-    const validation = b.addExecutable(.{
-        .name = "validate-mzml",
+    const file_check = b.addExecutable(.{
+        .name = "check-mzml",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("tools/validate_mzml.zig"),
+            .root_source_file = b.path("tools/check_mzml.zig"),
             .target = target,
             .optimize = optimize,
             .strip = strip,
             .imports = &.{.{ .name = "zmz", .module = zmz }},
         }),
     });
-    b.installArtifact(validation);
-    const validate = b.addRunArtifact(validation);
-    if (b.args) |args| validate.addArgs(args);
-    b.step("validate", "Read, decode, and compare indexed lookups in explicit external files").dependOn(&validate.step);
+    const check_file = b.addRunArtifact(file_check);
+    if (b.args) |args| check_file.addArgs(args);
+    const check_step = b.step("check-mzml", "Read, decode, and compare indexed lookups in explicit external files");
+    check_step.dependOn(&check_file.step);
+    check_step.dependOn(&b.addInstallArtifact(file_check, .{}).step);
 
     const vocabulary_module = b.createModule(.{
         .root_source_file = b.path("tools/vocabulary.zig"),

@@ -1,4 +1,4 @@
-//! Builds explicit, validated record indexes over stable bytes or a borrowed regular file.
+//! Builds explicit record indexes over stable bytes or a borrowed regular file.
 //!
 //! Rebuilding parses the file once; checksum verification makes another byte pass.
 //! Explicit embedded-index opening reads the header and trailer without a full scan.
@@ -73,11 +73,9 @@ lookup_reader: ?StreamReader = null,
 
 /// Builds an index under the selected policy, retaining metadata but not payloads.
 /// verify_embedded checks every target, complete coverage, indexListOffset, and SHA-1.
-/// open_embedded cannot be combined with reader.validation, which requires EOF.
 /// No automatic fallback occurs. Release with deinit; do not copy the returned owner.
 pub fn build(allocator: std.mem.Allocator, source: Source, options: Options) Error!IndexedReader {
-    if (options.reader.checks == .minimal and options.reader.validation != null) return error.InvalidOptions;
-    if (options.policy == .open_embedded and (options.reader.validation != null or options.tail_bytes == 0))
+    if (options.policy == .open_embedded and options.tail_bytes == 0)
         return error.InvalidOptions;
     const stamp = switch (source) {
         .bytes => null,

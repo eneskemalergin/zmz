@@ -60,7 +60,7 @@ test "[integration] - [mzML construction]: writes and decodes every declared pip
     }
 }
 
-test "[integration] - [mzML construction]: cleans failed allocations and rejects missing references" {
+test "[integration] - [mzML construction]: cleans failed allocations and preserves source references" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, support.constructAllocated, .{false});
     try std.testing.checkAllAllocationFailures(std.testing.allocator, support.constructAllocated, .{true});
     var input = std.Io.Reader.fixed(support.DOCUMENT);
@@ -70,10 +70,12 @@ test "[integration] - [mzML construction]: cleans failed allocations and rejects
     var builder = mzml.Builder.init(std.testing.allocator, .{});
     defer builder.deinit();
     header.run.attributes = &.{ .{ .name = "id", .value = "r" }, .{ .name = "defaultInstrumentConfigurationRef", .value = "missing" } };
-    try std.testing.expectError(error.MissingReference, builder.header(header));
+    try support.expectNode(header.run, (try builder.header(header)).run);
     try std.testing.expectError(error.InvalidRecord, builder.record(.scan, "bad", 0, 0, &.{}, &.{}, &.{}));
     header.run.attributes = &.{ .{ .name = "id", .value = "r" }, .{ .name = "defaultInstrumentConfigurationRef", .value = "sw" } };
-    try std.testing.expectError(error.WrongReferenceKind, builder.header(header));
+    try support.expectNode(header.run, (try builder.header(header)).run);
+    header.run.kind = .scan;
+    try std.testing.expectError(error.InvalidStructure, builder.header(header));
     const declaration = try builder.vocabulary(.{ .id = "units", .full_name = "Units", .uri = "urn:units", .version = "" });
     try std.testing.expectEqualStrings("", declaration.attribute("version").?);
     const param = try builder.number(.{ .cv_ref = "MS", .accession = mzml.model.Terms.SCAN_START_TIME, .name = "scan start time" }, -0.0);
@@ -133,7 +135,7 @@ test "[integration] - [mzML construction]: preserves primitive bits through emit
     }
 }
 
-test "[integration] - [mzML header IDs]: keeps the document label outside metadata reference IDs" {
+test "[integration] - [mzML header IDs]: preserves document labels, run labels, and source references" {
     inline for (.{ "sw", "", "ic" }) |id| {
         const source = try std.mem.replaceOwned(u8, std.testing.allocator, support.DOCUMENT, "id='example'", "id='" ++ id ++ "'");
         defer std.testing.allocator.free(source);
@@ -166,5 +168,5 @@ test "[integration] - [mzML header IDs]: keeps the document label outside metada
     };
     var builder = mzml.Builder.init(std.testing.allocator, .{});
     defer builder.deinit();
-    try std.testing.expectError(error.MissingReference, builder.header(header));
+    try support.expectNode(header.run, (try builder.header(header)).run);
 }

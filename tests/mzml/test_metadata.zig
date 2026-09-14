@@ -131,7 +131,7 @@ test "[integration] - [mzML scientific metadata]: keeps all scans ions and windo
     var chromatogram: mzml.owned.Record = undefined;
     {
         var input = std.Io.Reader.fixed(source);
-        var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{ .validation = .{} });
+        var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
         defer reader.deinit();
         header = try mzml.owned.Header.init(std.testing.allocator, (try reader.readHeader()).*, .{});
         errdefer header.deinit();
@@ -210,7 +210,6 @@ test "[integration] - [mzML scientific metadata]: keeps all scans ions and windo
     var sink = std.Io.Writer.fixed(&bytes);
     var writer = try mzml.Writer.init(std.testing.allocator, &sink, .{});
     defer writer.deinit();
-    try writer.enableValidation(.{});
     try writer.writeHeader(header.value);
     try writer.beginList(.spectrum_list, 1, "dp");
     try writer.writeRecord(record.node);
@@ -220,7 +219,7 @@ test "[integration] - [mzML scientific metadata]: keeps all scans ions and windo
     try writer.endList();
     try writer.finish();
     var rewritten_input = std.Io.Reader.fixed(sink.buffered());
-    var rewritten = try mzml.StreamReader.init(std.testing.allocator, &rewritten_input, .{ .validation = .{} });
+    var rewritten = try mzml.StreamReader.init(std.testing.allocator, &rewritten_input, .{});
     defer rewritten.deinit();
     try support.expectNode(header.value.document, (try rewritten.readHeader()).document);
     try support.expectNode(record.node, (try rewritten.nextRecord()).?.node);
@@ -232,7 +231,6 @@ test "[integration] - [mzML scientific metadata]: keeps all scans ions and windo
     {
         var index = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = sink.buffered() }, .{
             .policy = .rebuild,
-            .reader = .{ .validation = .{} },
         });
         defer index.deinit();
         indexed_header = try mzml.owned.Header.init(std.testing.allocator, index.header().*, .{});

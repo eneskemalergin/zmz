@@ -163,7 +163,6 @@ pub const Error = cv.ValueError || base64.Error || error{
     LimitExceeded,
     InvalidOptions,
     DuplicateAttribute,
-    InvalidDeclaration,
 };
 
 /// Checks retained metadata without emitting XML or requiring future record lists.
@@ -189,7 +188,6 @@ pub fn checkHeader(header: model.Header, limits: Limits) Error!void {
 }
 
 /// Checks a standalone hierarchy with the same structural rules used when writing.
-/// Does not validate ontology semantics, reference targets, or decoded payload values.
 pub fn checkNode(node: model.Node, limits: Limits) Error!void {
     try checkLimits(limits);
     var budget = limits.nodes;
@@ -201,15 +199,6 @@ pub fn checkMetadataNode(node: model.Node, limits: Limits) Error!void {
     try checkLimits(limits);
     var budget = limits.nodes;
     _ = try validateNode(node, limits, 1, &budget, false);
-}
-
-/// Checks a list opening without requiring its not-yet-seen children.
-pub fn checkList(node: model.Node) Error!void {
-    if (node.kind != .spectrum_list and node.kind != .chromatogram_list)
-        return error.InvalidStructure;
-    if (node.params.len != 0 or node.children.len != 0 or node.text != null)
-        return error.InvalidStructure;
-    try checkAttributes(node);
 }
 
 pub fn checkLimits(limits: Limits) Error!void {
@@ -317,180 +306,3 @@ fn validateParams(params: []const cv.Entry, allow_refs: bool) Error!void {
 }
 
 const MANY = std.math.maxInt(usize);
-
-// --- Explicit metadata conformance ---
-
-/// Identifies metadata declarations in the shared XML ID space, excluding run and record labels.
-pub fn hasXmlId(kind: model.Kind) bool {
-    return switch (kind) {
-        .cv, .source_file, .referenceable_param_group, .sample, .software, .scan_settings, .instrument_configuration, .data_processing => true,
-        else => false,
-    };
-}
-
-/// Returns the required metadata target kind for an unqualified reference attribute.
-pub fn referenceKind(kind: model.Kind, name: []const u8) ?model.Kind {
-    const references = .{
-        .{ "softwareRef", model.Kind.software },
-        .{ "defaultInstrumentConfigurationRef", model.Kind.instrument_configuration },
-        .{ "instrumentConfigurationRef", model.Kind.instrument_configuration },
-        .{ "scanSettingsRef", model.Kind.scan_settings },
-        .{ "sampleRef", model.Kind.sample },
-        .{ "defaultSourceFileRef", model.Kind.source_file },
-        .{ "sourceFileRef", model.Kind.source_file },
-        .{ "dataProcessingRef", model.Kind.data_processing },
-        .{ "defaultDataProcessingRef", model.Kind.data_processing },
-    };
-    inline for (references) |reference| {
-        if (std.mem.eql(u8, name, reference[0])) return reference[1];
-    }
-    if (std.mem.eql(u8, name, "ref")) return switch (kind) {
-        .software_ref => .software,
-        .source_file_ref => .source_file,
-        else => null,
-    };
-    return null;
-}
-
-/// Returns the collapsed ID/IDREF value as a borrowed slice; interior whitespace is invalid.
-pub fn normalizedId(text: []const u8) error{InvalidDeclaration}![]const u8 {
-    const value = std.mem.trim(u8, text, " \t\r\n");
-    const view = std.unicode.Utf8View.init(value) catch return error.InvalidDeclaration;
-    var chars = view.iterator();
-    if (!nameStart(chars.nextCodepoint() orelse return error.InvalidDeclaration))
-        return error.InvalidDeclaration;
-    while (chars.nextCodepoint()) |c| {
-        if (!nameStart(c) and c != '-' and c != '.' and !(c >= '0' and c <= '9') and
-            c != 0xb7 and !(c >= 0x300 and c <= 0x36f) and !(c >= 0x203f and c <= 0x2040))
-            return error.InvalidDeclaration;
-    }
-    return value;
-}
-
-/// Checks one node's metadata spellings; descendants and references are checked by Validator.
-pub fn checkLexical(node: model.Node) Error!void {
-    for (node.attributes) |attr| {
-        try checkText(attr.value);
-        if (attr.namespace_uri != null) continue;
-        if (referenceKind(node.kind, attr.name) != null) _ = try normalizedId(attr.value);
-    }
-    for (node.params) |entry| switch (entry) {
-        .group_ref => |ref| _ = try normalizedId(ref orelse return error.MissingAttribute),
-        .cv => |param| {
-            _ = try normalizedId(param.cv_ref orelse return error.MissingAttribute);
-            try checkText((param.accession orelse return error.MissingAttribute).raw);
-            try checkText(param.name orelse return error.MissingAttribute);
-            if (param.value) |value| try checkText(value);
-            try checkUnitText(param.unit);
-        },
-        .user => |param| {
-            try checkText(param.name orelse return error.MissingAttribute);
-            if (param.value) |value| try checkText(value);
-            if (param.value_type) |value| try checkText(value);
-            try checkUnitText(param.unit);
-        },
-    };
-    if (hasXmlId(node.kind)) _ = try normalizedId(node.attribute("id") orelse return error.MissingAttribute);
-    if (node.kind == .run) {
-        if ((node.attribute("id") orelse return error.MissingAttribute).len == 0)
-            return error.InvalidDeclaration;
-        if (node.attribute("startTimeStamp")) |text| try checkDateTime(text);
-    }
-    if (node.kind == .spectrum) {
-        const id = node.attribute("id") orelse return error.MissingAttribute;
-        var tokens = std.mem.splitScalar(u8, id, ' ');
-        while (tokens.next()) |token| {
-            if (std.mem.indexOfAny(u8, token, "\t\r\n") != null or token.len < 3)
-                return error.InvalidDeclaration;
-            if (std.mem.indexOfScalar(u8, token[1 .. token.len - 1], '=') == null)
-                return error.InvalidDeclaration;
-        }
-    }
-    if (node.kind == .index) {
-        const name = node.attribute("name") orelse return error.MissingAttribute;
-        if (!std.mem.eql(u8, name, "spectrum") and !std.mem.eql(u8, name, "chromatogram"))
-            return error.InvalidDeclaration;
-    }
-    if (node.kind == .offset or node.kind == .index_list_offset) {
-        _ = try cv.parseInteger(i64, node.text);
-        if (node.attribute("scanTime")) |text| _ = try cv.parseFloat(f64, text);
-    }
-}
-
-fn checkUnitText(unit: cv.Unit) Error!void {
-    if (unit.cv_ref) |ref| _ = try normalizedId(ref);
-    if (unit.name) |name| try checkText(name);
-    if (unit.accession) |accession| try checkText(accession.raw);
-}
-
-fn checkText(text: []const u8) error{InvalidValue}!void {
-    const view = std.unicode.Utf8View.init(text) catch return error.InvalidValue;
-    var chars = view.iterator();
-    while (chars.nextCodepoint()) |c| {
-        if (c != 9 and c != 10 and c != 13 and !(c >= 0x20 and c <= 0xd7ff) and
-            !(c >= 0xe000 and c <= 0xfffd) and !(c >= 0x10000 and c <= 0x10ffff))
-            return error.InvalidValue;
-    }
-}
-
-fn nameStart(c: u21) bool {
-    return switch (c) {
-        'A'...'Z', 'a'...'z', '_', 0xc0...0xd6, 0xd8...0xf6, 0xf8...0x2ff, 0x370...0x37d, 0x37f...0x1fff, 0x200c...0x200d, 0x2070...0x218f, 0x2c00...0x2fef, 0x3001...0xd7ff, 0xf900...0xfdcf, 0xfdf0...0xfffd, 0x10000...0xeffff => true,
-        else => false,
-    };
-}
-
-fn checkDateTime(text: []const u8) error{InvalidValue}!void {
-    const value = std.mem.trim(u8, text, " \t\r\n");
-    const start: usize = if (std.mem.startsWith(u8, value, "-")) 1 else 0;
-    var end = start;
-    var year_mod: u16 = 0;
-    var nonzero = false;
-    while (end < value.len and std.ascii.isDigit(value[end])) : (end += 1) {
-        const digit = value[end] - '0';
-        nonzero = nonzero or digit != 0;
-        year_mod = (year_mod * 10 + digit) % 400;
-    }
-    if (end - start < 4 or !nonzero or (end - start > 4 and value[start] == '0'))
-        return error.InvalidValue;
-    const parts = value[end..];
-    if (parts.len < 15 or parts[0] != '-' or parts[3] != '-' or parts[6] != 'T' or
-        parts[9] != ':' or parts[12] != ':') return error.InvalidValue;
-    const month = try twoDigits(parts[1..3]);
-    const day = try twoDigits(parts[4..6]);
-    const hour = try twoDigits(parts[7..9]);
-    const minute = try twoDigits(parts[10..12]);
-    const second = try twoDigits(parts[13..15]);
-    if (month < 1 or month > 12 or hour > 24 or minute > 59 or second > 59)
-        return error.InvalidValue;
-    const leap = year_mod % 4 == 0 and (year_mod % 100 != 0 or year_mod == 0);
-    const days: u8 = switch (month) {
-        2 => if (leap) 29 else 28,
-        4, 6, 9, 11 => 30,
-        else => 31,
-    };
-    if (day < 1 or day > days) return error.InvalidValue;
-    var position: usize = 15;
-    var fraction_zero = true;
-    if (position < parts.len and parts[position] == '.') {
-        position += 1;
-        const fraction_start = position;
-        while (position < parts.len and std.ascii.isDigit(parts[position])) : (position += 1)
-            fraction_zero = fraction_zero and parts[position] == '0';
-        if (position == fraction_start) return error.InvalidValue;
-    }
-    if (hour == 24 and (minute != 0 or second != 0 or !fraction_zero)) return error.InvalidValue;
-    const zone = parts[position..];
-    if (zone.len == 0 or std.mem.eql(u8, zone, "Z")) return;
-    if (zone.len != 6 or (zone[0] != '+' and zone[0] != '-') or zone[3] != ':')
-        return error.InvalidValue;
-    const zone_hour = try twoDigits(zone[1..3]);
-    const zone_minute = try twoDigits(zone[4..6]);
-    if (zone_hour > 14 or zone_minute > 59 or (zone_hour == 14 and zone_minute != 0))
-        return error.InvalidValue;
-}
-
-fn twoDigits(text: *const [2]u8) error{InvalidValue}!u8 {
-    if (!std.ascii.isDigit(text[0]) or !std.ascii.isDigit(text[1])) return error.InvalidValue;
-    return (text[0] - '0') * 10 + text[1] - '0';
-}

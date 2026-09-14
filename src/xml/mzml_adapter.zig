@@ -576,7 +576,7 @@ pub const Cursor = struct {
         }
     }
 
-    /// Validates and skips the current start-element subtree.
+    /// Checks and skips the current start-element subtree.
     pub fn skip(self: *Cursor) Error!void {
         const start = self.current orelse return error.InvalidState;
         switch (start.data) {

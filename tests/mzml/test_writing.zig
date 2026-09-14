@@ -69,6 +69,56 @@ test "[failure] - [mzML writer]: rejects counts and keeps output failures sticky
 
 test "[failure] - [mzML writer]: releases partial allocations during rewrite" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, support.rewriteAllocated, .{});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, support.indexedRewriteAllocated, .{});
+}
+
+test "[integration] - [mzML references]: preserves unresolved and external links through rewriting and indexed access" {
+    inline for (.{
+        "spectrumRef='scan=2'",
+        "spectrumRef='scan=absent'",
+        "externalSpectrumID='scan=outside' sourceFileRef='unavailable'",
+    }) |reference| {
+        const source = try std.mem.replaceOwned(u8, std.testing.allocator, support.REFERENCED_DOCUMENT, "spectrumRef='scan=2'", reference);
+        defer std.testing.allocator.free(source);
+        for (std.enums.values(mzml.StreamReader.Checks)) |checks| {
+            try support.readAll(std.testing.allocator, source, .{ .checks = checks, .payload = .skip });
+        }
+        for ([_]bool{ false, true }) |indexed| {
+            var bytes: [16384]u8 = undefined;
+            var sink = std.Io.Writer.fixed(&bytes);
+            try support.rewriteDocument(std.testing.allocator, source, &sink, indexed);
+            var original_input = std.Io.Reader.fixed(source);
+            var original = try mzml.StreamReader.init(std.testing.allocator, &original_input, .{});
+            defer original.deinit();
+            var rewritten_input = std.Io.Reader.fixed(sink.buffered());
+            var rewritten = try mzml.StreamReader.init(std.testing.allocator, &rewritten_input, .{});
+            defer rewritten.deinit();
+            var index = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = sink.buffered() }, .{
+                .policy = if (indexed) .verify_embedded else .rebuild,
+            });
+            defer index.deinit();
+            const header = try original.readHeader();
+            const rewritten_header = try rewritten.readHeader();
+            try support.expectNode(header.document, rewritten_header.document);
+            var count: usize = 0;
+            while (try original.nextRecord()) |record| {
+                const next = (try rewritten.nextRecord()).?;
+                try support.expectNode(record.node, next.node);
+                var found = (try index.at(std.testing.allocator, record.node.kind, record.index)).?;
+                defer found.deinit();
+                try support.expectNode(record.node, found.value.node);
+                for (next.binaryArrays()) |array| {
+                    var values: [1]f64 = undefined;
+                    try mzml.model.decodeArray(f64, &values, array, next.default_array_length, rewritten_header.groups, .{ .transport = &.{}, .transformed = &.{} }, .{});
+                    try std.testing.expectEqual(@as(f64, 1), values[0]);
+                }
+                count += 1;
+            }
+            try std.testing.expectEqual(@as(usize, 3), count);
+            try std.testing.expectEqual(null, try rewritten.nextRecord());
+            try std.testing.expectEqual(null, try index.byId(std.testing.allocator, "scan=absent"));
+        }
+    }
 }
 
 test "[integration] - [mzML prepared writing]: preserves primitive bytes across chunk and padding boundaries" {

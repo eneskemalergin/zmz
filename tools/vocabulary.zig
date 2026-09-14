@@ -529,7 +529,7 @@ fn monitored(resource: Vocabulary, term: Vocabulary.Term) !u3 {
 
 fn event(writer: *std.Io.Writer, kind: []const u8, resource: []const u8, accession: []const u8, before: anytype, after: anytype) !void {
     try std.json.Stringify.value(.{
-        .format_version = @as(u32, 1),
+        .format_version = @as(u32, 2),
         .kind = kind,
         .resource = resource,
         .accession = accession,
@@ -625,7 +625,6 @@ fn review(writer: *std.Io.Writer, baseline: []const Vocabulary, candidate: []con
                 try event(writer, "disposition", key, term.id, null, .{
                     .read = entry.read,
                     .write = entry.write,
-                    .validation = entry.validation,
                     .preservation = entry.preservation,
                     .reason = entry.reason,
                 });
@@ -714,28 +713,27 @@ const Disposition = struct {
     terms: []const []const u8,
     read: Operation,
     write: Operation,
-    validation: Operation,
     preservation: Operation,
     reason: []const u8,
 };
 
 const DISPOSITIONS = [_]Disposition{
-    .{ .family = 1, .terms = &.{ "MS:1000514", "MS:1000515", "MS:1000595" }, .read = .supported, .write = .supported, .validation = .preserved_only, .preservation = .supported, .reason = "model.Terms and Builder provide primary-array access and construction; no CV placement profile" },
+    .{ .family = 1, .terms = &.{ "MS:1000514", "MS:1000515", "MS:1000595" }, .read = .supported, .write = .supported, .preservation = .supported, .reason = "model.Terms and Builder provide primary-array access and construction" },
     .{ .family = 1, .terms = &.{
         "MS:1000516", "MS:1000517", "MS:1000617", "MS:1000786", "MS:1000820", "MS:1000821", "MS:1000822",
         "MS:1002477", "MS:1002478", "MS:1002529", "MS:1002530", "MS:1002742", "MS:1002743", "MS:1002744",
         "MS:1002745", "MS:1002816", "MS:1002893", "MS:1003006", "MS:1003007", "MS:1003008", "MS:1003143",
         "MS:1003153", "MS:1003154", "MS:1003155", "MS:1003156", "MS:1003157", "MS:1003158", "MS:1003870",
-    }, .read = .preserved_only, .write = .preserved_only, .validation = .preserved_only, .preservation = .supported, .reason = "Generic array access retains these roles; no role-specific scientific interpretation or profile is claimed" },
-    .{ .family = 2, .terms = &.{ "MS:1000519", "MS:1000521", "MS:1000522", "MS:1000523" }, .read = .supported, .write = .supported, .validation = .supported, .preservation = .supported, .reason = "binary/encoding.zig and arrays.zig implement these four primitives; binary and mzML suites check bytes and failures" },
-    .{ .family = 2, .terms = &.{"MS:1001479"}, .read = .blocked, .write = .blocked, .validation = .blocked, .preservation = .supported, .reason = "The array API has no string primitive; retained source arrays can be re-emitted" },
+    }, .read = .preserved_only, .write = .preserved_only, .preservation = .supported, .reason = "Generic array access retains these roles; no role-specific scientific interpretation is claimed" },
+    .{ .family = 2, .terms = &.{ "MS:1000519", "MS:1000521", "MS:1000522", "MS:1000523" }, .read = .supported, .write = .supported, .preservation = .supported, .reason = "binary/encoding.zig and arrays.zig implement these four primitives; binary and mzML suites check bytes and failures" },
+    .{ .family = 2, .terms = &.{"MS:1001479"}, .read = .blocked, .write = .blocked, .preservation = .supported, .reason = "The array API has no string primitive; retained source arrays can be re-emitted" },
     .{ .family = 4, .terms = &.{
         "MS:1000574", "MS:1000576", "MS:1002312", "MS:1002313", "MS:1002314", "MS:1002746", "MS:1002747", "MS:1002748",
-    }, .read = .supported, .write = .supported, .validation = .supported, .preservation = .supported, .reason = "Eight established pipelines in binary/encoding.zig; frozen writer bytes, Numpress vectors, and malformed-array tests" },
+    }, .read = .supported, .write = .supported, .preservation = .supported, .reason = "Eight established pipelines in binary/encoding.zig; frozen writer bytes, Numpress vectors, and malformed-array tests" },
     .{ .family = 4, .terms = &.{
         "MS:1003088", "MS:1003089", "MS:1003090", "MS:1003780", "MS:1003781", "MS:1003782",
         "MS:1003783", "MS:1003784", "MS:1003785", "MS:1003826",
-    }, .read = .blocked, .write = .blocked, .validation = .blocked, .preservation = .supported, .reason = "No production implementation for these transforms; ontology recognition does not enable payload operations" },
+    }, .read = .blocked, .write = .blocked, .preservation = .supported, .reason = "No production implementation for these transforms; ontology recognition does not enable payload operations" },
 };
 
 fn disposition(id: []const u8, families: u3) !?Disposition {

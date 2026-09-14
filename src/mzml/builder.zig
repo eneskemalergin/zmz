@@ -13,19 +13,15 @@ const arrays = @import("../binary/arrays.zig");
 const encoding = @import("../binary/encoding.zig");
 const zlib = @import("../binary/zlib.zig");
 const schema = @import("schema.zig");
-const Validator = @import("validator.zig");
 
 const Builder = @This();
 
 /// Construction checks, codec errors, and bounded allocation failures.
-pub const Error = owned.Error || schema.Error || Validator.Error || arrays.Error || model.EncodingError || model.LookupError || error{
-    DuplicateId,
-    MissingReference,
+pub const Error = owned.Error || schema.Error || arrays.Error || model.EncodingError || model.LookupError || error{
     InvalidDeclaration,
     InvalidUnit,
     InvalidRecord,
     InvalidArrayLength,
-    WrongReferenceKind,
 };
 
 /// A caller-selected array role and its source unit. No role or lossy codec is inferred.
@@ -67,7 +63,7 @@ pub fn reset(self: *Builder) void {
     self.remaining = self.limits.bytes;
 }
 
-/// Copies a source hierarchy after checking its structure. This is not ontology validation.
+/// Copies a source hierarchy after checking its structure.
 pub fn node(self: *Builder, source: model.Node) Error!model.Node {
     if (self.limits.depth > 64) return error.LimitExceeded;
     try schema.checkNode(source, .{ .depth = self.limits.depth, .text_bytes = self.limits.bytes });
@@ -225,15 +221,10 @@ pub fn record(
     return .{ .node = result, .id = result.attribute("id").?, .index = index, .default_array_length = default_length };
 }
 
-/// Copies a complete metadata header after structural, unique-ID, and local-reference checks.
-/// Does not infer scientific metadata, resolve an ontology, or validate future record references.
+/// Copies a complete metadata header after checking its structure and unit fields.
 pub fn header(self: *Builder, source: model.Header) Error!model.Header {
     if (self.limits.depth > 64) return error.LimitExceeded;
-    var validator = try Validator.init(self.arena.child_allocator, source, .{
-        .bytes = self.limits.bytes,
-        .structure = .{ .depth = self.limits.depth },
-    });
-    defer validator.deinit();
+    try schema.checkHeader(source, .{ .depth = self.limits.depth });
     try checkUnits(source.document);
     try checkUnits(source.run);
     var copier = self.makeCopier();

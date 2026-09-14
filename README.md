@@ -25,7 +25,7 @@ The first version brings the pieces needed for mzML into one package:
 
 - forward and indexed reading for sequential workflows and targeted record access;
 - plain and indexed writing for generated or transformed files;
-- checked metadata construction and document/reference validation;
+- checked metadata construction;
 - records and metadata that callers can retain beyond the next read;
 - binary-array decoding and encoding with Base64, zlib, and MS-Numpress;
 - scientific metadata and controlled-vocabulary access.
@@ -40,7 +40,6 @@ The near-term design aims for:
 - clear rules for borrowed data, retained data, and who frees allocated memory;
 - an XML engine focused on the forms required by mzML;
 - separate modules for additional mass-spectrometry file formats if the project grows in that direction;
-- deeper schema, profile, vocabulary, and binary-payload validation;
 - release builds that stay fast and small without unnecessary runtime dependencies.
 
 The project stays centered on mzML for the foreseeable future. Once that work is stable, it can follow the example set by `mzdata` and add readers for other mass-spectrometry file formats. Format-specific types should stay in their own modules, while shared XML, binary, and common data types remain reusable.

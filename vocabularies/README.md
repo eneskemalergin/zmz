@@ -1,6 +1,6 @@
 # Vocabulary resources
 
-The optional `cv.Resolver` uses complete PSI-MS and Unit Ontology snapshots. Ordinary reading, writing, reference checking, and array decoding do not use these tables. Vocabulary lookup does not enable codecs or validate mzML CV placement.
+The optional `cv.Resolver` uses complete PSI-MS and Unit Ontology snapshots. Ordinary reading, writing, and array decoding do not use these tables. Vocabulary lookup does not enable codecs.
 
 ## Sources and attribution
 
@@ -35,7 +35,7 @@ The resolver reports absent, empty, exact, historical, future, unrecognized-vers
 
 `Vocabulary.isA` checks reflexive ancestry. `Term.targets` returns direct relation targets. `Vocabulary.valueTypes` expands `has_value_type` into caller-provided slots while leaving the original targets available. Graph queries distinguish missing terms, cycles, work exhaustion, and insufficient output space. Nesting is capped at 64 terms. They allocate no memory. Exposed table slices must stay sorted, valid, and unchanged when callers provide their own resources.
 
-`unit_allowed` checks direct `has_units` targets only. `not_declared` means no such relation exists, not that units are prohibited. The resolver does not parse lists, convert units, enforce value types, normalize a document, or implement a mapping profile.
+`unit_allowed` checks direct `has_units` targets only. `not_declared` means no such relation exists, not that units are prohibited. The resolver does not parse lists, convert units, enforce value types, normalize a document.
 
 ## Numeric quantities
 
@@ -68,9 +68,11 @@ zig build vocabulary -- generate candidate-manifest.json psi-ms.obo uo.obo candi
 
 `inspect` checks provenance fields, source digests, OBO structure, and source versions, then prints actual counts and monitored descendants. It does not require the manifest's count assertions to match. Use its output to review those assertions before running `review` or `generate`.
 
-`review` compares the candidate with the package's current tables. Its newline-delimited JSON report identifies `format_version: 1` and includes term and header changes, additions, removals, resource identity changes, foreign definitions, cross-resource conflicts, and operation dispositions. `generate` runs the same checks, generates twice, compares the results, and formats the Zig output. It publishes a new file atomically and refuses to replace an existing path. It does not install or accept an update automatically.
+`review` compares the candidate with the package's current tables. Its newline-delimited JSON report identifies `format_version: 2` and includes term and header changes, additions, removals, resource identity changes, foreign definitions, cross-resource conflicts, and operation dispositions. `generate` runs the same checks, generates twice, compares the results, and formats the Zig output. It publishes a new file atomically and refuses to replace an existing path. It does not install or accept an update automatically.
 
-Both commands reject incorrect digests, required fields, duplicate primary or alternate IDs, unsupported manifest or artifact versions, and count mismatches. Input files are limited to 32 MiB each. The ingestion profile accepts OBO 1.2 and 1.4 term and typedef stanzas and requires `format-version`, `data-version`, and `ontology` headers. It is not a general OBO validator or reasoner.
+Version 2 is the current report shape. Consumers must reject other report versions before reading event fields.
+
+Both commands reject incorrect digests, required fields, duplicate primary or alternate IDs, unsupported manifest or artifact versions, and count mismatches. Input files are limited to 32 MiB each. The ingestion profile accepts OBO 1.2 and 1.4 term and typedef stanzas and requires `format-version`, `data-version`, and `ontology` headers.
 
 The update policy lives in [tools/vocabulary.zig](../tools/vocabulary.zig), separate from generated data:
 
@@ -79,7 +81,7 @@ The update policy lives in [tools/vocabulary.zig](../tools/vocabulary.zig), sepa
 - Dispositions record review status, not a runtime feature registry. A preserved role does not promise scientific interpretation. A blocked transform has no supported payload operation, even though its term resolves and retained XML can be written.
 - Metadata updates never change executable codec dispatch. Review code and wire tests separately when an update affects it.
 
-After reviewing the report, apply the candidate tables and manifest together, run the previous test set in Debug and ReleaseFast, repeat generation, check representative external files, and measure artifact size. The tests compare the shipped manifest with the generated resource identities. Keep provenance, attribution, and documented snapshot facts synchronized. A successful report means no unreviewed update blockers remain; it does not replace those acceptance checks. Schema, CV mapping profiles, and recommendation updates are separate work.
+After reviewing the report, apply the candidate tables and manifest together, run the previous test set in Debug and ReleaseFast, repeat generation, check representative external files, and measure artifact size. The tests compare the shipped manifest with the generated resource identities. Keep provenance, attribution, and documented snapshot facts synchronized. A successful report means no unreviewed update blockers remain; it does not replace those acceptance checks.
 
 ## External-file check
 
@@ -87,4 +89,4 @@ After reviewing the report, apply the candidate tables and manifest together, ru
 zig build vocabulary -Doptimize=ReleaseFast -- scan FILE.mzML [FILE.mzML ...]
 ```
 
-`scan` reads each explicit file through EOF, skips binary text retention, and resolves source parameters and supplied unit identities. It reports physical parameter occurrences, including group definitions once rather than every effective use. It does not decode arrays, verify an embedded index, or claim CV placement or full document validity. Unknown, obsolete, and stale metadata are reported, not treated as parse failures. Source files are opened read-only. External files never enter the unit or integration tests.
+`scan` reads each explicit file through EOF, skips binary text retention, and resolves source parameters and supplied unit identities. It reports physical parameter occurrences, including group definitions once rather than every effective use. It does not decode arrays or verify an embedded index. Unknown, obsolete, and stale metadata are reported, not treated as parse failures. Source files are opened read-only. External files never enter the unit or integration tests.

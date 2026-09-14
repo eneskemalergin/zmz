@@ -87,14 +87,13 @@ pub fn rewriteAllocated(allocator: std.mem.Allocator) !void {
     try rewriteFixture(allocator, &sink);
 }
 
-pub fn rewriteValidated(allocator: std.mem.Allocator, source: []const u8, sink: *std.Io.Writer, indexed: bool) !void {
+pub fn rewriteDocument(allocator: std.mem.Allocator, source: []const u8, sink: *std.Io.Writer, indexed: bool) !void {
     var input = std.Io.Reader.fixed(source);
     var reader = try mzml.StreamReader.init(allocator, &input, .{});
     defer reader.deinit();
     const header = try reader.readHeader();
     var writer = if (indexed) try mzml.Writer.initIndexed(allocator, sink, .{}, .{}) else try mzml.Writer.init(allocator, sink, .{});
     defer writer.deinit();
-    try writer.enableValidation(.{});
     try writer.writeHeader(header.*);
     var current = try reader.nextRecord();
     inline for (.{ mzml.model.Kind.spectrum_list, mzml.model.Kind.chromatogram_list }) |kind| {
@@ -114,45 +113,9 @@ pub fn rewriteValidated(allocator: std.mem.Allocator, source: []const u8, sink: 
     try writer.finish();
 }
 
-pub fn retainValidationReferences(allocator: std.mem.Allocator) !void {
-    var validator: mzml.Validator = undefined;
-    {
-        var input = std.Io.Reader.fixed(HEADER ++ "</run></mzML>");
-        var reader = try mzml.StreamReader.init(allocator, &input, .{});
-        defer reader.deinit();
-        validator = try mzml.Validator.init(allocator, (try reader.readHeader()).*, .{});
-    }
-    defer validator.deinit();
-    try validator.beginList(.{ .kind = .spectrum_list, .attributes = &.{
-        .{ .name = "count", .value = "2" }, .{ .name = "defaultDataProcessingRef", .value = "dp" },
-    } });
-    var id = "scan=1".*;
-    var target = "scan=2".*;
-    var attrs = [_]mzml.model.Attribute{
-        .{ .name = "id", .value = &id },                 .{ .name = "index", .value = "0" },
-        .{ .name = "defaultArrayLength", .value = "0" },
-    };
-    var scan_attrs = [_]mzml.model.Attribute{.{ .name = "spectrumRef", .value = &target }};
-    const children = [_]mzml.model.Node{.{
-        .kind = .scan_list,
-        .attributes = &.{.{ .name = "count", .value = "1" }},
-        .children = &.{.{ .kind = .scan, .attributes = &scan_attrs }},
-    }};
-    const node: mzml.model.Node = .{ .kind = .spectrum, .attributes = &attrs, .children = &children };
-    try validator.record(node);
-    @memset(&id, 'x');
-    @memset(&target, 'x');
-    attrs[0].value = "scan=2";
-    attrs[1].value = "1";
-    scan_attrs[0].value = "scan=1";
-    try validator.record(node);
-    try validator.endList();
-    try validator.finish();
-}
-
-pub fn validatedRewriteAllocated(allocator: std.mem.Allocator) !void {
+pub fn indexedRewriteAllocated(allocator: std.mem.Allocator) !void {
     var discard: std.Io.Writer.Discarding = .init(&.{});
-    try rewriteValidated(allocator, REFERENCED_DOCUMENT, &discard.writer, true);
+    try rewriteDocument(allocator, REFERENCED_DOCUMENT, &discard.writer, true);
 }
 
 pub fn constructFixture(allocator: std.mem.Allocator, sink: *std.Io.Writer, indexed: bool, pipelines: []const mzml.arrays.Pipeline, prepared: bool) !void {
@@ -334,7 +297,6 @@ pub fn copyRetained(allocator: std.mem.Allocator) !void {
 pub fn writeSingleRecord(allocator: std.mem.Allocator, sink: *std.Io.Writer, header: mzml.model.Header, record: mzml.model.Node, indexed: bool, arrays: ?[]const []const u8) !void {
     var writer = if (indexed) try mzml.Writer.initIndexed(allocator, sink, .{}, .{}) else try mzml.Writer.init(allocator, sink, .{});
     defer writer.deinit();
-    try writer.enableValidation(.{});
     try writer.writeHeader(header);
     try writer.beginList(.spectrum_list, 1, "dp");
     if (arrays) |wire| try writer.writeRecordWithArrays(record, wire) else try writer.writeRecord(record);

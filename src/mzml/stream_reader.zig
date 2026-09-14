@@ -19,10 +19,10 @@ pub const StreamReader = struct {
     /// Selects full structural checks or the explicitly reduced reader checks.
     pub const Checks = impl.Checks;
 
-    /// Reader limits, payload policy, check mode, and optional document validation.
+    /// Reader limits, payload policy, and check mode.
     pub const Options = impl.Options;
 
-    /// Structural, XML, validation, and allocation failures from reader operations.
+    /// Structural, XML, and allocation failures from reader operations.
     pub const Error = impl.Error;
 
     /// The first reader failure and its physical source location.

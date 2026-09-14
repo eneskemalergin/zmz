@@ -56,6 +56,8 @@ test "[unit] - [package API]: exposes mzML through one namespace" {
     try std.testing.expect(@hasDecl(zmz, "mzml"));
     try std.testing.expect(!@hasDecl(zmz, "StreamReader"));
     try std.testing.expect(!@hasDecl(zmz, "Writer"));
+    try std.testing.expect(!@hasDecl(mzml, "Validator"));
+    try std.testing.expect(!@hasDecl(mzml.Writer, "enableValidation"));
     try std.testing.expect(!@hasDecl(mzml.StreamReader, "Scope"));
     try std.testing.expect(!@hasDecl(mzml.StreamReader, "parseFragment"));
     try std.testing.expect(!@hasDecl(mzml.StreamReader, "readFragment"));
@@ -397,10 +399,6 @@ test "[integration] - [mzML minimal checks]: distinguishes omitted checks from r
             try std.testing.expectError(case[2], support.readAll(std.testing.allocator, source, .{ .checks = checks }));
         }
     }
-    var input = std.Io.Reader.fixed(support.DOCUMENT);
-    try std.testing.expectError(error.InvalidOptions, mzml.StreamReader.init(std.testing.allocator, &input, .{ .checks = .minimal, .validation = .{} }));
-    try std.testing.expectEqual(@as(usize, 0), input.seek);
-
     const extra = try std.mem.replaceOwned(u8, std.testing.allocator, support.DOCUMENT, "index='0'", "index='0' extra='source'");
     defer std.testing.allocator.free(extra);
     var extra_input = std.Io.Reader.fixed(extra);
@@ -712,7 +710,12 @@ test "[integration] - [mzML writer]: matches frozen XML and preserves attribute 
 test "[integration] - [mzML reader]: distinguishes read failures from truncated XML" {
     var unbuffered = std.Io.Reader.failing;
     try std.testing.expectError(error.InvalidOptions, mzml.StreamReader.init(std.testing.allocator, &unbuffered, .{}));
-    for ([_]mzml.StreamReader.Options{ .{}, .{ .validation = .{} }, .{ .checks = .minimal } }) |options| {
+    for ([_]mzml.StreamReader.Options{
+        .{},
+        .{ .checks = .minimal },
+        .{ .array_selector = .{ .select = selectSecond } },
+        .{ .checks = .minimal, .array_selector = .{ .select = selectSecond } },
+    }) |options| {
         var bytes: [support.DOCUMENT.len]u8 = undefined;
         for ([_]usize{ 0, support.HEADER.len, support.DOCUMENT.len / 2, support.DOCUMENT.len }) |length| {
             @memcpy(&bytes, support.DOCUMENT);

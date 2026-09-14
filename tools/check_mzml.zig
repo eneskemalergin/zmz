@@ -1,4 +1,4 @@
-//! Checks external mzML references, scientific metadata, arrays, and indexed lookups through the public API.
+//! Exercises metadata access, array decoding, and indexed lookups on explicit mzML files.
 
 const std = @import("std");
 const mzml = @import("zmz").mzml;
@@ -6,13 +6,13 @@ const mzml = @import("zmz").mzml;
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     if (args.len < 2) {
-        try std.Io.File.stderr().writeStreamingAll(init.io, "usage: zig build validate -- FILE.mzML [FILE.mzML ...]\n");
+        try std.Io.File.stderr().writeStreamingAll(init.io, "usage: zig build check-mzml -- FILE.mzML [FILE.mzML ...]\n");
         return error.MissingInput;
     }
     var buffer: [4096]u8 = undefined;
     var output = std.Io.File.stdout().writer(init.io, &buffer);
     for (args[1..]) |path| {
-        const totals = validateFile(init.gpa, init.io, path) catch |err| {
+        const totals = checkFile(init.gpa, init.io, path) catch |err| {
             var error_buffer: [4096]u8 = undefined;
             var diagnostic = std.Io.File.stderr().writer(init.io, &error_buffer);
             try diagnostic.interface.print("{s}: {s}\n", .{ path, @errorName(err) });
@@ -44,7 +44,7 @@ const Totals = struct {
     disallowed_units: usize = 0,
 };
 
-fn validateFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Totals {
+fn checkFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Totals {
     const file = try std.Io.Dir.cwd().openFile(io, path, .{});
     defer file.close(io);
     var index = mzml.IndexedReader.build(allocator, .{ .file = .{ .handle = file, .io = io } }, .{ .policy = .rebuild }) catch |err| {
@@ -54,7 +54,7 @@ fn validateFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Tot
     defer index.deinit();
     var buffer: [64 * 1024]u8 = undefined;
     var input = file.reader(io, &buffer);
-    var reader = try mzml.StreamReader.init(allocator, &input.interface, .{ .validation = .{} });
+    var reader = try mzml.StreamReader.init(allocator, &input.interface, .{});
     defer reader.deinit();
     const header = reader.readHeader() catch |err| {
         reportReaderFailure(&reader, err);
@@ -89,13 +89,12 @@ fn validateFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Tot
         var arrays = record.arrays(header.groups);
         while (try arrays.next()) |array| {
             const values = switch (array.encoding.pipeline) {
-                .linear, .pic, .slof, .linear_zlib, .pic_zlib, .slof_zlib =>
-                    try decodeArray(allocator, f64, array),
+                .linear, .pic, .slof, .linear_zlib, .pic_zlib, .slof_zlib => try decodeArray(allocator, f64, array),
                 .none, .zlib => switch (array.encoding.primitive) {
-                .float32 => try decodeArray(allocator, f32, array),
-                .float64 => try decodeArray(allocator, f64, array),
-                .int32 => try decodeArray(allocator, i32, array),
-                .int64 => try decodeArray(allocator, i64, array),
+                    .float32 => try decodeArray(allocator, f32, array),
+                    .float64 => try decodeArray(allocator, f64, array),
+                    .int32 => try decodeArray(allocator, i32, array),
+                    .int64 => try decodeArray(allocator, i64, array),
                 },
             };
             totals.values = std.math.add(usize, totals.values, values) catch return error.LimitExceeded;
