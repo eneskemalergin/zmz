@@ -1,7 +1,7 @@
 //! Tests independent ownership of parsed metadata and records.
 
 const std = @import("std");
-const mzml = @import("z_mzml");
+const mzml = @import("zmz").mzml;
 const support = @import("support.zig");
 
 test "[integration] - [mzML ownership]: retains grouped records after reader closure and cleans failed copies" {

@@ -1,9 +1,10 @@
 //! Verifies binary-array wire boundaries through the public package.
 
 const std = @import("std");
-const base64 = @import("z_mzml").base64;
-const zlib = @import("z_mzml").zlib;
-const arrays = @import("z_mzml").arrays;
+const mzml = @import("zmz").mzml;
+const base64 = mzml.base64;
+const zlib = mzml.zlib;
+const arrays = mzml.arrays;
 
 fn allocateCompressor(allocator: std.mem.Allocator) !void {
     var compressor = try zlib.Compressor.init(allocator, .default);

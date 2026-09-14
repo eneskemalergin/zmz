@@ -30,7 +30,7 @@ The first version brings the pieces needed for mzML into one package:
 - binary-array decoding and encoding with Base64, zlib, and MS-Numpress;
 - scientific metadata and controlled-vocabulary access.
 
-The public API is still taking shape. The package currently imports as `z_mzml`; the package rename will follow the project rename.
+The package imports as `zmz`. The mzML API is available under `@import("zmz").mzml`.
 
 ## Direction
 

@@ -1,7 +1,7 @@
 //! Shared fixtures and helpers for the mzML integration suites.
 
 const std = @import("std");
-const mzml = @import("z_mzml");
+const mzml = @import("zmz").mzml;
 
 pub const HEADER =
     "<mzML xmlns='http://psi.hupo.org/ms/mzml' version='1.1.0' id='example'>" ++

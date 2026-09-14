@@ -1,7 +1,7 @@
 //! Tests source metadata and scientific field access.
 
 const std = @import("std");
-const mzml = @import("z_mzml");
+const mzml = @import("zmz").mzml;
 const support = @import("support.zig");
 
 test "[property] - [mzML scientific metadata]: distinguishes absent repeated and contradictory record fields" {

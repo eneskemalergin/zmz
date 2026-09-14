@@ -1,7 +1,7 @@
 .{
-    .name = .z_mzml,
+    .name = .zmz,
     .version = "0.0.0",
-    .fingerprint = 0xa5452ddff19c0172,
+    .fingerprint = 0xc6a4b95cef75bbdc,
     .minimum_zig_version = "0.16.0",
     .paths = .{
         "build.zig",

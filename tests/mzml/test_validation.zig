@@ -1,7 +1,7 @@
 //! Tests document structure, references, and validation.
 
 const std = @import("std");
-const mzml = @import("z_mzml");
+const mzml = @import("zmz").mzml;
 const support = @import("support.zig");
 
 test "[integration] - [mzML document validation]: owns reference storage and cleans allocation failures" {

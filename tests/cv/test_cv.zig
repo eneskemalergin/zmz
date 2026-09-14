@@ -1,7 +1,7 @@
 //! Verifies exact vocabulary identities, lexical interpretation, and bounded group expansion.
 
 const std = @import("std");
-const cv = @import("z_mzml").cv;
+const cv = @import("zmz").mzml.cv;
 
 const GRAPH: cv.Vocabulary = .{
     .identity = .{ .key = "example", .version = "current", .namespace = "X" },

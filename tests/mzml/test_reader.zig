@@ -1,11 +1,15 @@
 //! Tests streaming reads, payload handling, and malformed input.
 
 const std = @import("std");
-const mzml = @import("z_mzml");
+const zmz = @import("zmz");
+const mzml = zmz.mzml;
 const gates = @import("gates_test_support");
 const support = @import("support.zig");
 
-test "public namespaces keep indexed helpers and copy machinery private" {
+test "[unit] - [package API]: exposes mzML through one namespace" {
+    try std.testing.expect(@hasDecl(zmz, "mzml"));
+    try std.testing.expect(!@hasDecl(zmz, "StreamReader"));
+    try std.testing.expect(!@hasDecl(zmz, "Writer"));
     try std.testing.expect(!@hasDecl(mzml.StreamReader, "Scope"));
     try std.testing.expect(!@hasDecl(mzml.StreamReader, "parseFragment"));
     try std.testing.expect(!@hasDecl(mzml.StreamReader, "readFragment"));

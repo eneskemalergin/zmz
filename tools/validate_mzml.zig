@@ -1,7 +1,7 @@
 //! Checks external mzML references, scientific metadata, arrays, and indexed lookups through the public API.
 
 const std = @import("std");
-const mzml = @import("z_mzml");
+const mzml = @import("zmz").mzml;
 
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());

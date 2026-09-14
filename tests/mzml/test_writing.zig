@@ -1,7 +1,7 @@
 //! Tests plain, indexed, and prepared writing.
 
 const std = @import("std");
-const mzml = @import("z_mzml");
+const mzml = @import("zmz").mzml;
 const support = @import("support.zig");
 
 test "[integration] - [mzML writer]: preserves metadata and records through a plain rewrite" {

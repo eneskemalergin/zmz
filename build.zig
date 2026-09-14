@@ -1,4 +1,4 @@
-//! Defines the z-mzML package module and verification step.
+//! Defines the zmz package module and verification step.
 
 const std = @import("std");
 
@@ -7,7 +7,6 @@ const LibraryTest = struct {
     root_source_file: []const u8,
     add_gates_support: bool = false,
 };
-
 const library_test_specs = [_]LibraryTest{
     .{ .root_source_file = "tests/binary/test_numpress.zig" },
     .{ .root_source_file = "tests/binary/test_codecs.zig" },
@@ -21,7 +20,7 @@ const library_test_specs = [_]LibraryTest{
     .{ .root_source_file = "tests/mzml/test_reader.zig", .add_gates_support = true },
 };
 
-fn configureMzmlModule(
+fn configureLibraryModule(
     module: *std.Build.Module,
     numpress_options: *std.Build.Step.Options,
     use_glibc_vector: bool,
@@ -41,7 +40,7 @@ pub fn build(b: *std.Build) void {
     ) orelse .bundled;
     const use_glibc_vector = numpress_slof_math_backend == .glibc_vector;
     const link_libc: ?bool = if (use_glibc_vector) true else null;
-    const mzml = b.addModule("z_mzml", .{
+    const zmz = b.addModule("zmz", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .link_libc = link_libc,
@@ -52,7 +51,7 @@ pub fn build(b: *std.Build) void {
         "slof_math_backend",
         @tagName(numpress_slof_math_backend),
     );
-    configureMzmlModule(mzml, numpress_options, use_glibc_vector);
+    configureLibraryModule(zmz, numpress_options, use_glibc_vector);
 
     const test_step = b.step("test", "Run library tests");
     const gates_test_support = b.createModule(.{
@@ -67,7 +66,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .strip = strip,
         });
-        test_module.addImport("z_mzml", mzml);
+        test_module.addImport("zmz", zmz);
         if (test_spec.add_gates_support)
             test_module.addImport("gates_test_support", gates_test_support);
         const library_test_artifact = b.addTest(.{ .root_module = test_module });
@@ -81,7 +80,7 @@ pub fn build(b: *std.Build) void {
         .strip = strip,
         .link_libc = link_libc,
     });
-    configureMzmlModule(package_tests_module, numpress_options, use_glibc_vector);
+    configureLibraryModule(package_tests_module, numpress_options, use_glibc_vector);
     const package_tests = b.addTest(.{ .root_module = package_tests_module });
     test_step.dependOn(&b.addRunArtifact(package_tests).step);
 
@@ -92,7 +91,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .strip = strip,
-            .imports = &.{.{ .name = "z_mzml", .module = mzml }},
+            .imports = &.{.{ .name = "zmz", .module = zmz }},
         }),
     });
     const validate = b.addRunArtifact(validation);
@@ -104,7 +103,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .strip = strip,
-        .imports = &.{.{ .name = "z_mzml", .module = mzml }},
+        .imports = &.{.{ .name = "zmz", .module = zmz }},
     });
     vocabulary_module.addAnonymousImport("pinned_manifest", .{
         .root_source_file = b.path("vocabularies/manifest.json"),

@@ -1,12 +1,12 @@
 //! Exposes source parameter types and optional vocabulary interpretation.
 
-const source = @import("cv/source.zig");
+const source = @import("source.zig");
 
 /// Immutable vocabulary metadata and bounded graph queries, separate from source parsing.
-pub const Vocabulary = @import("cv/vocabulary.zig");
+pub const Vocabulary = @import("vocabulary.zig");
 
 /// Optional declaration-aware lookup against explicit or bundled vocabulary resources.
-pub const Resolver = @import("cv/resolver.zig");
+pub const Resolver = @import("resolver.zig");
 
 /// An exact accession spelling borrowed from caller-owned text.
 pub const Accession = source.Accession;

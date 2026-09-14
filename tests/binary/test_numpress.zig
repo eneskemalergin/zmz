@@ -1,7 +1,7 @@
 //! Verifies the supported MS-Numpress API, wire bytes, loss bounds, and failures.
 
 const std = @import("std");
-const numpress = @import("z_mzml").numpress;
+const numpress = @import("zmz").mzml.numpress;
 
 test "[unit] - [numpress bounds]: reports exact or safe encoded capacities" {
     try std.testing.expectEqual(@as(usize, 8), try numpress.linearMaxEncodedLen(0));

@@ -1,7 +1,7 @@
 //! Tests indexed output, opening, indexing, and lookup.
 
 const std = @import("std");
-const mzml = @import("z_mzml");
+const mzml = @import("zmz").mzml;
 const support = @import("support.zig");
 
 test "[integration] - [mzML index]: retains inherited namespaces and UTF-16 physical spans" {

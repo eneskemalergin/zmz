@@ -1,7 +1,9 @@
 //! Generates pinned vocabulary tables and reviews explicit local OBO candidates offline.
 
 const std = @import("std");
-const Vocabulary = @import("z_mzml").cv.Vocabulary;
+const zmz = @import("zmz");
+const mzml = zmz.mzml;
+const Vocabulary = mzml.cv.Vocabulary;
 
 // --- Command dispatch ---
 
@@ -61,7 +63,7 @@ fn run(init: std.process.Init) !void {
         try stdout.interface.flush();
         return;
     }
-    const baseline = @import("z_mzml").cv.Resolver.init(&.{}).resources;
+    const baseline = mzml.cv.Resolver.init(&.{}).resources;
     const blocked = try review(&stdout.interface, baseline, &resources);
     try stdout.interface.flush();
     if (blocked) return error.UnreviewedUpdate;
@@ -147,7 +149,6 @@ const ScanCounts = struct {
 };
 
 fn scan(allocator: std.mem.Allocator, io: std.Io, path: []const u8, output: *std.Io.Writer) !ScanCounts {
-    const mzml = @import("z_mzml");
     const file = try std.Io.Dir.cwd().openFile(io, path, .{});
     defer file.close(io);
     var buffer: [64 * 1024]u8 = undefined;
@@ -183,9 +184,9 @@ fn scan(allocator: std.mem.Allocator, io: std.Io, path: []const u8, output: *std
     return counts;
 }
 
-fn scanNode(resolver: @import("z_mzml").cv.Resolver, node: @import("z_mzml").model.Node, counts: *ScanCounts) !void {
+fn scanNode(resolver: mzml.cv.Resolver, node: mzml.model.Node, counts: *ScanCounts) !void {
     for (node.params) |entry| {
-        const parameter: @import("z_mzml").cv.Param = switch (entry) {
+        const parameter: mzml.cv.Param = switch (entry) {
             .cv => |param| param,
             .user => |param| .{ .unit = param.unit },
             .group_ref => continue,
@@ -646,8 +647,8 @@ fn review(writer: *std.Io.Writer, baseline: []const Vocabulary, candidate: []con
 }
 
 fn isKernel(id: []const u8) bool {
-    inline for (comptime std.meta.declarations(@import("z_mzml").model.Terms)) |declaration| {
-        if (std.mem.eql(u8, id, @field(@import("z_mzml").model.Terms, declaration.name).raw)) return true;
+    inline for (comptime std.meta.declarations(mzml.model.Terms)) |declaration| {
+        if (std.mem.eql(u8, id, @field(mzml.model.Terms, declaration.name).raw)) return true;
     }
     for ([_][]const u8{
         "MS:1000519", "MS:1000521", "MS:1000522", "MS:1000523", "MS:1000574", "MS:1000576",
@@ -990,7 +991,7 @@ test "[unit] - [vocabulary update]: reports each metadata change without changin
 }
 
 test "[failure] - [vocabulary update]: blocks removals kernel changes and new family terms" {
-    const baseline = @import("z_mzml").cv.Resolver.init(&.{}).resources;
+    const baseline = mzml.cv.Resolver.init(&.{}).resources;
     var next = [_]Vocabulary{ baseline[0], baseline[1] };
     const terms = try std.testing.allocator.dupe(Vocabulary.Term, baseline[0].terms);
     defer std.testing.allocator.free(terms);
@@ -1027,7 +1028,7 @@ test "[failure] - [vocabulary update]: blocks removals kernel changes and new fa
 }
 
 test "[property] - [vocabulary coverage]: every active monitored term has one reviewed disposition" {
-    const resources = @import("z_mzml").cv.Resolver.init(&.{}).resources;
+    const resources = mzml.cv.Resolver.init(&.{}).resources;
     var counts = [_]usize{ 0, 0, 0 };
     for (resources[0].terms) |term| {
         const families = try monitored(resources[0], term);
@@ -1046,7 +1047,7 @@ test "[property] - [vocabulary coverage]: every active monitored term has one re
 }
 
 test "[property] - [vocabulary manifest]: matches pinned identities and rejects invalid metadata" {
-    const resources = @import("z_mzml").cv.Resolver.init(&.{}).resources;
+    const resources = mzml.cv.Resolver.init(&.{}).resources;
     const pinned = try std.json.parseFromSlice(Manifest, std.testing.allocator, @embedFile("pinned_manifest"), .{});
     defer pinned.deinit();
     try checkManifest(pinned.value);

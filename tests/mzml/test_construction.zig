@@ -1,7 +1,7 @@
 //! Tests checked construction and encoded array output.
 
 const std = @import("std");
-const mzml = @import("z_mzml");
+const mzml = @import("zmz").mzml;
 const support = @import("support.zig");
 
 test "[integration] - [mzML prepared writing]: matches frozen plain and indexed codec output" {
