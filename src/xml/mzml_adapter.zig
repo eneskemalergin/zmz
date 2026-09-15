@@ -1674,6 +1674,13 @@ pub const Writer = struct {
         var index: usize = 0;
         var brackets = self.text_brackets;
         while (index < value.len) {
+            if (brackets == 0) {
+                const length = ordinaryTextRun(value[index..], value.len - index);
+                if (length != 0) {
+                    index += length;
+                    continue;
+                }
+            }
             const byte = value[index];
             var replacement: ?[]const u8 = null;
             if (byte == '&') {
@@ -1750,6 +1757,12 @@ fn validateText(value: []const u8, initial_brackets: u2) WriterError!u2 {
     var index: usize = 0;
     var brackets = initial_brackets;
     while (index < value.len) {
+        const length = ordinaryTextRun(value[index..], value.len - index);
+        if (length != 0) {
+            index += length;
+            brackets = 0;
+            continue;
+        }
         const codepoint = try decodeValue(value, &index);
         if (!isXmlChar(codepoint)) return error.InvalidCharacter;
         if (codepoint == ']') {
@@ -2120,6 +2133,45 @@ test "[regression] - [mzML XML cursor]: keeps CDATA codepoints within text chunk
     try std.testing.expectEqual(text_length, cursor.current.?.data.text.bytes.len);
     try cursor.advance(true);
     try std.testing.expectEqualStrings("\xC2\xB5", cursor.current.?.data.text.bytes);
+}
+
+test "[property] - [mzML XML writer]: preserves text runs, split brackets, and late character failures" {
+    const ordinary: [4097]u8 = @splat('A');
+    var value_buffer: [8192]u8 = undefined;
+    var expected_buffer: [8192]u8 = undefined;
+    var output: [8192]u8 = undefined;
+    const opening = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><binary";
+    for ([_]usize{ 0, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 4095, 4096, 4097 }) |length| {
+        const value = try std.fmt.bufPrint(&value_buffer, "{s}]]><&\r\xc2\xb5]]", .{ordinary[0..length]});
+        const expected = try std.fmt.bufPrint(&expected_buffer, opening ++ ">]]{s}]]&gt;&lt;&amp;&#xD;\xc2\xb5]]&gt;</binary>", .{ordinary[0..length]});
+        for ([_]usize{ 0, length / 2, length, length + 1, length + 2, length + 3, value.len }) |split| {
+            var sink = std.Io.Writer.fixed(&output);
+            var writer = try Writer.init(std.testing.allocator, &sink, .{});
+            defer writer.deinit();
+            try writer.startDocument();
+            try writer.startElement("binary");
+            try writer.text("]]");
+            try writer.text(value[0..split]);
+            try writer.text(value[split..]);
+            try writer.text(">");
+            try writer.endElement();
+            try writer.endDocument();
+            try std.testing.expectEqualStrings(expected, sink.buffered());
+            try std.testing.expectEqual(@as(?u64, expected.len), writer.byteOffset());
+        }
+        for ([_][]const u8{ "\x00", "\x01", "\xc0\x80", "\xed\xa0\x80", "\xf4\x90\x80\x80", "\xef\xbf\xbe", "\xc2" }) |invalid| {
+            const bad = try std.fmt.bufPrint(&value_buffer, "{s}{s}", .{ ordinary[0..length], invalid });
+            var sink = std.Io.Writer.fixed(&output);
+            var writer = try Writer.init(std.testing.allocator, &sink, .{});
+            defer writer.deinit();
+            try writer.startDocument();
+            try writer.startElement("binary");
+            try std.testing.expectError(error.InvalidCharacter, writer.text(bad));
+            try std.testing.expectEqualStrings(opening, sink.buffered());
+            try std.testing.expectEqual(@as(?u64, opening.len), writer.byteOffset());
+            try std.testing.expectError(error.InvalidCharacter, writer.text("later"));
+        }
+    }
 }
 
 test "[unit] - [mzML XML writer]: emits escaped values and flushes empty text" {
