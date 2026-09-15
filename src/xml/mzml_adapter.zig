@@ -1547,6 +1547,25 @@ pub const Writer = struct {
         self.text_brackets = trailing;
     }
 
+    pub fn binary(self: *Writer, wire: []const u8) WriterError!void {
+        try self.checkAny();
+        if (self.state != .start_tag and self.state != .content) return self.fail(error.InvalidState);
+        if (self.state == .start_tag) {
+            try self.writeByte('>');
+            self.state = .content;
+        }
+        var encoded: [4096]u8 = undefined;
+        var offset: usize = 0;
+        while (offset < wire.len) {
+            const length = @min(wire.len - offset, encoded.len / 4 * 3);
+            // The encoder emits ASCII without XML metacharacters.
+            const value = std.base64.standard.Encoder.encode(&encoded, wire[offset..][0..length]);
+            try self.writeBytes(value);
+            offset += length;
+        }
+        if (wire.len != 0) self.text_brackets = 0;
+    }
+
     /// Closes the current element.
     pub fn endElement(self: *Writer) WriterError!void {
         try self.checkAny();
@@ -1731,7 +1750,59 @@ fn validateText(value: []const u8, initial_brackets: u2) WriterError!u2 {
     return brackets;
 }
 
+fn writeBinaryCase(writer: *Writer, wire: []const u8, direct: bool, prefix: []const u8) WriterError!void {
+    try writer.startDocument();
+    try writer.startElement("binary");
+    try writer.text(prefix);
+    if (direct) {
+        try writer.binary(wire);
+    } else if (wire.len == 0) {
+        try writer.text("");
+    } else {
+        var encoded: [4096]u8 = undefined;
+        var offset: usize = 0;
+        while (offset < wire.len) {
+            const length = @min(wire.len - offset, encoded.len / 4 * 3);
+            try writer.text(std.base64.standard.Encoder.encode(&encoded, wire[offset..][0..length]));
+            offset += length;
+        }
+    }
+    try writer.text(">");
+    try writer.endElement();
+    try writer.endDocument();
+}
+
 // --- Tests ---
+
+test "[property] - [mzML XML writer]: generated Base64 preserves text state, offsets, and sink failures" {
+    var wire: [6145]u8 = undefined;
+    for (&wire, 0..) |*byte, i| byte.* = @truncate(i);
+    var output: [2][9000]u8 = undefined;
+    for ([_]usize{ 0, 1, 2, 3, 3071, 3072, 3073, wire.len }) |length| {
+        for ([_]usize{ 0, 8, 48, 49, 100, 4096, 8192, output[0].len }) |capacity| {
+            for ([_][]const u8{ "", "]]" }) |prefix| {
+                var lengths: [2]usize = undefined;
+                var offsets: [2]?u64 = undefined;
+                var failures: [2]?WriterError = .{ null, null };
+                for (0..2) |i| {
+                    var sink = std.Io.Writer.fixed(output[i][0..capacity]);
+                    var writer = try Writer.init(std.testing.allocator, &sink, .{});
+                    defer writer.deinit();
+                    writeBinaryCase(&writer, wire[0..length], i == 1, prefix) catch |err| {
+                        failures[i] = err;
+                        try std.testing.expectError(err, writer.binary(""));
+                    };
+                    lengths[i] = sink.buffered().len;
+                    offsets[i] = writer.byteOffset();
+                    if (failures[i] == null) try std.testing.expectError(error.InvalidState, writer.binary(""));
+                }
+                try std.testing.expectEqual(failures[0], failures[1]);
+                try std.testing.expectEqual(offsets[0], offsets[1]);
+                try std.testing.expectEqualSlices(u8, output[0][0..lengths[0]], output[1][0..lengths[1]]);
+            }
+        }
+    }
+}
 
 test "[unit] - [mzML XML cursor]: skips declarations, comments, processing instructions, and decodes text" {
     const source = "<?xml version='1.0' encoding='UTF-8'?><?p?><p:mzML xmlns:p='" ++ NAMESPACE ++

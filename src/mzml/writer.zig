@@ -241,23 +241,11 @@ fn writeNode(self: *Writer, node: model.Node, comptime replace_arrays: bool, rem
     try self.writeAttributes(node.attributes);
     try self.writeParams(node.params);
     if (replace_arrays and node.kind == .binary) {
-        try self.writeBinary(remaining.*[0]);
+        try self.engine.binary(remaining.*[0]);
         remaining.* = remaining.*[1..];
     } else if (node.text) |text| try self.engine.text(text);
     for (node.children) |child| try self.writeNode(child, replace_arrays, remaining);
     try self.engine.endElement();
-}
-
-fn writeBinary(self: *Writer, wire: []const u8) Error!void {
-    var encoded: [4096]u8 = undefined;
-    if (wire.len == 0) return self.engine.text("");
-    var offset: usize = 0;
-    while (offset < wire.len) {
-        const length = @min(wire.len - offset, encoded.len / 4 * 3);
-        const text = try base64.encode(&encoded, wire[offset..][0..length]);
-        try self.engine.text(text);
-        offset += length;
-    }
 }
 
 fn overlaps(a: []const u8, b: []const u8) bool {
