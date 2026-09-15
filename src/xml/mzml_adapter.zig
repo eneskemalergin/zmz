@@ -929,13 +929,24 @@ pub const Cursor = struct {
 
             if (self.attribute_ranges.items.len == self.max_attributes) return error.LimitExceeded;
             const attribute_name = try self.parseQName();
-            try self.skipWhitespace();
-            const equals = try self.requiredCodepoint();
-            if (equals.value != '=') return error.InvalidXml;
-            try self.skipWhitespace();
-            const quote = try self.requiredCodepoint();
-            if (quote.value != '\'' and quote.value != '"') return error.InvalidXml;
-            const attribute_value = try self.parseAttributeValue(quote.value);
+            const quote: u21 = opening: {
+                if (try self.source.peekUtf8()) |bytes| {
+                    if (bytes.len >= 2 and bytes[0] == '=' and (bytes[1] == '\'' or bytes[1] == '"')) {
+                        const value = bytes[1];
+                        self.source.borrowed_len = 2;
+                        try self.source.commitBorrowed();
+                        break :opening value;
+                    }
+                }
+                try self.skipWhitespace();
+                const equals = try self.requiredCodepoint();
+                if (equals.value != '=') return error.InvalidXml;
+                try self.skipWhitespace();
+                const value = try self.requiredCodepoint();
+                if (value.value != '\'' and value.value != '"') return error.InvalidXml;
+                break :opening value.value;
+            };
+            const attribute_value = try self.parseAttributeValue(quote);
             for (self.attribute_ranges.items) |previous| {
                 if (std.mem.eql(u8, self.event_bytes.items[previous.name.start..][0..previous.name.len], self.event_bytes.items[attribute_name.start..][0..attribute_name.len])) {
                     return error.InvalidXml;
@@ -1909,6 +1920,41 @@ test "[property] - [mzML XML cursor]: preserves qualified names and namespace re
                 }
                 try cursor.advance(false);
                 try std.testing.expectEqual(null, cursor.current);
+            }
+        }
+    }
+}
+
+test "[property] - [mzML XML cursor]: preserves attribute openings across refills" {
+    var utf8: [256]u8 = undefined;
+    var utf16: [514]u8 = undefined;
+    var buffer: [514]u8 = undefined;
+    for ([_][]const u8{ "='", "=\"", " = '", "\t=\r\n\"", "= '" }) |opening| {
+        const source = try std.fmt.bufPrint(&utf8, "<mzML xmlns='{s}' a{s}x&amp;y{c}/>", .{ NAMESPACE, opening, opening[opening.len - 1] });
+        for ([_]?std.builtin.Endian{ null, .little, .big }) |encoding| {
+            const bytes = if (encoding) |endian| blk: {
+                std.mem.writeInt(u16, utf16[0..2], 0xfeff, endian);
+                for (source, 0..) |byte, index| std.mem.writeInt(u16, utf16[2 + index * 2 ..][0..2], byte, endian);
+                break :blk utf16[0 .. 2 + source.len * 2];
+            } else source;
+            for ([_]usize{ 4, 5, 7, 16, 64, buffer.len }) |size| {
+                for ([_]bool{ false, true }) |checked| {
+                    var input: std.testing.Reader = .init(buffer[0..size], &.{.{ .buffer = bytes }});
+                    input.artificial_limit = .limited(size);
+                    var cursor = try Cursor.init(std.testing.allocator, &input.interface, 64, 64, 1024, checked);
+                    defer cursor.deinit();
+                    try cursor.advance(false);
+                    const event = cursor.current.?;
+                    const start = event.data.start_element;
+                    try std.testing.expectEqualStrings("a", start.attributes[0].name.raw);
+                    try std.testing.expectEqualStrings("x&y", start.attributes[0].value);
+                    try std.testing.expectEqual(@as(u64, bytes.len), event.span.end);
+                    try cursor.advance(false);
+                    try std.testing.expectEqual(.end_element, std.meta.activeTag(cursor.current.?.data));
+                    try std.testing.expectEqual(@as(u64, bytes.len), cursor.current.?.span.end);
+                    try cursor.advance(false);
+                    try std.testing.expectEqual(null, cursor.current);
+                }
             }
         }
     }
