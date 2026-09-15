@@ -658,6 +658,7 @@ pub const Cursor = struct {
             self.normal_text_brackets = 0;
 
             const opening = try self.requiredCodepoint();
+            if (try self.readBufferedStartElement(opening.start)) |event| return event;
             const marker = self.requiredCodepoint() catch |err| return err;
             switch (marker.value) {
                 '/' => return try self.readEndElement(opening.start),
@@ -907,6 +908,95 @@ pub const Cursor = struct {
         return appendToCodepoint(destination, self.allocator, @intCast(number), limit);
     }
 
+    fn bufferedName(self: *Cursor, bytes: []const u8, position: *usize) ?NameRange {
+        const start = position.*;
+        if (start == bytes.len or !isAsciiNameStart(bytes[start])) return null;
+        var end = start + 1;
+        while (end < bytes.len and isAsciiNameChar(bytes[end])) : (end += 1) {}
+        if (end == bytes.len or !isNameDelimiter(bytes[end])) return null;
+        const length = end - start;
+        const capacity = @min(self.max_attribute_bytes, self.event_bytes.capacity);
+        if (length > capacity -| self.event_bytes.items.len) return null;
+        const result: NameRange = .{ .start = self.event_bytes.items.len, .len = length, .prefix_len = 0 };
+        self.event_bytes.appendSliceAssumeCapacity(bytes[start..end]);
+        position.* = end;
+        return result;
+    }
+
+    fn hasAttribute(self: *const Cursor, name: NameRange) bool {
+        const raw = self.event_bytes.items[name.start..][0..name.len];
+        for (self.attribute_ranges.items) |previous| {
+            if (std.mem.eql(u8, self.event_bytes.items[previous.name.start..][0..previous.name.len], raw)) return true;
+        }
+        return false;
+    }
+
+    fn readBufferedStartElement(self: *Cursor, start_offset: u64) Error!?Event {
+        if (self.source.encoding != .utf8 or self.source.probe_pos != self.source.probe_len or
+            self.source.pending_len != 0) return null;
+        const reader = self.source.reader orelse return null;
+        const bytes = reader.buffered();
+        if (bytes.len == 0 or !isAsciiNameStart(bytes[0])) return null;
+        self.event_bytes.clearRetainingCapacity();
+        self.attribute_ranges.clearRetainingCapacity();
+        self.namespace_declarations.clearRetainingCapacity();
+        self.attributes.clearRetainingCapacity();
+        var position: usize = 0;
+        const name_range = self.bufferedName(bytes, &position) orelse return null;
+        var empty = false;
+
+        // Do not consume input or grow storage until the complete tag is known.
+        // The incremental parser preserves failure order on every declined tag.
+        while (true) {
+            while (position < bytes.len and isXmlWhitespace(bytes[position])) : (position += 1) {}
+            if (position == bytes.len) return null;
+            if (bytes[position] == '>') {
+                position += 1;
+                break;
+            }
+            if (bytes[position] == '/') {
+                if (bytes.len - position < 2 or bytes[position + 1] != '>') return null;
+                position += 2;
+                empty = true;
+                break;
+            }
+            if (self.attribute_ranges.items.len == @min(self.max_attributes, self.attribute_ranges.capacity)) return null;
+            const name = self.bufferedName(bytes, &position) orelse return null;
+            if (std.mem.eql(u8, self.event_bytes.items[name.start..][0..name.len], "xmlns")) return null;
+            while (position < bytes.len and isXmlWhitespace(bytes[position])) : (position += 1) {}
+            if (position == bytes.len or bytes[position] != '=') return null;
+            position += 1;
+            while (position < bytes.len and isXmlWhitespace(bytes[position])) : (position += 1) {}
+            if (position == bytes.len) return null;
+            const quote = bytes[position];
+            if (quote != '\'' and quote != '"') return null;
+            position += 1;
+            const start = position;
+            while (position < bytes.len and bytes[position] != quote) : (position += 1) {
+                const byte = bytes[position];
+                if (byte < 0x20 or byte >= 0x80 or byte == '&' or byte == '<') return null;
+            }
+            if (position == bytes.len) return null;
+            const length = position - start;
+            const capacity = @min(self.max_attribute_bytes, self.event_bytes.capacity);
+            if (length > capacity -| self.event_bytes.items.len) return null;
+            const value: Range = .{ .start = self.event_bytes.items.len, .len = length };
+            self.event_bytes.appendSliceAssumeCapacity(bytes[start..position]);
+            position += 1;
+            if (self.hasAttribute(name)) return null;
+            self.attribute_ranges.appendAssumeCapacity(.{
+                .name = name,
+                .value = value,
+                .namespace_declaration = false,
+            });
+        }
+
+        const end = std.math.add(u64, self.source.position, position) catch return null;
+        reader.toss(position);
+        self.source.position = end;
+        return try self.finishStartElement(start_offset, name_range, empty);
+    }
+
     fn readStartElement(self: *Cursor, start_offset: u64) Error!Event {
         self.event_bytes.clearRetainingCapacity();
         self.attribute_ranges.clearRetainingCapacity();
@@ -947,11 +1037,7 @@ pub const Cursor = struct {
                 break :opening value.value;
             };
             const attribute_value = try self.parseAttributeValue(quote);
-            for (self.attribute_ranges.items) |previous| {
-                if (std.mem.eql(u8, self.event_bytes.items[previous.name.start..][0..previous.name.len], self.event_bytes.items[attribute_name.start..][0..attribute_name.len])) {
-                    return error.InvalidXml;
-                }
-            }
+            if (self.hasAttribute(attribute_name)) return error.InvalidXml;
             const raw_name = self.event_bytes.items[attribute_name.start..][0..attribute_name.len];
             const namespace_declaration = std.mem.eql(u8, raw_name, "xmlns") or
                 (std.mem.startsWith(u8, raw_name, "xmlns:") and raw_name.len > 6);
@@ -969,6 +1055,10 @@ pub const Cursor = struct {
             });
         }
 
+        return self.finishStartElement(start_offset, name_range, empty);
+    }
+
+    fn finishStartElement(self: *Cursor, start_offset: u64, name_range: NameRange, empty: bool) Error!Event {
         if (self.depth == 0) {
             if (self.root_closed) return error.InvalidXml;
             self.root_seen = true;
@@ -1967,6 +2057,58 @@ test "[property] - [mzML XML cursor]: preserves attribute openings across refill
                     try std.testing.expectEqual(@as(u64, bytes.len), cursor.current.?.span.end);
                     try cursor.advance(false);
                     try std.testing.expectEqual(null, cursor.current);
+                }
+            }
+        }
+    }
+}
+
+test "[property] - [mzML XML cursor]: buffered opening tags match incremental parsing and leave declined input unread" {
+    const cases = .{
+        .{ "child>", true },
+        .{ "child/>", true },
+        .{ "child \r\n a = 'one>two' b=\"\"/>", true },
+        .{ "child a='one' b='two'>", true },
+        .{ "child a='one'a='two'>", false },
+        .{ "child a='one' b='&amp;'>", false },
+        .{ "child a='one' b='\r\ntwo'>", false },
+        .{ "child a='one' b='\xc2\xb5'>", false },
+        .{ "child a='one' b='\xff'>", false },
+        .{ "child xmlns='http://psi.hupo.org/ms/mzml'>", false },
+        .{ "p:child>", false },
+        .{ "child p:a='one'>", false },
+        .{ "child a='one' b=two>", false },
+        .{ "child a='one' b='two' /", false },
+        .{ "child a='one' b='two", false },
+        .{ "child?", false },
+    };
+    inline for (cases) |case| {
+        for ([_]usize{ 1, 10, 128 }) |limit| {
+            for ([_]usize{ 1, 4 }) |attributes| {
+                var input = std.Io.Reader.fixed(case[0]);
+                var reference_input = std.Io.Reader.fixed(case[0]);
+                var cursor = try Cursor.init(std.testing.allocator, &input, 64, attributes, limit, false);
+                defer cursor.deinit();
+                var reference = try Cursor.init(std.testing.allocator, &reference_input, 64, attributes, limit, false);
+                defer reference.deinit();
+                cursor.source.detected = true;
+                reference.source.detected = true;
+                try cursor.event_bytes.ensureTotalCapacity(std.testing.allocator, 128);
+                try cursor.attribute_ranges.ensureTotalCapacity(std.testing.allocator, 4);
+
+                const event = try cursor.readBufferedStartElement(0);
+                if (limit == 128 and attributes == 4) try std.testing.expectEqual(case[1], event != null);
+                if (event) |actual| {
+                    try std.testing.expectEqualDeep(try reference.readStartElement(0), actual);
+                } else {
+                    try std.testing.expectEqual(@as(u64, 0), cursor.source.position);
+                    try std.testing.expectEqualStrings(case[0], input.buffered());
+                    const expected = reference.readStartElement(0) catch |err| {
+                        try std.testing.expectError(err, cursor.readStartElement(0));
+                        try std.testing.expectEqual(reference.source.currentOffset(), cursor.source.currentOffset());
+                        continue;
+                    };
+                    try std.testing.expectEqualDeep(expected, try cursor.readStartElement(0));
                 }
             }
         }
