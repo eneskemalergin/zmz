@@ -185,18 +185,19 @@ fn readEntry(self: *IndexedReader, allocator: std.mem.Allocator, entry: Entry) E
     if (length > self.options.record_span_bytes) return error.LimitExceeded;
     const prefix_end = std.math.add(usize, context.prefix.len, length) catch return error.LimitExceeded;
     const total = std.math.add(usize, prefix_end, context.suffix.len) catch return error.LimitExceeded;
-    const bytes = try allocator.alloc(u8, total);
-    defer allocator.free(bytes);
-    @memcpy(bytes[0..context.prefix.len], context.prefix);
-    try self.readAt(bytes[context.prefix.len..prefix_end], entry.start);
-    @memcpy(bytes[prefix_end..], context.suffix);
+    var buffer: [64 * 1024]u8 = undefined;
+    var input = FragmentInput.init(self, context.prefix, entry.start, length, context.suffix, buffer[0..@max(4, @min(buffer.len, total))]);
     if (self.lookup_reader == null) {
-        var input = std.Io.Reader.fixed(&.{});
-        self.lookup_reader = try StreamReader.init(self.allocator, &input, self.options.reader);
+        var empty_input = std.Io.Reader.fixed(&.{});
+        self.lookup_reader = try StreamReader.init(self.allocator, &empty_input, self.options.reader);
         reader_bridge.resetFragmentParser(&self.lookup_reader.?);
     }
-    var record = try reader_bridge.readFragment(&self.lookup_reader.?, allocator, bytes, context.ancestors, entry.start, context.prefix.len, self.options.policy != .open_embedded);
+    var record = reader_bridge.readFragment(&self.lookup_reader.?, allocator, &input.interface, context.ancestors, entry.start, context.prefix.len, self.options.policy != .open_embedded) catch |err| {
+        try input.finishSpan();
+        return err;
+    };
     errdefer record.deinit();
+    try input.finishSpan();
     if (record.value.node.kind != entry.kind or !std.mem.eql(u8, record.value.id, entry.id) or
         record.value.index != entry.index or record.value.node.start_offset != entry.start or
         record.value.node.end_offset > entry.end or
@@ -214,6 +215,66 @@ fn checkSource(self: *const IndexedReader) Error!void {
             !std.meta.eql(current.mtime, original.mtime)) return error.StaleSource;
     }
 }
+
+const FragmentInput = struct {
+    index: *const IndexedReader,
+    prefix: []const u8,
+    offset: u64,
+    remaining: usize,
+    suffix: []const u8,
+    failure: ?Error = null,
+    interface: std.Io.Reader,
+
+    fn init(index: *const IndexedReader, prefix: []const u8, offset: u64, length: usize, suffix: []const u8, buffer: []u8) FragmentInput {
+        return .{
+            .index = index,
+            .prefix = prefix,
+            .offset = offset,
+            .remaining = length,
+            .suffix = suffix,
+            .interface = .{ .vtable = &.{ .stream = stream }, .buffer = buffer, .seek = 0, .end = 0 },
+        };
+    }
+
+    fn stream(reader: *std.Io.Reader, writer: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const self: *FragmentInput = @fieldParentPtr("interface", reader);
+        if (self.failure != null) return error.ReadFailed;
+        if (limit == .nothing) return 0;
+        if (self.prefix.len != 0) {
+            const n = try writer.write(limit.sliceConst(self.prefix));
+            self.prefix = self.prefix[n..];
+            return n;
+        }
+        if (self.remaining != 0) {
+            const output = limit.min(.limited(self.remaining)).slice(try writer.writableSliceGreedy(1));
+            self.index.readAt(output, self.offset) catch |err| {
+                self.failure = err;
+                return error.ReadFailed;
+            };
+            self.offset += output.len;
+            self.remaining -= output.len;
+            writer.advance(output.len);
+            return output.len;
+        }
+        if (self.suffix.len != 0) {
+            const n = try writer.write(limit.sliceConst(self.suffix));
+            self.suffix = self.suffix[n..];
+            return n;
+        }
+        return error.EndOfStream;
+    }
+
+    fn finishSpan(self: *FragmentInput) Error!void {
+        if (self.failure) |err| return err;
+        // Source failures take precedence over target parsing failures.
+        while (self.remaining != 0) {
+            const output = self.interface.buffer[0..@min(self.remaining, self.interface.buffer.len)];
+            try self.index.readAt(output, self.offset);
+            self.offset += output.len;
+            self.remaining -= output.len;
+        }
+    }
+};
 
 fn openEmbedded(self: *IndexedReader, reader: *StreamReader) Error!void {
     const scopes = reader_bridge.scopes(reader);

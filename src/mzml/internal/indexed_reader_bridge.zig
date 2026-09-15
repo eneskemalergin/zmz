@@ -15,13 +15,13 @@ pub fn resetFragmentParser(reader: *Reader) void {
 pub fn readFragment(
     reader: *Reader,
     allocator: std.mem.Allocator,
-    bytes: []const u8,
+    input: *std.Io.Reader,
     ancestors: usize,
     physical_start: u64,
     prefix_length: usize,
     complete: bool,
 ) Reader.Error!owned.Record {
-    return reader.readFragment(allocator, bytes, ancestors, physical_start, prefix_length, complete);
+    return reader.readFragment(allocator, input, ancestors, physical_start, prefix_length, complete);
 }
 
 pub fn parseFooter(

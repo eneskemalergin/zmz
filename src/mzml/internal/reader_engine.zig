@@ -182,18 +182,18 @@ pub fn parseFragment(
     physical_start: u64,
     prefix_length: usize,
 ) Error!owned.Record {
+    if (prefix_length > bytes.len) return error.InvalidOptions;
     var input = std.Io.Reader.fixed(bytes);
     var reader = try init(allocator, &input, options);
     defer reader.deinit();
-    return reader.readFragment(allocator, bytes, ancestors, physical_start, prefix_length, true);
+    return reader.readFragment(allocator, &input, ancestors, physical_start, prefix_length, true);
 }
 
 /// Internal reusable fragment reader. Returned records use the requested allocator;
 /// parser and list scratch remain owned by this reader. No source bytes remain borrowed.
-pub fn readFragment(self: *StreamReader, allocator: std.mem.Allocator, bytes: []const u8, ancestors: usize, physical_start: u64, prefix_length: usize, complete: bool) Error!owned.Record {
-    if (self.header_ready or ancestors > 4 or physical_start < prefix_length or prefix_length > bytes.len) return error.InvalidOptions;
-    var input = std.Io.Reader.fixed(bytes);
-    try self.cursor.reset(&input);
+pub fn readFragment(self: *StreamReader, allocator: std.mem.Allocator, input: *std.Io.Reader, ancestors: usize, physical_start: u64, prefix_length: usize, complete: bool) Error!owned.Record {
+    if (self.header_ready or ancestors > 4 or physical_start < prefix_length) return error.InvalidOptions;
+    try self.cursor.reset(input);
     defer self.cursor.resetEmpty();
     self.record_store.arena.deinit();
     self.record_store = Storage.init(allocator, self.options.limits.record_bytes);

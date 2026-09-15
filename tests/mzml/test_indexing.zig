@@ -81,6 +81,56 @@ test "[integration] - [mzML indexed lookup]: retains records and recovers after 
     try std.testing.checkAllAllocationFailures(std.testing.allocator, support.checkLookupAllocator, .{});
 }
 
+test "[integration] - [mzML indexed lookup]: crosses file refills with UTF-16 and wrapped payloads" {
+    const allocator = std.testing.allocator;
+    const spaces: [65537]u8 = @splat(' ');
+    const split = comptime std.mem.indexOf(u8, support.SPECTRUM, "<binary>").? + "<binary>".len;
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    for ([_]usize{ 65534, 65535, 65536, 65537 }) |padding| {
+        var source: std.Io.Writer.Allocating = .init(allocator);
+        defer source.deinit();
+        try source.writer.writeAll(support.HEADER ++ "<spectrumList count='1' defaultDataProcessingRef='dp'>");
+        try source.writer.writeAll(support.SPECTRUM[0..split]);
+        try source.writer.writeAll(spaces[0..padding]);
+        try source.writer.writeAll("\r\n&#x9;" ++ support.SPECTRUM[split..] ++ "</spectrumList></run></mzML>");
+        for ([_]?std.builtin.Endian{ null, .little, .big }) |endian| {
+            const encoded = try allocator.alloc(u8, if (endian != null) 2 + source.written().len * 2 else source.written().len);
+            defer allocator.free(encoded);
+            if (endian) |order| {
+                std.mem.writeInt(u16, encoded[0..2], 0xfeff, order);
+                for (source.written(), 0..) |byte, i| std.mem.writeInt(u16, encoded[2 + i * 2 ..][0..2], byte, order);
+            } else @memcpy(encoded, source.written());
+            const file = try directory.dir.createFile(std.testing.io, "refills.mzML", .{ .read = true });
+            defer file.close(std.testing.io);
+            try file.writeStreamingAll(std.testing.io, encoded);
+            for ([_]mzml.StreamReader.Payload{ .retain, .skip }) |payload| {
+                var input = std.Io.Reader.fixed(encoded);
+                var reader = try mzml.StreamReader.init(allocator, &input, .{ .payload = payload });
+                defer reader.deinit();
+                const expected = (try reader.nextRecord()).?;
+                for ([_]mzml.IndexedReader.Source{ .{ .bytes = encoded }, .{ .file = .{ .handle = file, .io = std.testing.io } } }) |indexed_source| {
+                    var index = try mzml.IndexedReader.build(allocator, indexed_source, .{ .policy = .rebuild, .reader = .{ .payload = payload } });
+                    defer index.deinit();
+                    const span: usize = @intCast(index.entries.items[0].end - index.entries.items[0].start);
+                    index.options.record_span_bytes = span - 1;
+                    try std.testing.expectError(error.LimitExceeded, index.at(allocator, .spectrum, 0));
+                    index.options.record_span_bytes = span;
+                    var record = (try index.byId(allocator, expected.id)).?;
+                    defer record.deinit();
+                    try std.testing.expectEqualDeep(expected, record.value);
+                    if (payload == .retain) {
+                        var arrays = record.value.arrays(index.header().groups);
+                        var value: [1]f64 = undefined;
+                        try (try arrays.next()).?.decode(f64, &value, .{ .transport = &.{}, .transformed = &.{} }, .{});
+                        try std.testing.expectEqual(@as(f64, 1), value[0]);
+                    }
+                }
+            }
+        }
+    }
+}
+
 test "[regression] - [mzML indexed lookup]: reads a later target after a malformed record" {
     const allocator = std.testing.allocator;
     const bytes = try allocator.dupe(u8, @embedFile("data/writer_indexed.mzML"));
@@ -259,14 +309,51 @@ test "[integration] - [mzML index]: builds plain files explicitly and rejects ch
     var record = (try index.byId(std.testing.allocator, "native=a&b")).?;
     defer record.deinit();
     try std.testing.expectEqualStrings("native=a&b", record.value.id);
+    try std.testing.expectEqual(null, try index.byId(std.testing.allocator, "absent"));
+    try std.testing.expectEqual(null, try index.at(std.testing.allocator, .spectrum, 100));
     try file.setLength(std.testing.io, support.DOCUMENT.len - 1);
     try std.testing.expectError(error.StaleSource, index.byId(std.testing.allocator, "native=a&b"));
+    try std.testing.expectError(error.StaleSource, index.byId(std.testing.allocator, "absent"));
+    try std.testing.expectError(error.StaleSource, index.at(std.testing.allocator, .spectrum, 100));
     try std.testing.expectError(error.LimitExceeded, mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = support.DOCUMENT }, .{ .policy = .rebuild, .max_records = 1 }));
     try std.testing.expectError(error.LimitExceeded, mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = support.DOCUMENT }, .{ .policy = .rebuild, .index_bytes = 1 }));
     const duplicate = support.HEADER ++ "<spectrumList count='2' defaultDataProcessingRef='dp'>" ++
         "<spectrum id='scan=1' index='0' defaultArrayLength='0'/>" ++
         "<spectrum id='scan=1' index='1' defaultArrayLength='0'/></spectrumList></run></mzML>";
     try std.testing.expectError(error.DuplicateId, mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = duplicate }, .{ .policy = .rebuild }));
+}
+
+test "[failure] - [mzML indexed lookup]: checks the source after array selection" {
+    const Selection = struct {
+        file: std.Io.File,
+        changed: bool = false,
+        failed: bool = false,
+
+        fn select(data: ?*anyopaque, _: usize, _: []const mzml.model.Attribute, _: []const mzml.cv.Entry) mzml.StreamReader.Payload {
+            const self: *@This() = @ptrCast(@alignCast(data.?));
+            self.file.setLength(std.testing.io, support.DOCUMENT.len - 1) catch {
+                self.failed = true;
+                return .skip;
+            };
+            self.changed = true;
+            return .skip;
+        }
+    };
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    const file = try directory.dir.createFile(std.testing.io, "changing.mzML", .{ .read = true });
+    defer file.close(std.testing.io);
+    try file.writeStreamingAll(std.testing.io, support.DOCUMENT);
+    var selection: Selection = .{ .file = file };
+    var index = try mzml.IndexedReader.build(std.testing.allocator, .{ .file = .{ .handle = file, .io = std.testing.io } }, .{
+        .policy = .rebuild,
+        .reader = .{ .array_selector = .{ .user_data = &selection, .select = Selection.select } },
+    });
+    defer index.deinit();
+    try std.testing.expect(!selection.changed);
+    try std.testing.expectError(error.StaleSource, index.at(std.testing.allocator, .spectrum, 0));
+    try std.testing.expect(selection.changed);
+    try std.testing.expect(!selection.failed);
 }
 
 test "[integration] - [mzML record IDs]: keeps spectrum and chromatogram keys separate" {
