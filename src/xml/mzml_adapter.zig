@@ -573,7 +573,7 @@ pub const Cursor = struct {
                         self.current = event;
                         return;
                     }
-                    if (std.mem.trim(u8, value.bytes, " \t\r\n").len != 0) return error.InvalidXml;
+                    for (value.bytes) |byte| if (!isXmlWhitespace(byte)) return error.InvalidXml;
                 },
                 .document_end => {
                     self.current = null;
@@ -784,12 +784,14 @@ pub const Cursor = struct {
                     const bound = @min(bytes.len, self.max_attribute_bytes -| self.event_bytes.items.len);
                     var length: usize = 0;
                     while (length < bound and isAsciiNameChar(bytes[length])) : (length += 1) {}
+                    const finished = length < bytes.len and isNameDelimiter(bytes[length]);
                     if (length != 0) {
                         try self.appendEventSlice(bytes[0..length]);
                         self.source.borrowed_len = length;
                         try self.source.commitBorrowed();
-                        continue;
                     }
+                    if (finished) break;
+                    if (length != 0) continue;
                 }
             }
             const value = self.requiredCodepoint() catch |err| return err;
@@ -1841,6 +1843,36 @@ test "[property] - [mzML XML cursor]: preserves qualified names and namespace re
     }
 }
 
+test "[property] - [mzML XML cursor]: leaves QName delimiters unread at exact token limits" {
+    var source: [64]u8 = undefined;
+    var buffer: [64]u8 = undefined;
+    for ([_][]const u8{ "a", "scan_123", "p:array", "long_prefix:data-array.name" }) |name| {
+        for (" \t\r\n/>=?") |delimiter| {
+            const bytes = try std.fmt.bufPrint(&source, "{s}{c}x", .{ name, delimiter });
+            for ([_]usize{ 4, 7, 31, buffer.len }) |size| {
+                for (name.len..name.len + 3) |limit| {
+                    var input: std.testing.Reader = .init(buffer[0..size], &.{.{ .buffer = bytes }});
+                    var cursor = try Cursor.init(std.testing.allocator, &input.interface, 64, 64, limit, true);
+                    defer cursor.deinit();
+                    try cursor.appendEventByte('z');
+                    if (limit == name.len) {
+                        try std.testing.expectError(error.LimitExceeded, cursor.parseQName());
+                        continue;
+                    }
+                    const parsed = try cursor.parseQName();
+                    try std.testing.expectEqualStrings(name, cursor.event_bytes.items[parsed.start..][0..parsed.len]);
+                    try std.testing.expectEqual(@as(usize, 1), parsed.start);
+                    try std.testing.expectEqual(std.mem.indexOfScalar(u8, name, ':') orelse 0, parsed.prefix_len);
+                    const next = try cursor.requiredCodepoint();
+                    try std.testing.expectEqual(@as(u21, delimiter), next.value);
+                    try std.testing.expectEqual(@as(u64, name.len), next.start);
+                    try std.testing.expectEqual(@as(u64, name.len + 1), next.end);
+                }
+            }
+        }
+    }
+}
+
 test "[unit] - [mzML XML cursor]: enforces expanded names, document CDATA, text delimiters, and declaration order" {
     const cases = .{
         .{ "<mzML xmlns='" ++ NAMESPACE ++ "' xmlns:a='urn:test' xmlns:b='urn:test' a:x='1' b:x='2'/>", 0 },
@@ -1863,6 +1895,47 @@ test "[unit] - [mzML XML cursor]: enforces expanded names, document CDATA, text 
     defer cursor.deinit();
     try cursor.advance(false);
     try std.testing.expectEqualStrings(XML_NAMESPACE, cursor.current.?.data.start_element.attribute(XML_NAMESPACE, "lang").?.name.expanded.?.namespace_uri.?);
+}
+
+test "[property] - [mzML XML cursor]: ignores only XML whitespace when text is not requested" {
+    const prefix = "<mzML xmlns='" ++ NAMESPACE ++ "'>";
+    const cases = [_]struct { text: []const u8, whitespace: bool }{
+        .{ .text = "", .whitespace = true },
+        .{ .text = " \t\r\n", .whitespace = true },
+        .{ .text = "&#x20;&#x9;&#xD;&#xA;", .whitespace = true },
+        .{ .text = "<![CDATA[ \t\r\n]]>", .whitespace = true },
+        .{ .text = " x ", .whitespace = false },
+        .{ .text = "&#x20;x", .whitespace = false },
+        .{ .text = "&#x85;", .whitespace = false },
+        .{ .text = "&#xA0;", .whitespace = false },
+        .{ .text = "&#x2003;", .whitespace = false },
+        .{ .text = "<![CDATA[x]]>", .whitespace = false },
+    };
+    var utf8: [256]u8 = undefined;
+    var utf16: [514]u8 = undefined;
+    var buffer: [514]u8 = undefined;
+    for (cases) |case| {
+        const source = try std.fmt.bufPrint(&utf8, "{s}{s}</mzML>", .{ prefix, case.text });
+        for ([_]?std.builtin.Endian{ null, .little, .big }) |encoding| {
+            const bytes = if (encoding) |endian| blk: {
+                std.mem.writeInt(u16, utf16[0..2], 0xfeff, endian);
+                for (source, 0..) |byte, index| std.mem.writeInt(u16, utf16[2 + index * 2 ..][0..2], byte, endian);
+                break :blk utf16[0 .. 2 + source.len * 2];
+            } else source;
+            for ([_]usize{ 4, 7, 31, buffer.len }) |size| {
+                var input: std.testing.Reader = .init(buffer[0..size], &.{.{ .buffer = bytes }});
+                var cursor = try Cursor.init(std.testing.allocator, &input.interface, 64, 64, 1024, true);
+                defer cursor.deinit();
+                try cursor.advance(false);
+                if (case.whitespace) {
+                    try cursor.advance(false);
+                    try std.testing.expectEqualStrings("mzML", cursor.current.?.data.end_element.name.raw);
+                    try cursor.advance(false);
+                    try std.testing.expectEqual(null, cursor.current);
+                } else try std.testing.expectError(error.InvalidXml, cursor.advance(false));
+            }
+        }
+    }
 }
 
 test "[unit] - [mzML XML cursor]: bounds borrowed ordinary text events" {
