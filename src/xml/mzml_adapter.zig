@@ -540,7 +540,7 @@ pub const Cursor = struct {
     pub fn advance(self: *Cursor, text: bool) Error!void {
         self.current = null;
         while (true) {
-            const maybe_event = self.nextEvent() catch |err| {
+            const maybe_event = self.nextEvent(!text) catch |err| {
                 self.offset = self.source.currentOffset();
                 return switch (err) {
                     error.EndOfStream, error.NoText => error.InvalidXml,
@@ -592,7 +592,7 @@ pub const Cursor = struct {
         }
         var nested: usize = 1;
         while (nested != 0) {
-            const event = (self.nextEvent() catch |err| return switch (err) {
+            const event = (self.nextEvent(false) catch |err| return switch (err) {
                 error.EndOfStream, error.NoText => error.UnexpectedEnd,
                 else => err,
             }) orelse return error.UnexpectedEnd;
@@ -615,7 +615,23 @@ pub const Cursor = struct {
         self.attributes.clearRetainingCapacity();
     }
 
-    fn nextEvent(self: *Cursor) ParserError!?Event {
+    fn skipBufferedWhitespace(self: *Cursor) void {
+        if (self.source.encoding != .utf8 or self.source.probe_pos != self.source.probe_len or
+            self.source.pending_len != 0) return;
+        const reader = self.source.reader orelse return;
+        const bytes = reader.buffered();
+        const bound = @min(bytes.len, TEXT_CHUNK_BYTES);
+        var length: usize = 0;
+        while (length < bound and isXmlWhitespace(bytes[length])) : (length += 1) {}
+        // A complete run preserves the original text event's failure order.
+        if (length == 0 or length == bound or bytes[length] != '<') return;
+        const end = std.math.add(u64, self.source.position, length) catch return;
+        reader.toss(length);
+        self.source.position = end;
+        self.normal_text_brackets = 0;
+    }
+
+    fn nextEvent(self: *Cursor, ignore_whitespace: bool) ParserError!?Event {
         try self.beginEvent();
         if (self.document_ended) return null;
         if (!self.document_started) {
@@ -636,6 +652,7 @@ pub const Cursor = struct {
                     else => err,
                 };
             }
+            if (ignore_whitespace) self.skipBufferedWhitespace();
             const first = self.source.peekCodepoint() catch |err| switch (err) {
                 error.EndOfStream => {
                     if (self.root_seen and self.root_closed and self.depth == 0) {
@@ -2206,6 +2223,43 @@ test "[property] - [mzML XML cursor]: ignores only XML whitespace when text is n
                     try std.testing.expectEqual(null, cursor.current);
                 } else try std.testing.expectError(error.InvalidXml, cursor.advance(false));
             }
+        }
+    }
+}
+
+test "[property] - [mzML XML cursor]: discards complete buffered indentation without moving pending closes" {
+    const prefix = "<mzML xmlns='" ++ NAMESPACE ++ "'><child/>";
+    const suffix = "</mzML>";
+    const allocator = std.testing.allocator;
+    const source = try allocator.alloc(u8, prefix.len + TEXT_CHUNK_BYTES + 4 + suffix.len);
+    defer allocator.free(source);
+    const buffer = try allocator.alloc(u8, source.len);
+    defer allocator.free(buffer);
+    @memcpy(source[0..prefix.len], prefix);
+    for ([_]usize{ 0, 1, 3, 19, TEXT_CHUNK_BYTES - 1, TEXT_CHUNK_BYTES, TEXT_CHUNK_BYTES + 1 }) |length| {
+        for (source[prefix.len..][0..length], 0..) |*byte, i| byte.* = " \t\r\n"[i % 4];
+        @memcpy(source[prefix.len + length ..][0..suffix.len], suffix);
+        const bytes = source[0 .. prefix.len + length + suffix.len];
+        for ([_]usize{ 0, 4, 31, buffer.len }) |size| {
+            var fixed = std.Io.Reader.fixed(bytes);
+            var chunks: std.testing.Reader = .init(buffer[0..size], &.{.{ .buffer = bytes }});
+            var cursor = try Cursor.init(allocator, if (size == 0) &fixed else &chunks.interface, 64, 64, 1024, true);
+            defer cursor.deinit();
+            try cursor.advance(false);
+            try cursor.advance(false);
+            const before_close = cursor.source.currentOffset();
+            try cursor.advance(false);
+            try std.testing.expectEqualStrings("child", cursor.current.?.data.end_element.name.raw);
+            try std.testing.expectEqual(before_close, cursor.source.currentOffset());
+            try std.testing.expectEqual(prefix.len, cursor.current.?.span.start);
+            try cursor.advance(false);
+            try std.testing.expectEqualStrings("mzML", cursor.current.?.data.end_element.name.raw);
+            try std.testing.expectEqual(prefix.len + length, cursor.current.?.span.start);
+            try std.testing.expectEqual(bytes.len, cursor.current.?.span.end);
+            if (size == 0 and length < TEXT_CHUNK_BYTES)
+                try std.testing.expectEqual(@as(usize, 0), cursor.text_bytes.capacity);
+            try cursor.advance(false);
+            try std.testing.expectEqual(null, cursor.current);
         }
     }
 }
