@@ -321,11 +321,13 @@ fn openEmbedded(self: *IndexedReader, reader: *StreamReader) Error!void {
     const trailer_len = std.math.cast(usize, self.size - start) orelse return error.LimitExceeded;
     if (trailer_len > self.options.index_bytes) return error.LimitExceeded;
     const bytes_len = std.math.add(usize, prefix_len, trailer_len) catch return error.LimitExceeded;
-    const bytes = try self.allocator.alloc(u8, bytes_len);
-    defer self.allocator.free(bytes);
-    @memcpy(bytes[0..prefix_len], prefix);
-    try self.readAt(bytes[prefix_len..], start);
-    try self.readEmbeddedEntries(bytes, start, prefix_len, final_scope.end, endian);
+    var buffer: [64 * 1024]u8 = undefined;
+    var input = FragmentInput.init(self, prefix, start, trailer_len, &.{}, buffer[0..@max(4, @min(buffer.len, bytes_len))]);
+    self.readEmbeddedEntries(&input.interface, start, prefix_len, final_scope.end, endian) catch |err| {
+        try input.finishSpan();
+        return err;
+    };
+    try input.finishSpan();
     for (self.entries.items, 0..) |*entry, i| {
         if (i + 1 < self.entries.items.len) entry.end = self.entries.items[i + 1].start;
         if (entry.start >= entry.end) return error.InvalidIndex;
@@ -341,12 +343,12 @@ fn openEmbedded(self: *IndexedReader, reader: *StreamReader) Error!void {
             const span = std.math.cast(usize, last.end - last.start) orelse return error.LimitExceeded;
             if (span > self.options.record_span_bytes) return error.LimitExceeded;
             const fragment_len = std.math.add(usize, context.prefix.len, span) catch return error.LimitExceeded;
-            const fragment = try self.allocator.alloc(u8, fragment_len);
-            defer self.allocator.free(fragment);
-            @memcpy(fragment[0..context.prefix.len], context.prefix);
-            try self.readAt(fragment[context.prefix.len..], last.start);
-            var input = std.Io.Reader.fixed(fragment);
-            try reader_bridge.resumeFollowingList(reader, &input, context.ancestors, last.start, context.prefix.len);
+            var fragment = FragmentInput.init(self, context.prefix, last.start, span, &.{}, buffer[0..@max(4, @min(buffer.len, fragment_len))]);
+            reader_bridge.resumeFollowingList(reader, &fragment.interface, context.ancestors, last.start, context.prefix.len) catch |err| {
+                try fragment.finishSpan();
+                return err;
+            };
+            try fragment.finishSpan();
         }
         self.contexts[1] = try self.captureAncestors(reader, 1);
     }
@@ -362,10 +364,9 @@ fn openEmbedded(self: *IndexedReader, reader: *StreamReader) Error!void {
     }
 }
 
-fn readEmbeddedEntries(self: *IndexedReader, bytes: []const u8, index_start: u64, prefix_len: usize, minimum: u64, endian: ?std.builtin.Endian) Error!void {
-    var input = std.Io.Reader.fixed(bytes);
+fn readEmbeddedEntries(self: *IndexedReader, input: *std.Io.Reader, index_start: u64, prefix_len: usize, minimum: u64, endian: ?std.builtin.Endian) Error!void {
     const limits = self.options.reader.limits;
-    var cursor = try xml.Cursor.init(self.allocator, &input, limits.depth, limits.attributes, limits.attribute_bytes, true);
+    var cursor = try xml.Cursor.init(self.allocator, input, limits.depth, limits.attributes, limits.attribute_bytes, true);
     defer cursor.deinit();
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(self.allocator);

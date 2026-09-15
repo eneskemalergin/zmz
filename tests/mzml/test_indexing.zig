@@ -182,44 +182,108 @@ test "[integration] - [mzML index]: opens embedded targets without claiming full
 }
 
 test "[integration] - [mzML index]: opens encoded trailers and list namespace declarations" {
+    const FailedRead = struct {
+        start: u64,
+        stop: u64,
+        truncated: bool,
+        active: bool = false,
+        failed: bool = false,
+
+        fn stat(_: ?*anyopaque, file: std.Io.File) std.Io.File.StatError!std.Io.File.Stat {
+            return file.stat(std.testing.io);
+        }
+
+        fn read(data: ?*anyopaque, file: std.Io.File, slices: []const []u8, offset: u64) std.Io.File.ReadPositionalError!usize {
+            const self: *@This() = @ptrCast(@alignCast(data.?));
+            if (offset == self.start) self.active = true;
+            if (self.active and offset >= self.stop) {
+                self.failed = true;
+                if (self.truncated) return 0;
+                return error.InputOutput;
+            }
+            const length: usize = @intCast(@min(slices[0].len, 113, if (self.active) self.stop - offset else std.math.maxInt(u64)));
+            return std.testing.io.vtable.fileReadPositional(std.testing.io.userdata, file, &.{slices[0][0..length]}, offset);
+        }
+    };
     const allocator = std.testing.allocator;
+    const spaces: [65537]u8 = @splat(' ');
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
     for ([_]?std.builtin.Endian{ null, .little, .big }) |endian| {
-        for (0..2) |spectra| {
-            const width: usize = if (endian != null) 2 else 1;
-            const bom: usize = if (endian != null) 2 else 0;
-            var source: std.Io.Writer.Allocating = .init(allocator);
-            defer source.deinit();
-            try source.writer.writeAll("<p:indexedmzML xmlns:p='http://psi.hupo.org/ms/mzml'>" ++ support.HEADER);
-            try source.writer.print("<spectrumList count='{d}' defaultDataProcessingRef='dp'>", .{spectra});
-            const spectrum_start = bom + width * source.written().len;
-            if (spectra != 0) try source.writer.writeAll("<spectrum id='a&amp;b' index='0' defaultArrayLength='0'/>");
-            try source.writer.writeAll("</spectrumList><chromatogramList xmlns:q='http://psi.hupo.org/ms/mzml' count='1' defaultDataProcessingRef='dp'>");
-            const chromatogram_start = bom + width * source.written().len;
-            try source.writer.writeAll("<q:chromatogram id='tic' index='0' defaultArrayLength='1'>" ++ support.ARRAYS ++ "</q:chromatogram></chromatogramList></run></mzML>");
-            const index_start = bom + width * source.written().len;
-            try source.writer.print("<p:indexList count='2'><p:index name='chromatogram'><p:offset idRef='tic'>{d}</p:offset></p:index><p:index name='spectrum'>", .{chromatogram_start});
-            if (spectra != 0) try source.writer.print("<p:offset idRef='a&amp;b'>{d}</p:offset>", .{spectrum_start});
-            try source.writer.print("</p:index></p:indexList><p:indexListOffset>{d}</p:indexListOffset><p:fileChecksum>0000000000000000000000000000000000000000</p:fileChecksum></p:indexedmzML><!-- <indexListOffset>fake -->", .{index_start});
-            const bytes = try allocator.alloc(u8, bom + width * source.written().len);
-            defer allocator.free(bytes);
-            if (endian) |order| {
-                std.mem.writeInt(u16, bytes[0..2], 0xfeff, order);
-                for (source.written(), 0..) |byte, i| std.mem.writeInt(u16, bytes[2 + 2 * i ..][0..2], byte, order);
-            } else @memcpy(bytes, source.written());
-            for (std.enums.values(mzml.StreamReader.Checks)) |checks| {
-                var opened = try mzml.IndexedReader.build(allocator, .{ .bytes = bytes }, .{ .policy = .open_embedded, .reader = .{ .checks = checks } });
-                defer opened.deinit();
-                var rebuilt = try mzml.IndexedReader.build(allocator, .{ .bytes = bytes }, .{ .policy = .rebuild });
-                defer rebuilt.deinit();
-                try std.testing.expectEqual(spectra + 1, opened.entries.items.len);
-                for (opened.entries.items) |entry| {
-                    var actual = (try opened.at(allocator, entry.kind, 0)).?;
-                    defer actual.deinit();
-                    var expected = (try rebuilt.at(allocator, entry.kind, 0)).?;
-                    defer expected.deinit();
-                    try support.expectNode(expected.value.node, actual.value.node);
-                    try std.testing.expectEqual(expected.value.node.start_offset, actual.value.node.start_offset);
-                    try std.testing.expectEqual(expected.value.node.end_offset, actual.value.node.end_offset);
+        for ([_]usize{ 0, spaces.len }) |padding| {
+            for (0..2) |spectra| {
+                const width: usize = if (endian != null) 2 else 1;
+                const bom: usize = if (endian != null) 2 else 0;
+                var source: std.Io.Writer.Allocating = .init(allocator);
+                defer source.deinit();
+                try source.writer.writeAll("<p:indexedmzML xmlns:p='http://psi.hupo.org/ms/mzml'>" ++ support.HEADER);
+                try source.writer.print("<spectrumList count='{d}' defaultDataProcessingRef='dp'>", .{spectra});
+                const spectrum_start = bom + width * source.written().len;
+                if (spectra != 0) try source.writer.writeAll("<spectrum id='a&amp;b' index='0' defaultArrayLength='0'/>");
+                try source.writer.writeAll(spaces[0..padding]);
+                try source.writer.writeAll("</spectrumList><chromatogramList xmlns:q='http://psi.hupo.org/ms/mzml' count='1' defaultDataProcessingRef='dp'>");
+                const chromatogram_start = bom + width * source.written().len;
+                try source.writer.writeAll("<q:chromatogram id='tic' index='0' defaultArrayLength='1'>" ++ support.ARRAYS ++ "</q:chromatogram></chromatogramList></run></mzML>");
+                const index_start = bom + width * source.written().len;
+                try source.writer.print("<p:indexList count='2'><p:index name='chromatogram'><p:offset idRef='tic'>{d}</p:offset></p:index><p:index name='spectrum'>", .{chromatogram_start});
+                try source.writer.writeAll(spaces[0..padding]);
+                if (spectra != 0) try source.writer.print("<p:offset idRef='a&amp;b'>{d}</p:offset>", .{spectrum_start});
+                try source.writer.print("</p:index></p:indexList><p:indexListOffset>{d}</p:indexListOffset><p:fileChecksum>0000000000000000000000000000000000000000</p:fileChecksum></p:indexedmzML><!-- <indexListOffset>fake -->", .{index_start});
+                const bytes = try allocator.alloc(u8, bom + width * source.written().len);
+                defer allocator.free(bytes);
+                if (endian) |order| {
+                    std.mem.writeInt(u16, bytes[0..2], 0xfeff, order);
+                    for (source.written(), 0..) |byte, i| std.mem.writeInt(u16, bytes[2 + 2 * i ..][0..2], byte, order);
+                } else @memcpy(bytes, source.written());
+                const file = try directory.dir.createFile(std.testing.io, "opening.mzML", .{ .read = true });
+                defer file.close(std.testing.io);
+                try file.writeStreamingAll(std.testing.io, bytes);
+                for ([_]mzml.IndexedReader.Source{ .{ .bytes = bytes }, .{ .file = .{ .handle = file, .io = std.testing.io } } }) |indexed_source| {
+                    for (std.enums.values(mzml.StreamReader.Checks)) |checks| {
+                        var opened = try mzml.IndexedReader.build(allocator, indexed_source, .{ .policy = .open_embedded, .reader = .{ .checks = checks } });
+                        defer opened.deinit();
+                        var rebuilt = try mzml.IndexedReader.build(allocator, .{ .bytes = bytes }, .{ .policy = .rebuild });
+                        defer rebuilt.deinit();
+                        try std.testing.expectEqual(spectra + 1, opened.entries.items.len);
+                        for (opened.entries.items) |entry| {
+                            var actual = (try opened.at(allocator, entry.kind, 0)).?;
+                            defer actual.deinit();
+                            var expected = (try rebuilt.at(allocator, entry.kind, 0)).?;
+                            defer expected.deinit();
+                            try support.expectNode(expected.value.node, actual.value.node);
+                            try std.testing.expectEqual(expected.value.node.start_offset, actual.value.node.start_offset);
+                            try std.testing.expectEqual(expected.value.node.end_offset, actual.value.node.end_offset);
+                        }
+                        if (spectra != 0) try std.testing.expectError(error.LimitExceeded, mzml.IndexedReader.build(allocator, indexed_source, .{
+                            .policy = .open_embedded,
+                            .record_span_bytes = chromatogram_start - spectrum_start - 1,
+                            .reader = .{ .checks = checks },
+                        }));
+                        try std.testing.expectError(error.LimitExceeded, mzml.IndexedReader.build(allocator, indexed_source, .{
+                            .policy = .open_embedded,
+                            .index_bytes = bytes.len - index_start - 1,
+                            .reader = .{ .checks = checks },
+                        }));
+                    }
+                }
+                if (padding != 0 and spectra != 0) {
+                    var vtable = std.Io.failing.vtable.*;
+                    vtable.fileStat = FailedRead.stat;
+                    vtable.fileReadPositional = FailedRead.read;
+                    for ([_]usize{ index_start, spectrum_start }) |start| {
+                        for ([_]bool{ false, true }) |malformed| {
+                            var name: [2]u8 = .{ 'x', 0 };
+                            if (endian) |order| std.mem.writeInt(u16, &name, 'x', order);
+                            if (malformed) try file.writePositionalAll(std.testing.io, name[0..width], start + width);
+                            for ([_]bool{ false, true }) |truncated| {
+                                var failure: FailedRead = .{ .start = start, .stop = start + 65536, .truncated = truncated };
+                                const io: std.Io = .{ .userdata = &failure, .vtable = &vtable };
+                                try std.testing.expectError(if (truncated) error.TruncatedSource else error.InputOutput, mzml.IndexedReader.build(allocator, .{ .file = .{ .handle = file, .io = io } }, .{ .policy = .open_embedded }));
+                                try std.testing.expect(failure.failed);
+                            }
+                            try file.writePositionalAll(std.testing.io, bytes[start + width ..][0..width], start + width);
+                        }
+                    }
                 }
             }
         }
