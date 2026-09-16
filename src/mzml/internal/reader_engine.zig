@@ -546,7 +546,11 @@ fn parseNode(self: *StreamReader, storage: *Storage, depth: usize, advance_after
         else
             4;
         if (sequence.rules.len != 0)
-            try self.child_scratch.ensureUnusedCapacity(self.allocator, @min(capacity, self.options.limits.list_entries));
+            try self.child_scratch.ensureUnusedCapacity(self.allocator, @min(
+                capacity,
+                self.options.limits.list_entries,
+                (storage.limit -| storage.used) / @sizeOf(model.Node),
+            ));
         while (self.cursor.current) |event| {
             if (event.data == .end_element) break;
             const child_kind = try self.kind();

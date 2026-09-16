@@ -275,6 +275,44 @@ test "[regression] - [mzML array decoding]: reads empty producer arrays with zli
     try std.testing.expectEqual(null, try reader.nextRecord());
 }
 
+test "[regression] - [mzML reader]: oversized count hints do not exhaust bounded storage" {
+    const source = support.HEADER ++ "<spectrumList count='1' defaultDataProcessingRef='dp'>" ++
+        "<spectrum id='x' index='0' defaultArrayLength='0'><scanList count='1'><scan/></scanList></spectrum>" ++
+        "</spectrumList></run></mzML>";
+    const backing = try std.testing.allocator.alloc(u8, 64 * 1024);
+    defer std.testing.allocator.free(backing);
+    for ([_][]const u8{ "cvList", "scanList" }) |name| {
+        const before = try std.fmt.allocPrint(std.testing.allocator, "<{s} count='1'>", .{name});
+        defer std.testing.allocator.free(before);
+        const after = try std.fmt.allocPrint(std.testing.allocator, "<{s} count='100000'>", .{name});
+        defer std.testing.allocator.free(after);
+        const changed = try std.mem.replaceOwned(u8, std.testing.allocator, source, before, after);
+        defer std.testing.allocator.free(changed);
+        for ([_]bool{ true, false }) |check_counts| {
+            var fixed = std.heap.FixedBufferAllocator.init(backing);
+            var input = std.Io.Reader.fixed(changed);
+            var reader = try mzml.StreamReader.init(fixed.allocator(), &input, .{
+                .check_counts = check_counts,
+                .limits = .{ .header_bytes = 8192, .record_bytes = 1024 },
+            });
+            defer reader.deinit();
+            if (check_counts) {
+                try std.testing.expectError(error.CountMismatch, reader.nextRecord());
+                try std.testing.expectError(error.FailedState, reader.nextRecord());
+            } else {
+                const record = (try reader.nextRecord()).?;
+                const node = if (std.mem.eql(u8, name, "cvList"))
+                    (try reader.readHeader()).document.child(.cv_list).?
+                else
+                    record.node.child(.scan_list).?;
+                try std.testing.expectEqual(@as(usize, 1), node.children.len);
+                try std.testing.expectEqual(@as(?usize, 100000), try node.declaredCount());
+                try std.testing.expectEqual(null, try reader.nextRecord());
+            }
+        }
+    }
+}
+
 test "[property] - [mzML binary text]: counts significant characters across vector and XML text boundaries" {
     var buffer: [8192]u8 = undefined;
     var text: [257]u8 = undefined;
