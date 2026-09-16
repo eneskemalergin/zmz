@@ -3,6 +3,8 @@
 const std = @import("std");
 const model = @import("../model.zig");
 const owned = @import("../owned.zig");
+const cv = @import("../../cv/source.zig");
+const DecodedArrays = @import("../decoded_arrays.zig");
 
 pub const Reader = @import("reader_engine.zig");
 pub const Scope = Reader.Scope;
@@ -20,7 +22,15 @@ pub fn readFragment(
     physical_start: u64,
     prefix_length: usize,
     complete: bool,
+    groups: []const cv.Group,
+    output: ?*DecodedArrays,
 ) Reader.Error!owned.Record {
+    reader.header.groups = groups;
+    reader.decoded_arrays = output;
+    defer {
+        reader.header.groups = &.{};
+        reader.decoded_arrays = null;
+    }
     return reader.readFragment(allocator, input, ancestors, physical_start, prefix_length, complete);
 }
 

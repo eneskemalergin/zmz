@@ -1,4 +1,4 @@
-//! Stores decoded arrays for StreamReader.nextDecodedRecord without retaining Base64 text.
+//! Stores decoded arrays for sequential and indexed reads without retaining Base64 text.
 //!
 //! Each array keeps its source primitive, except Numpress output is always f64. Numeric
 //! buffers and shared wire scratch grow as needed and are reused between records.

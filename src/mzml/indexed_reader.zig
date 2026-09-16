@@ -11,6 +11,7 @@ const cv = @import("../cv/source.zig");
 const owned = @import("owned.zig");
 const reader_bridge = @import("internal/indexed_reader_bridge.zig");
 const PublicStreamReader = @import("stream_reader.zig").StreamReader;
+const DecodedArrays = PublicStreamReader.DecodedArrays;
 const StreamReader = reader_bridge.Reader;
 const xml = @import("../xml/mzml_adapter.zig");
 const schema = @import("schema.zig");
@@ -165,23 +166,62 @@ pub fn header(self: *const IndexedReader) *const model.Header {
 /// Returns AmbiguousId when both a spectrum and a chromatogram use this ID.
 /// Lookups reuse parser storage and must not run concurrently on this reader.
 pub fn byId(self: *IndexedReader, allocator: std.mem.Allocator, id: []const u8) Error!?owned.Record {
-    try self.checkSource();
-    const spectrum = self.ids[0].get(id);
-    const chromatogram = self.ids[1].get(id);
-    if (spectrum != null and chromatogram != null) return error.AmbiguousId;
-    const position = spectrum orelse chromatogram orelse return null;
-    return try self.readEntry(allocator, self.entries.items[position]);
+    const position = try self.idPosition(id) orelse return null;
+    return try self.readEntry(allocator, self.entries.items[position], null);
 }
 
 /// Looks up a zero-based ordinal within spectra or chromatograms; other kinds fail.
 pub fn at(self: *IndexedReader, allocator: std.mem.Allocator, kind: model.Kind, ordinal: usize) Error!?owned.Record {
+    const position = try self.ordinalPosition(kind, ordinal) orelse return null;
+    return try self.readEntry(allocator, self.entries.items[position], null);
+}
+
+/// Returns independent metadata and decodes all arrays into caller-owned reusable storage.
+/// Binary text is omitted. Requires checked mode without an array selector; payload is ignored.
+/// Missing IDs and failures clear output. Source, XML, and target errors precede decode errors.
+/// Numeric slices last until output is reused, reset, or deinitialized, independently of metadata.
+pub fn byIdDecoded(self: *IndexedReader, allocator: std.mem.Allocator, id: []const u8, output: *DecodedArrays) (Error || DecodedArrays.Error)!?owned.Record {
+    output.reset();
+    errdefer output.reset();
+    if (self.options.reader.checks != .checked or self.options.reader.array_selector != null)
+        return error.InvalidOptions;
+    const position = try self.idPosition(id) orelse return null;
+    return try self.readDecodedEntry(allocator, self.entries.items[position], output);
+}
+
+/// Uses byIdDecoded's storage and failure rules for a zero-based spectrum or chromatogram ordinal.
+pub fn atDecoded(self: *IndexedReader, allocator: std.mem.Allocator, kind: model.Kind, ordinal: usize, output: *DecodedArrays) (Error || DecodedArrays.Error)!?owned.Record {
+    output.reset();
+    errdefer output.reset();
+    if (self.options.reader.checks != .checked or self.options.reader.array_selector != null)
+        return error.InvalidOptions;
+    const position = try self.ordinalPosition(kind, ordinal) orelse return null;
+    return try self.readDecodedEntry(allocator, self.entries.items[position], output);
+}
+
+fn idPosition(self: *IndexedReader, id: []const u8) Error!?usize {
+    try self.checkSource();
+    const spectrum = self.ids[0].get(id);
+    const chromatogram = self.ids[1].get(id);
+    if (spectrum != null and chromatogram != null) return error.AmbiguousId;
+    return spectrum orelse chromatogram;
+}
+
+fn ordinalPosition(self: *IndexedReader, kind: model.Kind, ordinal: usize) Error!?usize {
     if (kind != .spectrum and kind != .chromatogram) return error.InvalidIndex;
     try self.checkSource();
     if (ordinal >= self.counts[kindIndex(kind)]) return null;
-    return try self.readEntry(allocator, self.entries.items[ordinal + if (kind == .spectrum) @as(usize, 0) else self.counts[0]]);
+    return ordinal + if (kind == .spectrum) @as(usize, 0) else self.counts[0];
 }
 
-fn readEntry(self: *IndexedReader, allocator: std.mem.Allocator, entry: Entry) Error!owned.Record {
+fn readDecodedEntry(self: *IndexedReader, allocator: std.mem.Allocator, entry: Entry, output: *DecodedArrays) (Error || DecodedArrays.Error)!owned.Record {
+    var record = try self.readEntry(allocator, entry, output);
+    errdefer record.deinit();
+    try output.complete();
+    return record;
+}
+
+fn readEntry(self: *IndexedReader, allocator: std.mem.Allocator, entry: Entry, output: ?*DecodedArrays) Error!owned.Record {
     try self.checkSource();
     const context = self.contexts[kindIndex(entry.kind)].?;
     const length = std.math.cast(usize, entry.end - entry.start) orelse return error.LimitExceeded;
@@ -195,7 +235,7 @@ fn readEntry(self: *IndexedReader, allocator: std.mem.Allocator, entry: Entry) E
         self.lookup_reader = try StreamReader.init(self.allocator, &empty_input, self.options.reader);
         reader_bridge.resetFragmentParser(&self.lookup_reader.?);
     }
-    var record = reader_bridge.readFragment(&self.lookup_reader.?, allocator, &input.interface, context.ancestors, entry.start, context.prefix.len, self.options.policy != .open_embedded) catch |err| {
+    var record = reader_bridge.readFragment(&self.lookup_reader.?, allocator, &input.interface, context.ancestors, entry.start, context.prefix.len, self.options.policy != .open_embedded, self.header().groups, output) catch |err| {
         try input.finishSpan();
         return err;
     };

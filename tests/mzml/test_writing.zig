@@ -190,6 +190,21 @@ test "[integration] - [mzML prepared writing]: preserves primitive bytes across 
                         var index = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = rewritten.buffered() }, .{ .policy = .verify_embedded });
                         defer index.deinit();
                         try std.testing.expectEqual(@as(usize, 1), index.entries.items.len);
+                        var fetched = (try index.atDecoded(std.testing.allocator, .spectrum, 0, &decoded_arrays)).?;
+                        defer fetched.deinit();
+                        try std.testing.expectEqual(@as(usize, 2), decoded_arrays.len());
+                        for (0..decoded_arrays.len()) |position| {
+                            switch (decoded_arrays.get(position).?.values) {
+                                inline else => |items| try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(values[0..count]), std.mem.sliceAsBytes(items)),
+                            }
+                        }
+                        const fetched_values = decoded_arrays.get(0).?.values;
+                        const fetched_typed: []const T = if (T == f32) fetched_values.float32 else if (T == f64) fetched_values.float64 else if (T == i32) fetched_values.int32 else fetched_values.int64;
+                        const fetched_wire = try mzml.arrays.encodeWire(T, fetched_typed, .{ .pipeline = pipeline }, scratch, &compressor);
+                        var fetched_bytes: [32768]u8 = undefined;
+                        var fetched_sink = std.Io.Writer.fixed(&fetched_bytes);
+                        try support.writeSingleRecord(std.testing.allocator, &fetched_sink, header.*, fetched.value.node, true, &.{ fetched_wire, fetched_wire });
+                        try std.testing.expectEqualSlices(u8, expected.buffered(), fetched_sink.buffered());
                     }
                     try std.testing.expectEqual(null, try decoded_reader.nextDecodedRecord(&decoded_arrays));
                 }
