@@ -28,6 +28,8 @@ pub const StreamReader = struct {
     /// The first reader failure and its physical source location.
     pub const Diagnostic = impl.Diagnostic;
 
+    pub const DecodedArrays = @import("decoded_arrays.zig");
+
     inner: impl,
 
     /// Borrows input for the reader's lifetime and allocates parser state.
@@ -49,6 +51,16 @@ pub const StreamReader = struct {
     /// Returns the current borrowed record or null at document end.
     pub fn nextRecord(self: *Reader) Error!?model.Record {
         return self.inner.nextRecord();
+    }
+
+    /// Reads a complete record and decodes every array into reusable output storage.
+    /// Metadata borrows this reader as in nextRecord; binary text is not retained.
+    /// Output slices last until output is reused, reset, or deinitialized. EOF and errors
+    /// clear its visible results. Requires checked mode and no array_selector; payload
+    /// does not affect this call. XML/record errors precede decoding errors. A decoding
+    /// error consumes the record but does not poison the reader or set its diagnostic.
+    pub fn nextDecodedRecord(self: *Reader, output: *DecodedArrays) (Error || DecodedArrays.Error)!?model.Record {
+        return self.inner.nextDecodedRecord(output);
     }
 
     /// Returns the first sticky failure without borrowing parser event memory.

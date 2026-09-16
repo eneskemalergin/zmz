@@ -6,6 +6,7 @@ const model = @import("../model.zig");
 const schema = @import("../schema.zig");
 const xml = @import("../../xml/mzml_adapter.zig");
 const owned = @import("../owned.zig");
+const DecodedArrays = @import("../decoded_arrays.zig");
 
 const StreamReader = @This();
 
@@ -112,6 +113,7 @@ scope_count: usize = 0,
 list_scopes: [2]?Scope = .{ null, null },
 child_scratch: std.ArrayList(model.Node) = .empty,
 param_scratch: std.ArrayList(cv.Entry) = .empty,
+decoded_arrays: ?*DecodedArrays = null,
 
 pub const Scope = struct { start: u64, end: u64, name: []const u8 };
 
@@ -160,6 +162,18 @@ pub fn nextRecord(self: *StreamReader) Error!?model.Record {
     self.record_store.reset();
     if (self.done) return null;
     return self.nextRecordInner() catch |err| return self.fail(err);
+}
+
+pub fn nextDecodedRecord(self: *StreamReader, output: *DecodedArrays) (Error || DecodedArrays.Error)!?model.Record {
+    output.reset();
+    errdefer output.reset();
+    if (self.options.checks != .checked or self.options.array_selector != null)
+        return error.InvalidOptions;
+    self.decoded_arrays = output;
+    defer self.decoded_arrays = null;
+    const record = try self.nextRecord() orelse return null;
+    try output.complete();
+    return record;
 }
 
 /// Returns the first failure without borrowing parser event memory.
@@ -463,6 +477,9 @@ fn parseNode(self: *StreamReader, storage: *Storage, depth: usize, advance_after
     if (depth > self.options.limits.depth) return error.LimitExceeded;
     const kind_value = try self.kind();
     var node = try self.startNode(storage, kind_value);
+    if (storage == &self.record_store and depth == 1) {
+        if (self.decoded_arrays) |output| output.startRecord(node);
+    }
     const has_text = kind_value == .binary or kind_value == .offset or kind_value == .index_list_offset or kind_value == .file_checksum;
     try self.cursor.advance(has_text);
     if (has_text) {
@@ -475,6 +492,9 @@ fn parseNode(self: *StreamReader, storage: *Storage, depth: usize, advance_after
             text_size = std.math.add(usize, text_size, bytes.len) catch return error.LimitExceeded;
             if (text_size > self.options.limits.binary_text_bytes) return error.LimitExceeded;
             if (self.options.checks == .checked) significant += significantLength(bytes);
+            if (kind_value == .binary and storage == &self.record_store) {
+                if (self.decoded_arrays) |output| output.text(bytes);
+            }
             if (payload == .retain or kind_value != .binary) {
                 if (text_size > storage.limit -| storage.used) return error.LimitExceeded;
                 try text.appendSlice(storage.arena.allocator(), bytes);
@@ -487,10 +507,19 @@ fn parseNode(self: *StreamReader, storage: *Storage, depth: usize, advance_after
         }
         // The parent uses this count before returning the source span to the caller.
         storage.last_binary_length = significant;
+        if (kind_value == .binary and storage == &self.record_store) {
+            if (self.decoded_arrays) |output| output.finishArray();
+        }
     } else {
         if (schema.hasParams(kind_value))
             node.params = try self.parseParams(storage, kind_value != .referenceable_param_group);
         var child_payload = payload;
+        if (kind_value == .binary_data_array and storage == &self.record_store) {
+            if (self.decoded_arrays) |output| {
+                output.beginArray(node, self.header.groups);
+                child_payload = .skip;
+            }
+        }
         if (kind_value == .binary_data_array and storage == &self.record_store and self.options.payload == .retain) {
             if (self.options.array_selector) |selector| {
                 const position = storage.arrays;

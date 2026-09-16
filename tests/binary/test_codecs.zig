@@ -396,6 +396,12 @@ test "[integration] - [primitive wire]: matches fixed little-endian Base64 vecto
         try std.testing.expectEqualStrings(case[2], wire);
         const prepared = try arrays.encodeWire(T, &expected, .{}, .{ .transport = &.{}, .transformed = &transformed }, null);
         try std.testing.expectEqualStrings(case[2], try base64.encode(&encoded, prepared));
+        @memset(std.mem.sliceAsBytes(&output), 0xa5);
+        try arrays.decodeWire(T, &output, prepared, .none, &.{}, .{});
+        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&expected), std.mem.sliceAsBytes(&output));
+        @memcpy(std.mem.sliceAsBytes(&output), prepared);
+        try arrays.decodeWire(T, &output, std.mem.sliceAsBytes(&output), .none, &.{}, .{});
+        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&expected), std.mem.sliceAsBytes(&output));
         if (@import("builtin").cpu.arch.endian() == .little) {
             const borrowed = try arrays.encodeWire(T, &expected, .{}, .{ .transport = &.{}, .transformed = &.{} }, null);
             try std.testing.expectEqual(@intFromPtr(expected[0..].ptr), @intFromPtr(borrowed.ptr));
@@ -407,6 +413,22 @@ test "[integration] - [primitive wire]: matches fixed little-endian Base64 vecto
         try arrays.decode(T, &output, compressed, .zlib, .{ .transport = &transport, .transformed = &.{} }, .{});
         try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&expected), std.mem.sliceAsBytes(&output));
     }
+}
+
+test "[failure] - [wire decoding]: rejects overlap type size and limit errors" {
+    var output: [4]u64 = undefined;
+    const bytes = std.mem.sliceAsBytes(&output);
+    const source = [_]u8{ 4, 3, 2, 1 };
+    var values: [1]i32 = undefined;
+    try arrays.decodeWire(i32, &values, &source, .none, &.{}, .{ .base64_text = .{ .text_bytes = 0, .significant_bytes = 0 } });
+    try std.testing.expectEqual(@as(i32, 0x01020304), values[0]);
+    try std.testing.expectError(error.OverlappingBuffers, arrays.decodeWire(i64, std.mem.bytesAsSlice(i64, bytes)[0..1], bytes[1..9], .none, &.{}, .{}));
+    try std.testing.expectError(error.OverlappingBuffers, arrays.decodeWire(i64, std.mem.bytesAsSlice(i64, bytes)[0..1], bytes[0..8], .zlib, &.{}, .{}));
+    try std.testing.expectError(error.OverlappingBuffers, arrays.decodeWire(i64, std.mem.bytesAsSlice(i64, bytes)[0..1], bytes[0..16], .none, bytes[8..16], .{}));
+    try std.testing.expectError(error.DecodedSizeMismatch, arrays.decodeWire(i32, &values, source[0..3], .none, &.{}, .{}));
+    try std.testing.expectError(error.TypeMismatch, arrays.decodeWire(i32, &values, &source, .pic, &.{}, .{}));
+    try std.testing.expectError(error.LimitExceeded, arrays.decodeWire(i32, &values, &source, .none, &.{}, .{ .array_bytes = 3 }));
+    try std.testing.expectError(error.LimitExceeded, arrays.decodeWire(i32, &values, &source, .none, &.{}, .{ .base64_text = .{ .decoded_bytes = 3 } }));
 }
 
 test "[integration] - [SLOF pipeline]: decodes a frozen zlib envelope" {

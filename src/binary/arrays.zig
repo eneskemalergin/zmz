@@ -67,16 +67,48 @@ pub fn decode(
         _ = try base64.validate(source, limits.base64_text);
         return error.DecodedSizeMismatch;
     };
-    var wire: []const u8 = destination[0..counts.decoded_bytes];
+    try decodeWireInner(T, output, destination[0..counts.decoded_bytes], pipeline, scratch.transformed);
+}
+
+/// Decodes bytes after Base64 into exactly output.len values without allocation.
+/// T and primitive byte order follow decode. Transformed scratch is needed only for
+/// Numpress with zlib. Buffers must be disjoint, except that .none permits source and
+/// output to start at the same address. Only decoded_bytes and array_bytes limits apply.
+pub fn decodeWire(
+    comptime T: type,
+    output: []T,
+    source: []const u8,
+    pipeline: Pipeline,
+    transformed: []u8,
+    limits: Limits,
+) Error!void {
+    checkType(T);
+    const bytes = std.mem.sliceAsBytes(output);
+    const in_place = pipeline == .none and bytes.ptr == source.ptr;
+    try checkBuffers(bytes, if (in_place) &.{} else source, .{ .transport = &.{}, .transformed = transformed });
+    if (in_place) try checkBuffers(transformed, source, .{ .transport = &.{}, .transformed = &.{} });
+    if (bytes.len > limits.array_bytes or source.len > limits.base64_text.decoded_bytes)
+        return error.LimitExceeded;
+    if (transform(pipeline) != .none and T != f64) return error.TypeMismatch;
+    try decodeWireInner(T, output, source, pipeline, transformed);
+}
+
+fn decodeWireInner(comptime T: type, output: []T, source: []const u8, pipeline: Pipeline, transformed: []u8) Error!void {
+    const array_bytes = std.math.mul(usize, output.len, @sizeOf(T)) catch return error.LengthOverflow;
+    var wire = source;
     if (hasZlib(pipeline)) {
         const maximum = try wireBound(T, output.len, pipeline);
-        const inflated = if (transform(pipeline) == .none) std.mem.sliceAsBytes(output) else scratch.transformed[0..@min(maximum, scratch.transformed.len)];
+        const inflated = if (transform(pipeline) == .none) std.mem.sliceAsBytes(output) else transformed[0..@min(maximum, transformed.len)];
         wire = try zlib.decompress(inflated, wire);
     }
     switch (transform(pipeline)) {
         .none => {
             if (wire.len != array_bytes) return error.DecodedSizeMismatch;
-            if (@import("builtin").cpu.arch.endian() == .little) return;
+            if (@import("builtin").cpu.arch.endian() == .little) {
+                const bytes = std.mem.sliceAsBytes(output);
+                if (bytes.ptr != wire.ptr) @memcpy(bytes, wire);
+                return;
+            }
             const Bits = @Int(.unsigned, @bitSizeOf(T));
             for (output, 0..) |*value, index| {
                 const offset = index * @sizeOf(T);

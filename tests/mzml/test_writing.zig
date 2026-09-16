@@ -167,6 +167,31 @@ test "[integration] - [mzML prepared writing]: preserves primitive bytes across 
                     var actual = std.Io.Writer.fixed(&actual_bytes);
                     try support.writeSingleRecord(std.testing.allocator, &actual, header.*, metadata, indexed, &.{ wire, wire });
                     try std.testing.expectEqualStrings(expected.buffered(), actual.buffered());
+                    var source = std.Io.Reader.fixed(expected.buffered());
+                    var decoded_reader = try mzml.StreamReader.init(std.testing.allocator, &source, .{});
+                    defer decoded_reader.deinit();
+                    var decoded_arrays = mzml.StreamReader.DecodedArrays.init(std.testing.allocator, .{});
+                    defer decoded_arrays.deinit();
+                    const decoded_record = (try decoded_reader.nextDecodedRecord(&decoded_arrays)).?;
+                    try std.testing.expectEqual(@as(usize, 2), decoded_arrays.len());
+                    for (0..decoded_arrays.len()) |position| {
+                        switch (decoded_arrays.get(position).?.values) {
+                            inline else => |decoded| try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(values[0..count]), std.mem.sliceAsBytes(decoded)),
+                        }
+                    }
+                    const decoded = decoded_arrays.get(0).?.values;
+                    const typed: []const T = if (T == f32) decoded.float32 else if (T == f64) decoded.float64 else if (T == i32) decoded.int32 else decoded.int64;
+                    const reencoded = try mzml.arrays.encodeWire(T, typed, .{ .pipeline = pipeline }, scratch, &compressor);
+                    var rewritten_bytes: [32768]u8 = undefined;
+                    var rewritten = std.Io.Writer.fixed(&rewritten_bytes);
+                    try support.writeSingleRecord(std.testing.allocator, &rewritten, header.*, decoded_record.node, indexed, &.{ reencoded, reencoded });
+                    try std.testing.expectEqualSlices(u8, expected.buffered(), rewritten.buffered());
+                    if (indexed) {
+                        var index = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = rewritten.buffered() }, .{ .policy = .verify_embedded });
+                        defer index.deinit();
+                        try std.testing.expectEqual(@as(usize, 1), index.entries.items.len);
+                    }
+                    try std.testing.expectEqual(null, try decoded_reader.nextDecodedRecord(&decoded_arrays));
                 }
             }
         }
