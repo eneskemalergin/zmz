@@ -114,8 +114,15 @@ list_scopes: [2]?Scope = .{ null, null },
 child_scratch: std.ArrayList(model.Node) = .empty,
 param_scratch: std.ArrayList(cv.Entry) = .empty,
 decoded_arrays: ?*DecodedArrays = null,
+index_visitor: ?IndexVisitor = null,
 
 pub const Scope = struct { start: u64, end: u64, name: []const u8 };
+
+pub const IndexVisitor = struct {
+    user_data: *anyopaque,
+    index_start: u64 = 0,
+    visit: *const fn (*anyopaque, u64, model.Node) void,
+};
 
 /// Borrows input for the reader's lifetime. Input and initialized reader must not be copied.
 /// This allocates parser state but does not consume input. Release all owned storage with deinit.
@@ -413,6 +420,8 @@ fn nextRecordInner(self: *StreamReader) Error!?model.Record {
     try self.consumeEnd(.run, true);
     try self.consumeEnd(.mzml, true);
     if (self.header.indexed) {
+        if (self.index_visitor) |*visitor|
+            visitor.index_start = (self.cursor.current orelse return error.UnexpectedEnd).span.start;
         inline for (.{ model.Kind.index_list, .index_list_offset, .file_checksum }, 0..) |expected, i| {
             if (try self.kind() != expected) return error.InvalidStructure;
             if (self.options.retain_index) {
@@ -510,6 +519,8 @@ fn parseNode(self: *StreamReader, storage: *Storage, depth: usize, advance_after
         if (kind_value == .binary and storage == &self.record_store) {
             if (self.decoded_arrays) |output| output.finishArray();
         }
+    } else if (kind_value == .index and self.index_visitor != null) {
+        try self.parseIndexOffsets(storage, depth, node);
     } else {
         if (schema.hasParams(kind_value))
             node.params = try self.parseParams(storage, kind_value != .referenceable_param_group);
@@ -560,6 +571,32 @@ fn parseNode(self: *StreamReader, storage: *Storage, depth: usize, advance_after
     node.end_offset = end.span.end;
     try self.consumeEnd(kind_value, advance_after);
     return node;
+}
+
+fn parseIndexOffsets(self: *StreamReader, storage: *Storage, depth: usize, node: model.Node) Error!void {
+    const visitor = self.index_visitor.?;
+    visitor.visit(visitor.user_data, visitor.index_start, node);
+    var offsets = Storage.init(self.allocator, storage.limit);
+    defer offsets.arena.deinit();
+    offsets.used = storage.used;
+    offsets.nodes = storage.nodes;
+    var sequence: schema.Sequence = .{ .rules = schema.children(.index) };
+    var count: usize = 0;
+    while (self.cursor.current) |event| {
+        if (event.data == .end_element) break;
+        try sequence.accept(try self.kind());
+        if (count == self.options.limits.list_entries) return error.LimitExceeded;
+        const offset = try self.parseNode(&offsets, depth + 1, true, .skip);
+        visitor.visit(visitor.user_data, visitor.index_start, offset);
+        count += 1;
+        _ = offsets.arena.reset(.retain_capacity);
+    }
+    try sequence.finish();
+    self.current_kind = .index;
+    storage.used = offsets.used;
+    storage.nodes = offsets.nodes;
+    // Verification keeps the retained-tree byte limit and its original failure point.
+    try storage.charge(model.Node, count);
 }
 
 fn parseParams(self: *StreamReader, storage: *Storage, allow_refs: bool) Error![]const cv.Entry {
@@ -754,10 +791,14 @@ const Storage = struct {
         self.arrays = 0;
     }
 
-    fn alloc(self: *Storage, comptime T: type, count: usize) Error![]T {
+    fn charge(self: *Storage, comptime T: type, count: usize) Error!void {
         const bytes = std.math.mul(usize, count, @sizeOf(T)) catch return error.LimitExceeded;
         if (bytes > self.limit -| self.used) return error.LimitExceeded;
         self.used += bytes;
+    }
+
+    fn alloc(self: *Storage, comptime T: type, count: usize) Error![]T {
+        try self.charge(T, count);
         return self.arena.allocator().alloc(T, count);
     }
 

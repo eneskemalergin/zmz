@@ -181,7 +181,7 @@ test "[integration] - [mzML index]: opens embedded targets without claiming full
     try std.testing.expectError(error.InvalidIndex, mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = sink.buffered() }, .{}));
 }
 
-test "[integration] - [mzML index]: opens encoded trailers and list namespace declarations" {
+test "[integration] - [mzML index]: opens and verifies encoded trailers and list namespace declarations" {
     const FailedRead = struct {
         start: u64,
         stop: u64,
@@ -235,6 +235,13 @@ test "[integration] - [mzML index]: opens encoded trailers and list namespace de
                     std.mem.writeInt(u16, bytes[0..2], 0xfeff, order);
                     for (source.written(), 0..) |byte, i| std.mem.writeInt(u16, bytes[2 + 2 * i ..][0..2], byte, order);
                 } else @memcpy(bytes, source.written());
+                const checksum_start = bom + width * (std.mem.indexOf(u8, source.written(), "<p:fileChecksum>").? + "<p:fileChecksum>".len);
+                var digest: [20]u8 = undefined;
+                std.crypto.hash.Sha1.hash(bytes[0..checksum_start], &digest, .{});
+                const hex = std.fmt.bytesToHex(digest, .lower);
+                if (endian) |order| {
+                    for (hex, 0..) |byte, i| std.mem.writeInt(u16, bytes[checksum_start + 2 * i ..][0..2], byte, order);
+                } else @memcpy(bytes[checksum_start..][0..hex.len], &hex);
                 const file = try directory.dir.createFile(std.testing.io, "opening.mzML", .{ .read = true });
                 defer file.close(std.testing.io);
                 try file.writeStreamingAll(std.testing.io, bytes);
@@ -244,6 +251,10 @@ test "[integration] - [mzML index]: opens encoded trailers and list namespace de
                         defer opened.deinit();
                         var rebuilt = try mzml.IndexedReader.build(allocator, .{ .bytes = bytes }, .{ .policy = .rebuild });
                         defer rebuilt.deinit();
+                        var verified = try mzml.IndexedReader.build(allocator, indexed_source, .{ .reader = .{ .checks = checks } });
+                        defer verified.deinit();
+                        try std.testing.expectEqualDeep(rebuilt.entries.items, verified.entries.items);
+                        try std.testing.expectEqualDeep(rebuilt.header().*, verified.header().*);
                         try std.testing.expectEqual(spectra + 1, opened.entries.items.len);
                         for (opened.entries.items) |entry| {
                             var actual = (try opened.at(allocator, entry.kind, 0)).?;
@@ -359,6 +370,48 @@ test "[integration] - [mzML index]: verifies emitted targets checksum and indepe
     var rebuilt = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = sink.buffered() }, .{ .policy = .rebuild });
     defer rebuilt.deinit();
     try std.testing.expectEqual(@as(usize, 16), rebuilt.entries.items.len);
+}
+
+test "[property] - [mzML index]: retains trailer limits before reporting unmatched entries" {
+    const Parse = struct {
+        fn failure(bytes: []const u8, limits: mzml.StreamReader.Limits) ?mzml.StreamReader.Error {
+            var input = std.Io.Reader.fixed(bytes);
+            var reader = mzml.StreamReader.init(std.testing.allocator, &input, .{ .payload = .skip, .retain_index = true, .limits = limits }) catch |err| return err;
+            defer reader.deinit();
+            while ((reader.nextRecord() catch |err| return err) != null) {}
+            return null;
+        }
+    };
+    const source = @embedFile("data/writer_indexed.mzML");
+    var bytes: [source.len]u8 = source.*;
+    const id = std.mem.indexOf(u8, &bytes, "idRef=\"scan=none\"").? + "idRef=\"".len;
+    bytes[id] = 'x';
+    for ([_]usize{ 0, 1, 2, 3, 4, 7, 8, 16, 24, 32, 39, 40, 64, 128, 1024, 4096, 8192 }) |limit| {
+        for ([_]mzml.StreamReader.Limits{
+            .{ .header_bytes = limit },      .{ .nodes = limit },           .{ .list_entries = limit },
+            .{ .binary_text_bytes = limit }, .{ .depth = @min(limit, 64) },
+        }) |limits| {
+            const expected = Parse.failure(&bytes, limits) orelse error.InvalidIndex;
+            try std.testing.expectError(expected, mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = &bytes }, .{ .reader = .{ .limits = limits } }));
+        }
+    }
+}
+
+test "[failure] - [mzML index]: checks the complete trailer before deferred matching errors" {
+    const source = @embedFile("data/writer_indexed.mzML");
+    var bytes: [source.len]u8 = source.*;
+    const target = std.mem.indexOf(u8, &bytes, "<offset idRef=\"scan=none\">").? + "<offset idRef=\"scan=none\">".len;
+    const list_offset = std.mem.indexOf(u8, &bytes, "<indexListOffset>").? + "<indexListOffset>".len;
+    bytes[target] = 'x';
+    bytes[list_offset] = '0';
+    try std.testing.expectError(error.InvalidIndex, mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = &bytes }, .{}));
+    bytes[list_offset] = source[list_offset];
+    try std.testing.expectError(error.InvalidValue, mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = &bytes }, .{}));
+    const closing = std.mem.indexOf(u8, &bytes, "</fileChecksum>").?;
+    bytes[closing + 2] = 'x';
+    try std.testing.expectError(error.InvalidXml, mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = &bytes }, .{}));
+    const trailer = std.mem.indexOf(u8, &bytes, "<indexList ").?;
+    try std.testing.expectError(error.InvalidXml, mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = bytes[0..trailer] }, .{}));
 }
 
 test "[integration] - [mzML index]: builds plain files explicitly and rejects changed file sources" {

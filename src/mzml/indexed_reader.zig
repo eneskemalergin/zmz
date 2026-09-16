@@ -110,6 +110,9 @@ pub fn build(allocator: std.mem.Allocator, source: Source, options: Options) Err
     reader_options.retain_index = options.policy == .verify_embedded;
     var reader = try StreamReader.init(allocator, input, reader_options);
     defer reader.deinit();
+    var verification: TrailerVerifier = .{ .reader = &self };
+    if (options.policy == .verify_embedded)
+        reader_bridge.visitIndexOffsets(&reader, .{ .user_data = &verification, .visit = TrailerVerifier.visit });
     const source_header = try reader.readHeader();
     if (options.policy != .rebuild and !source_header.indexed) return error.MissingIndex;
     if (options.policy == .open_embedded) {
@@ -135,7 +138,7 @@ pub fn build(allocator: std.mem.Allocator, source: Source, options: Options) Err
         try self.entries.ensureUnusedCapacity(allocator, 1);
         self.entries.appendAssumeCapacity(.{ .kind = record.node.kind, .id = id, .index = record.index, .start = record.node.start_offset, .end = record.node.end_offset });
     }
-    if (options.policy == .verify_embedded) try self.verifyTrailer(reader_bridge.indexTrailer(&reader).*);
+    if (options.policy == .verify_embedded) try self.verifyTrailer(reader_bridge.indexTrailer(&reader).*, verification);
     self.counts = ordinals;
     self.metadata = try owned.Header.init(allocator, source_header.*, .{ .bytes = options.reader.limits.header_bytes });
     try self.checkSource();
@@ -505,28 +508,47 @@ fn encoding(self: *const IndexedReader) Error!?std.builtin.Endian {
     return if (signature[0] == 0xff or (signature[0] == '<' and signature[1] == 0)) .little else if (signature[0] == 0xfe or (signature[0] == 0 and signature[1] == '<')) .big else null;
 }
 
-fn verifyTrailer(self: *IndexedReader, trailer: [3]model.Node) Error!void {
-    if (try cv.parseInteger(u64, trailer[1].text) != trailer[0].start_offset) return error.InvalidIndex;
-    var seen: [2]bool = .{ false, false };
-    var total: usize = 0;
-    for (trailer[0].children) |index| {
-        const name = index.attribute("name").?;
-        const kind: model.Kind = if (std.mem.eql(u8, name, "spectrum")) .spectrum else if (std.mem.eql(u8, name, "chromatogram")) .chromatogram else return error.InvalidIndex;
-        const k = kindIndex(kind);
-        if (seen[k]) return error.InvalidIndex;
-        seen[k] = true;
-        var previous: u64 = 0;
-        for (index.children) |offset| {
-            const target = try cv.parseInteger(u64, offset.text);
-            if (target == 0 or target <= previous or target >= trailer[0].start_offset) return error.InvalidIndex;
-            previous = target;
-            const position = self.ids[k].get(offset.attribute("idRef").?) orelse return error.InvalidIndex;
-            const entry = self.entries.items[position];
-            if (entry.kind != kind or entry.start != target) return error.InvalidIndex;
-            total += 1;
-        }
+const TrailerVerifier = struct {
+    reader: *const IndexedReader,
+    failure: ?Error = null,
+    seen: [2]bool = .{ false, false },
+    kind: model.Kind = .spectrum,
+    previous: u64 = 0,
+    total: usize = 0,
+
+    fn visit(user_data: *anyopaque, index_start: u64, node: model.Node) void {
+        const self: *TrailerVerifier = @ptrCast(@alignCast(user_data));
+        if (self.failure != null) return;
+        self.match(index_start, node) catch |err| {
+            self.failure = err;
+        };
     }
-    if (total != self.entries.items.len) return error.InvalidIndex;
+
+    fn match(self: *TrailerVerifier, index_start: u64, node: model.Node) Error!void {
+        if (node.kind == .index) {
+            const name = node.attribute("name").?;
+            self.kind = if (std.mem.eql(u8, name, "spectrum")) .spectrum else if (std.mem.eql(u8, name, "chromatogram")) .chromatogram else return error.InvalidIndex;
+            const k = kindIndex(self.kind);
+            if (self.seen[k]) return error.InvalidIndex;
+            self.seen[k] = true;
+            self.previous = 0;
+            return;
+        }
+        const target = try cv.parseInteger(u64, node.text);
+        if (target == 0 or target <= self.previous or target >= index_start) return error.InvalidIndex;
+        self.previous = target;
+        const position = self.reader.ids[kindIndex(self.kind)].get(node.attribute("idRef").?) orelse return error.InvalidIndex;
+        const entry = self.reader.entries.items[position];
+        if (entry.kind != self.kind or entry.start != target) return error.InvalidIndex;
+        self.total += 1;
+    }
+};
+
+fn verifyTrailer(self: *IndexedReader, trailer: [3]model.Node, verification: TrailerVerifier) Error!void {
+    if (try cv.parseInteger(u64, trailer[1].text) != trailer[0].start_offset) return error.InvalidIndex;
+    // XML and indexListOffset failures precede the first mismatched entry.
+    if (verification.failure) |err| return err;
+    if (verification.total != self.entries.items.len) return error.InvalidIndex;
     const expected = try checksum(trailer[2]);
     var hash = std.crypto.hash.Sha1.init(.{});
     var buffer: [64 * 1024]u8 = undefined;
