@@ -504,6 +504,31 @@ test "[integration] - [mzML record IDs]: keeps spectrum and chromatogram keys se
     try std.testing.expectEqual(.chromatogram, found.value.node.kind);
 }
 
+test "[integration] - [mzML indexed writer]: preserves bytes and checksum through short sink writes" {
+    const ShortSink = struct {
+        out: std.Io.Writer,
+        chunk: usize,
+        writer: std.Io.Writer = .{ .vtable = &.{ .drain = drain }, .buffer = &.{} },
+
+        fn drain(writer: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+            std.debug.assert(data.len == 1 and splat == 1);
+            const self: *@This() = @alignCast(@fieldParentPtr("writer", writer));
+            const length = @min(data[0].len, self.chunk);
+            try self.out.writeAll(data[0][0..length]);
+            return length;
+        }
+    };
+    const expected = std.mem.trimEnd(u8, @embedFile("data/writer_indexed.mzML"), "\n");
+    for ([_]usize{ 1, 7, 63, 64, 65, 4096 }) |chunk| {
+        var bytes: [16384]u8 = undefined;
+        var sink: ShortSink = .{ .out = .fixed(&bytes), .chunk = chunk };
+        try support.constructFixture(std.testing.allocator, &sink.writer, true, std.meta.tags(mzml.arrays.Pipeline), false);
+        try sink.writer.flush();
+        try std.testing.expectEqualStrings(expected, sink.out.buffered());
+        try support.checkIndexed(std.testing.allocator, sink.out.buffered());
+    }
+}
+
 test "[failure] - [mzML indexed writer]: keeps record-limit and sink failures sticky" {
     var input = std.Io.Reader.fixed(support.DOCUMENT);
     var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});

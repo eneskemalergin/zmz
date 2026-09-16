@@ -56,7 +56,7 @@ pub fn initIndexed(allocator: std.mem.Allocator, sink: *std.Io.Writer, limits: L
     try schema.checkLimits(limits);
     const state = try allocator.create(IndexState);
     errdefer allocator.destroy(state);
-    state.* = .{ .allocator = allocator, .hashed = .initHasher(sink, .init(.{}), &.{}), .arena = .init(allocator), .limits = index_limits };
+    state.* = .{ .allocator = allocator, .hashed = .{ .out = sink }, .arena = .init(allocator), .limits = index_limits };
     return .{ .engine = try xml.Writer.init(allocator, &state.hashed.writer, .{}), .allocator = allocator, .limits = limits, .index_state = state };
 }
 
@@ -300,10 +300,25 @@ fn optionalAttribute(self: *Writer, name: []const u8, value: ?[]const u8) Error!
 
 const IndexState = struct {
     allocator: std.mem.Allocator,
-    hashed: std.Io.Writer.Hashed(std.crypto.hash.Sha1),
+    hashed: ChecksumWriter,
     arena: std.heap.ArenaAllocator,
     limits: IndexLimits,
     entries: std.ArrayList(struct { kind: model.Kind, id: []const u8, offset: u64 }) = .empty,
     ids: [2]std.StringHashMapUnmanaged(void) = .{ .empty, .empty },
     id_bytes: usize = 0,
+};
+
+const ChecksumWriter = struct {
+    out: *std.Io.Writer,
+    hasher: std.crypto.hash.Sha1 = .init(.{}),
+    writer: std.Io.Writer = .{ .vtable = &.{ .drain = drain }, .buffer = &.{} },
+
+    fn drain(writer: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        // The XML writer submits one slice per write, without buffering or splats.
+        std.debug.assert(writer.end == 0 and data.len == 1 and splat == 1);
+        const self: *ChecksumWriter = @alignCast(@fieldParentPtr("writer", writer));
+        const written = try self.out.write(data[0]);
+        if (written != 0) self.hasher.update(data[0][0..written]);
+        return written;
+    }
 };
