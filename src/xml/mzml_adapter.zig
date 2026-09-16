@@ -1657,12 +1657,14 @@ pub const Writer = struct {
         const frame = &self.frames[self.frame_count - 1];
         var position = frame.attribute_start;
         while (position < self.attribute_names.items.len) {
-            const end = std.mem.indexOfScalarPos(u8, self.attribute_names.items, position, 0) orelse self.attribute_names.items.len;
+            const length = std.mem.bytesToValue(usize, self.attribute_names.items[position..][0..@sizeOf(usize)]);
+            position += @sizeOf(usize);
+            const end = position + length;
             if (std.mem.eql(u8, self.attribute_names.items[position..end], name)) return self.fail(error.DuplicateAttribute);
-            position = if (end == self.attribute_names.items.len) end else end + 1;
+            position = end;
         }
+        self.attribute_names.appendSlice(self.allocator, std.mem.asBytes(&name.len)) catch return self.fail(error.OutOfMemory);
         self.attribute_names.appendSlice(self.allocator, name) catch return self.fail(error.OutOfMemory);
-        self.attribute_names.append(self.allocator, 0) catch return self.fail(error.OutOfMemory);
         try self.writeByte(' ');
         try self.writeBytes(name);
         try self.writeBytes("=\"");
@@ -2446,6 +2448,39 @@ test "[unit] - [mzML XML writer]: keeps duplicate-attribute failures sticky" {
     try writer.attribute("id", "one");
     try std.testing.expectError(error.DuplicateAttribute, writer.attribute("id", "two"));
     try std.testing.expectError(error.DuplicateAttribute, writer.text("later"));
+}
+
+test "[property] - [mzML XML writer]: copies attribute names and permits reuse on child and sibling tags" {
+    const original: [4096]u8 = @splat('a');
+    const changed: [4096]u8 = @splat('b');
+    var name: [4096]u8 = undefined;
+    var output: [32768]u8 = undefined;
+    var expected_buffer: [32768]u8 = undefined;
+    for ([_]usize{ 1, 7, 8, 9, 15, 16, 17, 255, 256, 257, 4096 }) |length| {
+        var sink = std.Io.Writer.fixed(&output);
+        var writer = try Writer.init(std.testing.allocator, &sink, .{});
+        defer writer.deinit();
+        try writer.startDocument();
+        try writer.startElement("mzML");
+        @memcpy(name[0..length], original[0..length]);
+        try writer.attribute(name[0..length], "one");
+        @memcpy(name[0..length], changed[0..length]);
+        try writer.attribute(name[0..length], "two");
+        for (0..2) |_| {
+            try writer.startElement("run");
+            try writer.attribute(original[0..length], "three");
+            try writer.endElement();
+        }
+        try writer.endElement();
+        try writer.endDocument();
+        const expected = try std.fmt.bufPrint(
+            &expected_buffer,
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><mzML {s}=\"one\" {s}=\"two\"><run {s}=\"three\"/><run {s}=\"three\"/></mzML>",
+            .{ original[0..length], changed[0..length], original[0..length], original[0..length] },
+        );
+        try std.testing.expectEqualStrings(expected, sink.buffered());
+        try std.testing.expectEqual(@as(?u64, expected.len), writer.byteOffset());
+    }
 }
 
 test "[unit] - [mzML XML writer]: rejects generic and undeclared namespace names" {
