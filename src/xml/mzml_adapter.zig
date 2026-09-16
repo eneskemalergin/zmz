@@ -946,7 +946,7 @@ pub const Cursor = struct {
         return appendToCodepoint(destination, self.allocator, @intCast(number), limit);
     }
 
-    fn bufferedName(self: *Cursor, bytes: []const u8, position: *usize) ?NameRange {
+    fn bufferedName(self: *Cursor, bytes: []const u8, position: *usize, used: *usize) ?NameRange {
         const start = position.*;
         if (start == bytes.len or !isAsciiNameStart(bytes[start])) return null;
         var end = start + 1;
@@ -954,17 +954,17 @@ pub const Cursor = struct {
         if (end == bytes.len or !isNameDelimiter(bytes[end])) return null;
         const length = end - start;
         const capacity = @min(self.max_attribute_bytes, self.event_bytes.capacity);
-        if (length > capacity -| self.event_bytes.items.len) return null;
-        const result: NameRange = .{ .start = self.event_bytes.items.len, .len = length, .prefix_len = 0 };
-        self.event_bytes.appendSliceAssumeCapacity(bytes[start..end]);
+        if (length > capacity -| used.*) return null;
+        const result: NameRange = .{ .start = start, .len = length, .prefix_len = 0 };
+        used.* += length;
         position.* = end;
         return result;
     }
 
-    fn hasAttribute(self: *const Cursor, name: NameRange) bool {
-        const raw = self.event_bytes.items[name.start..][0..name.len];
+    fn hasAttribute(self: *const Cursor, bytes: []const u8, name: NameRange) bool {
+        const raw = bytes[name.start..][0..name.len];
         for (self.attribute_ranges.items) |previous| {
-            if (std.mem.eql(u8, self.event_bytes.items[previous.name.start..][0..previous.name.len], raw)) return true;
+            if (std.mem.eql(u8, bytes[previous.name.start..][0..previous.name.len], raw)) return true;
         }
         return false;
     }
@@ -980,7 +980,8 @@ pub const Cursor = struct {
         self.namespace_declarations.clearRetainingCapacity();
         self.attributes.clearRetainingCapacity();
         var position: usize = 0;
-        const name_range = self.bufferedName(bytes, &position) orelse return null;
+        var used: usize = 0;
+        const name_range = self.bufferedName(bytes, &position, &used) orelse return null;
         var empty = false;
 
         // Do not consume input or grow storage until the complete tag is known.
@@ -999,8 +1000,8 @@ pub const Cursor = struct {
                 break;
             }
             if (self.attribute_ranges.items.len == @min(self.max_attributes, self.attribute_ranges.capacity)) return null;
-            const name = self.bufferedName(bytes, &position) orelse return null;
-            if (std.mem.eql(u8, self.event_bytes.items[name.start..][0..name.len], "xmlns")) return null;
+            const name = self.bufferedName(bytes, &position, &used) orelse return null;
+            if (std.mem.eql(u8, bytes[name.start..][0..name.len], "xmlns")) return null;
             while (position < bytes.len and isXmlWhitespace(bytes[position])) : (position += 1) {}
             if (position == bytes.len or bytes[position] != '=') return null;
             position += 1;
@@ -1014,11 +1015,11 @@ pub const Cursor = struct {
             if (position == bytes.len or bytes[position] != quote) return null;
             const length = position - start;
             const capacity = @min(self.max_attribute_bytes, self.event_bytes.capacity);
-            if (length > capacity -| self.event_bytes.items.len) return null;
-            const value: Range = .{ .start = self.event_bytes.items.len, .len = length };
-            self.event_bytes.appendSliceAssumeCapacity(bytes[start..position]);
+            if (length > capacity -| used) return null;
+            const value: Range = .{ .start = start, .len = length };
+            used += length;
             position += 1;
-            if (self.hasAttribute(name)) return null;
+            if (self.hasAttribute(bytes, name)) return null;
             self.attribute_ranges.appendAssumeCapacity(.{
                 .name = name,
                 .value = value,
@@ -1029,7 +1030,7 @@ pub const Cursor = struct {
         const end = std.math.add(u64, self.source.position, position) catch return null;
         reader.toss(position);
         self.source.position = end;
-        return try self.finishStartElement(start_offset, name_range, empty);
+        return try self.finishStartElement(bytes, start_offset, name_range, empty);
     }
 
     fn readStartElement(self: *Cursor, start_offset: u64) Error!Event {
@@ -1072,7 +1073,7 @@ pub const Cursor = struct {
                 break :opening value.value;
             };
             const attribute_value = try self.parseAttributeValue(quote);
-            if (self.hasAttribute(attribute_name)) return error.InvalidXml;
+            if (self.hasAttribute(self.event_bytes.items, attribute_name)) return error.InvalidXml;
             const raw_name = self.event_bytes.items[attribute_name.start..][0..attribute_name.len];
             const namespace_declaration = std.mem.eql(u8, raw_name, "xmlns") or
                 (std.mem.startsWith(u8, raw_name, "xmlns:") and raw_name.len > 6);
@@ -1090,10 +1091,10 @@ pub const Cursor = struct {
             });
         }
 
-        return self.finishStartElement(start_offset, name_range, empty);
+        return self.finishStartElement(self.event_bytes.items, start_offset, name_range, empty);
     }
 
-    fn finishStartElement(self: *Cursor, start_offset: u64, name_range: NameRange, empty: bool) Error!Event {
+    fn finishStartElement(self: *Cursor, bytes: []const u8, start_offset: u64, name_range: NameRange, empty: bool) Error!Event {
         if (self.depth == 0) {
             if (self.root_closed) return error.InvalidXml;
             self.root_seen = true;
@@ -1103,10 +1104,10 @@ pub const Cursor = struct {
         const binding_start = self.namespace_bindings.items.len;
         const namespace_bytes_start = self.namespace_bytes.items.len;
         if (self.check_namespaces) try self.installNamespaces(binding_start);
-        const element_name = try self.makeName(name_range, self.check_namespaces);
+        const element_name = try self.makeName(bytes, name_range, self.check_namespaces);
 
         const frame_name_start = self.open_names.items.len;
-        try self.open_names.appendSlice(self.allocator, self.event_bytes.items[name_range.start..][0..name_range.len]);
+        try self.open_names.appendSlice(self.allocator, bytes[name_range.start..][0..name_range.len]);
         self.frames[self.depth] = .{
             .name_start = frame_name_start,
             .name_len = name_range.len,
@@ -1121,7 +1122,7 @@ pub const Cursor = struct {
         try self.attributes.ensureTotalCapacityPrecise(self.allocator, self.attribute_ranges.items.len);
         for (self.attribute_ranges.items) |attribute_range| {
             if (attribute_range.namespace_declaration) continue;
-            const attribute_name = try self.makeAttributeName(attribute_range.name);
+            const attribute_name = try self.makeAttributeName(bytes, attribute_range.name);
             if (self.check_namespaces) {
                 const expanded = attribute_name.expanded.?;
                 for (self.attributes.items) |previous| {
@@ -1130,7 +1131,7 @@ pub const Cursor = struct {
             }
             try self.attributes.append(self.allocator, .{
                 .name = attribute_name,
-                .value = self.event_bytes.items[attribute_range.value.start..][0..attribute_range.value.len],
+                .value = bytes[attribute_range.value.start..][0..attribute_range.value.len],
             });
         }
         return .{
@@ -1187,8 +1188,8 @@ pub const Cursor = struct {
         return null;
     }
 
-    fn makeName(self: *const Cursor, range: NameRange, resolve: bool) Error!Name {
-        const raw = self.event_bytes.items[range.start..][0..range.len];
+    fn makeName(self: *const Cursor, bytes: []const u8, range: NameRange, resolve: bool) Error!Name {
+        const raw = bytes[range.start..][0..range.len];
         if (!resolve) return .{ .raw = raw, .expanded = null };
         const prefix = if (range.prefix_len == 0) null else raw[0..range.prefix_len];
         const local = if (range.prefix_len == 0) raw else raw[range.prefix_len + 1 ..];
@@ -1201,8 +1202,8 @@ pub const Cursor = struct {
         } };
     }
 
-    fn makeAttributeName(self: *const Cursor, range: NameRange) Error!Name {
-        const raw = self.event_bytes.items[range.start..][0..range.len];
+    fn makeAttributeName(self: *const Cursor, bytes: []const u8, range: NameRange) Error!Name {
+        const raw = bytes[range.start..][0..range.len];
         if (!self.check_namespaces) return .{ .raw = raw, .expanded = null };
         const prefix = if (range.prefix_len == 0) null else raw[0..range.prefix_len];
         const local = if (range.prefix_len == 0) raw else raw[range.prefix_len + 1 ..];
@@ -1225,7 +1226,7 @@ pub const Cursor = struct {
         const raw = self.event_bytes.items[name_range.start..][0..name_range.len];
         const expected = self.open_names.items[frame.name_start..][0..frame.name_len];
         if (!std.mem.eql(u8, raw, expected)) return error.InvalidXml;
-        const name = try self.makeName(name_range, self.check_namespaces);
+        const name = try self.makeName(self.event_bytes.items, name_range, self.check_namespaces);
         self.depth -= 1;
         self.open_names.items.len = frame.name_start;
         self.namespace_bindings.items.len = frame.binding_start;
@@ -1242,7 +1243,7 @@ pub const Cursor = struct {
         const frame = self.frames[self.depth - 1];
         self.event_bytes.clearRetainingCapacity();
         try self.event_bytes.appendSlice(self.allocator, self.open_names.items[frame.name_start..][0..frame.name_len]);
-        const name = try self.makeName(.{ .start = 0, .len = self.event_bytes.items.len, .prefix_len = frame.prefix_len }, self.check_namespaces);
+        const name = try self.makeName(self.event_bytes.items, .{ .start = 0, .len = self.event_bytes.items.len, .prefix_len = frame.prefix_len }, self.check_namespaces);
         self.pending_empty = false;
         self.depth -= 1;
         self.open_names.items.len = frame.name_start;
@@ -2164,6 +2165,15 @@ test "[property] - [mzML XML cursor]: buffered opening tags match incremental pa
                 if (limit == 128 and attributes == 4) try std.testing.expectEqual(case[1], event != null);
                 if (event) |actual| {
                     try std.testing.expectEqualDeep(try reference.readStartElement(0), actual);
+                    try std.testing.expectEqual(@as(usize, 0), cursor.event_bytes.items.len);
+                    const base = @intFromPtr(case[0].ptr);
+                    const name = actual.data.start_element.name.raw;
+                    try std.testing.expect(@intFromPtr(name.ptr) >= base);
+                    try std.testing.expect(@intFromPtr(name.ptr) + name.len <= base + case[0].len);
+                    for (actual.data.start_element.attributes) |attribute| {
+                        try std.testing.expect(@intFromPtr(attribute.value.ptr) >= base);
+                        try std.testing.expect(@intFromPtr(attribute.value.ptr) + attribute.value.len <= base + case[0].len);
+                    }
                 } else {
                     try std.testing.expectEqual(@as(u64, 0), cursor.source.position);
                     try std.testing.expectEqualStrings(case[0], input.buffered());
@@ -2177,6 +2187,33 @@ test "[property] - [mzML XML cursor]: buffered opening tags match incremental pa
             }
         }
     }
+}
+
+test "[property] - [mzML XML cursor]: closing names survive consumed opening-buffer reuse" {
+    const root = "<mzML xmlns='" ++ NAMESPACE ++ "'>";
+    const first = "<child value='one'>";
+    const close = "</child>";
+    const second = "<other value='two'/>";
+    var bytes = (root ++ first ++ close ++ second ++ "</mzML>").*;
+    var input = std.Io.Reader.fixed(&bytes);
+    var cursor = try Cursor.init(std.testing.allocator, &input, 64, 64, 1024, true);
+    defer cursor.deinit();
+    try cursor.advance(false);
+    try cursor.advance(false);
+    try std.testing.expectEqualStrings("one", cursor.current.?.data.start_element.attributes[0].value);
+    try std.testing.expectEqual(@as(usize, 0), cursor.event_bytes.items.len);
+    @memset(bytes[root.len..][0..first.len], '?');
+    try cursor.advance(false);
+    try std.testing.expectEqualStrings("child", cursor.current.?.data.end_element.name.raw);
+    try cursor.advance(false);
+    try std.testing.expectEqualStrings("two", cursor.current.?.data.start_element.attributes[0].value);
+    @memset(bytes[root.len + first.len + close.len ..][0..second.len], '?');
+    try cursor.advance(false);
+    try std.testing.expectEqualStrings("other", cursor.current.?.data.end_element.name.raw);
+    try cursor.advance(false);
+    try std.testing.expectEqualStrings("mzML", cursor.current.?.data.end_element.name.raw);
+    try cursor.advance(false);
+    try std.testing.expectEqual(null, cursor.current);
 }
 
 test "[property] - [mzML XML cursor]: leaves QName delimiters unread at exact token limits" {
