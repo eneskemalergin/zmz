@@ -154,20 +154,30 @@ pub fn constructFixture(allocator: std.mem.Allocator, sink: *std.Io.Writer, inde
                 else => null,
             } };
             var nodes: [2]mzml.Builder.Array = undefined;
-            inline for (0..2) |i| nodes[i] = try builder.binaryArray(f64, &.{ 1, 2, 3 }, .{
-                .cv_ref = "MS",
-                .encoding = options,
-                .role = .{
+            var wires: [2][]const u8 = undefined;
+            var prepared_transport: [2][512]u8 = undefined;
+            var prepared_transformed: [2][512]u8 = undefined;
+            inline for (0..2) |i| {
+                const array_options: mzml.Builder.ArrayOptions = .{
                     .cv_ref = "MS",
-                    .accession = if (i == 1) mzml.model.Terms.INTENSITY_ARRAY else if (list_kind == .spectrum_list) mzml.model.Terms.MZ_ARRAY else mzml.model.Terms.TIME_ARRAY,
-                    .name = if (i == 1) "intensity array" else if (list_kind == .spectrum_list) "m/z array" else "time array",
-                },
-            }, &encoded, .{ .transport = &transport, .transformed = &transformed }, &compressor);
+                    .encoding = options,
+                    .role = .{
+                        .cv_ref = "MS",
+                        .accession = if (i == 1) mzml.model.Terms.INTENSITY_ARRAY else if (list_kind == .spectrum_list) mzml.model.Terms.MZ_ARRAY else mzml.model.Terms.TIME_ARRAY,
+                        .name = if (i == 1) "intensity array" else if (list_kind == .spectrum_list) "m/z array" else "time array",
+                    },
+                };
+                if (prepared) {
+                    const built = try builder.prepareArray(f64, &.{ 1, 2, 3 }, array_options, .{ .transport = &prepared_transport[i], .transformed = &prepared_transformed[i] }, &compressor);
+                    nodes[i] = built.array;
+                    wires[i] = built.wire;
+                } else nodes[i] = try builder.binaryArray(f64, &.{ 1, 2, 3 }, array_options, &encoded, .{ .transport = &transport, .transformed = &transformed }, &compressor);
+            }
             var id: [64]u8 = undefined;
-            const record = try builder.record(if (list_kind == .spectrum_list) .spectrum else .chromatogram, try std.fmt.bufPrint(&id, "{s}={s}", .{ if (list_kind == .spectrum_list) "scan" else "chromatogram", @tagName(pipeline) }), index, 3, if (list_kind == .spectrum_list) &.{.{ .group_ref = "record-type" }} else &.{}, &.{}, &nodes);
+            const build_record: *const @TypeOf(mzml.Builder.record) = if (prepared) mzml.Builder.preparedRecord else mzml.Builder.record;
+            const record = try build_record(&builder, if (list_kind == .spectrum_list) .spectrum else .chromatogram, try std.fmt.bufPrint(&id, "{s}={s}", .{ if (list_kind == .spectrum_list) "scan" else "chromatogram", @tagName(pipeline) }), index, 3, if (list_kind == .spectrum_list) &.{.{ .group_ref = "record-type" }} else &.{}, &.{}, &nodes);
             if (prepared) {
-                const wire = try mzml.arrays.encodeWire(f64, &.{ 1, 2, 3 }, options, .{ .transport = &transport, .transformed = &transformed }, &compressor);
-                try writer.writeRecordWithArrays(record.node, &.{ wire, wire });
+                try writer.writeRecordWithArrays(record.node, &wires);
             } else try writer.writeRecord(record.node);
         }
         try writer.endList();

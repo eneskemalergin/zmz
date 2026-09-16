@@ -1,7 +1,8 @@
 //! Constructs owned mzML metadata and encoded arrays with explicit allocation limits.
 //!
-//! Returned views last until reset or deinit. Borrowed inputs are copied; constructed arrays
-//! are reused by records in the same builder. Failed operations
+//! Returned metadata lasts until reset or deinit. Metadata and ordinary Base64 inputs are
+//! copied; prepared wire borrows values or caller scratch until writing completes. Constructed
+//! arrays are reused by records in the same builder. Failed operations
 //! may consume arena capacity; reset releases that storage and invalidates previous views.
 
 const std = @import("std");
@@ -10,6 +11,7 @@ const model = @import("model.zig");
 const owned = @import("owned.zig");
 const copy = @import("internal/owned_copy.zig");
 const arrays = @import("../binary/arrays.zig");
+const base64 = @import("../binary/base64.zig");
 const encoding = @import("../binary/encoding.zig");
 const zlib = @import("../binary/zlib.zig");
 const schema = @import("schema.zig");
@@ -41,6 +43,9 @@ pub const Array = struct {
     /// Arrays may only be attached to records in this owner, before its next reset.
     owner: *const Builder,
 };
+
+/// Metadata belongs to the builder; wire borrows values or scratch until writing completes.
+pub const PreparedArray = struct { array: Array, wire: []const u8 };
 
 arena: std.heap.ArenaAllocator,
 limits: owned.Limits,
@@ -121,6 +126,15 @@ pub fn binaryArray(
     scratch: arrays.Scratch,
     compressor: ?*zlib.Compressor,
 ) Error!Array {
+    return (try self.buildArray(T, values, options, output, scratch, compressor, false)).array;
+}
+
+/// Encodes wire once and constructs metadata without retaining Base64.
+pub fn prepareArray(self: *Builder, comptime T: type, values: []const T, options: ArrayOptions, scratch: arrays.Scratch, compressor: ?*zlib.Compressor) Error!PreparedArray {
+    return self.buildArray(T, values, options, &.{}, scratch, compressor, true);
+}
+
+fn buildArray(self: *Builder, comptime T: type, values: []const T, options: ArrayOptions, output: []u8, scratch: arrays.Scratch, compressor: ?*zlib.Compressor, comptime prepared: bool) Error!PreparedArray {
     if (options.cv_ref.len == 0 or options.role.cv_ref == null or options.role.accession == null or
         options.role.name == null) return error.InvalidDeclaration;
     if (!options.role.unit.isAbsent() and !options.role.unit.isComplete()) return error.InvalidUnit;
@@ -135,11 +149,13 @@ pub fn binaryArray(
         else => @compileError("binaryArray requires f32, f64, i32, or i64"),
     });
     const codec = encoding.codecTerm(options.encoding.pipeline);
-    const encoded = try arrays.encode(T, output, values, options.encoding, scratch, compressor);
+    const wire = if (prepared) try arrays.encodeWire(T, values, options.encoding, scratch, compressor) else &.{};
+    const encoded: ?[]const u8 = if (prepared) null else try arrays.encode(T, output, values, options.encoding, scratch, compressor);
+    const encoded_length = if (prepared) try base64.encodedSize(wire.len) else encoded.?.len;
     var length: [32]u8 = undefined;
     var count: [32]u8 = undefined;
     var attrs = [_]model.Attribute{
-        .{ .name = "encodedLength", .value = std.fmt.bufPrint(&length, "{d}", .{encoded.len}) catch return error.LimitExceeded },
+        .{ .name = "encodedLength", .value = std.fmt.bufPrint(&length, "{d}", .{encoded_length}) catch return error.LimitExceeded },
         .{ .name = "arrayLength", .value = std.fmt.bufPrint(&count, "{d}", .{values.len}) catch return error.LimitExceeded },
         .{ .name = "dataProcessingRef", .value = options.data_processing_ref orelse "" },
     };
@@ -155,7 +171,14 @@ pub fn binaryArray(
         .children = &.{.{ .kind = .binary, .text = encoded }},
     };
     _ = try model.arrayEncoding(result, &.{});
-    return .{ .node = try self.node(result), .length = values.len, .is_default = is_default, .owner = self };
+    const copied = if (prepared) blk: {
+        if (self.limits.depth > 64) return error.LimitExceeded;
+        try schema.checkMetadataNode(result, .{ .depth = self.limits.depth, .text_bytes = self.limits.bytes });
+        var copier = self.makeCopier();
+        defer self.remaining = copier.remaining;
+        break :blk try copier.node(result, self.limits.depth);
+    } else try self.node(result);
+    return .{ .array = .{ .node = copied, .length = values.len, .is_default = is_default, .owner = self }, .wire = wire };
 }
 
 /// Creates a spectrum or chromatogram with generated numeric attributes and copied children.
@@ -171,6 +194,15 @@ pub fn record(
     children: []const model.Node,
     binary_arrays: []const Array,
 ) Error!model.Record {
+    return self.recordInner(kind, id, index, default_length, params, children, binary_arrays, false);
+}
+
+/// Constructs metadata for writeRecordWithArrays; wire remains caller-owned.
+pub fn preparedRecord(self: *Builder, kind: model.Kind, id: []const u8, index: usize, default_length: usize, params: []const cv.Entry, children: []const model.Node, binary_arrays: []const Array) Error!model.Record {
+    return self.recordInner(kind, id, index, default_length, params, children, binary_arrays, true);
+}
+
+fn recordInner(self: *Builder, kind: model.Kind, id: []const u8, index: usize, default_length: usize, params: []const cv.Entry, children: []const model.Node, binary_arrays: []const Array, comptime prepared: bool) Error!model.Record {
     if ((kind != .spectrum and kind != .chromatogram) or id.len == 0) return error.InvalidRecord;
     for (children) |child| if (child.kind == .binary_data_array_list) return error.InvalidRecord;
     for (binary_arrays) |array| {
@@ -217,7 +249,9 @@ pub fn record(
         .{ .name = "defaultArrayLength", .value = std.fmt.bufPrint(&length_text, "{d}", .{default_length}) catch return error.LimitExceeded },
     }, .params = params }, self.limits.depth);
     result.children = record_children;
-    try schema.checkNode(result, .{ .depth = self.limits.depth, .text_bytes = self.limits.bytes });
+    if (prepared) {
+        try schema.checkMetadataNode(result, .{ .depth = self.limits.depth, .text_bytes = self.limits.bytes });
+    } else try schema.checkNode(result, .{ .depth = self.limits.depth, .text_bytes = self.limits.bytes });
     return .{ .node = result, .id = result.attribute("id").?, .index = index, .default_array_length = default_length };
 }
 
