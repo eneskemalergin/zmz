@@ -214,6 +214,27 @@ fn ordinaryTextRun(bytes: []const u8, limit: usize) usize {
     return length;
 }
 
+fn ordinaryAttributeRun(bytes: []const u8, quote: u8) usize {
+    const width = @min(16, std.simd.suggestVectorLength(u8) orelse 16);
+    const Vector = @Vector(width, u8);
+    var length: usize = 0;
+    while (bytes.len - length >= width) {
+        const run: Vector = bytes[length..][0..width].*;
+        const exceptional = (run < @as(Vector, @splat(0x20))) |
+            (run >= @as(Vector, @splat(0x80))) |
+            (run == @as(Vector, @splat(quote))) |
+            (run == @as(Vector, @splat('&'))) |
+            (run == @as(Vector, @splat('<')));
+        if (std.simd.firstTrue(exceptional)) |lane| return length + lane;
+        length += width;
+    }
+    while (length < bytes.len) : (length += 1) {
+        const byte = bytes[length];
+        if (byte < 0x20 or byte >= 0x80 or byte == quote or byte == '&' or byte == '<') break;
+    }
+    return length;
+}
+
 fn qnameParts(raw: []const u8) Error!struct { prefix: ?[]const u8, local: []const u8 } {
     const colon = std.mem.indexOfScalar(u8, raw, ':') orelse {
         if (raw.len == 0) return error.InvalidXml;
@@ -989,11 +1010,8 @@ pub const Cursor = struct {
             if (quote != '\'' and quote != '"') return null;
             position += 1;
             const start = position;
-            while (position < bytes.len and bytes[position] != quote) : (position += 1) {
-                const byte = bytes[position];
-                if (byte < 0x20 or byte >= 0x80 or byte == '&' or byte == '<') return null;
-            }
-            if (position == bytes.len) return null;
+            position += ordinaryAttributeRun(bytes[position..], quote);
+            if (position == bytes.len or bytes[position] != quote) return null;
             const length = position - start;
             const capacity = @min(self.max_attribute_bytes, self.event_bytes.capacity);
             if (length > capacity -| self.event_bytes.items.len) return null;
@@ -2074,6 +2092,33 @@ test "[property] - [mzML XML cursor]: preserves attribute openings across refill
                     try std.testing.expectEqual(@as(u64, bytes.len), cursor.current.?.span.end);
                     try cursor.advance(false);
                     try std.testing.expectEqual(null, cursor.current);
+                }
+            }
+        }
+    }
+}
+
+test "[property] - [mzML XML cursor]: quoted runs stop at the first exceptional byte" {
+    var storage: [128]u8 = undefined;
+    for ([_]u8{ '\'', '"' }) |quote| {
+        for ([_]usize{ 0, 1, 7, 15 }) |alignment| {
+            for ([_]usize{ 0, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 96 }) |length| {
+                const bytes = storage[alignment..][0..length];
+                @memset(bytes, 'x');
+                try std.testing.expectEqual(length, ordinaryAttributeRun(bytes, quote));
+                for (0..length) |position| {
+                    for (0..256) |value| {
+                        const byte: u8 = @intCast(value);
+                        bytes[position] = byte;
+                        const expected = if (byte < 0x20 or byte >= 0x80 or byte == quote or byte == '&' or byte == '<') position else length;
+                        try std.testing.expectEqual(expected, ordinaryAttributeRun(bytes, quote));
+                    }
+                    bytes[position] = 'x';
+                }
+                if (length >= 2) {
+                    bytes[0] = quote;
+                    bytes[1] = 0xff;
+                    try std.testing.expectEqual(@as(usize, 0), ordinaryAttributeRun(bytes, quote));
                 }
             }
         }
