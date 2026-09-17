@@ -617,6 +617,46 @@ test "[integration] - [mzML index]: verifies emitted targets checksum and indepe
     try std.testing.expectEqual(@as(usize, 16), rebuilt.entries.items.len);
 }
 
+test "[property] - [mzML index]: preserves record checks and byte limits during rebuilding" {
+    const Parse = struct {
+        fn failure(bytes: []const u8, limits: mzml.StreamReader.Limits) ?anyerror {
+            support.readAll(std.testing.allocator, bytes, .{ .payload = .skip, .limits = limits }) catch |err| return err;
+            return null;
+        }
+
+        fn compare(bytes: []const u8, limits: mzml.StreamReader.Limits) !void {
+            const expected = failure(bytes, limits);
+            var index = mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = bytes }, .{ .policy = .rebuild, .reader = .{ .limits = limits } }) catch |err| {
+                try std.testing.expectEqual(expected, @as(?anyerror, err));
+                return;
+            };
+            defer index.deinit();
+            try std.testing.expectEqual(null, expected);
+            try std.testing.expectEqual(@as(usize, 2), index.entries.items.len);
+        }
+    };
+    for ([_]usize{ 0, 1, 2, 3, 4, 8, 16, 32, 64, 256, 1024, 4096, 8192 }) |limit| {
+        for ([_]mzml.StreamReader.Limits{
+            .{ .record_bytes = limit }, .{ .nodes = limit }, .{ .list_entries = limit },
+        }) |limits| try Parse.compare(support.DOCUMENT, limits);
+    }
+    for ([_][2][]const u8{
+        .{ "encodedLength='12'", "encodedLength='11'" },
+        .{ "arrayLength='1'", "arrayLength='bad'" },
+        .{ "<scanList count='1'>", "<scanList count='2'>" },
+        .{ "<userParam name='note' value=''/>", "<userParam value='' extra='x'/>" },
+        .{ "<userParam name='note' value=''/>", "<userParam name='note' extra='x'/>" },
+        .{ "<scan>", "<scan xmlns='urn:wrong'>" },
+        .{ "<activation/>", "" },
+    }) |replacement| {
+        const bytes = try std.mem.replaceOwned(u8, std.testing.allocator, support.DOCUMENT, replacement[0], replacement[1]);
+        defer std.testing.allocator.free(bytes);
+        try std.testing.expect(Parse.failure(bytes, .{}) != null);
+        for ([_]usize{ 0, 512, 4096, 256 * 1024 * 1024 }) |limit|
+            try Parse.compare(bytes, .{ .record_bytes = limit });
+    }
+}
+
 test "[property] - [mzML index]: retains trailer limits before reporting unmatched entries" {
     const Parse = struct {
         fn failure(bytes: []const u8, limits: mzml.StreamReader.Limits) ?mzml.StreamReader.Error {

@@ -10,6 +10,10 @@ pub const Reader = @import("reader_engine.zig");
 pub const Scope = Reader.Scope;
 pub const ParsedFooter = Reader.ParsedFooter;
 
+pub fn nextIndexRecord(reader: *Reader) Reader.Error!?model.Record {
+    return reader.nextIndexRecord();
+}
+
 pub fn resetFragmentParser(reader: *Reader) void {
     reader.cursor.resetEmpty();
 }

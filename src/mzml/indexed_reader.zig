@@ -123,7 +123,7 @@ pub fn build(allocator: std.mem.Allocator, source: Source, options: Options) Err
         return self;
     }
     var ordinals = [_]usize{ 0, 0 };
-    while (try reader.nextRecord()) |record| {
+    while (try reader_bridge.nextIndexRecord(&reader)) |record| {
         if (self.entries.items.len == options.max_records) return error.LimitExceeded;
         const k = kindIndex(record.node.kind);
         if (record.index != ordinals[k]) return error.InvalidIndex;
