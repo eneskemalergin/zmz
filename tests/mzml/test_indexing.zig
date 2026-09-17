@@ -835,7 +835,59 @@ test "[integration] - [mzML index]: verifies emitted targets checksum and indepe
     try std.testing.expectEqual(@as(usize, 16), rebuilt.entries.items.len);
 }
 
-test "[property] - [mzML index]: preserves record checks and byte limits during rebuilding" {
+test "[integration] - [mzML index]: discarded metadata does not consume retained record bytes" {
+    const allocator = std.testing.allocator;
+    const large: [1024]u8 = @splat('x');
+    for (0..3) |case| {
+        const children = switch (case) {
+            0 => try std.fmt.allocPrint(allocator, "<scanList count='1'><scan><userParam name='note' value='{s}'/></scan></scanList>", .{large}),
+            1 => try std.fmt.allocPrint(allocator, "<scanList count='1'><scan instrumentConfigurationRef='{s}'/></scanList>", .{large}),
+            else => try allocator.dupe(u8, "<scanList count='16'>" ++ "<scan/>" ** 16 ++ "</scanList>"),
+        };
+        defer allocator.free(children);
+        const bytes = try std.fmt.allocPrint(allocator, support.HEADER ++ "<spectrumList count='2' defaultDataProcessingRef='dp'>" ++
+            "<spectrum id='large' index='0' defaultArrayLength='0'>{s}</spectrum>" ++
+            "<spectrum id='small' index='1' defaultArrayLength='0'/></spectrumList></run></mzML>", .{children});
+        defer allocator.free(bytes);
+        var index = try mzml.IndexedReader.build(allocator, .{ .bytes = bytes }, .{
+            .policy = .rebuild,
+            .reader = .{ .limits = .{ .record_bytes = 384 } },
+        });
+        defer index.deinit();
+        try std.testing.expectEqual(@as(usize, 2), index.entries.items.len);
+        try std.testing.expectEqualStrings("large", index.entries.items[0].id);
+        try std.testing.expectEqualStrings("small", index.entries.items[1].id);
+        try std.testing.expectError(error.LimitExceeded, index.at(allocator, .spectrum, 0));
+        var small = (try index.at(allocator, .spectrum, 1)).?;
+        defer small.deinit();
+        try std.testing.expectEqualStrings("small", small.value.id);
+        try std.testing.expectEqual(@as(usize, 1), small.value.index);
+        try std.testing.expectEqual(@as(usize, 0), small.value.node.children.len);
+        try std.testing.expectError(error.LimitExceeded, support.readAll(allocator, bytes, .{ .limits = .{ .record_bytes = 384 } }));
+        try std.testing.expectError(error.LimitExceeded, mzml.IndexedReader.build(allocator, .{ .bytes = bytes }, .{
+            .policy = .rebuild,
+            .reader = .{ .limits = .{ .record_bytes = 0 } },
+        }));
+        try std.testing.expectError(error.LimitExceeded, mzml.IndexedReader.build(allocator, .{ .bytes = bytes }, .{
+            .policy = .rebuild,
+            .max_records = 1,
+        }));
+        if (case != 2) try std.testing.expectError(error.LimitExceeded, mzml.IndexedReader.build(allocator, .{ .bytes = bytes }, .{
+            .policy = .rebuild,
+            .reader = .{ .limits = .{ .attribute_bytes = 512 } },
+        }));
+        if (case == 2) {
+            for ([_]mzml.StreamReader.Limits{ .{ .nodes = 17 }, .{ .list_entries = 15 } }) |limits| {
+                try std.testing.expectError(error.LimitExceeded, mzml.IndexedReader.build(allocator, .{ .bytes = bytes }, .{
+                    .policy = .rebuild,
+                    .reader = .{ .limits = limits },
+                }));
+            }
+        }
+    }
+}
+
+test "[property] - [mzML index]: preserves parser checks and limits during rebuilding" {
     const Parse = struct {
         fn failure(bytes: []const u8, limits: mzml.StreamReader.Limits) ?anyerror {
             support.readAll(std.testing.allocator, bytes, .{ .payload = .skip, .limits = limits }) catch |err| return err;
@@ -855,7 +907,7 @@ test "[property] - [mzML index]: preserves record checks and byte limits during 
     };
     for ([_]usize{ 0, 1, 2, 3, 4, 8, 16, 32, 64, 256, 1024, 4096, 8192 }) |limit| {
         for ([_]mzml.StreamReader.Limits{
-            .{ .record_bytes = limit }, .{ .nodes = limit }, .{ .list_entries = limit },
+            .{ .nodes = limit }, .{ .list_entries = limit },
         }) |limits| try Parse.compare(support.DOCUMENT, limits);
     }
     for ([_][2][]const u8{
@@ -867,8 +919,7 @@ test "[property] - [mzML index]: preserves record checks and byte limits during 
         const bytes = try std.mem.replaceOwned(u8, std.testing.allocator, support.DOCUMENT, replacement[0], replacement[1]);
         defer std.testing.allocator.free(bytes);
         try std.testing.expect(Parse.failure(bytes, .{}) != null);
-        for ([_]usize{ 0, 512, 4096, 256 * 1024 * 1024 }) |limit|
-            try Parse.compare(bytes, .{ .record_bytes = limit });
+        try Parse.compare(bytes, .{});
     }
     for ([_][2][]const u8{
         .{ "<scanList count='1'>", "<scanList count='2'>" },

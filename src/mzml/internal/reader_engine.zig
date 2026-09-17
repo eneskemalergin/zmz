@@ -108,7 +108,6 @@ scope_count: usize = 0,
 list_scopes: [2]?Scope = .{ null, null },
 child_scratch: std.ArrayList(model.Node) = .empty,
 param_scratch: std.ArrayList(cv.Entry) = .empty,
-attribute_scratch: std.ArrayList(model.Attribute) = .empty,
 decoded_arrays: ?*DecodedArrays = null,
 fragment_ancestors: ?xml.Ancestors = null,
 
@@ -138,7 +137,6 @@ pub fn deinit(self: *StreamReader) void {
     self.cursor.deinit();
     self.child_scratch.deinit(self.allocator);
     self.param_scratch.deinit(self.allocator);
-    self.attribute_scratch.deinit(self.allocator);
     self.header_store.arena.deinit();
     self.record_store.arena.deinit();
     self.* = undefined;
@@ -496,7 +494,6 @@ fn parseNodeFor(self: *StreamReader, storage: *Storage, depth: usize, advance_af
     if (depth > self.options.limits.depth) return error.LimitExceeded;
     const kind_value = try self.kind();
     var node = try self.startNodeFor(storage, kind_value, retention != .none);
-    if (retention == .none) node.attributes = &.{};
     if (storage == &self.record_store and depth == 1) {
         if (self.decoded_arrays) |output| try output.startRecord(node);
     }
@@ -566,7 +563,7 @@ fn parseNodeFor(self: *StreamReader, storage: *Storage, depth: usize, advance_af
         self.current_kind = kind_value;
         if (retention == .tree) {
             node.children = try storage.copy(model.Node, self.child_scratch.items[children_start..]);
-        } else try storage.charge(model.Node, child_count);
+        }
     }
     const end = self.cursor.current orelse return error.UnexpectedEnd;
     node.end_offset = end.span.end;
@@ -628,7 +625,6 @@ fn parseParams(self: *StreamReader, storage: *Storage, allow_refs: bool, comptim
         try self.cursor.advance(false);
     }
     if (retain) return storage.copy(cv.Entry, entries.items);
-    try storage.charge(cv.Entry, count);
     return &.{};
 }
 
@@ -658,13 +654,10 @@ fn copyParamAttributes(storage: *Storage, start: xml.Start, selected: u2, compti
         (selected != 2 and result.value_type != null)) return error.UnknownAttribute;
     if (selected == 0 and (result.name != null or result.value != null or result.unit_cv_ref != null or
         result.unit_accession != null or result.unit_name != null)) return error.UnknownAttribute;
+    if (!retain) return result;
     var length: usize = 0;
     inline for (std.meta.fields(ParamAttributes)) |field| {
         if (@field(result, field.name)) |value| length = std.math.add(usize, length, value.len) catch return error.LimitExceeded;
-    }
-    if (!retain) {
-        try storage.charge(u8, length);
-        return result;
     }
     const bytes = try storage.alloc(u8, length);
     var position: usize = 0;
@@ -688,12 +681,11 @@ fn copyAttributes(
     comptime retain: bool,
 ) Error![]const model.Attribute {
     return switch (self.options.checks) {
-        inline else => |checks| self.copyAttributesFor(storage, start, required, optional, checks, retain),
+        inline else => |checks| copyAttributesFor(storage, start, required, optional, checks, retain),
     };
 }
 
 fn copyAttributesFor(
-    self: *StreamReader,
     storage: *Storage,
     start: xml.Start,
     required: []const u8,
@@ -716,20 +708,13 @@ fn copyAttributesFor(
                 return error.UnknownAttribute;
         } else if (checks == .checked and !schema.contains(required, name.local) and !schema.contains(optional, name.local))
             return error.UnknownAttribute;
-        attribute_count += 1;
-        byte_count = std.math.add(usize, byte_count, name.local.len) catch return error.LimitExceeded;
-        byte_count = std.math.add(usize, byte_count, attribute.value.len) catch return error.LimitExceeded;
-    }
-    if (!retain) {
-        try storage.charge(model.Attribute, attribute_count);
-        try storage.charge(u8, byte_count);
-        try self.attribute_scratch.resize(self.allocator, attribute_count);
-        for (start.attributes, self.attribute_scratch.items) |attribute, *result| {
-            const name = attribute.name.expanded.?;
-            result.* = .{ .name = name.local, .namespace_uri = name.namespace_uri, .value = attribute.value };
+        if (retain) {
+            attribute_count += 1;
+            byte_count = std.math.add(usize, byte_count, name.local.len) catch return error.LimitExceeded;
+            byte_count = std.math.add(usize, byte_count, attribute.value.len) catch return error.LimitExceeded;
         }
-        return self.attribute_scratch.items;
     }
+    if (!retain) return &.{};
     const result = try storage.alloc(model.Attribute, attribute_count);
     const bytes = try storage.alloc(u8, byte_count);
     var offset: usize = 0;
