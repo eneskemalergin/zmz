@@ -117,7 +117,7 @@ decoded_arrays: ?*DecodedArrays = null,
 fragment_ancestors: ?xml.Ancestors = null,
 
 pub const Scope = struct { start: u64, end: u64, name: []const u8 };
-pub const FragmentTarget = struct { kind: model.Kind, id: []const u8, index: usize };
+pub const FragmentTarget = struct { kind: model.Kind, id: []const u8 };
 
 /// Borrows input for the reader's lifetime. Input and initialized reader must not be copied.
 /// This allocates parser state but does not consume input. Release all owned storage with deinit.
@@ -246,9 +246,7 @@ pub fn readFragment(self: *StreamReader, allocator: std.mem.Allocator, input: *s
         if (kind_value != target.kind) return error.InvalidIndex;
         const start = self.cursor.current.?.data.start_element;
         const id = start.attributeRaw("id") orelse return error.MissingAttribute;
-        const index = try cv.parseInteger(usize, if (start.attributeRaw("index")) |attribute| attribute.value else null);
-        if (!std.mem.eql(u8, id.value, target.id) or index != target.index)
-            return error.InvalidIndex;
+        if (!std.mem.eql(u8, id.value, target.id)) return error.InvalidIndex;
     }
     if (kind_value != .spectrum and kind_value != .chromatogram) return error.InvalidStructure;
     var node = try self.parseNode(&self.record_store, 1, complete, self.options.payload);

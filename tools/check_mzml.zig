@@ -72,14 +72,18 @@ fn checkFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Totals
     const resolver = mzml.cv.Resolver.init(declarations);
     const count = index.entries.items.len;
     var totals: Totals = .{};
+    var ordinals = [_]usize{ 0, 0 };
     while (true) {
         const next = reader.nextRecord() catch |err| {
             reportReaderFailure(&reader, err);
             return err;
         };
         const record = next orelse break;
+        const k: usize = if (record.node.kind == .spectrum) 0 else 1;
+        const ordinal = ordinals[k];
+        ordinals[k] += 1;
         if (totals.records == 0 or totals.records == count / 2 or totals.records == count -| 1) {
-            var found = (try index.at(allocator, record.node.kind, record.index)) orelse return error.MissingIndexedRecord;
+            var found = (try index.at(allocator, record.node.kind, ordinal)) orelse return error.MissingIndexedRecord;
             defer found.deinit();
             if (!sameNode(record.node, found.value.node)) return error.IndexedRecordMismatch;
             totals.lookups += 1;

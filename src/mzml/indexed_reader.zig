@@ -40,7 +40,8 @@ pub const Options = struct {
     reader: PublicStreamReader.Options = .{},
 };
 
-/// Physical span and source identity, borrowed from this index. With open_embedded,
+/// Physical span and ID, borrowed from this index. Index is the zero-based lookup
+/// ordinal within the record kind, not the source record's index. With open_embedded,
 /// start may precede XML whitespace and end bounds the span at the next target or trailer.
 pub const Entry = struct { kind: model.Kind, id: []const u8, index: usize, start: u64, end: u64 };
 
@@ -115,12 +116,9 @@ pub fn build(allocator: std.mem.Allocator, source: Source, options: Options) Err
         try self.checkSource();
         return self;
     }
-    var ordinals = [_]usize{ 0, 0 };
     while (try reader_bridge.nextIndexRecord(&reader)) |record| {
         if (self.entries.items.len == options.max_records) return error.LimitExceeded;
         const k = kindIndex(record.node.kind);
-        if (record.index != ordinals[k]) return error.InvalidIndex;
-        ordinals[k] += 1;
         if (record.node.start_offset >= record.node.end_offset or record.node.end_offset > self.size)
             return error.InvalidIndex;
         if (self.contexts[k] == null) self.contexts[k] = try self.captureAncestors(&reader, k);
@@ -130,9 +128,9 @@ pub fn build(allocator: std.mem.Allocator, source: Source, options: Options) Err
         if (entry.found_existing) return error.DuplicateId;
         entry.key_ptr.* = self.entries.items.len;
         try self.entries.ensureUnusedCapacity(allocator, 1);
-        self.entries.appendAssumeCapacity(.{ .kind = record.node.kind, .id = id, .index = record.index, .start = record.node.start_offset, .end = record.node.end_offset });
+        self.entries.appendAssumeCapacity(.{ .kind = record.node.kind, .id = id, .index = self.counts[k], .start = record.node.start_offset, .end = record.node.end_offset });
+        self.counts[k] += 1;
     }
-    self.counts = ordinals;
     self.metadata = try owned.Header.init(allocator, source_header.*, .{ .bytes = options.reader.limits.header_bytes });
     try self.checkSource();
     return self;
@@ -229,7 +227,7 @@ fn readEntry(self: *IndexedReader, allocator: std.mem.Allocator, entry: Entry, o
         self.lookup_reader = try StreamReader.init(self.allocator, &empty_input, self.options.reader);
         reader_bridge.resetFragmentParser(&self.lookup_reader.?);
     }
-    var record = reader_bridge.readFragment(&self.lookup_reader.?, allocator, &input.interface, context.ancestors, entry.start, context.prefix.len, self.options.policy != .open_embedded, self.header().groups, output, reuse_ancestors, .{ .kind = entry.kind, .id = entry.id, .index = entry.index }) catch |err| return input.originalError(err);
+    var record = reader_bridge.readFragment(&self.lookup_reader.?, allocator, &input.interface, context.ancestors, entry.start, context.prefix.len, self.options.policy != .open_embedded, self.header().groups, output, reuse_ancestors, .{ .kind = entry.kind, .id = entry.id }) catch |err| return input.originalError(err);
     errdefer record.deinit();
     if (record.value.node.end_offset > entry.end or
         (self.options.policy == .rebuild and
