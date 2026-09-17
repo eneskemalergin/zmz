@@ -61,9 +61,9 @@ pub const ArraySelector = struct {
 
 /// Checked is the default. Minimal preserves valid mzML metadata but skips namespace resolution,
 /// and nested child cardinalities/order.
-/// XML parsing, required attributes, envelope order, and resource limits remain.
+/// XML parsing, attributes needed for returned fields, envelope order, and resource limits remain.
 /// In minimal mode, a prefixed schemaLocation is treated as XSI without resolving its prefix;
-/// other prefixed attributes fail. Unrecognized unprefixed node attributes remain retained.
+/// other prefixed attributes fail. Unqualified node attributes remain retained in both modes.
 pub const Checks = enum { checked, minimal };
 
 pub const Options = struct {
@@ -371,7 +371,7 @@ fn readHeaderInner(self: *StreamReader) Error!void {
     const group_nodes = if (group_list) |list| list.children else &.{};
     const groups = try self.header_store.alloc(cv.Group, group_nodes.len);
     for (group_nodes, groups) |node, *group| {
-        group.* = .{ .id = node.attribute("id").?, .entries = node.params };
+        group.* = .{ .id = node.attribute("id") orelse return error.MissingAttribute, .entries = node.params };
     }
     self.header = .{ .document = document, .run = run, .groups = groups, .indexed = indexed };
     self.header_ready = true;
@@ -474,8 +474,13 @@ fn startNodeFor(self: *StreamReader, storage: *Storage, kind_value: model.Kind, 
     const attributes = try self.copyAttributes(
         storage,
         event.data.start_element,
-        schema.requiredAttributes(kind_value),
-        schema.optionalAttributes(kind_value),
+        switch (kind_value) {
+            .mzml => "version",
+            .referenceable_param_group => "id",
+            .spectrum, .chromatogram => "id index defaultArrayLength",
+            .spectrum_list, .chromatogram_list => "count",
+            else => "",
+        },
         retain,
     );
     return .{
@@ -670,11 +675,10 @@ fn copyAttributes(
     storage: *Storage,
     start: xml.Start,
     required: []const u8,
-    optional: []const u8,
     comptime retain: bool,
 ) Error![]const model.Attribute {
     return switch (self.options.checks) {
-        inline else => |checks| copyAttributesFor(storage, start, required, optional, checks, retain),
+        inline else => |checks| copyAttributesFor(storage, start, required, checks, retain),
     };
 }
 
@@ -682,13 +686,11 @@ fn copyAttributesFor(
     storage: *Storage,
     start: xml.Start,
     required: []const u8,
-    optional: []const u8,
     comptime checks: Checks,
     comptime retain: bool,
 ) Error![]const model.Attribute {
     var names = std.mem.tokenizeScalar(u8, required, ' ');
     while (names.next()) |name| {
-        if (std.mem.eql(u8, name, "encodedLength")) continue;
         const attribute = if (checks == .checked) start.attribute(null, name) else start.attributeRaw(name);
         if (attribute == null) return error.MissingAttribute;
     }
@@ -699,8 +701,7 @@ fn copyAttributesFor(
         if (name.namespace_uri) |uri| {
             if (!std.mem.eql(u8, uri, xml.XSI) or !std.mem.eql(u8, name.local, "schemaLocation"))
                 return error.UnknownAttribute;
-        } else if (checks == .checked and !schema.contains(required, name.local) and !schema.contains(optional, name.local))
-            return error.UnknownAttribute;
+        }
         if (retain) {
             attribute_count += 1;
             byte_count = std.math.add(usize, byte_count, name.local.len) catch return error.LimitExceeded;

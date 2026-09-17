@@ -590,6 +590,71 @@ test "[integration] - [mzML reader]: reuses storage across growing and shrinking
     try compareDecoded(source.written(), 7);
 }
 
+test "[integration] - [mzML attributes]: preserves extras without requiring unused fields" {
+    const source = "<mzML xmlns='http://psi.hupo.org/ms/mzml' version='1.1.0' extra='document'>" ++
+        "<cvList><cv/></cvList><fileDescription><fileContent/><sourceFileList><sourceFile/></sourceFileList></fileDescription>" ++
+        "<referenceableParamGroupList><referenceableParamGroup id='encoding'>" ++
+        "<cvParam accession='MS:1000523'/><cvParam accession='MS:1000576'/></referenceableParamGroup></referenceableParamGroupList>" ++
+        "<sampleList><sample/></sampleList><softwareList><software/></softwareList>" ++
+        "<scanSettingsList><scanSettings><sourceFileRefList><sourceFileRef/></sourceFileRefList><targetList><target/></targetList></scanSettings></scanSettingsList>" ++
+        "<instrumentConfigurationList><instrumentConfiguration><componentList><source/><analyzer/><detector/></componentList><softwareRef/></instrumentConfiguration></instrumentConfigurationList>" ++
+        "<dataProcessingList><dataProcessing><processingMethod/></dataProcessing></dataProcessingList>" ++
+        "<run extra='run'><spectrumList count='1'><spectrum id='x' index='0' defaultArrayLength='1' extra='record'>" ++
+        "<scanList extra='scans'><scan/></scanList>" ++ support.ARRAYS ++ "</spectrum></spectrumList></run></mzML>";
+    for (std.enums.values(mzml.StreamReader.Checks)) |checks| {
+        var input = std.Io.Reader.fixed(source);
+        var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{ .checks = checks });
+        defer reader.deinit();
+        const header = try reader.readHeader();
+        try std.testing.expectEqualStrings("document", header.document.attribute("extra").?);
+        try std.testing.expectEqualStrings("run", header.run.attribute("extra").?);
+        try std.testing.expectEqual(null, header.run.attribute("id"));
+        const cv_list = header.document.child(.cv_list).?;
+        try std.testing.expectEqual(null, try cv_list.declaredCount());
+        try std.testing.expectEqual(@as(usize, 0), cv_list.children[0].attributes.len);
+        const record = (try reader.nextRecord()).?;
+        try std.testing.expectEqualStrings("record", record.node.attribute("extra").?);
+        try std.testing.expectEqualStrings("scans", record.node.child(.scan_list).?.attribute("extra").?);
+        try std.testing.expectEqual(null, try record.node.child(.scan_list).?.declaredCount());
+        try std.testing.expectEqual(@as(usize, 2), record.binaryArrays().len);
+        try std.testing.expectEqual(null, try reader.nextRecord());
+    }
+    try compareDecoded(source, 1);
+    var index = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = source }, .{ .policy = .rebuild });
+    defer index.deinit();
+    var output = mzml.StreamReader.DecodedArrays.init(std.testing.allocator, .{});
+    defer output.deinit();
+    var record = (try index.atDecoded(std.testing.allocator, .spectrum, 0, &output)).?;
+    defer record.deinit();
+    try std.testing.expectEqualStrings("record", record.value.node.attribute("extra").?);
+    try std.testing.expectEqualStrings("scans", record.value.node.child(.scan_list).?.attribute("extra").?);
+    try std.testing.expectEqual(@as(usize, 2), output.len());
+    for (0..output.len()) |i| try std.testing.expectEqualSlices(f64, &.{1}, output.get(i).?.values.float64);
+}
+
+test "[failure] - [mzML attributes]: missing returned fields fail before reading their body" {
+    for ([_][]const u8{
+        "version='1.1.0'", "id='encoding'", "id='native=a&amp;b'", "index='0'", "defaultArrayLength='1'",
+    }) |attribute| {
+        const removed = try std.mem.replaceOwned(u8, std.testing.allocator, support.DOCUMENT, attribute, "");
+        defer std.testing.allocator.free(removed);
+        const source = try std.mem.replaceOwned(u8, std.testing.allocator, removed, "<binary>AAAA", "<binary>&missing;AAA");
+        defer std.testing.allocator.free(source);
+        for (std.enums.values(mzml.StreamReader.Checks)) |checks| {
+            try std.testing.expectError(error.MissingAttribute, support.readAll(std.testing.allocator, source, .{ .checks = checks }));
+        }
+        try std.testing.expectError(error.MissingAttribute, readDecoded(std.testing.allocator, source, .{}));
+        try std.testing.expectError(error.MissingAttribute, mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = source }, .{ .policy = .rebuild }));
+    }
+    const missing_count = support.HEADER ++ "<spectrumList><broken";
+    try std.testing.expectError(error.MissingAttribute, support.readAll(std.testing.allocator, missing_count, .{}));
+    const unexpected_start = try std.mem.replaceOwned(u8, std.testing.allocator, support.DOCUMENT, "<referenceableParamGroup id='encoding'>", "<sourceFile>");
+    defer std.testing.allocator.free(unexpected_start);
+    const unexpected_group = try std.mem.replaceOwned(u8, std.testing.allocator, unexpected_start, "</referenceableParamGroup>", "</sourceFile>");
+    defer std.testing.allocator.free(unexpected_group);
+    try std.testing.expectError(error.MissingAttribute, support.readAll(std.testing.allocator, unexpected_group, .{ .checks = .minimal }));
+}
+
 test "[integration] - [mzML numeric attributes]: reads source text and checks numbers when used" {
     const cases = .{
         .{ "word", error.InvalidValue },
@@ -816,7 +881,6 @@ test "[integration] - [mzML minimal checks]: distinguishes omitted checks from r
     const omitted = .{
         .{ "http://psi.hupo.org/ms/mzml", "urn:unchecked", error.WrongNamespace },
         .{ "<activation/>", "", error.InvalidStructure },
-        .{ "index='0'", "index='0' extra='source'", error.UnknownAttribute },
     };
     inline for (omitted) |case| {
         const source = try std.mem.replaceOwned(u8, std.testing.allocator, support.DOCUMENT, case[0], case[1]);
@@ -847,13 +911,6 @@ test "[integration] - [mzML minimal checks]: distinguishes omitted checks from r
             try std.testing.expectError(case[2], support.readAll(std.testing.allocator, source, .{ .checks = checks }));
         }
     }
-    const extra = try std.mem.replaceOwned(u8, std.testing.allocator, support.DOCUMENT, "index='0'", "index='0' extra='source'");
-    defer std.testing.allocator.free(extra);
-    var extra_input = std.Io.Reader.fixed(extra);
-    var reader = try mzml.StreamReader.init(std.testing.allocator, &extra_input, .{ .checks = .minimal });
-    defer reader.deinit();
-    try std.testing.expectEqualStrings("source", (try reader.nextRecord()).?.node.attribute("extra").?);
-
     const invalid_payload = try std.mem.replaceOwned(u8, std.testing.allocator, support.DOCUMENT, "<binary>AAAA", "<binary>!AAA");
     defer std.testing.allocator.free(invalid_payload);
     var invalid_input = std.Io.Reader.fixed(invalid_payload);

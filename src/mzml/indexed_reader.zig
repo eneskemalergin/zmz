@@ -14,7 +14,6 @@ const PublicStreamReader = @import("stream_reader.zig").StreamReader;
 const DecodedArrays = PublicStreamReader.DecodedArrays;
 const StreamReader = reader_bridge.Reader;
 const xml = @import("../xml/mzml_adapter.zig");
-const schema = @import("schema.zig");
 
 const IndexedReader = @This();
 
@@ -390,15 +389,15 @@ fn readEmbeddedEntries(self: *IndexedReader, input: *std.Io.Reader, index_start:
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(self.allocator);
     try cursor.advance(false);
-    _ = try indexStart(&cursor, .indexed_mzml, false);
+    _ = try indexStart(&cursor, .indexed_mzml);
     try cursor.advance(false);
-    _ = try indexStart(&cursor, .index_list, true);
+    _ = try indexStart(&cursor, .index_list);
     var seen = [_]bool{ false, false };
     var indexes: usize = 0;
     try cursor.advance(false);
     while ((cursor.current orelse return error.UnexpectedEnd).data == .start_element) {
-        const index = try indexStart(&cursor, .index, true);
-        const name = index.attribute(null, "name").?.value;
+        const index = try indexStart(&cursor, .index);
+        const name = (index.attribute(null, "name") orelse return error.MissingAttribute).value;
         const kind: model.Kind = if (std.mem.eql(u8, name, "spectrum")) .spectrum else if (std.mem.eql(u8, name, "chromatogram")) .chromatogram else return error.InvalidIndex;
         const k = kindIndex(kind);
         if (seen[k]) return error.InvalidIndex;
@@ -407,10 +406,11 @@ fn readEmbeddedEntries(self: *IndexedReader, input: *std.Io.Reader, index_start:
         var previous: u64 = 0;
         try cursor.advance(false);
         while ((cursor.current orelse return error.UnexpectedEnd).data == .start_element) {
-            const offset = try indexStart(&cursor, .offset, true);
+            const offset = try indexStart(&cursor, .offset);
+            const id_ref = (offset.attribute(null, "idRef") orelse return error.MissingAttribute).value;
             if (self.entries.items.len == self.options.max_records) return error.LimitExceeded;
             try self.charge(@sizeOf(Entry) + @sizeOf(usize) * 4);
-            const id = try self.copy(offset.attribute(null, "idRef").?.value);
+            const id = try self.copy(id_ref);
             const target = try cv.parseInteger(u64, try self.indexText(&cursor, &text, .offset));
             if (target <= previous or target >= index_start or target < minimum or
                 (endian != null and target % 2 != 0) or target > std.math.maxInt(i64)) return error.InvalidIndex;
@@ -425,9 +425,9 @@ fn readEmbeddedEntries(self: *IndexedReader, input: *std.Io.Reader, index_start:
     }
     if (indexes == 0) return error.InvalidStructure;
     try indexEnd(&cursor, .index_list);
-    _ = try indexStart(&cursor, .index_list_offset, true);
+    _ = try indexStart(&cursor, .index_list_offset);
     if (try cv.parseInteger(u64, try self.indexText(&cursor, &text, .index_list_offset)) != index_start) return error.InvalidIndex;
-    _ = try indexStart(&cursor, .file_checksum, true);
+    _ = try indexStart(&cursor, .file_checksum);
     _ = try self.indexText(&cursor, &text, .file_checksum);
     try indexEnd(&cursor, .indexed_mzml);
     if (cursor.current != null) return error.InvalidStructure;
@@ -442,23 +442,10 @@ fn readEmbeddedEntries(self: *IndexedReader, input: *std.Io.Reader, index_start:
     }
 }
 
-fn indexStart(cursor: *const xml.Cursor, kind: model.Kind, attributes: bool) Error!xml.Start {
+fn indexStart(cursor: *const xml.Cursor, kind: model.Kind) Error!xml.Start {
     const event = cursor.current orelse return error.UnexpectedEnd;
     if (event.data != .start_element or !event.data.start_element.name.eql(xml.NAMESPACE, kind.xmlName())) return error.InvalidStructure;
-    const start = event.data.start_element;
-    if (attributes) {
-        const required = schema.requiredAttributes(kind);
-        const optional = schema.optionalAttributes(kind);
-        var names = std.mem.tokenizeScalar(u8, required, ' ');
-        while (names.next()) |name| if (start.attribute(null, name) == null) return error.MissingAttribute;
-        for (start.attributes) |attribute| {
-            const name = attribute.name.expanded.?;
-            if (name.namespace_uri) |uri| {
-                if (!std.mem.eql(u8, uri, xml.XSI) or !std.mem.eql(u8, name.local, "schemaLocation")) return error.UnknownAttribute;
-            } else if (!schema.contains(required, name.local) and !schema.contains(optional, name.local)) return error.UnknownAttribute;
-        }
-    }
-    return start;
+    return event.data.start_element;
 }
 
 fn indexEnd(cursor: *xml.Cursor, kind: model.Kind) Error!void {

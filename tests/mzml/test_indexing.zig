@@ -198,6 +198,28 @@ test "[integration] - [mzML index]: traverses entries without trusting declared 
     }
 }
 
+test "[integration] - [mzML index]: reads trailer fields used for lookup" {
+    const allocator = std.testing.allocator;
+    const bytes = try allocator.dupe(u8, @embedFile("data/writer_indexed.mzML"));
+    defer allocator.free(bytes);
+    const count = std.mem.indexOf(u8, bytes, "<indexList count=\"2\">").? + "<indexList ".len;
+    @memset(bytes[count..][0.."count=\"2\"".len], ' ');
+    {
+        var index = try mzml.IndexedReader.build(allocator, .{ .bytes = bytes }, .{});
+        defer index.deinit();
+        try std.testing.expectEqual(@as(usize, 16), index.entries.items.len);
+        var record = (try index.at(allocator, .spectrum, 0)).?;
+        defer record.deinit();
+        try std.testing.expectEqualStrings("scan=none", record.value.id);
+    }
+    for ([_][]const u8{ "name=\"spectrum\"", "idRef=\"scan=none\"" }) |attribute| {
+        const offset = std.mem.indexOf(u8, bytes[count..], attribute).? + count;
+        @memset(bytes[offset..][0..attribute.len], ' ');
+        try std.testing.expectError(error.MissingAttribute, mzml.IndexedReader.build(allocator, .{ .bytes = bytes }, .{}));
+        @memcpy(bytes[offset..][0..attribute.len], attribute);
+    }
+}
+
 test "[failure] - [mzML indexed decoding]: clears results and recovers after decode and target failures" {
     const Selection = struct {
         fn select(_: ?*anyopaque, _: usize, _: []const mzml.model.Attribute, _: []const mzml.cv.Entry) mzml.StreamReader.Payload {
