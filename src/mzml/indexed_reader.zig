@@ -71,6 +71,7 @@ metadata: ?owned.Header = null,
 contexts: [2]?FragmentAncestors = .{ null, null },
 counts: [2]usize = .{ 0, 0 },
 lookup_reader: ?StreamReader = null,
+lookup_kind: ?model.Kind = null,
 
 /// Builds an index under the selected policy, retaining metadata but not payloads.
 /// verify_embedded checks every target, complete coverage, indexListOffset, and SHA-1.
@@ -229,13 +230,15 @@ fn readEntry(self: *IndexedReader, allocator: std.mem.Allocator, entry: Entry, o
     const prefix_end = std.math.add(usize, context.prefix.len, length) catch return error.LimitExceeded;
     const total = std.math.add(usize, prefix_end, context.suffix.len) catch return error.LimitExceeded;
     var buffer: [64 * 1024]u8 = undefined;
-    var input = FragmentInput.init(self, context.prefix, entry.start, length, context.suffix, buffer[0..@max(4, @min(buffer.len, total))]);
+    const reuse_ancestors = self.lookup_kind == entry.kind;
+    self.lookup_kind = null;
+    var input = FragmentInput.init(self, if (reuse_ancestors) &.{} else context.prefix, entry.start, length, context.suffix, buffer[0..@max(4, @min(buffer.len, total))]);
     if (self.lookup_reader == null) {
         var empty_input = std.Io.Reader.fixed(&.{});
         self.lookup_reader = try StreamReader.init(self.allocator, &empty_input, self.options.reader);
         reader_bridge.resetFragmentParser(&self.lookup_reader.?);
     }
-    var record = reader_bridge.readFragment(&self.lookup_reader.?, allocator, &input.interface, context.ancestors, entry.start, context.prefix.len, self.options.policy != .open_embedded, self.header().groups, output) catch |err| {
+    var record = reader_bridge.readFragment(&self.lookup_reader.?, allocator, &input.interface, context.ancestors, entry.start, context.prefix.len, self.options.policy != .open_embedded, self.header().groups, output, reuse_ancestors) catch |err| {
         try input.finishSpan();
         return err;
     };
@@ -246,6 +249,7 @@ fn readEntry(self: *IndexedReader, allocator: std.mem.Allocator, entry: Entry, o
         record.value.node.end_offset > entry.end or
         (self.options.policy != .open_embedded and record.value.node.end_offset != entry.end)) return error.InvalidIndex;
     try self.checkSource();
+    self.lookup_kind = entry.kind;
     return record;
 }
 

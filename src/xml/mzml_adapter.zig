@@ -454,6 +454,16 @@ const Frame = struct {
     opening_end: u64,
 };
 
+pub const Ancestors = struct {
+    depth: usize,
+    names: usize,
+    namespace_bytes: usize,
+    bindings: usize,
+    encoding: Encoding,
+    version: XmlVersion,
+    pending_empty: bool,
+};
+
 /// Bounded streaming XML cursor for the mzML reader and indexed fragments.
 pub const Cursor = struct {
     allocator: std.mem.Allocator,
@@ -524,16 +534,52 @@ pub const Cursor = struct {
     /// Reuses the cursor with a new input stream and clears parser state.
     pub fn reset(self: *Cursor, input: *std.Io.Reader) Error!void {
         self.source.reset(input);
-        self.resetState();
+        self.resetState(false);
     }
 
     /// Clears the input reference and parser state after fragment use.
     pub fn resetEmpty(self: *Cursor) void {
         self.source.resetEmpty();
-        self.resetState();
+        self.resetState(false);
     }
 
-    fn resetState(self: *Cursor) void {
+    pub fn detachFragment(self: *Cursor) void {
+        self.source.resetEmpty();
+        self.resetState(true);
+    }
+
+    pub fn ancestors(self: *const Cursor) Ancestors {
+        return .{
+            .depth = self.depth,
+            .names = self.open_names.items.len,
+            .namespace_bytes = self.namespace_bytes.items.len,
+            .bindings = self.namespace_bindings.items.len,
+            .encoding = self.source.encoding,
+            .version = self.effective_version,
+            .pending_empty = self.pending_empty,
+        };
+    }
+
+    /// Restores ancestor storage left intact by a successful fragment read.
+    /// A failed read or a different prefix requires parsing those ancestors again.
+    pub fn resetToAncestors(self: *Cursor, input: *std.Io.Reader, saved: Ancestors, prefix_length: usize) Error!void {
+        self.source.reset(input);
+        self.resetState(true);
+        self.source.detected = true;
+        self.source.encoding = saved.encoding;
+        self.source.position = prefix_length;
+        self.offset = prefix_length;
+        self.document_started = true;
+        self.root_seen = true;
+        self.depth = saved.depth;
+        self.open_names.items = self.open_names.allocatedSlice()[0..saved.names];
+        self.namespace_bytes.items = self.namespace_bytes.allocatedSlice()[0..saved.namespace_bytes];
+        self.namespace_bindings.items = self.namespace_bindings.allocatedSlice()[0..saved.bindings];
+        self.effective_version = saved.version;
+        self.pending_empty = saved.pending_empty;
+    }
+
+    fn resetState(self: *Cursor, keep_ancestors: bool) void {
         self.current = null;
         self.offset = 0;
         self.document_started = false;
@@ -552,9 +598,12 @@ pub const Cursor = struct {
         self.attribute_ranges.clearRetainingCapacity();
         self.namespace_declarations.clearRetainingCapacity();
         self.attributes.clearRetainingCapacity();
-        self.open_names.clearRetainingCapacity();
-        self.namespace_bytes.clearRetainingCapacity();
-        self.namespace_bindings.clearRetainingCapacity();
+        // Successful fragments leave their ancestor prefixes initialized for reuse.
+        if (!keep_ancestors) {
+            self.open_names.clearRetainingCapacity();
+            self.namespace_bytes.clearRetainingCapacity();
+            self.namespace_bindings.clearRetainingCapacity();
+        }
     }
 
     /// Advances to the next significant event, optionally returning text.

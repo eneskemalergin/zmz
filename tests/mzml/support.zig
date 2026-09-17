@@ -224,10 +224,12 @@ pub fn checkLookupAllocator(record_allocator: std.mem.Allocator) !void {
         defer index.deinit();
         var first = (try index.at(std.testing.allocator, .spectrum, 0)).?;
         errdefer first.deinit();
+        var warm = (try index.at(std.testing.allocator, .chromatogram, 0)).?;
+        warm.deinit();
         var last = (index.at(record_allocator, .chromatogram, 7) catch |err| {
-            var recovered = (try index.at(std.testing.allocator, .spectrum, 1)).?;
+            var recovered = (try index.at(std.testing.allocator, .chromatogram, 1)).?;
             defer recovered.deinit();
-            try std.testing.expectEqualStrings("scan=zlib", recovered.value.id);
+            try std.testing.expectEqualStrings("chromatogram=zlib", recovered.value.id);
             try std.testing.expectEqualStrings("scan=none", first.value.id);
             return err;
         }).?;

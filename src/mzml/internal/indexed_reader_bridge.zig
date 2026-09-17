@@ -28,6 +28,7 @@ pub fn readFragment(
     complete: bool,
     groups: []const cv.Group,
     output: ?*DecodedArrays,
+    reuse_ancestors: bool,
 ) Reader.Error!owned.Record {
     reader.header.groups = groups;
     reader.decoded_arrays = output;
@@ -35,7 +36,7 @@ pub fn readFragment(
         reader.header.groups = &.{};
         reader.decoded_arrays = null;
     }
-    return reader.readFragment(allocator, input, ancestors, physical_start, prefix_length, complete);
+    return reader.readFragment(allocator, input, ancestors, physical_start, prefix_length, complete, reuse_ancestors);
 }
 
 pub fn parseFooter(

@@ -116,6 +116,7 @@ param_scratch: std.ArrayList(cv.Entry) = .empty,
 attribute_scratch: std.ArrayList(model.Attribute) = .empty,
 decoded_arrays: ?*DecodedArrays = null,
 index_visitor: ?IndexVisitor = null,
+fragment_ancestors: ?xml.Ancestors = null,
 
 pub const Scope = struct { start: u64, end: u64, name: []const u8 };
 
@@ -219,15 +220,21 @@ pub fn parseFragment(
     var input = std.Io.Reader.fixed(bytes);
     var reader = try init(allocator, &input, options);
     defer reader.deinit();
-    return reader.readFragment(allocator, &input, ancestors, physical_start, prefix_length, true);
+    return reader.readFragment(allocator, &input, ancestors, physical_start, prefix_length, true, false);
 }
 
 /// Internal reusable fragment reader. Returned records use the requested allocator;
 /// parser and list scratch remain owned by this reader. No source bytes remain borrowed.
-pub fn readFragment(self: *StreamReader, allocator: std.mem.Allocator, input: *std.Io.Reader, ancestors: usize, physical_start: u64, prefix_length: usize, complete: bool) Error!owned.Record {
+pub fn readFragment(self: *StreamReader, allocator: std.mem.Allocator, input: *std.Io.Reader, ancestors: usize, physical_start: u64, prefix_length: usize, complete: bool, reuse_ancestors: bool) Error!owned.Record {
     if (self.header_ready or ancestors > 4 or physical_start < prefix_length) return error.InvalidOptions;
-    try self.cursor.reset(input);
-    defer self.cursor.resetEmpty();
+    errdefer self.fragment_ancestors = null;
+    if (reuse_ancestors) {
+        try self.cursor.resetToAncestors(input, self.fragment_ancestors.?, prefix_length);
+    } else {
+        self.fragment_ancestors = null;
+        try self.cursor.reset(input);
+    }
+    defer self.cursor.detachFragment();
     self.record_store.arena.deinit();
     self.record_store = Storage.init(allocator, self.options.limits.record_bytes);
     defer {
@@ -235,9 +242,10 @@ pub fn readFragment(self: *StreamReader, allocator: std.mem.Allocator, input: *s
         self.record_store = Storage.init(self.allocator, self.options.limits.record_bytes);
     }
     try self.cursor.advance(false);
-    for (0..ancestors) |_| {
+    for (0..if (reuse_ancestors) 0 else ancestors) |i| {
         if ((self.cursor.current orelse return error.UnexpectedEnd).data != .start_element)
             return error.InvalidStructure;
+        if (i + 1 == ancestors) self.fragment_ancestors = self.cursor.ancestors();
         try self.cursor.advance(false);
     }
     const kind_value = try self.kind();

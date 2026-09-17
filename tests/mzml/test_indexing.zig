@@ -290,19 +290,36 @@ test "[integration] - [mzML indexed selection]: selects only fetched arrays and 
     try std.testing.expectEqual(null, next.value.binaryArrays()[1].child(.binary).?.text);
 }
 
-test "[integration] - [mzML index]: retains inherited namespaces and UTF-16 physical spans" {
-    const prefixed = support.HEADER ++ "<spectrumList xmlns:p='http://psi.hupo.org/ms/mzml' count='1' defaultDataProcessingRef='dp'>" ++
-        "<p:spectrum id='scan=1' index='0' defaultArrayLength='0'/>" ++ "</spectrumList></run></mzML>";
+test "[integration] - [mzML index]: restores inherited namespaces across repeated encoded lookups" {
+    const prefixed = support.HEADER ++
+        "<spectrumList xmlns:p='http://psi.hupo.org/ms/mzml' xmlns:q='http://www.w3.org/2001/XMLSchema-instance' count='2' defaultDataProcessingRef='dp'>" ++
+        "<p:spectrum xmlns:q='urn:shadow' xmlns:unused='" ++ "x" ** 512 ++ "' id='scan=1' index='0' defaultArrayLength='0'><p:userParam name='note' value='one'/></p:spectrum>" ++
+        "<p:spectrum q:schemaLocation='restored' id='scan=2' index='1' defaultArrayLength='0'/></spectrumList>" ++
+        "<chromatogramList xmlns:p='http://psi.hupo.org/ms/mzml' xmlns:q='http://www.w3.org/2001/XMLSchema-instance' count='1' defaultDataProcessingRef='dp'>" ++
+        "<p:chromatogram q:schemaLocation='chromatogram' id='tic' index='0' defaultArrayLength='1'>" ++ support.ARRAYS ++ "</p:chromatogram></chromatogramList></run></mzML>";
     var bytes: [prefixed.len * 2 + 2]u8 = undefined;
-    inline for (.{ std.builtin.Endian.little, std.builtin.Endian.big }) |endian| {
-        std.mem.writeInt(u16, bytes[0..2], 0xfeff, endian);
-        for (prefixed, 0..) |byte, i| std.mem.writeInt(u16, bytes[2 + i * 2 ..][0..2], byte, endian);
-        var index = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = &bytes }, .{ .policy = .rebuild });
-        defer index.deinit();
-        var record = (try index.byId(std.testing.allocator, "scan=1")).?;
-        defer record.deinit();
-        try std.testing.expectEqual(@as(u64, 2 + 2 * std.mem.indexOf(u8, prefixed, "<p:spectrum ").?), record.value.node.start_offset);
-        try std.testing.expectEqualStrings("scan=1", record.value.id);
+    for ([_]?std.builtin.Endian{ null, .little, .big }) |encoding| {
+        const encoded = if (encoding) |endian| blk: {
+            std.mem.writeInt(u16, bytes[0..2], 0xfeff, endian);
+            for (prefixed, 0..) |byte, i| std.mem.writeInt(u16, bytes[2 + i * 2 ..][0..2], byte, endian);
+            break :blk bytes[0..];
+        } else prefixed;
+        for (std.enums.values(mzml.StreamReader.Checks)) |checks| {
+            var index = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = encoded }, .{ .policy = .rebuild, .reader = .{ .checks = checks } });
+            defer index.deinit();
+            for ([_]usize{ 0, 1, 0, 2, 2, 1, 1 }) |position| {
+                var input = std.Io.Reader.fixed(encoded);
+                var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{ .checks = checks });
+                defer reader.deinit();
+                for (0..position) |_| _ = try reader.nextRecord();
+                const expected = (try reader.nextRecord()).?;
+                var record = (try index.byId(std.testing.allocator, expected.id)).?;
+                defer record.deinit();
+                try std.testing.expectEqualDeep(expected, record.value);
+                const first_offset = std.mem.indexOf(u8, prefixed, "<p:spectrum ").?;
+                if (position == 0) try std.testing.expectEqual(@as(u64, if (encoding != null) 2 + 2 * first_offset else first_offset), record.value.node.start_offset);
+            }
+        }
     }
 }
 
@@ -377,10 +394,15 @@ test "[regression] - [mzML indexed lookup]: reads a later target after a malform
     bytes[end + "</spectrum>".len - 2] = 'x';
     var index = try mzml.IndexedReader.build(allocator, .{ .bytes = bytes }, .{ .policy = .open_embedded });
     defer index.deinit();
+    var retained = (try index.at(allocator, .spectrum, 1)).?;
+    defer retained.deinit();
     try std.testing.expectError(error.InvalidXml, index.at(allocator, .spectrum, 0));
-    var valid = (try index.at(allocator, .spectrum, 1)).?;
-    defer valid.deinit();
-    try std.testing.expectEqualStrings("scan=zlib", valid.value.id);
+    for (0..2) |_| {
+        var valid = (try index.at(allocator, .spectrum, 1)).?;
+        defer valid.deinit();
+        try std.testing.expectEqualDeep(retained.value, valid.value);
+        try std.testing.expectEqualStrings("scan=zlib", valid.value.id);
+    }
 }
 
 test "[integration] - [mzML index]: opens embedded targets without claiming full verification" {
