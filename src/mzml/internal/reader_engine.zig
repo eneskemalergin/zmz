@@ -124,6 +124,7 @@ pub const IndexVisitor = struct {
     user_data: *anyopaque,
     index_start: u64 = 0,
     visit: *const fn (*anyopaque, u64, model.Node) void,
+    limits: Limits,
 };
 
 /// Borrows input for the reader's lifetime. Input and initialized reader must not be copied.
@@ -440,8 +441,14 @@ fn nextRecordInner(self: *StreamReader, comptime retention: Retention) Error!?mo
     try self.consumeEnd(.run, true);
     try self.consumeEnd(.mzml, true);
     if (self.header.indexed) {
-        if (self.index_visitor) |*visitor|
+        if (self.index_visitor) |*visitor| {
             visitor.index_start = (self.cursor.current orelse return error.UnexpectedEnd).span.start;
+            // Trailer nodes share the header arena but consume the separate index budget.
+            self.options.limits = visitor.limits;
+            self.header_store.limit = visitor.limits.header_bytes;
+            self.header_store.used = 0;
+            self.header_store.nodes = 0;
+        }
         inline for (.{ model.Kind.index_list, .index_list_offset, .file_checksum }, 0..) |expected, i| {
             if (try self.kind() != expected) return error.InvalidStructure;
             if (self.options.retain_index) {
@@ -639,7 +646,7 @@ fn parseIndexOffsets(self: *StreamReader, storage: *Storage, depth: usize, node:
     self.current_kind = .index;
     storage.used = offsets.used;
     storage.nodes = offsets.nodes;
-    // Verification keeps the retained-tree byte limit and its original failure point.
+    // Discarded offset nodes still count toward the trailer byte budget.
     try storage.charge(model.Node, count);
 }
 

@@ -28,7 +28,7 @@ pub const Source = union(enum) {
 /// and each fetched target, but does not check unread records or hash the document.
 pub const Policy = enum { rebuild, verify_embedded, open_embedded };
 
-/// Bounds index storage separately from parser and returned record storage.
+/// Bounds index storage and trailer parsing separately from header and record storage.
 pub const Options = struct {
     policy: Policy = .verify_embedded,
     max_records: usize = 1_000_000,
@@ -114,7 +114,7 @@ pub fn build(allocator: std.mem.Allocator, source: Source, options: Options) Err
     defer reader.deinit();
     var verification: TrailerVerifier = .{ .reader = &self };
     if (options.policy == .verify_embedded)
-        reader_bridge.visitIndexOffsets(&reader, .{ .user_data = &verification, .visit = TrailerVerifier.visit });
+        reader_bridge.visitIndexOffsets(&reader, .{ .user_data = &verification, .visit = TrailerVerifier.visit, .limits = self.trailerLimits() });
     const source_header = try reader.readHeader();
     if (options.policy != .rebuild and !source_header.indexed) return error.MissingIndex;
     if (options.policy == .open_embedded) {
@@ -324,6 +324,14 @@ const FragmentInput = struct {
     }
 };
 
+fn trailerLimits(self: *const IndexedReader) PublicStreamReader.Limits {
+    var limits = self.options.reader.limits;
+    limits.header_bytes = self.options.index_bytes;
+    limits.list_entries = @max(2, self.options.max_records);
+    limits.nodes = self.options.max_records +| 5;
+    return limits;
+}
+
 fn openEmbedded(self: *IndexedReader, reader: *StreamReader) Error!void {
     const scopes = reader_bridge.scopes(reader);
     const prefix_len = std.math.cast(usize, scopes[0].end) orelse return error.LimitExceeded;
@@ -342,9 +350,7 @@ fn openEmbedded(self: *IndexedReader, reader: *StreamReader) Error!void {
     var trailer_options = self.options.reader;
     trailer_options.checks = .checked;
     trailer_options.check_counts = true;
-    trailer_options.limits.header_bytes = self.options.index_bytes;
-    trailer_options.limits.list_entries = @max(1, self.options.max_records);
-    trailer_options.limits.nodes = std.math.add(usize, self.options.max_records, 5) catch return error.LimitExceeded;
+    trailer_options.limits = self.trailerLimits();
     while (offsetTag(tail[0..search_end], endian)) |start| {
         search_end = start;
         const physical_start = tail_start + start;
