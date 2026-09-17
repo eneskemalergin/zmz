@@ -696,7 +696,10 @@ test "[integration] - [mzML minimal checks]: retains index bounds and record ide
     try std.testing.expectError(error.InvalidIndex, opened.at(allocator, .spectrum, 0));
     const malformed = try std.mem.replaceOwned(u8, allocator, source, "order=\"0\"", "order=\"bad\"");
     defer allocator.free(malformed);
-    try std.testing.expectError(error.InvalidValue, mzml.IndexedReader.build(allocator, .{ .bytes = malformed }, .{ .policy = .rebuild, .reader = .{ .checks = .minimal } }));
+    var rebuilt = try mzml.IndexedReader.build(allocator, .{ .bytes = malformed }, .{ .policy = .rebuild, .reader = .{ .checks = .minimal } });
+    defer rebuilt.deinit();
+    const method = rebuilt.header().document.child(.data_processing_list).?.children[0].children[0];
+    try std.testing.expectEqualStrings("bad", method.attribute("order").?);
 }
 
 test "[integration] - [mzML index]: verifies emitted targets checksum and independent lookups" {
@@ -757,8 +760,6 @@ test "[property] - [mzML index]: preserves record checks and byte limits during 
         }) |limits| try Parse.compare(support.DOCUMENT, limits);
     }
     for ([_][2][]const u8{
-        .{ "encodedLength='12'", "encodedLength='11'" },
-        .{ "arrayLength='1'", "arrayLength='bad'" },
         .{ "<scanList count='1'>", "<scanList count='2'>" },
         .{ "<userParam name='note' value=''/>", "<userParam value='' extra='x'/>" },
         .{ "<userParam name='note' value=''/>", "<userParam name='note' extra='x'/>" },
@@ -770,6 +771,17 @@ test "[property] - [mzML index]: preserves record checks and byte limits during 
         try std.testing.expect(Parse.failure(bytes, .{}) != null);
         for ([_]usize{ 0, 512, 4096, 256 * 1024 * 1024 }) |limit|
             try Parse.compare(bytes, .{ .record_bytes = limit });
+    }
+    for ([_][2][]const u8{
+        .{ "encodedLength='12'", "encodedLength='11'" },
+        .{ "encodedLength='12'", "encodedLength='bad'" },
+        .{ "encodedLength='12'", "" },
+        .{ "arrayLength='1'", "arrayLength='bad'" },
+    }) |replacement| {
+        const bytes = try std.mem.replaceOwned(u8, std.testing.allocator, support.DOCUMENT, replacement[0], replacement[1]);
+        defer std.testing.allocator.free(bytes);
+        try std.testing.expectEqual(null, Parse.failure(bytes, .{}));
+        try Parse.compare(bytes, .{});
     }
 }
 

@@ -189,7 +189,6 @@ test "[failure] - [mzML reader]: returns completed results before a broken next 
 test "[failure] - [mzML decoded reading]: stops at the first error and clears failed output" {
     const cases = .{
         .{ "!AAAAAAA8D8=", 12, 1, "MS:1000576", error.InvalidCharacter },
-        .{ "AAAAAAAA8D8=", 11, 1, "MS:1000576", error.EncodedLengthMismatch },
         .{ "!AAAAAAA8D8=", 11, 1, "MS:1000576", error.InvalidCharacter },
         .{ "!AAAAAAA8D8=</broken>", 12, 1, "MS:1000576", error.InvalidCharacter },
         .{ "AAAAAAAA8D8=", 12, 0, "MS:1000576", error.DecodedSizeMismatch },
@@ -241,14 +240,21 @@ test "[failure] - [mzML decoded reading]: bounds storage and releases failed all
     try std.testing.expectError(error.InvalidCharacter, readDecoded(std.testing.allocator, source, .{ .base64_text = .{ .text_bytes = 65536 } }));
 }
 
-test "[failure] - [mzML decoded reading]: does not allocate from encoded length hints" {
+test "[integration] - [mzML decoded reading]: preserves encoded length hints without using them" {
     const cases = .{
         .{ "AAAAAAAA8D8=", "MS:1000576" },
         .{ "eJxjYACBD/YAAicBMA==", "MS:1000574" },
     };
     inline for (cases) |case| {
-        for ([_]usize{ 0, case[0].len, 1048576 }) |hint| {
-            const source = try decodedDocument(std.testing.allocator, case[0], hint, 1, case[1]);
+        const original = try decodedDocument(std.testing.allocator, case[0], 0, 1, case[1]);
+        defer std.testing.allocator.free(original);
+        for ([_]?[]const u8{ null, "", "0", "1", "12", "20", "1048576", "bad", "-1" }) |hint| {
+            const attribute = if (hint) |value|
+                try std.fmt.allocPrint(std.testing.allocator, "encodedLength='{s}'", .{value})
+            else
+                try std.testing.allocator.dupe(u8, "");
+            defer std.testing.allocator.free(attribute);
+            const source = try std.mem.replaceOwned(u8, std.testing.allocator, original, "encodedLength='0'", attribute);
             defer std.testing.allocator.free(source);
             var input = std.Io.Reader.fixed(source);
             var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
@@ -258,13 +264,9 @@ test "[failure] - [mzML decoded reading]: does not allocate from encoded length 
             var output = mzml.StreamReader.DecodedArrays.init(allocator.allocator(), .{ .array_bytes = 8 });
             defer output.deinit();
 
-            if (hint == case[0].len) {
-                try std.testing.expect((try reader.nextDecodedRecord(&output)) != null);
-                try std.testing.expectEqualSlices(f64, &.{1}, output.get(0).?.values.float64);
-            } else {
-                try std.testing.expectError(error.EncodedLengthMismatch, reader.nextDecodedRecord(&output));
-                try std.testing.expectEqual(@as(usize, 0), output.len());
-            }
+            const record = (try reader.nextDecodedRecord(&output)).?;
+            try std.testing.expectEqualDeep(hint, record.binaryArrays()[0].attribute("encodedLength"));
+            try std.testing.expectEqualSlices(f64, &.{1}, output.get(0).?.values.float64);
         }
     }
 }
@@ -459,20 +461,16 @@ test "[regression] - [mzML reader]: oversized count hints do not exhaust bounded
     }
 }
 
-test "[property] - [mzML binary text]: counts significant characters across vector and XML text boundaries" {
+test "[property] - [mzML binary text]: retains or skips text without interpreting encoded length" {
     var buffer: [8192]u8 = undefined;
     var text: [257]u8 = undefined;
-    const alphabet = "A =+/\t\r\n";
+    const alphabet = "A =+/!\t\n";
     for ([_]usize{ 0, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 257 }) |length| {
-        var significant: usize = 0;
-        for (text[0..length], 0..) |*byte, i| {
-            byte.* = alphabet[i % alphabet.len];
-            if (byte.* != ' ' and byte.* != '\t' and byte.* != '\r' and byte.* != '\n') significant += 1;
-        }
+        for (text[0..length], 0..) |*byte, i| byte.* = alphabet[i % alphabet.len];
         var source = std.Io.Writer.fixed(&buffer);
         try source.writeAll(support.HEADER ++ "<spectrumList count='1' defaultDataProcessingRef='dp'><spectrum id='scan=1' index='0' defaultArrayLength='0'><binaryDataArrayList count='2'>");
         for (0..2) |_| {
-            try source.print("<binaryDataArray encodedLength='{d}'><binary><![CDATA[{s}]]></binary></binaryDataArray>", .{ significant, text[0..length] });
+            try source.print("<binaryDataArray encodedLength='unused'><binary><![CDATA[{s}]]></binary></binaryDataArray>", .{text[0..length]});
         }
         try source.writeAll("</binaryDataArrayList></spectrum></spectrumList></run></mzML>");
         for ([_]mzml.StreamReader.Payload{ .retain, .skip }) |payload| {
@@ -481,6 +479,10 @@ test "[property] - [mzML binary text]: counts significant characters across vect
             defer reader.deinit();
             const record = (try reader.nextRecord()).?;
             try std.testing.expectEqual(@as(usize, 2), record.binaryArrays().len);
+            for (record.binaryArrays()) |array| {
+                try std.testing.expectEqualStrings("unused", array.attribute("encodedLength").?);
+                try std.testing.expectEqualDeep(if (payload == .retain) @as(?[]const u8, text[0..length]) else null, array.child(.binary).?.text);
+            }
             try std.testing.expectEqual(null, try reader.nextRecord());
         }
     }
@@ -529,7 +531,7 @@ test "[integration] - [mzML reader]: reuses storage across growing and shrinking
     try compareDecoded(source.written(), 7);
 }
 
-test "[integration] - [mzML numeric attributes]: enforces schema ranges in reading and construction" {
+test "[integration] - [mzML numeric attributes]: reads source text and checks numbers when used" {
     const cases = .{
         .{ "word", error.InvalidValue },
         .{ "1_0", error.InvalidValue },
@@ -540,7 +542,12 @@ test "[integration] - [mzML numeric attributes]: enforces schema ranges in readi
     inline for (cases) |case| {
         const source = try std.mem.replaceOwned(u8, std.testing.allocator, support.DOCUMENT, "order='0'", "order='" ++ case[0] ++ "'");
         defer std.testing.allocator.free(source);
-        try std.testing.expectError(case[1], support.readAll(std.testing.allocator, source, .{}));
+        var input = std.Io.Reader.fixed(source);
+        var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+        defer reader.deinit();
+        const method = (try reader.readHeader()).document.child(.data_processing_list).?.children[0].children[0];
+        try std.testing.expectEqualStrings(case[0], method.attribute("order").?);
+        while (try reader.nextRecord()) |_| {}
         try std.testing.expectError(case[1], builder.node(.{
             .kind = .processing_method,
             .attributes = &.{ .{ .name = "order", .value = case[0] }, .{ .name = "softwareRef", .value = "sw" } },
@@ -553,7 +560,12 @@ test "[integration] - [mzML numeric attributes]: enforces schema ranges in readi
             "</componentList></instrumentConfiguration>";
         const source = try std.mem.replaceOwned(u8, std.testing.allocator, support.DOCUMENT, "<instrumentConfiguration id='ic'/>", components);
         defer std.testing.allocator.free(source);
-        try std.testing.expectError(expected, support.readAll(std.testing.allocator, source, .{}));
+        var input = std.Io.Reader.fixed(source);
+        var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+        defer reader.deinit();
+        const component = (try reader.readHeader()).document.child(.instrument_configuration_list).?.children[0].child(.component_list).?.children[0];
+        try std.testing.expectEqualStrings(value, component.attribute("order").?);
+        while (try reader.nextRecord()) |_| {}
         try std.testing.expectError(expected, builder.node(.{
             .kind = .source,
             .attributes = &.{.{ .name = "order", .value = value }},
@@ -568,18 +580,19 @@ test "[integration] - [mzML numeric attributes]: enforces schema ranges in readi
     }) |case| {
         const source = try std.mem.replaceOwned(u8, std.testing.allocator, support.DOCUMENT, case[0], case[1]);
         defer std.testing.allocator.free(source);
-        try std.testing.expectError(error.Overflow, support.readAll(std.testing.allocator, source, .{
+        try support.readAll(std.testing.allocator, source, .{
             .check_counts = false,
-            .limits = .{ .list_entries = std.math.maxInt(usize) },
-        }));
+            .limits = .{ .list_entries = std.math.maxInt(usize), .header_bytes = 8192, .record_bytes = 8192 },
+        });
     }
     try std.testing.expectError(error.Overflow, builder.record(.spectrum, "scan=1", 0, 2147483648, &.{}, &.{}, &.{}));
 
-    const record_cases = [_]struct { length: []const u8, index: []const u8, failure: ?mzml.cv.ValueError }{
-        .{ .length = "2147483648", .index = "bad", .failure = error.InvalidValue },
-        .{ .length = "-1", .index = "bad", .failure = error.Overflow },
-        .{ .length = "2147483648", .index = "0", .failure = error.Overflow },
-        .{ .length = " +2147483647 ", .index = "0", .failure = null },
+    const record_cases = [_]struct { length: []const u8, index: []const u8, read_error: ?mzml.cv.ValueError, build_error: ?mzml.cv.ValueError }{
+        .{ .length = "2147483648", .index = "bad", .read_error = error.InvalidValue, .build_error = error.InvalidValue },
+        .{ .length = "-1", .index = "bad", .read_error = error.InvalidValue, .build_error = error.Overflow },
+        .{ .length = "-1", .index = "0", .read_error = error.Overflow, .build_error = error.Overflow },
+        .{ .length = "2147483648", .index = "0", .read_error = null, .build_error = error.Overflow },
+        .{ .length = " +2147483647 ", .index = "0", .read_error = null, .build_error = null },
     };
     for (record_cases) |case| {
         const source = try std.fmt.allocPrint(std.testing.allocator, support.HEADER ++
@@ -590,15 +603,35 @@ test "[integration] - [mzML numeric attributes]: enforces schema ranges in readi
             .{ .name = "index", .value = case.index },
             .{ .name = "defaultArrayLength", .value = case.length },
         } };
-        if (case.failure) |failure| {
+        if (case.read_error) |failure| {
             try std.testing.expectError(failure, support.readAll(std.testing.allocator, source, .{}));
+        } else {
+            var input = std.Io.Reader.fixed(source);
+            var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+            defer reader.deinit();
+            const record = (try reader.nextRecord()).?;
+            try std.testing.expectEqual(try mzml.cv.parseInteger(usize, case.length), record.default_array_length);
+            try std.testing.expectEqualStrings(case.length, record.node.attribute("defaultArrayLength").?);
+        }
+        if (case.build_error) |failure| {
             try std.testing.expectError(failure, builder.node(node));
         } else {
-            try support.readAll(std.testing.allocator, source, .{});
             const copied = try builder.node(node);
             try std.testing.expectEqualStrings(case.length, copied.attribute("defaultArrayLength").?);
         }
     }
+    const bad_length = try std.mem.replaceOwned(u8, std.testing.allocator, support.DOCUMENT, "arrayLength='1'", "arrayLength='bad'");
+    defer std.testing.allocator.free(bad_length);
+    var input = std.Io.Reader.fixed(bad_length);
+    var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+    defer reader.deinit();
+    const header = try reader.readHeader();
+    const record = (try reader.nextRecord()).?;
+    try std.testing.expectEqualStrings("bad", record.binaryArrays()[1].attribute("arrayLength").?);
+    var descriptors = record.arrays(header.groups);
+    _ = try descriptors.next();
+    try std.testing.expectError(error.InvalidValue, descriptors.next());
+    try std.testing.expectError(error.InvalidValue, readDecoded(std.testing.allocator, bad_length, .{}));
 }
 
 test "[integration] - [mzML chunks]: retains values across short reads and UTF-16 code units" {
@@ -725,11 +758,7 @@ test "[integration] - [mzML minimal checks]: distinguishes omitted checks from r
     const omitted = .{
         .{ "http://psi.hupo.org/ms/mzml", "urn:unchecked", error.WrongNamespace },
         .{ "count='1'", "count='2'", error.CountMismatch },
-        .{ "encodedLength='12'", "encodedLength='13'", error.EncodedLengthMismatch },
-        .{ "encodedLength='12'", "encodedLength='bad'", error.InvalidValue },
         .{ "<scanWindowList count='1'>", "<scanWindowList count='bad'>", error.InvalidValue },
-        .{ "order='0'", "order='bad'", error.InvalidValue },
-        .{ "defaultArrayLength='1'", "defaultArrayLength='2147483648'", error.Overflow },
         .{ "<activation/>", "", error.InvalidStructure },
         .{ "<scanWindow/>", "<scanWindow/><scanWindow/>", error.CountMismatch },
         .{ "<userParam name='note' value=''/>", "<userParam name='note' value=''/><cvParam cvRef='MS' accession='X:future' name='later'/>", error.InvalidStructure },
@@ -878,11 +907,10 @@ test "[integration] - [mzML array selection]: preserves metadata and decodes sel
     }
 }
 
-test "[failure] - [mzML array selection]: preserves skipped XML errors and checked length diagnostics" {
+test "[failure] - [mzML array selection]: preserves skipped XML errors and diagnostics" {
     const cases = .{
         .{ "<binary>AAAA", "<binary>\x01AAA", error.InvalidXml },
         .{ "<binary>AAAA", "<binary>\xffAAA", error.InvalidEncoding },
-        .{ "encodedLength='12'", "encodedLength='11'", error.EncodedLengthMismatch },
         .{ "<binary>AAAA", "<binary>&missing;AAA", error.InvalidXml },
         .{ "</binary>", "</broken>", error.InvalidXml },
     };
@@ -890,10 +918,6 @@ test "[failure] - [mzML array selection]: preserves skipped XML errors and check
         const source = try std.mem.replaceOwned(u8, std.testing.allocator, support.DOCUMENT, case[0], case[1]);
         defer std.testing.allocator.free(source);
         for (std.enums.values(mzml.StreamReader.Checks)) |checks| {
-            if (checks == .minimal and case[2] == error.EncodedLengthMismatch) {
-                try support.readAll(std.testing.allocator, source, .{ .checks = checks, .array_selector = .{ .select = selectSecond } });
-                continue;
-            }
             var expected: ?mzml.StreamReader.Diagnostic = null;
             for ([_]bool{ false, true }) |selected| {
                 var input = std.Io.Reader.fixed(source);

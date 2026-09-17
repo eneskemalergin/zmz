@@ -47,7 +47,7 @@ pub const Limits = struct {
     binary_text_bytes: usize = 256 * 1024 * 1024,
 };
 
-/// Retention does not decode arrays. Skip checks XML; checked mode also checks encodedLength.
+/// Retention and skipping parse XML without interpreting array bytes or encodedLength.
 pub const Payload = enum { retain, skip };
 
 /// Chooses text retention after an array's leading parameters and before its binary text.
@@ -61,8 +61,7 @@ pub const ArraySelector = struct {
 
 /// Checked is the default. Minimal preserves valid mzML metadata but skips namespace resolution,
 /// nested child cardinalities/order, parameter order and group-reference placement,
-/// numeric schema ranges, and length/count
-/// comparisons. XML parsing, required attributes, envelope order, and resource limits remain.
+/// and count comparisons. XML parsing, required attributes, envelope order, and resource limits remain.
 /// In minimal mode, a prefixed schemaLocation is treated as XSI without resolving its prefix;
 /// other prefixed attributes fail. Unrecognized unprefixed node attributes remain retained.
 pub const Checks = enum { checked, minimal };
@@ -86,7 +85,6 @@ pub const Error = xml.Error || cv.ValueError || DecodedArrays.Error || std.mem.A
     MissingAttribute,
     UnknownAttribute,
     CountMismatch,
-    EncodedLengthMismatch,
     FailedState,
     InvalidOptions,
     InvalidIndex,
@@ -495,7 +493,6 @@ fn startNodeFor(self: *StreamReader, storage: *Storage, kind_value: model.Kind, 
         .content_offset = event.span.end,
     };
     if (self.options.checks == .checked) {
-        try schema.checkNumericAttributes(node);
         if (node.attribute("count")) |value| {
             const count = try cv.parseInteger(usize, value);
             if (kind_value != .spectrum_list and kind_value != .chromatogram_list and
@@ -513,12 +510,8 @@ fn parseNodeFor(self: *StreamReader, storage: *Storage, depth: usize, advance_af
     if (depth > self.options.limits.depth) return error.LimitExceeded;
     const kind_value = try self.kind();
     var node = try self.startNodeFor(storage, kind_value, retention != .none);
-    // Borrowed attributes expire on advance; only these numbers survive discarded nodes.
+    // Borrowed attributes expire on advance; this count survives discarded nodes.
     const discarded_count = if (retention == .none) try node.declaredCount() else null;
-    const discarded_length = if (retention == .none and kind_value == .binary_data_array)
-        try cv.parseInteger(usize, node.attribute("encodedLength"))
-    else
-        null;
     if (retention == .none) node.attributes = &.{};
     if (storage == &self.record_store and depth == 1) {
         if (self.decoded_arrays) |output| try output.startRecord(node);
@@ -528,13 +521,11 @@ fn parseNodeFor(self: *StreamReader, storage: *Storage, depth: usize, advance_af
     if (has_text) {
         var text: std.ArrayList(u8) = .empty;
         var text_size: usize = 0;
-        var significant: usize = 0;
         while (self.cursor.current) |event| {
             if (event.data != .text) break;
             const bytes = event.data.text.bytes;
             text_size = std.math.add(usize, text_size, bytes.len) catch return error.LimitExceeded;
             if (text_size > self.options.limits.binary_text_bytes) return error.LimitExceeded;
-            if (self.options.checks == .checked) significant += significantLength(bytes);
             if (kind_value == .binary and storage == &self.record_store) {
                 if (self.decoded_arrays) |output| try output.text(bytes);
             }
@@ -548,8 +539,6 @@ fn parseNodeFor(self: *StreamReader, storage: *Storage, depth: usize, advance_af
             storage.used += text.items.len;
             node.text = text.items;
         }
-        // The parent uses this count before returning the source span to the caller.
-        storage.last_binary_length = significant;
         if (kind_value == .binary and storage == &self.record_store) {
             if (self.decoded_arrays) |output| try output.finishArray();
         }
@@ -603,9 +592,6 @@ fn parseNodeFor(self: *StreamReader, storage: *Storage, depth: usize, advance_af
         if (retention == .tree) {
             node.children = try storage.copy(model.Node, self.child_scratch.items[children_start..]);
         } else try storage.charge(model.Node, child_count);
-        if (self.options.checks == .checked and kind_value == .binary_data_array and
-            (if (retention == .none) discarded_length.? else try cv.parseInteger(usize, node.attribute("encodedLength"))) != storage.last_binary_length)
-            return error.EncodedLengthMismatch;
     }
     const end = self.cursor.current orelse return error.UnexpectedEnd;
     node.end_offset = end.span.end;
@@ -718,23 +704,6 @@ fn copyParamAttributes(storage: *Storage, start: xml.Start, selected: u2, compti
     return result;
 }
 
-fn significantLength(bytes: []const u8) usize {
-    const width = @min(64, std.simd.suggestVectorLength(u8) orelse 16);
-    const Vector = @Vector(width, u8);
-    var position: usize = 0;
-    var count: usize = 0;
-    while (bytes.len - position >= width) : (position += width) {
-        const run: Vector = bytes[position..][0..width].*;
-        const whitespace = (run == @as(Vector, @splat(' '))) | (run == @as(Vector, @splat('\t'))) |
-            (run == @as(Vector, @splat('\r'))) | (run == @as(Vector, @splat('\n')));
-        count += width - @popCount(@as(@Int(.unsigned, width), @bitCast(whitespace)));
-    }
-    for (bytes[position..]) |byte| {
-        count += @intFromBool(byte != ' ' and byte != '\t' and byte != '\r' and byte != '\n');
-    }
-    return count;
-}
-
 fn copyAttributes(
     self: *StreamReader,
     storage: *Storage,
@@ -759,6 +728,7 @@ fn copyAttributesFor(
 ) Error![]const model.Attribute {
     var names = std.mem.tokenizeScalar(u8, required, ' ');
     while (names.next()) |name| {
+        if (std.mem.eql(u8, name, "encodedLength")) continue;
         const attribute = if (checks == .checked) start.attribute(null, name) else start.attributeRaw(name);
         if (attribute == null) return error.MissingAttribute;
     }
@@ -813,7 +783,6 @@ const Storage = struct {
     used: usize = 0,
     nodes: usize = 0,
     arrays: usize = 0,
-    last_binary_length: usize = 0,
 
     fn init(allocator: std.mem.Allocator, limit: usize) Storage {
         return .{ .arena = .init(allocator), .limit = limit };
