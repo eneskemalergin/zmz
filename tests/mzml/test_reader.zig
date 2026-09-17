@@ -175,12 +175,12 @@ test "[failure] - [mzML reader]: returns completed results before a broken next 
     }
 }
 
-test "[failure] - [mzML decoded reading]: preserves error order and clears failed output" {
+test "[failure] - [mzML decoded reading]: stops at the first error and clears failed output" {
     const cases = .{
         .{ "!AAAAAAA8D8=", 12, 1, "MS:1000576", error.InvalidCharacter },
         .{ "AAAAAAAA8D8=", 11, 1, "MS:1000576", error.EncodedLengthMismatch },
-        .{ "!AAAAAAA8D8=", 11, 1, "MS:1000576", error.EncodedLengthMismatch },
-        .{ "!AAAAAAA8D8=</broken>", 12, 1, "MS:1000576", error.InvalidXml },
+        .{ "!AAAAAAA8D8=", 11, 1, "MS:1000576", error.InvalidCharacter },
+        .{ "!AAAAAAA8D8=</broken>", 12, 1, "MS:1000576", error.InvalidCharacter },
         .{ "AAAAAAAA8D8=", 12, 0, "MS:1000576", error.DecodedSizeMismatch },
         .{ "AAAAAAAA8D8=!AAA", 16, 0, "MS:1000576", error.InvalidPadding },
         .{ "AAAAAAAA8D8", 11, 1, "MS:1000576", error.TruncatedInput },
@@ -198,13 +198,12 @@ test "[failure] - [mzML decoded reading]: preserves error order and clears faile
         defer output.deinit();
         try std.testing.expectError(case[4], reader.nextDecodedRecord(&output));
         try std.testing.expectEqual(@as(usize, 0), output.len());
-        if (case[4] == error.EncodedLengthMismatch or case[4] == error.InvalidXml) {
-            try std.testing.expectEqual(case[4], reader.diagnostic().?.code);
-            try std.testing.expectError(error.FailedState, reader.nextDecodedRecord(&output));
-        } else {
-            try std.testing.expectEqual(null, reader.diagnostic());
-            try std.testing.expectEqual(null, try reader.nextDecodedRecord(&output));
-        }
+        try std.testing.expect(reader.diagnostic() != null);
+        const diagnostic = reader.diagnostic().?;
+        try std.testing.expectEqual(case[4], diagnostic.code);
+        try std.testing.expectError(error.FailedState, reader.nextDecodedRecord(&output));
+        try std.testing.expectError(error.FailedState, reader.nextRecord());
+        try std.testing.expectEqualDeep(diagnostic, reader.diagnostic().?);
     }
     const initial = try decodedDocument(std.testing.allocator, "AAAAAAAA8D8=", 12, 1, "MS:1000574");
     defer std.testing.allocator.free(initial);
@@ -228,7 +227,30 @@ test "[failure] - [mzML decoded reading]: bounds storage and releases failed all
     const text = "!" ++ "A" ** 70000;
     const source = try decodedDocument(std.testing.allocator, text, text.len, 1, "MS:1000576");
     defer std.testing.allocator.free(source);
-    try std.testing.expectError(error.LimitExceeded, readDecoded(std.testing.allocator, source, .{ .base64_text = .{ .text_bytes = 65536 } }));
+    try std.testing.expectError(error.InvalidCharacter, readDecoded(std.testing.allocator, source, .{ .base64_text = .{ .text_bytes = 65536 } }));
+}
+
+test "[failure] - [mzML decoded reading]: does not read beyond a known payload error" {
+    const source = try decodedDocument(std.testing.allocator, "!AAAAAAA8D8=", 12, 1, "MS:1000576");
+    defer std.testing.allocator.free(source);
+    const first_end = std.mem.indexOf(u8, source, "</binary>").? + "</binary>".len;
+    var input = std.Io.Reader.failing;
+    input.buffer = source;
+    input.end = first_end;
+    var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+    defer reader.deinit();
+    var output = mzml.StreamReader.DecodedArrays.init(std.testing.allocator, .{});
+    defer output.deinit();
+    try std.testing.expectError(error.InvalidCharacter, reader.nextDecodedRecord(&output));
+    try std.testing.expect(input.seek < first_end);
+    try std.testing.expectEqual(@as(usize, 0), output.len());
+    const diagnostic = reader.diagnostic().?;
+    try std.testing.expectEqual(error.InvalidCharacter, diagnostic.code);
+    try std.testing.expectEqual(.binary, diagnostic.element.?);
+    try std.testing.expect(diagnostic.byte_offset < first_end);
+    const position = input.seek;
+    try std.testing.expectError(error.FailedState, reader.nextDecodedRecord(&output));
+    try std.testing.expectEqual(position, input.seek);
 }
 
 test "[integration] - [mzML decoded reading]: keeps numeric lifetimes independent and rejects incompatible options" {

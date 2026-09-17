@@ -107,23 +107,26 @@ test "[failure] - [mzML indexed decoding]: clears results and recovers after dec
     const payload = std.mem.indexOf(u8, source, "<binary>").? + "<binary>".len;
     const end = std.mem.indexOf(u8, source, "</spectrum>").? + "</spectrum".len - 1;
     const ordinal = std.mem.indexOf(u8, source, "index=\"0\"").? + "index=\"".len;
+    const id = std.mem.indexOf(u8, source, "id=\"scan=none\"").? + "id=\"".len;
     const saved = source[payload];
-    for (0..3) |failure| {
+    for (0..4) |failure| {
         var good = (try index.atDecoded(allocator, .spectrum, 1, &output)).?;
         defer good.deinit();
         source[payload] = '!';
         const closing = source[end];
         if (failure == 1) source[end] = 'x';
         if (failure == 2) source[ordinal] = '9';
+        if (failure == 3) source[id] = 'x';
         try std.testing.expectError(switch (failure) {
             0 => error.InvalidCharacter,
-            1 => error.InvalidXml,
+            1 => error.InvalidCharacter,
             else => error.InvalidIndex,
         }, index.atDecoded(allocator, .spectrum, 0, &output));
         try std.testing.expectEqual(@as(usize, 0), output.len());
         source[payload] = saved;
         source[end] = closing;
         source[ordinal] = '0';
+        source[id] = 's';
     }
     var recovered = (try index.byIdDecoded(allocator, "scan=none", &output)).?;
     defer recovered.deinit();
@@ -630,19 +633,31 @@ test "[integration] - [mzML index]: opens indented encoded targets and restores 
                     vtable.fileReadPositional = FailedRead.read;
                     for ([_]usize{ index_start, spectrum_start }) |start| {
                         for ([_]bool{ false, true }) |malformed| {
-                            var name: [2]u8 = .{ 'x', 0 };
-                            if (endian) |order| std.mem.writeInt(u16, &name, 'x', order);
+                            const damaged: u8 = if (start == index_start) '<' else 'x';
+                            var name: [2]u8 = .{ damaged, 0 };
+                            if (endian) |order| std.mem.writeInt(u16, &name, damaged, order);
                             const damage_offset = start + "\r\n \t<".len * width;
                             if (malformed) try file.writePositionalAll(std.testing.io, name[0..width], damage_offset);
                             for ([_]bool{ false, true }) |truncated| {
                                 var failure: FailedRead = .{ .start = start, .stop = start + 65536, .truncated = truncated };
                                 const io: std.Io = .{ .userdata = &failure, .vtable = &vtable };
-                                try std.testing.expectError(if (truncated) error.TruncatedSource else error.InputOutput, mzml.IndexedReader.build(allocator, .{ .file = .{ .handle = file, .io = io } }, .{ .policy = .open_embedded }));
-                                try std.testing.expect(failure.failed);
+                                const expected = if (malformed)
+                                    (if (start == index_start) error.InvalidXml else error.InvalidStructure)
+                                else if (truncated) error.TruncatedSource else error.InputOutput;
+                                try std.testing.expectError(expected, mzml.IndexedReader.build(allocator, .{ .file = .{ .handle = file, .io = io } }, .{ .policy = .open_embedded }));
+                                try std.testing.expectEqual(!malformed, failure.failed);
                             }
                             try file.writePositionalAll(std.testing.io, bytes[damage_offset..][0..width], damage_offset);
                         }
                     }
+                    var opened = try mzml.IndexedReader.build(allocator, .{ .file = .{ .handle = file, .io = std.testing.io } }, .{});
+                    defer opened.deinit();
+                    var failure: FailedRead = .{ .start = spectrum_start, .stop = spectrum_start + 65536, .truncated = false };
+                    opened.source.file.io = .{ .userdata = &failure, .vtable = &vtable };
+                    var record = (try opened.at(allocator, .spectrum, 0)).?;
+                    defer record.deinit();
+                    try std.testing.expectEqualStrings("a&b", record.value.id);
+                    try std.testing.expect(!failure.failed);
                 }
             }
         }

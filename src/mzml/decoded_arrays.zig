@@ -32,10 +32,7 @@ transformed: std.ArrayList(u8) = .empty,
 count: usize = 0,
 ready: bool = false,
 default_length: usize = 0,
-failure: ?Error = null,
-array_failure: ?base64.Error = null,
 decoder: base64.Decoder = undefined,
-text_length: usize = 0,
 
 pub fn init(allocator: std.mem.Allocator, limits: arrays.Limits) DecodedArrays {
     return .{ .allocator = allocator, .limits = limits };
@@ -53,7 +50,6 @@ pub fn deinit(self: *DecodedArrays) void {
 pub fn reset(self: *DecodedArrays) void {
     self.count = 0;
     self.ready = false;
-    self.failure = null;
 }
 
 pub fn len(self: *const DecodedArrays) usize {
@@ -74,61 +70,19 @@ pub fn get(self: *const DecodedArrays, position: usize) ?Array {
     };
 }
 
-pub fn startRecord(self: *DecodedArrays, node: model.Node) void {
-    self.default_length = cv.parseInteger(usize, node.attribute("defaultArrayLength")) catch |err| {
-        self.failure = err;
-        return;
-    };
+pub fn startRecord(self: *DecodedArrays, node: model.Node) Error!void {
+    self.default_length = try cv.parseInteger(usize, node.attribute("defaultArrayLength"));
 }
 
-pub fn beginArray(self: *DecodedArrays, node: model.Node, groups: []const cv.Group) void {
-    self.array_failure = null;
-    self.text_length = 0;
-    if (self.failure != null) return;
-    self.beginInner(node, groups) catch |err| {
-        self.failure = err;
-    };
+pub fn text(self: *DecodedArrays, bytes: []const u8) Error!void {
+    try self.decoder.update(bytes);
 }
 
-pub fn text(self: *DecodedArrays, bytes: []const u8) void {
-    if (self.failure != null) return;
-    self.text_length = std.math.add(usize, self.text_length, bytes.len) catch {
-        self.array_failure = error.LengthOverflow;
-        return;
-    };
-    if (self.array_failure != null) return;
-    self.decoder.update(bytes) catch |err| {
-        self.array_failure = err;
-    };
-}
-
-pub fn finishArray(self: *DecodedArrays) void {
-    if (self.failure != null) return;
-    self.finishInner() catch |err| {
-        self.failure = err;
-    };
-}
-
-pub fn complete(self: *DecodedArrays) Error!void {
-    if (self.failure) |failure| return failure;
+pub fn complete(self: *DecodedArrays) void {
     self.ready = true;
 }
 
-const Output = struct {
-    words: std.ArrayList(u64) = .empty,
-    encoding: model.Encoding = undefined,
-    length: usize = 0,
-
-    fn primitive(self: *const Output) model.Primitive {
-        return if (encoding.isNumpress(self.encoding.pipeline)) .float64 else self.encoding.primitive;
-    }
-
-    fn values(self: *const Output, comptime T: type) []T {
-        return std.mem.bytesAsSlice(T, std.mem.sliceAsBytes(self.words.items))[0..self.length];
-    }
-};
-
-fn beginInner(self: *DecodedArrays, node: model.Node, groups: []const cv.Group) Error!void {
+pub fn beginArray(self: *DecodedArrays, node: model.Node, groups: []const cv.Group) Error!void {
     const array = try model.BinaryArray.init(node, self.default_length, groups);
     if (self.count == self.outputs.items.len) try self.outputs.append(self.allocator, .{});
     const output = &self.outputs.items[self.count];
@@ -155,10 +109,7 @@ fn beginInner(self: *DecodedArrays, node: model.Node, groups: []const cv.Group) 
     self.decoder = base64.Decoder.init(destination, self.limits.base64_text);
 }
 
-fn finishInner(self: *DecodedArrays) Error!void {
-    // A whole-text decode checks this limit before looking at any Base64 character.
-    if (self.text_length > self.limits.base64_text.text_bytes) return error.LimitExceeded;
-    if (self.array_failure) |failure| return failure;
+pub fn finishArray(self: *DecodedArrays) Error!void {
     const counts = try self.decoder.finish();
     const output = &self.outputs.items[self.count - 1];
     const wire = self.decoder.output[0..counts.decoded_bytes];
@@ -173,3 +124,17 @@ fn finishInner(self: *DecodedArrays) Error!void {
         .int64 => try arrays.decodeWire(i64, output.values(i64), wire, pipeline, self.transformed.items, self.limits),
     }
 }
+
+const Output = struct {
+    words: std.ArrayList(u64) = .empty,
+    encoding: model.Encoding = undefined,
+    length: usize = 0,
+
+    fn primitive(self: *const Output) model.Primitive {
+        return if (encoding.isNumpress(self.encoding.pipeline)) .float64 else self.encoding.primitive;
+    }
+
+    fn values(self: *const Output, comptime T: type) []T {
+        return std.mem.bytesAsSlice(T, std.mem.sliceAsBytes(self.words.items))[0..self.length];
+    }
+};

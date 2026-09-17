@@ -63,8 +63,6 @@ pub fn decode(
     const destination = if (pipeline == .none) std.mem.sliceAsBytes(output) else scratch.transport;
     const counts = base64.decode(destination, source, limits.base64_text) catch |err| {
         if (pipeline != .none or err != error.OutputTooSmall) return err;
-        // Preserve lexical and limit failures that precede the final exact-size check.
-        _ = try base64.validate(source, limits.base64_text);
         return error.DecodedSizeMismatch;
     };
     try decodeWireInner(T, output, destination[0..counts.decoded_bytes], pipeline, scratch.transformed);

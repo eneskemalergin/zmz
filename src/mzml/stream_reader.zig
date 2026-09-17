@@ -22,7 +22,7 @@ pub const StreamReader = struct {
     /// Reader limits, payload policy, and check mode.
     pub const Options = impl.Options;
 
-    /// Structural, XML, and allocation failures from reader operations.
+    /// Includes decoding errors when numeric arrays are requested.
     pub const Error = impl.Error;
 
     /// The first reader failure and its physical source location.
@@ -57,9 +57,9 @@ pub const StreamReader = struct {
     /// Metadata borrows this reader as in nextRecord; binary text is not retained.
     /// Output slices last until output is reused, reset, or deinitialized. EOF and errors
     /// clear its visible results. Requires checked mode and no array_selector; payload
-    /// does not affect this call. XML/record errors precede decoding errors. A decoding
-    /// error consumes the record but does not poison the reader or set its diagnostic.
-    pub fn nextDecodedRecord(self: *Reader, output: *DecodedArrays) (Error || DecodedArrays.Error)!?model.Record {
+    /// does not affect this call. The first failure stops reading and sets the diagnostic;
+    /// subsequent reads return FailedState. No automatic record skipping occurs.
+    pub fn nextDecodedRecord(self: *Reader, output: *DecodedArrays) Error!?model.Record {
         return self.inner.nextDecodedRecord(output);
     }
 

@@ -81,8 +81,7 @@ pub const Options = struct {
     retain_index: bool = false,
 };
 
-/// Structural and resource failures, distinct from errors returned by explicit array decoding.
-pub const Error = xml.Error || cv.ValueError || std.mem.Allocator.Error || error{
+pub const Error = xml.Error || cv.ValueError || DecodedArrays.Error || std.mem.Allocator.Error || error{
     InvalidStructure,
     MissingAttribute,
     UnknownAttribute,
@@ -90,9 +89,11 @@ pub const Error = xml.Error || cv.ValueError || std.mem.Allocator.Error || error
     EncodedLengthMismatch,
     FailedState,
     InvalidOptions,
+    InvalidIndex,
 };
 
-/// A failure location in physical bytes. Element identity is present when known.
+/// Physical offset of the parser event at failure, not the failing decoded character.
+/// Element identity is present when known.
 pub const Diagnostic = struct { code: Error, byte_offset: u64, element: ?model.Kind };
 
 allocator: std.mem.Allocator,
@@ -118,6 +119,7 @@ decoded_arrays: ?*DecodedArrays = null,
 fragment_ancestors: ?xml.Ancestors = null,
 
 pub const Scope = struct { start: u64, end: u64, name: []const u8 };
+pub const FragmentTarget = struct { kind: model.Kind, id: []const u8, index: usize };
 
 /// Borrows input for the reader's lifetime. Input and initialized reader must not be copied.
 /// This allocates parser state but does not consume input. Release all owned storage with deinit.
@@ -177,7 +179,7 @@ fn nextRecordFor(self: *StreamReader, comptime retention: Retention) Error!?mode
     return self.nextRecordInner(retention) catch |err| return self.fail(err);
 }
 
-pub fn nextDecodedRecord(self: *StreamReader, output: *DecodedArrays) (Error || DecodedArrays.Error)!?model.Record {
+pub fn nextDecodedRecord(self: *StreamReader, output: *DecodedArrays) Error!?model.Record {
     output.reset();
     errdefer output.reset();
     if (self.options.checks != .checked or self.options.array_selector != null)
@@ -185,7 +187,7 @@ pub fn nextDecodedRecord(self: *StreamReader, output: *DecodedArrays) (Error || 
     self.decoded_arrays = output;
     defer self.decoded_arrays = null;
     const record = try self.nextRecord() orelse return null;
-    try output.complete();
+    output.complete();
     return record;
 }
 
@@ -213,12 +215,12 @@ pub fn parseFragment(
     var input = std.Io.Reader.fixed(bytes);
     var reader = try init(allocator, &input, options);
     defer reader.deinit();
-    return reader.readFragment(allocator, &input, ancestors, physical_start, prefix_length, true, false);
+    return reader.readFragment(allocator, &input, ancestors, physical_start, prefix_length, true, false, null);
 }
 
 /// Internal reusable fragment reader. Returned records use the requested allocator;
 /// parser and list scratch remain owned by this reader. No source bytes remain borrowed.
-pub fn readFragment(self: *StreamReader, allocator: std.mem.Allocator, input: *std.Io.Reader, ancestors: usize, physical_start: u64, prefix_length: usize, complete: bool, reuse_ancestors: bool) Error!owned.Record {
+pub fn readFragment(self: *StreamReader, allocator: std.mem.Allocator, input: *std.Io.Reader, ancestors: usize, physical_start: u64, prefix_length: usize, complete: bool, reuse_ancestors: bool, expected: ?FragmentTarget) Error!owned.Record {
     if (self.header_ready or ancestors > 4 or physical_start < prefix_length) return error.InvalidOptions;
     errdefer self.fragment_ancestors = null;
     if (reuse_ancestors) {
@@ -242,6 +244,14 @@ pub fn readFragment(self: *StreamReader, allocator: std.mem.Allocator, input: *s
         try self.cursor.advance(false);
     }
     const kind_value = try self.kind();
+    if (expected) |target| {
+        if (kind_value != target.kind) return error.InvalidIndex;
+        const start = self.cursor.current.?.data.start_element;
+        const id = start.attributeRaw("id") orelse return error.MissingAttribute;
+        const index = try cv.parseInteger(usize, if (start.attributeRaw("index")) |attribute| attribute.value else null);
+        if (!std.mem.eql(u8, id.value, target.id) or index != target.index)
+            return error.InvalidIndex;
+    }
     if (kind_value != .spectrum and kind_value != .chromatogram) return error.InvalidStructure;
     var node = try self.parseNode(&self.record_store, 1, complete, self.options.payload);
     if (complete) {
@@ -511,7 +521,7 @@ fn parseNodeFor(self: *StreamReader, storage: *Storage, depth: usize, advance_af
         null;
     if (retention == .none) node.attributes = &.{};
     if (storage == &self.record_store and depth == 1) {
-        if (self.decoded_arrays) |output| output.startRecord(node);
+        if (self.decoded_arrays) |output| try output.startRecord(node);
     }
     const has_text = kind_value == .binary or kind_value == .offset or kind_value == .index_list_offset or kind_value == .file_checksum;
     try self.cursor.advance(has_text);
@@ -526,7 +536,7 @@ fn parseNodeFor(self: *StreamReader, storage: *Storage, depth: usize, advance_af
             if (text_size > self.options.limits.binary_text_bytes) return error.LimitExceeded;
             if (self.options.checks == .checked) significant += significantLength(bytes);
             if (kind_value == .binary and storage == &self.record_store) {
-                if (self.decoded_arrays) |output| output.text(bytes);
+                if (self.decoded_arrays) |output| try output.text(bytes);
             }
             if (payload == .retain or kind_value != .binary) {
                 if (text_size > storage.limit -| storage.used) return error.LimitExceeded;
@@ -541,7 +551,7 @@ fn parseNodeFor(self: *StreamReader, storage: *Storage, depth: usize, advance_af
         // The parent uses this count before returning the source span to the caller.
         storage.last_binary_length = significant;
         if (kind_value == .binary and storage == &self.record_store) {
-            if (self.decoded_arrays) |output| output.finishArray();
+            if (self.decoded_arrays) |output| try output.finishArray();
         }
     } else {
         if (schema.hasParams(kind_value))
@@ -549,7 +559,7 @@ fn parseNodeFor(self: *StreamReader, storage: *Storage, depth: usize, advance_af
         var child_payload = payload;
         if (kind_value == .binary_data_array and storage == &self.record_store) {
             if (self.decoded_arrays) |output| {
-                output.beginArray(node, self.header.groups);
+                try output.beginArray(node, self.header.groups);
                 child_payload = .skip;
             }
         }

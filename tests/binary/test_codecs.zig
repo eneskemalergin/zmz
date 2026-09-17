@@ -564,7 +564,7 @@ test "[integration] - [array limits]: rejects short scratch and mismatched count
     );
 }
 
-test "[integration] - [uncompressed arrays]: checks complete text and exact size without scratch" {
+test "[integration] - [uncompressed arrays]: reports the first decode error without rescanning" {
     const scratch: arrays.Scratch = .{ .transport = &.{}, .transformed = &.{} };
     var output: [2]i32 = undefined;
     try arrays.decode(i32, output[0..1], " B\tAMC\rAQ==\n", .none, scratch, .{});
@@ -573,9 +573,12 @@ test "[integration] - [uncompressed arrays]: checks complete text and exact size
     try std.testing.expectError(error.DecodedSizeMismatch, arrays.decode(i32, &output, "BAMCAQ==", .none, scratch, .{}));
     try std.testing.expectError(error.DecodedSizeMismatch, arrays.decode(i32, output[0..0], "BAMCAQ==", .none, scratch, .{}));
     try std.testing.expectError(error.DecodedSizeMismatch, arrays.decode(i32, output[0..1], "BAMCAQAAAAAA", .none, scratch, .{}));
-    try std.testing.expectError(error.InvalidCharacter, arrays.decode(i32, output[0..1], "BAMCAQAAAAAA!", .none, scratch, .{}));
-    try std.testing.expectError(error.TruncatedInput, arrays.decode(i32, output[0..1], "BAMCAQAAAAAAA", .none, scratch, .{}));
-    try std.testing.expectError(error.NonCanonicalTail, arrays.decode(i32, output[0..1], "BAMCAQAAAAAABR==", .none, scratch, .{}));
+    try std.testing.expectError(error.DecodedSizeMismatch, arrays.decode(i32, output[0..1], "BAMCAQAAAAAA!", .none, scratch, .{}));
+    try std.testing.expectError(error.DecodedSizeMismatch, arrays.decode(i32, output[0..1], "BAMCAQAAAAAAA", .none, scratch, .{}));
+    try std.testing.expectError(error.DecodedSizeMismatch, arrays.decode(i32, output[0..1], "BAMCAQAAAAAABR==", .none, scratch, .{}));
+    try std.testing.expectError(error.InvalidCharacter, arrays.decode(i32, output[0..1], "!AMCAQAAAAAA", .none, scratch, .{}));
+    try std.testing.expectError(error.TruncatedInput, arrays.decode(i32, output[0..1], "BAM", .none, scratch, .{}));
+    try std.testing.expectError(error.NonCanonicalTail, arrays.decode(i32, output[0..1], "BR==", .none, scratch, .{}));
     try std.testing.expectError(error.LimitExceeded, arrays.decode(i32, output[0..1], "BAMCAQAAAAAA", .none, scratch, .{ .base64_text = .{ .decoded_bytes = 5 } }));
     try std.testing.expectError(error.OverlappingBuffers, arrays.decode(i32, &output, std.mem.sliceAsBytes(&output), .none, scratch, .{}));
     try std.testing.expectError(error.OverlappingBuffers, arrays.decode(i32, &output, "BAMCAQ==", .none, .{ .transport = std.mem.sliceAsBytes(&output), .transformed = &.{} }, .{}));

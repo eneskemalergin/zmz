@@ -170,9 +170,9 @@ pub fn at(self: *IndexedReader, allocator: std.mem.Allocator, kind: model.Kind, 
 
 /// Returns independent metadata and decodes all arrays into caller-owned reusable storage.
 /// Binary text is omitted. Requires checked mode without an array selector; payload is ignored.
-/// Missing IDs and failures clear output. Source, XML, and target errors precede decode errors.
+/// Missing IDs and failures clear output. A failed lookup stops immediately; later lookups may retry.
 /// Numeric slices last until output is reused, reset, or deinitialized, independently of metadata.
-pub fn byIdDecoded(self: *IndexedReader, allocator: std.mem.Allocator, id: []const u8, output: *DecodedArrays) (Error || DecodedArrays.Error)!?owned.Record {
+pub fn byIdDecoded(self: *IndexedReader, allocator: std.mem.Allocator, id: []const u8, output: *DecodedArrays) Error!?owned.Record {
     output.reset();
     errdefer output.reset();
     if (self.options.reader.checks != .checked or self.options.reader.array_selector != null)
@@ -182,7 +182,7 @@ pub fn byIdDecoded(self: *IndexedReader, allocator: std.mem.Allocator, id: []con
 }
 
 /// Uses byIdDecoded's storage and failure rules for a zero-based spectrum or chromatogram ordinal.
-pub fn atDecoded(self: *IndexedReader, allocator: std.mem.Allocator, kind: model.Kind, ordinal: usize, output: *DecodedArrays) (Error || DecodedArrays.Error)!?owned.Record {
+pub fn atDecoded(self: *IndexedReader, allocator: std.mem.Allocator, kind: model.Kind, ordinal: usize, output: *DecodedArrays) Error!?owned.Record {
     output.reset();
     errdefer output.reset();
     if (self.options.reader.checks != .checked or self.options.reader.array_selector != null)
@@ -207,10 +207,9 @@ fn ordinalPosition(self: *IndexedReader, kind: model.Kind, ordinal: usize) Error
     return ordinal + if (kind == .spectrum) @as(usize, 0) else self.counts[0];
 }
 
-fn readDecodedEntry(self: *IndexedReader, allocator: std.mem.Allocator, entry: Entry, output: *DecodedArrays) (Error || DecodedArrays.Error)!owned.Record {
-    var record = try self.readEntry(allocator, entry, output);
-    errdefer record.deinit();
-    try output.complete();
+fn readDecodedEntry(self: *IndexedReader, allocator: std.mem.Allocator, entry: Entry, output: *DecodedArrays) Error!owned.Record {
+    const record = try self.readEntry(allocator, entry, output);
+    output.complete();
     return record;
 }
 
@@ -230,15 +229,9 @@ fn readEntry(self: *IndexedReader, allocator: std.mem.Allocator, entry: Entry, o
         self.lookup_reader = try StreamReader.init(self.allocator, &empty_input, self.options.reader);
         reader_bridge.resetFragmentParser(&self.lookup_reader.?);
     }
-    var record = reader_bridge.readFragment(&self.lookup_reader.?, allocator, &input.interface, context.ancestors, entry.start, context.prefix.len, self.options.policy != .open_embedded, self.header().groups, output, reuse_ancestors) catch |err| {
-        try input.finishSpan();
-        return err;
-    };
+    var record = reader_bridge.readFragment(&self.lookup_reader.?, allocator, &input.interface, context.ancestors, entry.start, context.prefix.len, self.options.policy != .open_embedded, self.header().groups, output, reuse_ancestors, .{ .kind = entry.kind, .id = entry.id, .index = entry.index }) catch |err| return input.originalError(err);
     errdefer record.deinit();
-    try input.finishSpan();
-    if (record.value.node.kind != entry.kind or !std.mem.eql(u8, record.value.id, entry.id) or
-        record.value.index != entry.index or
-        record.value.node.end_offset > entry.end or
+    if (record.value.node.end_offset > entry.end or
         (self.options.policy == .rebuild and
             (record.value.node.start_offset != entry.start or record.value.node.end_offset != entry.end))) return error.InvalidIndex;
     try self.checkSource();
@@ -304,15 +297,8 @@ const FragmentInput = struct {
         return error.EndOfStream;
     }
 
-    fn finishSpan(self: *FragmentInput) Error!void {
-        if (self.failure) |err| return err;
-        // Source failures take precedence over target parsing failures.
-        while (self.remaining != 0) {
-            const output = self.interface.buffer[0..@min(self.remaining, self.interface.buffer.len)];
-            try self.index.readAt(output, self.offset);
-            self.offset += output.len;
-            self.remaining -= output.len;
-        }
+    fn originalError(self: *const FragmentInput, err: Error) Error {
+        return if (err == error.ReadFailed) self.failure orelse err else err;
     }
 };
 
@@ -369,11 +355,7 @@ fn openEmbedded(self: *IndexedReader, reader: *StreamReader) Error!void {
     const bytes_len = std.math.add(usize, prefix_len, trailer_len) catch return error.LimitExceeded;
     var buffer: [64 * 1024]u8 = undefined;
     var input = FragmentInput.init(self, prefix, start, trailer_len, &.{}, buffer[0..@max(4, @min(buffer.len, bytes_len))]);
-    self.readEmbeddedEntries(&input.interface, start, final_scope.end, endian) catch |err| {
-        try input.finishSpan();
-        return err;
-    };
-    try input.finishSpan();
+    self.readEmbeddedEntries(&input.interface, start, final_scope.end, endian) catch |err| return input.originalError(err);
     for (self.entries.items, 0..) |*entry, i| {
         if (i + 1 < self.entries.items.len) entry.end = self.entries.items[i + 1].start;
         if (entry.start >= entry.end) return error.InvalidIndex;
@@ -390,11 +372,7 @@ fn openEmbedded(self: *IndexedReader, reader: *StreamReader) Error!void {
             if (span > self.options.record_span_bytes) return error.LimitExceeded;
             const fragment_len = std.math.add(usize, context.prefix.len, span) catch return error.LimitExceeded;
             var fragment = FragmentInput.init(self, context.prefix, last.start, span, &.{}, buffer[0..@max(4, @min(buffer.len, fragment_len))]);
-            reader_bridge.resumeFollowingList(reader, &fragment.interface, context.ancestors, last.start, context.prefix.len) catch |err| {
-                try fragment.finishSpan();
-                return err;
-            };
-            try fragment.finishSpan();
+            reader_bridge.resumeFollowingList(reader, &fragment.interface, context.ancestors, last.start, context.prefix.len) catch |err| return fragment.originalError(err);
         }
         self.contexts[1] = try self.captureAncestors(reader, 1);
     }
