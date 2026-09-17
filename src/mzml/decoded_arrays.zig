@@ -75,7 +75,20 @@ pub fn startRecord(self: *DecodedArrays, node: model.Node) Error!void {
 }
 
 pub fn text(self: *DecodedArrays, bytes: []const u8) Error!void {
-    try self.decoder.update(bytes);
+    const compressed = self.outputs.items[self.count - 1].encoding.pipeline != .none;
+    if (compressed) {
+        const total = std.math.add(usize, self.decoder.counts.text_bytes, bytes.len) catch return error.LengthOverflow;
+        if (total > self.limits.base64_text.text_bytes) return error.LimitExceeded;
+        const incoming = @min(bytes.len, self.limits.base64_text.significant_bytes -| self.decoder.counts.significant_bytes);
+        const pending = std.math.add(usize, incoming, self.decoder.quartet_len) catch return error.LengthOverflow;
+        const needed = std.math.add(usize, self.decoder.counts.decoded_bytes, pending / 4 * 3) catch return error.LengthOverflow;
+        try self.wire.resize(self.allocator, @min(needed, self.limits.base64_text.decoded_bytes));
+        self.decoder.output = self.wire.items;
+    }
+    self.decoder.update(bytes) catch |err| return if (err == error.OutputTooSmall and !compressed)
+        error.DecodedSizeMismatch
+    else
+        err;
 }
 
 pub fn complete(self: *DecodedArrays) void {
@@ -95,17 +108,13 @@ pub fn beginArray(self: *DecodedArrays, node: model.Node, groups: []const cv.Gro
     };
     const bytes = std.math.mul(usize, array.length, width) catch return error.LengthOverflow;
     if (bytes > self.limits.array_bytes) return error.LimitExceeded;
-    const encoded = try cv.parseInteger(usize, node.attribute("encodedLength"));
-    const hint = std.math.add(usize, std.math.mul(usize, encoded / 4, 3) catch return error.LengthOverflow, 3) catch return error.LengthOverflow;
-    const capacity = @min(hint, self.limits.base64_text.decoded_bytes);
-    const output_bytes = if (array.encoding.pipeline == .none) @max(bytes, capacity) else bytes;
-    try output.words.resize(self.allocator, output_bytes / 8 + @intFromBool(output_bytes % 8 != 0));
-    try self.wire.resize(self.allocator, if (array.encoding.pipeline == .none) 0 else capacity);
+    try output.words.resize(self.allocator, bytes / 8 + @intFromBool(bytes % 8 != 0));
+    self.wire.clearRetainingCapacity();
     try self.transformed.resize(self.allocator, switch (array.encoding.pipeline) {
         .linear_zlib, .pic_zlib, .slof_zlib => try arrays.wireBound(f64, array.length, array.encoding.pipeline),
         else => 0,
     });
-    const destination = if (array.encoding.pipeline == .none) std.mem.sliceAsBytes(output.words.items) else self.wire.items;
+    const destination = if (array.encoding.pipeline == .none) std.mem.sliceAsBytes(output.words.items)[0..bytes] else self.wire.items;
     self.decoder = base64.Decoder.init(destination, self.limits.base64_text);
 }
 

@@ -63,6 +63,17 @@ fn readDecoded(allocator: std.mem.Allocator, source: []const u8, limits: mzml.ar
     try std.testing.expectEqual(null, output.get(0));
 }
 
+fn readDecodedRecord(allocator: std.mem.Allocator, source: []const u8, limits: mzml.arrays.Limits) !void {
+    var input = std.Io.Reader.fixed(source);
+    var reader = try mzml.StreamReader.init(allocator, &input, .{});
+    defer reader.deinit();
+    var output = mzml.StreamReader.DecodedArrays.init(allocator, limits);
+    defer output.deinit();
+    errdefer std.debug.assert(output.len() == 0);
+    try std.testing.expect((try reader.nextDecodedRecord(&output)) != null);
+    try std.testing.expectEqual(@as(usize, 2), output.len());
+}
+
 fn compareDecoded(source: []const u8, chunk: usize) !void {
     var storage: [31]u8 = undefined;
     var a_input = std.Io.Reader.fixed(source);
@@ -182,7 +193,7 @@ test "[failure] - [mzML decoded reading]: stops at the first error and clears fa
         .{ "!AAAAAAA8D8=", 11, 1, "MS:1000576", error.InvalidCharacter },
         .{ "!AAAAAAA8D8=</broken>", 12, 1, "MS:1000576", error.InvalidCharacter },
         .{ "AAAAAAAA8D8=", 12, 0, "MS:1000576", error.DecodedSizeMismatch },
-        .{ "AAAAAAAA8D8=!AAA", 16, 0, "MS:1000576", error.InvalidPadding },
+        .{ "AAAAAAAA8D8=!AAA", 16, 0, "MS:1000576", error.DecodedSizeMismatch },
         .{ "AAAAAAAA8D8", 11, 1, "MS:1000576", error.TruncatedInput },
         .{ "AB==", 4, 0, "MS:1000576", error.NonCanonicalTail },
         .{ "AA=A", 4, 0, "MS:1000576", error.InvalidPadding },
@@ -228,6 +239,78 @@ test "[failure] - [mzML decoded reading]: bounds storage and releases failed all
     const source = try decodedDocument(std.testing.allocator, text, text.len, 1, "MS:1000576");
     defer std.testing.allocator.free(source);
     try std.testing.expectError(error.InvalidCharacter, readDecoded(std.testing.allocator, source, .{ .base64_text = .{ .text_bytes = 65536 } }));
+}
+
+test "[failure] - [mzML decoded reading]: does not allocate from encoded length hints" {
+    const cases = .{
+        .{ "AAAAAAAA8D8=", "MS:1000576" },
+        .{ "eJxjYACBD/YAAicBMA==", "MS:1000574" },
+    };
+    inline for (cases) |case| {
+        for ([_]usize{ 0, case[0].len, 1048576 }) |hint| {
+            const source = try decodedDocument(std.testing.allocator, case[0], hint, 1, case[1]);
+            defer std.testing.allocator.free(source);
+            var input = std.Io.Reader.fixed(source);
+            var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+            defer reader.deinit();
+            var backing: [4096]u8 = undefined;
+            var allocator = std.heap.FixedBufferAllocator.init(&backing);
+            var output = mzml.StreamReader.DecodedArrays.init(allocator.allocator(), .{ .array_bytes = 8 });
+            defer output.deinit();
+
+            if (hint == case[0].len) {
+                try std.testing.expect((try reader.nextDecodedRecord(&output)) != null);
+                try std.testing.expectEqualSlices(f64, &.{1}, output.get(0).?.values.float64);
+            } else {
+                try std.testing.expectError(error.EncodedLengthMismatch, reader.nextDecodedRecord(&output));
+                try std.testing.expectEqual(@as(usize, 0), output.len());
+            }
+        }
+    }
+}
+
+test "[integration] - [mzML decoded reading]: grows wire storage across fragments within byte limits" {
+    var values: [256]f64 = undefined;
+    var random: std.Random.DefaultPrng = .init(0);
+    random.random().bytes(std.mem.sliceAsBytes(&values));
+    var compressor = try mzml.zlib.Compressor.init(std.testing.allocator, .fastest);
+    defer compressor.deinit();
+    var transport: [4096]u8 = undefined;
+    var transformed: [2048]u8 = undefined;
+    const wire = try mzml.arrays.encodeWire(f64, &values, .{ .pipeline = .zlib }, .{
+        .transport = &transport,
+        .transformed = &transformed,
+    }, &compressor);
+    var text_buffer: [8192]u8 = undefined;
+    const text = try mzml.base64.encode(&text_buffer, wire);
+    var fragments: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer fragments.deinit();
+    var position: usize = 0;
+    while (position < text.len) {
+        const end = @min(position + 13, text.len);
+        try fragments.writer.print("<![CDATA[{s}]]>", .{text[position..end]});
+        position = end;
+    }
+    const source = try decodedDocument(std.testing.allocator, fragments.written(), text.len, values.len, "MS:1000574");
+    defer std.testing.allocator.free(source);
+    try compareDecoded(source, 7);
+    const limits: mzml.arrays.Limits = .{
+        .array_bytes = @sizeOf(@TypeOf(values)),
+        .base64_text = .{ .text_bytes = text.len, .significant_bytes = text.len, .decoded_bytes = wire.len },
+    };
+    // EOF can attempt optional arena consolidation, whose allocation failure is recoverable.
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, readDecodedRecord, .{ source, limits });
+    for (0..4) |limit| {
+        var too_small = limits;
+        switch (limit) {
+            0 => too_small.array_bytes -= 1,
+            1 => too_small.base64_text.text_bytes -= 1,
+            2 => too_small.base64_text.significant_bytes -= 1,
+            3 => too_small.base64_text.decoded_bytes -= 1,
+            else => unreachable,
+        }
+        try std.testing.expectError(error.LimitExceeded, readDecoded(std.testing.allocator, source, too_small));
+    }
 }
 
 test "[failure] - [mzML decoded reading]: does not read beyond a known payload error" {
@@ -443,6 +526,7 @@ test "[integration] - [mzML reader]: reuses storage across growing and shrinking
         }
     }
     try std.testing.expectEqual(null, try reader.nextRecord());
+    try compareDecoded(source.written(), 7);
 }
 
 test "[integration] - [mzML numeric attributes]: enforces schema ranges in reading and construction" {
