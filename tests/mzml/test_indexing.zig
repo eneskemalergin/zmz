@@ -836,6 +836,31 @@ test "[property] - [mzML index]: preserves record checks and byte limits during 
     }
 }
 
+test "[integration] - [mzML index]: rebuilds from records without reading the unused trailer" {
+    const allocator = std.testing.allocator;
+    const source = @embedFile("data/writer_indexed.mzML");
+    const end = std.mem.indexOf(u8, source, "</mzML>").? + "</mzML>".len;
+    var expected = try mzml.IndexedReader.build(allocator, .{ .bytes = source }, .{ .policy = .rebuild });
+    defer expected.deinit();
+    for ([_][]const u8{ "", "<broken" }) |suffix| {
+        const bytes = try std.mem.concat(allocator, u8, &.{ source[0..end], suffix });
+        defer allocator.free(bytes);
+        var actual = try mzml.IndexedReader.build(allocator, .{ .bytes = bytes }, .{ .policy = .rebuild });
+        defer actual.deinit();
+        try std.testing.expectEqualDeep(expected.header().*, actual.header().*);
+        try std.testing.expectEqualDeep(expected.entries.items, actual.entries.items);
+        for ([_]usize{ 0, 7, 8, 15 }) |position| {
+            const entry = actual.entries.items[position];
+            var left = (try expected.byId(allocator, entry.id)).?;
+            defer left.deinit();
+            var right = (try actual.at(allocator, entry.kind, entry.index)).?;
+            defer right.deinit();
+            try std.testing.expectEqualDeep(left.value, right.value);
+        }
+        try std.testing.expectError(error.MissingIndex, mzml.IndexedReader.build(allocator, .{ .bytes = bytes }, .{}));
+    }
+}
+
 test "[integration] - [mzML index]: separates trailer budgets from header and record limits" {
     const allocator = std.testing.allocator;
     const source = @embedFile("data/writer_indexed.mzML");

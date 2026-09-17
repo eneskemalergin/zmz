@@ -48,7 +48,8 @@ pub const StreamReader = struct {
         return self.inner.readHeader();
     }
 
-    /// Returns the current borrowed record or null at document end.
+    /// Returns a borrowed record or null after the mzML content.
+    /// Indexed trailers are read only with retain_index; input buffering may fetch ahead.
     pub fn nextRecord(self: *Reader) Error!?model.Record {
         return self.inner.nextRecord();
     }
@@ -68,7 +69,7 @@ pub const StreamReader = struct {
         return self.inner.diagnostic();
     }
 
-    /// Returns retained indexed wrapper nodes after EOF, valid until deinit, or null when none were retained.
+    /// Returns retained indexed wrapper nodes after traversal, valid until deinit, or null when none were retained.
     pub fn indexTrailer(self: *const Reader) ?[]const model.Node {
         if (!self.inner.done or !self.inner.header.indexed or !self.inner.options.retain_index)
             return null;

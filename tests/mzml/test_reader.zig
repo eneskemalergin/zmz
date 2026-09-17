@@ -1097,6 +1097,76 @@ test "[integration] - [mzML writer]: matches frozen XML and preserves attribute 
     try std.testing.expectError(error.InvalidState, writer.finish());
 }
 
+test "[integration] - [mzML reader]: reads indexed trailers only when requested" {
+    const allocator = std.testing.allocator;
+    const document = "<indexedmzML xmlns='http://psi.hupo.org/ms/mzml'>" ++ support.DOCUMENT;
+    const trailer = "<indexList count='1'><index name='spectrum'><offset idRef='native=a&amp;b'>0</offset></index></indexList>" ++
+        "<indexListOffset>0</indexListOffset><fileChecksum>unchecked</fileChecksum></indexedmzML>";
+    for ([_][]const u8{ document, document ++ "<broken", document ++ trailer }) |text| {
+        var utf16: [(document.len + trailer.len) * 2 + 2]u8 = undefined;
+        for ([_]?std.builtin.Endian{ null, .little, .big }) |encoding| {
+            const source = if (encoding) |endian| blk: {
+                std.mem.writeInt(u16, utf16[0..2], 0xfeff, endian);
+                for (text, 0..) |byte, i| std.mem.writeInt(u16, utf16[2 + 2 * i ..][0..2], byte, endian);
+                break :blk utf16[0 .. text.len * 2 + 2];
+            } else text;
+            for (std.enums.values(mzml.StreamReader.Checks)) |checks| {
+                var buffer: [7]u8 = undefined;
+                var input: std.testing.Reader = .init(&buffer, &.{.{ .buffer = source }});
+                input.artificial_limit = .limited(1);
+                var reader = try mzml.StreamReader.init(allocator, &input.interface, .{ .checks = checks });
+                defer reader.deinit();
+                const header = try reader.readHeader();
+                var output = mzml.StreamReader.DecodedArrays.init(allocator, .{});
+                defer output.deinit();
+                var count: usize = 0;
+                while (if (checks == .checked) try reader.nextDecodedRecord(&output) else try reader.nextRecord()) |record| {
+                    try std.testing.expectEqualStrings(if (count == 0) "native=a&b" else "tic", record.id);
+                    if (checks == .checked) {
+                        try std.testing.expectEqual(@as(usize, 2), output.len());
+                        for (0..output.len()) |i| try std.testing.expectEqualSlices(f64, &.{1}, output.get(i).?.values.float64);
+                    }
+                    count += 1;
+                }
+                try std.testing.expectEqual(@as(usize, 2), count);
+                try std.testing.expectEqual(@as(usize, 0), output.len());
+                try std.testing.expectEqual(@as(u64, if (encoding != null) document.len * 2 + 2 else document.len), header.document.end_offset);
+                try std.testing.expectEqual(null, reader.indexTrailer());
+                try std.testing.expectEqual(null, reader.diagnostic());
+                try std.testing.expectEqual(null, try reader.nextRecord());
+            }
+        }
+    }
+    for ([_]bool{ false, true }) |retain_index| {
+        var bytes: [document.len]u8 = document.*;
+        var input = std.Io.Reader.failing;
+        input.buffer = &bytes;
+        input.end = bytes.len;
+        var reader = try mzml.StreamReader.init(allocator, &input, .{ .retain_index = retain_index });
+        defer reader.deinit();
+        _ = (try reader.nextRecord()).?;
+        _ = (try reader.nextRecord()).?;
+        if (retain_index) {
+            try std.testing.expectError(error.ReadFailed, reader.nextRecord());
+            try std.testing.expectError(error.FailedState, reader.nextRecord());
+        } else try std.testing.expectEqual(null, try reader.nextRecord());
+        try std.testing.expectEqual(null, reader.indexTrailer());
+    }
+    for ([_][]const u8{ document[0 .. document.len - 1], document ++ "<broken" }) |source| {
+        try std.testing.expectError(error.InvalidXml, support.readAll(allocator, source, .{ .retain_index = true }));
+    }
+    try std.testing.expectError(error.InvalidXml, support.readAll(allocator, document[0 .. document.len - 1], .{}));
+    var input = std.Io.Reader.fixed(document ++ trailer);
+    var retained = try mzml.StreamReader.init(allocator, &input, .{ .retain_index = true });
+    defer retained.deinit();
+    while (try retained.nextRecord()) |_| {}
+    const nodes = retained.indexTrailer().?;
+    try std.testing.expectEqual(@as(usize, 3), nodes.len);
+    try std.testing.expectEqualStrings("native=a&b", nodes[0].children[0].children[0].attribute("idRef").?);
+    try std.testing.expectEqualStrings("0", nodes[1].text.?);
+    try std.testing.expectEqualStrings("unchecked", nodes[2].text.?);
+}
+
 test "[integration] - [mzML reader]: distinguishes read failures from truncated XML" {
     var unbuffered = std.Io.Reader.failing;
     try std.testing.expectError(error.InvalidOptions, mzml.StreamReader.init(std.testing.allocator, &unbuffered, .{}));

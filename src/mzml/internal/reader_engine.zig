@@ -156,9 +156,9 @@ pub fn readHeader(self: *StreamReader) Error!*const model.Header {
     return &self.header;
 }
 
-/// Returns a borrowed spectrum or chromatogram, or null after checking the document end.
+/// Returns a borrowed spectrum or chromatogram, or null after the mzML content.
 /// Every call invalidates the previous record, including its encoded payload. Failures are sticky.
-/// Indexed wrappers can be traversed, but index targets and checksums are not verified.
+/// Indexed trailers are read only with retain_index; targets and checksums are not checked.
 pub fn nextRecord(self: *StreamReader) Error!?model.Record {
     return self.nextRecordFor(.tree);
 }
@@ -434,13 +434,16 @@ fn nextRecordInner(self: *StreamReader, comptime retention: Retention) Error!?mo
     }
     try self.run_sequence.finish();
     try self.consumeEnd(.run, true);
-    try self.consumeEnd(.mzml, true);
+    try self.consumeEnd(.mzml, false);
+    if (self.header.indexed and !self.options.retain_index) {
+        self.done = true;
+        return null;
+    }
+    try self.cursor.advance(false);
     if (self.header.indexed) {
         inline for (.{ model.Kind.index_list, .index_list_offset, .file_checksum }, 0..) |expected, i| {
             if (try self.kind() != expected) return error.InvalidStructure;
-            if (self.options.retain_index) {
-                self.index_trailer[i] = try self.parseNode(&self.header_store, 1, true, self.options.payload);
-            } else try self.cursor.skip();
+            self.index_trailer[i] = try self.parseNode(&self.header_store, 1, true, self.options.payload);
         }
         try self.consumeEnd(.indexed_mzml, true);
     }
