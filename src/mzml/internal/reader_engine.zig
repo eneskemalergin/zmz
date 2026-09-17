@@ -60,8 +60,8 @@ pub const ArraySelector = struct {
 };
 
 /// Checked is the default. Minimal preserves valid mzML metadata but skips namespace resolution,
-/// nested child cardinalities/order, parameter order and group-reference placement,
-/// and count comparisons. XML parsing, required attributes, envelope order, and resource limits remain.
+/// nested child cardinalities/order, parameter order and group-reference placement.
+/// XML parsing, required attributes, envelope order, and resource limits remain.
 /// In minimal mode, a prefixed schemaLocation is treated as XSI without resolving its prefix;
 /// other prefixed attributes fail. Unrecognized unprefixed node attributes remain retained.
 pub const Checks = enum { checked, minimal };
@@ -73,9 +73,6 @@ pub const Options = struct {
     /// Does not classify encodings or resolve parameters on the caller's behalf.
     array_selector: ?ArraySelector = null,
     checks: Checks = .checked,
-    /// False preserves mismatched source counts.
-    /// Ignored in minimal mode, which skips count comparisons and nested cardinalities.
-    check_counts: bool = true,
     /// Retains the index trailer within header limits for StreamReader.indexTrailer().
     retain_index: bool = false,
 };
@@ -84,7 +81,6 @@ pub const Error = xml.Error || cv.ValueError || DecodedArrays.Error || std.mem.A
     InvalidStructure,
     MissingAttribute,
     UnknownAttribute,
-    CountMismatch,
     FailedState,
     InvalidOptions,
     InvalidIndex,
@@ -320,8 +316,7 @@ pub fn resumeFollowingList(self: *StreamReader, input: *std.Io.Reader, ancestors
 
 /// Internal indexed-open operation for an empty spectrum list preceding chromatograms.
 pub fn finishEmptySpectrumList(self: *StreamReader) Error!void {
-    if (self.active_list != .spectrum_list or
-        self.header.spectrum_list.?.declared_count != 0) return error.InvalidOptions;
+    if (self.active_list != .spectrum_list) return error.InvalidOptions;
     try self.cursor.advance(false);
     try self.consumeEnd(.spectrum_list, true);
     self.active_list = null;
@@ -413,8 +408,6 @@ fn nextRecordInner(self: *StreamReader, comptime retention: Retention) Error!?mo
             self.current_kind = list_kind;
             if (self.options.checks == .checked and list_kind == .chromatogram_list and list.observed_count == 0)
                 return error.InvalidStructure;
-            if (self.options.checks == .checked and self.options.check_counts and list.observed_count != list.declared_count)
-                return error.CountMismatch;
             self.active_list = null;
             try self.cursor.advance(false);
             try self.openList();
@@ -487,20 +480,12 @@ fn startNodeFor(self: *StreamReader, storage: *Storage, kind_value: model.Kind, 
         schema.optionalAttributes(kind_value),
         retain,
     );
-    const node: model.Node = .{
+    return .{
         .kind = kind_value,
         .attributes = attributes,
         .start_offset = event.span.start,
         .content_offset = event.span.end,
     };
-    if (self.options.checks == .checked) {
-        if (node.attribute("count")) |value| {
-            const count = try cv.parseInteger(usize, value);
-            if (kind_value != .spectrum_list and kind_value != .chromatogram_list and
-                count > self.options.limits.list_entries) return error.LimitExceeded;
-        }
-    }
-    return node;
 }
 
 fn parseNode(self: *StreamReader, storage: *Storage, depth: usize, advance_after: bool, payload: Payload) Error!model.Node {
@@ -511,8 +496,6 @@ fn parseNodeFor(self: *StreamReader, storage: *Storage, depth: usize, advance_af
     if (depth > self.options.limits.depth) return error.LimitExceeded;
     const kind_value = try self.kind();
     var node = try self.startNodeFor(storage, kind_value, retention != .none);
-    // Borrowed attributes expire on advance; this count survives discarded nodes.
-    const discarded_count = if (retention == .none) try node.declaredCount() else null;
     if (retention == .none) node.attributes = &.{};
     if (storage == &self.record_store and depth == 1) {
         if (self.decoded_arrays) |output| try output.startRecord(node);
@@ -563,13 +546,9 @@ fn parseNodeFor(self: *StreamReader, storage: *Storage, depth: usize, advance_af
         var sequence: schema.Sequence = .{ .rules = schema.children(kind_value) };
         const children_start = self.child_scratch.items.len;
         defer self.child_scratch.shrinkRetainingCapacity(children_start);
-        const capacity = if (self.options.checks == .checked)
-            (if (node.attribute("count")) |value| try cv.parseInteger(usize, value) else 4)
-        else
-            4;
         if (retention == .tree and sequence.rules.len != 0)
             try self.child_scratch.ensureUnusedCapacity(self.allocator, @min(
-                capacity,
+                4,
                 self.options.limits.list_entries,
                 (storage.limit -| storage.used) / @sizeOf(model.Node),
             ));
@@ -585,11 +564,6 @@ fn parseNodeFor(self: *StreamReader, storage: *Storage, depth: usize, advance_af
         }
         if (self.options.checks == .checked) try sequence.finish();
         self.current_kind = kind_value;
-        if (self.options.checks == .checked and self.options.check_counts) {
-            if (if (retention == .none) discarded_count else try node.declaredCount()) |count| {
-                if (count != child_count) return error.CountMismatch;
-            }
-        }
         if (retention == .tree) {
             node.children = try storage.copy(model.Node, self.child_scratch.items[children_start..]);
         } else try storage.charge(model.Node, child_count);

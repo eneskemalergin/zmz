@@ -104,7 +104,6 @@ pub fn build(allocator: std.mem.Allocator, source: Source, options: Options) Err
     var reader_options = options.reader;
     if (options.policy != .open_embedded) reader_options.checks = .checked;
     reader_options.payload = .skip;
-    reader_options.check_counts = true;
     reader_options.retain_index = false;
     var reader = try StreamReader.init(allocator, input, reader_options);
     defer reader.deinit();
@@ -325,7 +324,6 @@ fn openEmbedded(self: *IndexedReader, reader: *StreamReader) Error!void {
     var index_start: ?u64 = null;
     var trailer_options = self.options.reader;
     trailer_options.checks = .checked;
-    trailer_options.check_counts = true;
     trailer_options.limits = self.trailerLimits();
     while (offsetTag(tail[0..search_end], endian)) |start| {
         search_end = start;
@@ -376,8 +374,7 @@ fn openEmbedded(self: *IndexedReader, reader: *StreamReader) Error!void {
     }
     const source_header = reader_bridge.header(reader);
     for ([_]?model.RecordList{ source_header.spectrum_list, source_header.chromatogram_list }, 0..) |list, k| {
-        if (list) |value| {
-            if (value.declared_count != self.counts[k]) return error.InvalidIndex;
+        if (list != null) {
             if (self.counts[k] != 0) {
                 const first = self.entries.items[if (k == 0) 0 else self.counts[0]];
                 if (first.start < reader_bridge.listScope(reader, k).?.end) return error.InvalidIndex;
@@ -395,8 +392,7 @@ fn readEmbeddedEntries(self: *IndexedReader, input: *std.Io.Reader, index_start:
     try cursor.advance(false);
     _ = try indexStart(&cursor, .indexed_mzml, false);
     try cursor.advance(false);
-    const list = try indexStart(&cursor, .index_list, true);
-    const declared = try cv.parseInteger(usize, list.attribute(null, "count").?.value);
+    _ = try indexStart(&cursor, .index_list, true);
     var seen = [_]bool{ false, false };
     var indexes: usize = 0;
     try cursor.advance(false);
@@ -428,7 +424,6 @@ fn readEmbeddedEntries(self: *IndexedReader, input: *std.Io.Reader, index_start:
         try indexEnd(&cursor, .index);
     }
     if (indexes == 0) return error.InvalidStructure;
-    if (declared != indexes) return error.CountMismatch;
     try indexEnd(&cursor, .index_list);
     _ = try indexStart(&cursor, .index_list_offset, true);
     if (try cv.parseInteger(u64, try self.indexText(&cursor, &text, .index_list_offset)) != index_start) return error.InvalidIndex;

@@ -306,7 +306,8 @@ pub const Header = struct {
     chromatogram_list: ?RecordList = null,
 };
 
-/// Streaming list counts; observed_count increases as records are consumed.
+/// Preserves the source count without comparing it to traversed records.
+/// observed_count increases as records are consumed, independently of declared_count.
 pub const RecordList = struct {
     attributes: []const Attribute,
     declared_count: usize,

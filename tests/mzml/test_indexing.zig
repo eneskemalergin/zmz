@@ -150,6 +150,54 @@ test "[integration] - [mzML index]: keeps lookup ordinals separate from source i
     }
 }
 
+test "[integration] - [mzML index]: traverses entries without trusting declared counts" {
+    const allocator = std.testing.allocator;
+    const empty_spectra = support.HEADER ++ "<spectrumList count='0' defaultDataProcessingRef='dp'></spectrumList>" ++
+        "<chromatogramList count='1' defaultDataProcessingRef='dp'><chromatogram id='tic' index='0' defaultArrayLength='1'>" ++
+        support.ARRAYS ++ "</chromatogram></chromatogramList></run></mzML>";
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    for ([_][]const u8{ empty_spectra, support.DOCUMENT }, 0..) |plain, spectra| {
+        for ([_]u8{ '0', '9' }) |count| {
+            var sink: std.Io.Writer.Allocating = .init(allocator);
+            defer sink.deinit();
+            try support.rewriteDocument(allocator, plain, &sink.writer, true);
+            const bytes = sink.written();
+            var offset: usize = 0;
+            while (std.mem.indexOfPos(u8, bytes, offset, "count=\"")) |start| {
+                offset = start + "count=\"".len;
+                bytes[offset] = count;
+            }
+            const file = try directory.dir.createFile(std.testing.io, "counts.mzML", .{ .read = true });
+            defer file.close(std.testing.io);
+            try file.writeStreamingAll(std.testing.io, bytes);
+            for ([_]mzml.IndexedReader.Source{ .{ .bytes = bytes }, .{ .file = .{ .handle = file, .io = std.testing.io } } }) |source| {
+                for (std.enums.values(mzml.IndexedReader.Policy)) |policy| {
+                    var index = try mzml.IndexedReader.build(allocator, source, .{ .policy = policy });
+                    defer index.deinit();
+                    try std.testing.expectEqualDeep([_]usize{ spectra, 1 }, index.counts);
+                    try std.testing.expectEqual(@as(usize, count - '0'), index.header().spectrum_list.?.declared_count);
+                    try std.testing.expectEqual(@as(usize, count - '0'), index.header().chromatogram_list.?.declared_count);
+                    var input = std.Io.Reader.fixed(bytes);
+                    var reader = try mzml.StreamReader.init(allocator, &input, .{ .retain_index = true });
+                    defer reader.deinit();
+                    var output = mzml.StreamReader.DecodedArrays.init(allocator, .{});
+                    defer output.deinit();
+                    var records: usize = 0;
+                    while (try reader.nextRecord()) |record| {
+                        var actual = (try index.byIdDecoded(allocator, record.id, &output)).?;
+                        defer actual.deinit();
+                        try expectDecodedRecord(record, index.header().groups, actual.value, &output);
+                        records += 1;
+                    }
+                    try std.testing.expectEqual(spectra + 1, records);
+                    try std.testing.expectEqualStrings(&.{count}, reader.indexTrailer().?[0].attribute("count").?);
+                }
+            }
+        }
+    }
+}
+
 test "[failure] - [mzML indexed decoding]: clears results and recovers after decode and target failures" {
     const Selection = struct {
         fn select(_: ?*anyopaque, _: usize, _: []const mzml.model.Attribute, _: []const mzml.cv.Entry) mzml.StreamReader.Payload {
@@ -811,7 +859,6 @@ test "[property] - [mzML index]: preserves record checks and byte limits during 
         }) |limits| try Parse.compare(support.DOCUMENT, limits);
     }
     for ([_][2][]const u8{
-        .{ "<scanList count='1'>", "<scanList count='2'>" },
         .{ "<userParam name='note' value=''/>", "<userParam value='' extra='x'/>" },
         .{ "<userParam name='note' value=''/>", "<userParam name='note' extra='x'/>" },
         .{ "<scan>", "<scan xmlns='urn:wrong'>" },
@@ -824,6 +871,9 @@ test "[property] - [mzML index]: preserves record checks and byte limits during 
             try Parse.compare(bytes, .{ .record_bytes = limit });
     }
     for ([_][2][]const u8{
+        .{ "<scanList count='1'>", "<scanList count='2'>" },
+        .{ "<scanWindowList count='1'>", "<scanWindowList count='bad'>" },
+        .{ "<scanWindow/>", "<scanWindow/><scanWindow/>" },
         .{ "encodedLength='12'", "encodedLength='11'" },
         .{ "encodedLength='12'", "encodedLength='bad'" },
         .{ "encodedLength='12'", "" },

@@ -432,29 +432,26 @@ test "[regression] - [mzML reader]: oversized count hints do not exhaust bounded
     for ([_][]const u8{ "cvList", "scanList" }) |name| {
         const before = try std.fmt.allocPrint(std.testing.allocator, "<{s} count='1'>", .{name});
         defer std.testing.allocator.free(before);
-        const after = try std.fmt.allocPrint(std.testing.allocator, "<{s} count='100000'>", .{name});
-        defer std.testing.allocator.free(after);
-        const changed = try std.mem.replaceOwned(u8, std.testing.allocator, source, before, after);
-        defer std.testing.allocator.free(changed);
-        for ([_]bool{ true, false }) |check_counts| {
-            var fixed = std.heap.FixedBufferAllocator.init(backing);
-            var input = std.Io.Reader.fixed(changed);
-            var reader = try mzml.StreamReader.init(fixed.allocator(), &input, .{
-                .check_counts = check_counts,
-                .limits = .{ .header_bytes = 8192, .record_bytes = 1024 },
-            });
-            defer reader.deinit();
-            if (check_counts) {
-                try std.testing.expectError(error.CountMismatch, reader.nextRecord());
-                try std.testing.expectError(error.FailedState, reader.nextRecord());
-            } else {
+        for ([_][]const u8{ "0", "100000", "bad", "18446744073709551616" }) |count| {
+            const after = try std.fmt.allocPrint(std.testing.allocator, "<{s} count='{s}'>", .{ name, count });
+            defer std.testing.allocator.free(after);
+            const changed = try std.mem.replaceOwned(u8, std.testing.allocator, source, before, after);
+            defer std.testing.allocator.free(changed);
+            for (std.enums.values(mzml.StreamReader.Checks)) |checks| {
+                var fixed = std.heap.FixedBufferAllocator.init(backing);
+                var input = std.Io.Reader.fixed(changed);
+                var reader = try mzml.StreamReader.init(fixed.allocator(), &input, .{
+                    .checks = checks,
+                    .limits = .{ .header_bytes = 8192, .record_bytes = 1024, .list_entries = 8 },
+                });
+                defer reader.deinit();
                 const record = (try reader.nextRecord()).?;
                 const node = if (std.mem.eql(u8, name, "cvList"))
                     (try reader.readHeader()).document.child(.cv_list).?
                 else
                     record.node.child(.scan_list).?;
                 try std.testing.expectEqual(@as(usize, 1), node.children.len);
-                try std.testing.expectEqual(@as(?usize, 100000), try node.declaredCount());
+                try std.testing.expectEqualStrings(count, node.attribute("count").?);
                 try std.testing.expectEqual(null, try reader.nextRecord());
             }
         }
@@ -581,7 +578,6 @@ test "[integration] - [mzML numeric attributes]: reads source text and checks nu
         const source = try std.mem.replaceOwned(u8, std.testing.allocator, support.DOCUMENT, case[0], case[1]);
         defer std.testing.allocator.free(source);
         try support.readAll(std.testing.allocator, source, .{
-            .check_counts = false,
             .limits = .{ .list_entries = std.math.maxInt(usize), .header_bytes = 8192, .record_bytes = 8192 },
         });
     }
@@ -757,10 +753,7 @@ test "[integration] - [mzML minimal checks]: preserves complete metadata across 
 test "[integration] - [mzML minimal checks]: distinguishes omitted checks from retained failures" {
     const omitted = .{
         .{ "http://psi.hupo.org/ms/mzml", "urn:unchecked", error.WrongNamespace },
-        .{ "count='1'", "count='2'", error.CountMismatch },
-        .{ "<scanWindowList count='1'>", "<scanWindowList count='bad'>", error.InvalidValue },
         .{ "<activation/>", "", error.InvalidStructure },
-        .{ "<scanWindow/>", "<scanWindow/><scanWindow/>", error.CountMismatch },
         .{ "<userParam name='note' value=''/>", "<userParam name='note' value=''/><cvParam cvRef='MS' accession='X:future' name='later'/>", error.InvalidStructure },
         .{ "<referenceableParamGroup id='encoding'>", "<referenceableParamGroup id='encoding'><referenceableParamGroupRef ref='other'/>", error.InvalidStructure },
         .{ "index='0'", "index='0' extra='source'", error.UnknownAttribute },
@@ -819,8 +812,6 @@ test "[failure] - [mzML reader]: rejects unsafe XML wrong namespaces and malform
         .{ "<mzML xmlns='http://psi.hupo.org/ms/mzml' version='1.0.0'/>", error.UnsupportedVersion },
         .{ "<?xml version='1.1'?>" ++ support.DOCUMENT, error.UnsupportedVersion },
         .{ "<mzML xmlns='http://psi.hupo.org/ms/mzml' version='1.1.0'/>", error.InvalidStructure },
-        .{ support.HEADER ++ "<spectrumList count='2' defaultDataProcessingRef='dp'>" ++ support.SPECTRUM ++
-            "</spectrumList></run></mzML>", error.CountMismatch },
     };
     inline for (cases) |case| {
         try std.testing.expectError(case[1], support.readAll(std.testing.allocator, case[0], .{}));
@@ -1047,20 +1038,26 @@ test "[failure] - [mzML reader]: releases partial allocations and enforces reten
     }
 }
 
-test "[integration] - [mzML reader]: reports the list that has a count mismatch" {
-    const document = support.HEADER ++ "<spectrumList count='2' defaultDataProcessingRef='dp'>" ++
-        support.SPECTRUM ++ "</spectrumList></run></mzML>";
-    var input = std.Io.Reader.fixed(document);
-    var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
-    defer reader.deinit();
-    _ = (try reader.nextRecord()).?;
-    try std.testing.expectError(error.CountMismatch, reader.nextRecord());
-    const diagnostic = reader.diagnostic().?;
-    try std.testing.expectEqual(.spectrum_list, diagnostic.element.?);
-    try std.testing.expectEqual(@as(u64, std.mem.indexOf(u8, document, "</spectrumList>").?), diagnostic.byte_offset);
-    try std.testing.expectError(error.FailedState, reader.nextRecord());
-    try std.testing.expectEqualDeep(diagnostic, reader.diagnostic().?);
-    try support.readAll(std.testing.allocator, document, .{ .check_counts = false });
+test "[integration] - [mzML reader]: keeps declared and observed counts separate" {
+    for ([_][]const u8{ "count='0'", "count='2'" }, [_]usize{ 0, 2 }) |replacement, declared| {
+        const document = try std.mem.replaceOwned(u8, std.testing.allocator, support.DOCUMENT, "count='1'", replacement);
+        defer std.testing.allocator.free(document);
+        for (std.enums.values(mzml.StreamReader.Checks)) |checks| {
+            var input = std.Io.Reader.fixed(document);
+            var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{ .checks = checks });
+            defer reader.deinit();
+            const header = try reader.readHeader();
+            try std.testing.expectEqual(declared, header.spectrum_list.?.declared_count);
+            try std.testing.expectEqual(@as(usize, 0), header.spectrum_list.?.observed_count);
+            try std.testing.expectEqualStrings("native=a&b", (try reader.nextRecord()).?.id);
+            try std.testing.expectEqualStrings("tic", (try reader.nextRecord()).?.id);
+            try std.testing.expectEqual(null, try reader.nextRecord());
+            try std.testing.expectEqual(@as(usize, 1), header.spectrum_list.?.observed_count);
+            try std.testing.expectEqual(declared, header.chromatogram_list.?.declared_count);
+            try std.testing.expectEqual(@as(usize, 1), header.chromatogram_list.?.observed_count);
+            try std.testing.expectEqual(null, reader.diagnostic());
+        }
+    }
 }
 
 test "[integration] - [mzML writer]: matches frozen XML and preserves attribute characters" {
