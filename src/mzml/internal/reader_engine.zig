@@ -305,7 +305,7 @@ pub fn resumeFollowingList(self: *StreamReader, input: *std.Io.Reader, ancestors
     try self.cursor.skip();
     try self.consumeEnd(.spectrum_list, true);
     self.active_list = null;
-    try self.openListInner(false);
+    try self.openList();
     if (self.active_list != .chromatogram_list) return error.InvalidStructure;
     const scope = &self.list_scopes[1].?;
     scope.start = std.math.add(u64, scope.start, physical_start - prefix_length) catch return error.LimitExceeded;
@@ -316,9 +316,10 @@ pub fn resumeFollowingList(self: *StreamReader, input: *std.Io.Reader, ancestors
 pub fn finishEmptySpectrumList(self: *StreamReader) Error!void {
     if (self.active_list != .spectrum_list or
         self.header.spectrum_list.?.declared_count != 0) return error.InvalidOptions;
+    try self.cursor.advance(false);
     try self.consumeEnd(.spectrum_list, true);
     self.active_list = null;
-    try self.openListInner(false);
+    try self.openList();
     if (self.active_list != .chromatogram_list) return error.InvalidStructure;
 }
 
@@ -379,10 +380,6 @@ fn readHeaderInner(self: *StreamReader) Error!void {
 }
 
 fn openList(self: *StreamReader) Error!void {
-    return self.openListInner(true);
-}
-
-fn openListInner(self: *StreamReader, advance: bool) Error!void {
     const event = self.cursor.current orelse return error.UnexpectedEnd;
     if (event.data == .end_element) return;
     const kind_value = try self.kind();
@@ -399,11 +396,11 @@ fn openListInner(self: *StreamReader, advance: bool) Error!void {
     }
     self.active_list = kind_value;
     self.list_scopes[if (kind_value == .spectrum_list) @as(usize, 0) else 1] = try self.captureScope();
-    if (advance) try self.cursor.advance(false);
 }
 
 fn nextRecordInner(self: *StreamReader, comptime retention: Retention) Error!?model.Record {
     while (self.active_list) |list_kind| {
+        try self.cursor.advance(false);
         const event = self.cursor.current orelse return error.UnexpectedEnd;
         const list = if (list_kind == .spectrum_list) &self.header.spectrum_list.? else &self.header.chromatogram_list.?;
         if (event.data == .end_element) {
@@ -419,7 +416,7 @@ fn nextRecordInner(self: *StreamReader, comptime retention: Retention) Error!?mo
         }
         const expected: model.Kind = if (list_kind == .spectrum_list) .spectrum else .chromatogram;
         if (try self.kind() != expected) return error.InvalidStructure;
-        const node = try self.parseNodeFor(&self.record_store, 1, true, self.options.payload, retention);
+        const node = try self.parseNodeFor(&self.record_store, 1, false, self.options.payload, retention);
         list.observed_count = std.math.add(usize, list.observed_count, 1) catch
             return error.LimitExceeded;
         return .{

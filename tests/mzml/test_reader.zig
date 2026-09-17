@@ -134,6 +134,47 @@ test "[integration] - [mzML decoded reading]: preserves metadata and values acro
     }
 }
 
+test "[failure] - [mzML reader]: returns completed results before a broken next opening" {
+    const opening = support.HEADER ++ "<spectrumList count='2' defaultDataProcessingRef='dp'>";
+    for ([_][]const u8{ "", "<spectrum id='empty' index='0' defaultArrayLength='0'/>", support.SPECTRUM }) |record_text| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "{s}{s}<spectrum id='unfinished", .{ opening, record_text });
+        defer std.testing.allocator.free(source);
+        for ([_]?std.builtin.Endian{ null, .little, .big }) |encoding| {
+            const width: usize = if (encoding != null) 2 else 1;
+            const bom: usize = if (encoding != null) 2 else 0;
+            const bytes = try std.testing.allocator.alloc(u8, bom + source.len * width);
+            defer std.testing.allocator.free(bytes);
+            if (encoding) |endian| {
+                std.mem.writeInt(u16, bytes[0..2], 0xfeff, endian);
+                for (source, 0..) |byte, i| std.mem.writeInt(u16, bytes[2 + i * 2 ..][0..2], byte, endian);
+            } else @memcpy(bytes, source);
+            for ([_]usize{ 1, 31 }) |chunk| {
+                var buffer: [31]u8 = undefined;
+                var input: std.testing.Reader = .init(buffer[0..chunk], &.{.{ .buffer = bytes }});
+                input.artificial_limit = .limited(chunk);
+                var reader = try mzml.StreamReader.init(std.testing.allocator, &input.interface, .{});
+                defer reader.deinit();
+                const header = try reader.readHeader();
+                try std.testing.expectEqual(@as(usize, 0), header.spectrum_list.?.observed_count);
+                if (record_text.len != 0) {
+                    const record = (try reader.nextRecord()).?;
+                    try std.testing.expectEqual(bom + opening.len * width, record.node.start_offset);
+                    try std.testing.expectEqual(bom + (opening.len + record_text.len) * width, record.node.end_offset);
+                    try std.testing.expectEqual(@as(usize, 1), header.spectrum_list.?.observed_count);
+                }
+                const position = input.interface.seek;
+                try std.testing.expectEqual(header, try reader.readHeader());
+                try std.testing.expectEqual(position, input.interface.seek);
+                try std.testing.expectError(error.InvalidXml, reader.nextRecord());
+                const diagnostic = reader.diagnostic().?;
+                try std.testing.expectEqual(error.InvalidXml, diagnostic.code);
+                try std.testing.expectError(error.FailedState, reader.nextRecord());
+                try std.testing.expectEqualDeep(diagnostic, reader.diagnostic().?);
+            }
+        }
+    }
+}
+
 test "[failure] - [mzML decoded reading]: preserves error order and clears failed output" {
     const cases = .{
         .{ "!AAAAAAA8D8=", 12, 1, "MS:1000576", error.InvalidCharacter },
