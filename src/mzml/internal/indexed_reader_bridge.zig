@@ -74,11 +74,3 @@ pub fn listScope(reader: *const Reader, index: usize) ?Scope {
 pub fn header(reader: *const Reader) *const model.Header {
     return &reader.header;
 }
-
-pub fn indexTrailer(reader: *const Reader) *const [3]model.Node {
-    return &reader.index_trailer;
-}
-
-pub fn visitIndexOffsets(reader: *Reader, visitor: Reader.IndexVisitor) void {
-    reader.index_visitor = visitor;
-}

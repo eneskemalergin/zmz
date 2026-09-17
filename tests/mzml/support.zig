@@ -194,14 +194,25 @@ pub fn checkIndexed(allocator: std.mem.Allocator, bytes: []const u8) !void {
     var index = try mzml.IndexedReader.build(allocator, .{ .bytes = bytes }, .{});
     defer index.deinit();
     try std.testing.expectEqual(@as(usize, 16), index.entries.items.len);
-    try std.testing.expectEqual(@as(usize, 8), index.header().spectrum_list.?.observed_count);
+    try std.testing.expectEqual(@as(usize, 0), index.header().spectrum_list.?.observed_count);
+    var input = std.Io.Reader.fixed(bytes);
+    var reader = try mzml.StreamReader.init(allocator, &input, .{});
+    defer reader.deinit();
+    for (index.entries.items) |entry| {
+        const record = (try reader.nextRecord()).?;
+        try std.testing.expectEqualStrings(entry.id, record.id);
+        try std.testing.expectEqual(entry.kind, record.node.kind);
+        try std.testing.expectEqual(entry.start, record.node.start_offset);
+        try std.testing.expect(record.node.end_offset <= entry.end);
+    }
+    try std.testing.expectEqual(null, try reader.nextRecord());
     for ([_]usize{ 15, 0, 7, 8, 6 }) |position| {
         const entry = index.entries.items[position];
         var record = (try index.byId(allocator, entry.id)).?;
         defer record.deinit();
         try std.testing.expectEqualStrings(entry.id, record.value.id);
         try std.testing.expectEqual(entry.start, record.value.node.start_offset);
-        try std.testing.expectEqual(entry.end, record.value.node.end_offset);
+        try std.testing.expect(record.value.node.end_offset <= entry.end);
         try std.testing.expectEqual(@as(usize, 2), record.value.binaryArrays().len);
         var ordinal = (try index.at(allocator, entry.kind, entry.index)).?;
         defer ordinal.deinit();

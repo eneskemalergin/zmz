@@ -1,9 +1,9 @@
 //! Builds explicit record indexes over stable bytes or a borrowed regular file.
 //!
-//! Rebuilding parses the file once; checksum verification makes another byte pass.
-//! Explicit embedded-index opening reads the header and trailer without a full scan.
-//! Lookups use saved ancestor opening tags and read one
-//! record span; they never rebuild or scan preceding records. Keep the source unchanged.
+//! Opening reads the header and embedded index without scanning every record or
+//! hashing the file. Rebuilding requires an explicit policy and parses the file once.
+//! Lookups use saved ancestor opening tags and read one record span; they never
+//! rebuild or scan preceding records. Keep the source unchanged.
 
 const std = @import("std");
 const model = @import("model.zig");
@@ -24,21 +24,19 @@ pub const Source = union(enum) {
     file: struct { handle: std.Io.File, io: std.Io },
 };
 
-/// Rebuild and verify_embedded scan every record. open_embedded checks the trailer
-/// and each fetched target, but does not check unread records or hash the document.
-pub const Policy = enum { rebuild, verify_embedded, open_embedded };
+pub const Policy = enum { rebuild, open_embedded };
 
 /// Bounds index storage and trailer parsing separately from header and record storage.
 pub const Options = struct {
-    policy: Policy = .verify_embedded,
+    policy: Policy = .open_embedded,
     max_records: usize = 1_000_000,
     index_bytes: usize = 256 * 1024 * 1024,
     /// Maximum raw XML record span read by a lookup, separate from retained-node limits.
     record_span_bytes: usize = 256 * 1024 * 1024,
     /// Bounded backward search for indexListOffset when opening an embedded index.
     tail_bytes: usize = 64 * 1024,
-    /// Applies to returned records and open_embedded headers. Full scans and trailers
-    /// remain checked regardless of reader.checks; index integrity checks are unchanged.
+    /// Applies to returned records and open_embedded headers. Rebuilding and trailer
+    /// parsing use checked mode regardless of reader.checks.
     reader: PublicStreamReader.Options = .{},
 };
 
@@ -46,11 +44,9 @@ pub const Options = struct {
 /// end is an upper bound at the next target or trailer, not the record's closing tag.
 pub const Entry = struct { kind: model.Kind, id: []const u8, index: usize, start: u64, end: u64 };
 
-/// Source, parser, checksum, and target failures remain distinct.
 pub const Error = PublicStreamReader.Error || owned.Error || std.Io.File.StatError || std.Io.File.ReadPositionalError || error{
     MissingIndex,
     InvalidIndex,
-    ChecksumMismatch,
     DuplicateId,
     AmbiguousId,
     StaleSource,
@@ -74,7 +70,6 @@ lookup_reader: ?StreamReader = null,
 lookup_kind: ?model.Kind = null,
 
 /// Builds an index under the selected policy, retaining metadata but not payloads.
-/// verify_embedded checks every target, complete coverage, indexListOffset, and SHA-1.
 /// No automatic fallback occurs. Release with deinit; do not copy the returned owner.
 pub fn build(allocator: std.mem.Allocator, source: Source, options: Options) Error!IndexedReader {
     if (options.policy == .open_embedded and options.tail_bytes == 0)
@@ -109,12 +104,9 @@ pub fn build(allocator: std.mem.Allocator, source: Source, options: Options) Err
     if (options.policy != .open_embedded) reader_options.checks = .checked;
     reader_options.payload = .skip;
     reader_options.check_counts = true;
-    reader_options.retain_index = options.policy == .verify_embedded;
+    reader_options.retain_index = false;
     var reader = try StreamReader.init(allocator, input, reader_options);
     defer reader.deinit();
-    var verification: TrailerVerifier = .{ .reader = &self };
-    if (options.policy == .verify_embedded)
-        reader_bridge.visitIndexOffsets(&reader, .{ .user_data = &verification, .visit = TrailerVerifier.visit, .limits = self.trailerLimits() });
     const source_header = try reader.readHeader();
     if (options.policy != .rebuild and !source_header.indexed) return error.MissingIndex;
     if (options.policy == .open_embedded) {
@@ -140,7 +132,6 @@ pub fn build(allocator: std.mem.Allocator, source: Source, options: Options) Err
         try self.entries.ensureUnusedCapacity(allocator, 1);
         self.entries.appendAssumeCapacity(.{ .kind = record.node.kind, .id = id, .index = record.index, .start = record.node.start_offset, .end = record.node.end_offset });
     }
-    if (options.policy == .verify_embedded) try self.verifyTrailer(reader_bridge.indexTrailer(&reader).*, verification);
     self.counts = ordinals;
     self.metadata = try owned.Header.init(allocator, source_header.*, .{ .bytes = options.reader.limits.header_bytes });
     try self.checkSource();
@@ -466,7 +457,7 @@ fn readEmbeddedEntries(self: *IndexedReader, input: *std.Io.Reader, index_start:
     _ = try indexStart(&cursor, .index_list_offset, true);
     if (try cv.parseInteger(u64, try self.indexText(&cursor, &text, .index_list_offset)) != index_start) return error.InvalidIndex;
     _ = try indexStart(&cursor, .file_checksum, true);
-    _ = try checksum(.{ .kind = .file_checksum, .text = try self.indexText(&cursor, &text, .file_checksum) });
+    _ = try self.indexText(&cursor, &text, .file_checksum);
     try indexEnd(&cursor, .indexed_mzml);
     if (cursor.current != null) return error.InvalidStructure;
     // Each kind is already ordered. Rotate only when the two index elements are reversed.
@@ -517,14 +508,6 @@ fn indexText(self: *const IndexedReader, cursor: *xml.Cursor, text: *std.ArrayLi
     }
     try indexEnd(cursor, kind);
     return text.items;
-}
-
-fn checksum(node: model.Node) Error![20]u8 {
-    const text = std.mem.trim(u8, node.text orelse return error.InvalidIndex, " \t\r\n");
-    if (text.len != 40) return error.InvalidIndex;
-    var result: [20]u8 = undefined;
-    _ = std.fmt.hexToBytes(&result, text) catch return error.InvalidIndex;
-    return result;
 }
 
 // This only finds candidates. The XML cursor parses the candidate and complete trailer.
@@ -587,60 +570,6 @@ const IdQuery = struct {
         return std.mem.eql(u8, id, self.entries[position].id);
     }
 };
-
-const TrailerVerifier = struct {
-    reader: *const IndexedReader,
-    failure: ?Error = null,
-    seen: [2]bool = .{ false, false },
-    kind: model.Kind = .spectrum,
-    previous: u64 = 0,
-    total: usize = 0,
-
-    fn visit(user_data: *anyopaque, index_start: u64, node: model.Node) void {
-        const self: *TrailerVerifier = @ptrCast(@alignCast(user_data));
-        if (self.failure != null) return;
-        self.match(index_start, node) catch |err| {
-            self.failure = err;
-        };
-    }
-
-    fn match(self: *TrailerVerifier, index_start: u64, node: model.Node) Error!void {
-        if (node.kind == .index) {
-            const name = node.attribute("name").?;
-            self.kind = if (std.mem.eql(u8, name, "spectrum")) .spectrum else if (std.mem.eql(u8, name, "chromatogram")) .chromatogram else return error.InvalidIndex;
-            const k = kindIndex(self.kind);
-            if (self.seen[k]) return error.InvalidIndex;
-            self.seen[k] = true;
-            self.previous = 0;
-            return;
-        }
-        const target = try cv.parseInteger(u64, node.text);
-        if (target == 0 or target <= self.previous or target >= index_start) return error.InvalidIndex;
-        self.previous = target;
-        const position = self.reader.ids[kindIndex(self.kind)].getKeyAdapted(node.attribute("idRef").?, IdQuery{ .entries = self.reader.entries.items }) orelse return error.InvalidIndex;
-        const entry = self.reader.entries.items[position];
-        if (entry.kind != self.kind or entry.start != target) return error.InvalidIndex;
-        self.total += 1;
-    }
-};
-
-fn verifyTrailer(self: *IndexedReader, trailer: [3]model.Node, verification: TrailerVerifier) Error!void {
-    if (try cv.parseInteger(u64, trailer[1].text) != trailer[0].start_offset) return error.InvalidIndex;
-    // XML and indexListOffset failures precede the first mismatched entry.
-    if (verification.failure) |err| return err;
-    if (verification.total != self.entries.items.len) return error.InvalidIndex;
-    const expected = try checksum(trailer[2]);
-    var hash = std.crypto.hash.Sha1.init(.{});
-    var buffer: [64 * 1024]u8 = undefined;
-    var offset: u64 = 0;
-    while (offset < trailer[2].content_offset) {
-        const length: usize = @intCast(@min(buffer.len, trailer[2].content_offset - offset));
-        try self.readAt(buffer[0..length], offset);
-        hash.update(buffer[0..length]);
-        offset += length;
-    }
-    if (!std.mem.eql(u8, &hash.finalResult(), &expected)) return error.ChecksumMismatch;
-}
 
 fn captureAncestors(self: *IndexedReader, reader: *StreamReader, k: usize) Error!FragmentAncestors {
     const current_scopes = reader_bridge.scopes(reader);

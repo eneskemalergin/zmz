@@ -392,7 +392,7 @@ test "[regression] - [mzML indexed lookup]: reads a later target after a malform
     defer allocator.free(bytes);
     const end = std.mem.indexOf(u8, bytes, "</spectrum>").?;
     bytes[end + "</spectrum>".len - 2] = 'x';
-    var index = try mzml.IndexedReader.build(allocator, .{ .bytes = bytes }, .{ .policy = .open_embedded });
+    var index = try mzml.IndexedReader.build(allocator, .{ .bytes = bytes }, .{});
     defer index.deinit();
     var retained = (try index.at(allocator, .spectrum, 1)).?;
     defer retained.deinit();
@@ -483,7 +483,7 @@ test "[property] - [mzML index]: preserves ID lookups across growth and reversed
     }
 }
 
-test "[integration] - [mzML index]: opens embedded targets without claiming full verification" {
+test "[integration] - [mzML index]: opens embedded targets without checking unread records or checksums" {
     var buffer: [32768]u8 = undefined;
     var sink = std.Io.Writer.fixed(&buffer);
     try support.constructFixture(std.testing.allocator, &sink, true, std.meta.tags(mzml.arrays.Pipeline), false);
@@ -496,7 +496,7 @@ test "[integration] - [mzML index]: opens embedded targets without claiming full
     const saved = buffer[checksum_start];
     buffer[checksum_start] = if (saved == '0') '1' else '0';
     try support.checkOpenEmbedded(std.testing.allocator, sink.buffered());
-    try std.testing.expectError(error.ChecksumMismatch, mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = sink.buffered() }, .{}));
+    try support.checkIndexed(std.testing.allocator, sink.buffered());
     buffer[checksum_start] = saved;
     const marker = "<offset idRef=\"scan=none\">";
     const target_start = std.mem.indexOf(u8, sink.buffered(), marker).? + marker.len;
@@ -509,17 +509,21 @@ test "[integration] - [mzML index]: opens embedded targets without claiming full
     try std.testing.expectError(error.DuplicateId, mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = sink.buffered() }, .{ .policy = .open_embedded }));
     @memcpy(buffer[id_start..][0..4], "none");
     buffer[checksum_start] = 'x';
-    try std.testing.expectError(error.InvalidIndex, mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = sink.buffered() }, .{ .policy = .open_embedded }));
+    try support.checkIndexed(std.testing.allocator, sink.buffered());
     buffer[checksum_start] = saved;
+    for ([_][]const u8{ "", "unchecked", "0" ** 41 }) |text| {
+        const bytes = try std.mem.replaceOwned(u8, std.testing.allocator, sink.buffered(), sink.buffered()[checksum_start..][0..40], text);
+        defer std.testing.allocator.free(bytes);
+        try support.checkIndexed(std.testing.allocator, bytes);
+    }
     const first_index = std.mem.indexOf(u8, sink.buffered(), "index=\"0\"").? + "index=\"".len;
     buffer[first_index] = '9';
-    var opened = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = sink.buffered() }, .{ .policy = .open_embedded });
+    var opened = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = sink.buffered() }, .{});
     defer opened.deinit();
     try std.testing.expectError(error.InvalidIndex, opened.at(std.testing.allocator, .spectrum, 0));
-    try std.testing.expectError(error.InvalidIndex, mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = sink.buffered() }, .{}));
 }
 
-test "[integration] - [mzML index]: opens and verifies encoded trailers and list namespace declarations" {
+test "[integration] - [mzML index]: opens encoded trailers and restores list namespace declarations" {
     const FailedRead = struct {
         start: u64,
         stop: u64,
@@ -585,14 +589,10 @@ test "[integration] - [mzML index]: opens and verifies encoded trailers and list
                 try file.writeStreamingAll(std.testing.io, bytes);
                 for ([_]mzml.IndexedReader.Source{ .{ .bytes = bytes }, .{ .file = .{ .handle = file, .io = std.testing.io } } }) |indexed_source| {
                     for (std.enums.values(mzml.StreamReader.Checks)) |checks| {
-                        var opened = try mzml.IndexedReader.build(allocator, indexed_source, .{ .policy = .open_embedded, .reader = .{ .checks = checks } });
+                        var opened = try mzml.IndexedReader.build(allocator, indexed_source, .{ .reader = .{ .checks = checks } });
                         defer opened.deinit();
                         var rebuilt = try mzml.IndexedReader.build(allocator, .{ .bytes = bytes }, .{ .policy = .rebuild });
                         defer rebuilt.deinit();
-                        var verified = try mzml.IndexedReader.build(allocator, indexed_source, .{ .reader = .{ .checks = checks } });
-                        defer verified.deinit();
-                        try std.testing.expectEqualDeep(rebuilt.entries.items, verified.entries.items);
-                        try std.testing.expectEqualDeep(rebuilt.header().*, verified.header().*);
                         try std.testing.expectEqual(spectra + 1, opened.entries.items.len);
                         for (opened.entries.items) |entry| {
                             var actual = (try opened.at(allocator, entry.kind, 0)).?;
@@ -646,7 +646,7 @@ test "[integration] - [mzML index]: opens and verifies encoded trailers and list
     }
 }
 
-test "[integration] - [mzML minimal checks]: retains index verification and record identity checks" {
+test "[integration] - [mzML minimal checks]: retains index bounds and record identity checks" {
     const allocator = std.testing.allocator;
     const source = @embedFile("data/writer_indexed.mzML");
     for (std.enums.values(mzml.IndexedReader.Policy)) |policy| {
@@ -668,7 +668,8 @@ test "[integration] - [mzML minimal checks]: retains index verification and reco
     defer allocator.free(bytes);
     const checksum_start = std.mem.indexOf(u8, bytes, "<fileChecksum>").? + "<fileChecksum>".len;
     bytes[checksum_start] = if (bytes[checksum_start] == '0') '1' else '0';
-    try std.testing.expectError(error.ChecksumMismatch, mzml.IndexedReader.build(allocator, .{ .bytes = bytes }, .{ .reader = .{ .checks = .minimal } }));
+    var changed_checksum = try mzml.IndexedReader.build(allocator, .{ .bytes = bytes }, .{ .reader = .{ .checks = .minimal } });
+    changed_checksum.deinit();
     @memcpy(bytes, source);
     const first_index = std.mem.indexOf(u8, bytes, "index=\"0\"").? + "index=\"".len;
     bytes[first_index] = '9';
@@ -677,9 +678,7 @@ test "[integration] - [mzML minimal checks]: retains index verification and reco
     try std.testing.expectError(error.InvalidIndex, opened.at(allocator, .spectrum, 0));
     const malformed = try std.mem.replaceOwned(u8, allocator, source, "order=\"0\"", "order=\"bad\"");
     defer allocator.free(malformed);
-    for ([_]mzml.IndexedReader.Policy{ .rebuild, .verify_embedded }) |policy| {
-        try std.testing.expectError(error.InvalidValue, mzml.IndexedReader.build(allocator, .{ .bytes = malformed }, .{ .policy = policy, .reader = .{ .checks = .minimal } }));
-    }
+    try std.testing.expectError(error.InvalidValue, mzml.IndexedReader.build(allocator, .{ .bytes = malformed }, .{ .policy = .rebuild, .reader = .{ .checks = .minimal } }));
 }
 
 test "[integration] - [mzML index]: verifies emitted targets checksum and independent lookups" {
@@ -693,10 +692,6 @@ test "[integration] - [mzML index]: verifies emitted targets checksum and indepe
     std.crypto.hash.Sha1.hash(sink.buffered()[0..checksum_start], &digest, .{});
     try std.testing.expectEqualStrings(&std.fmt.bytesToHex(digest, .lower), sink.buffered()[checksum_start..][0..40]);
     try std.testing.expectEqualStrings(std.mem.trimEnd(u8, @embedFile("data/writer_indexed.mzML"), "\n"), sink.buffered());
-    const saved = buffer[checksum_start];
-    buffer[checksum_start] = if (saved == '0') '1' else '0';
-    try std.testing.expectError(error.ChecksumMismatch, mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = sink.buffered() }, .{}));
-    buffer[checksum_start] = saved;
     const marker = "<offset idRef=\"scan=none\">";
     const target_start = std.mem.indexOf(u8, sink.buffered(), marker).? + marker.len;
     const target_end = std.mem.indexOfScalarPos(u8, sink.buffered(), target_start, '<').?;
@@ -706,12 +701,15 @@ test "[integration] - [mzML index]: verifies emitted targets checksum and indepe
     @memset(buffer[target_start..target_end], '0');
     try std.testing.expectError(error.InvalidIndex, mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = sink.buffered() }, .{}));
     @memcpy(buffer[target_start..target_end], target[0..target_length]);
-    buffer[target_end - 1] = if (buffer[target_end - 1] == '9') '8' else buffer[target_end - 1] + 1;
-    try std.testing.expectError(error.InvalidIndex, mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = sink.buffered() }, .{}));
-    @memcpy(buffer[target_start..target_end], target[0..target_length]);
+    const id_start = target_start - "none\">".len;
+    buffer[id_start] = 'x';
+    var wrong_target = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = sink.buffered() }, .{});
+    defer wrong_target.deinit();
+    try std.testing.expectError(error.InvalidIndex, wrong_target.byId(std.testing.allocator, "scan=xone"));
+    buffer[id_start] = 'n';
     const offset_start = std.mem.indexOf(u8, sink.buffered(), "<indexListOffset>").? + "<indexListOffset>".len;
     buffer[offset_start] = '0';
-    try std.testing.expectError(error.InvalidIndex, mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = sink.buffered() }, .{}));
+    try std.testing.expectError(error.InvalidXml, mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = sink.buffered() }, .{}));
     var rebuilt = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = sink.buffered() }, .{ .policy = .rebuild });
     defer rebuilt.deinit();
     try std.testing.expectEqual(@as(usize, 16), rebuilt.entries.items.len);
@@ -764,32 +762,26 @@ test "[integration] - [mzML index]: separates trailer budgets from header and re
         .{ .nodes = 32 }, .{ .list_entries = 4 }, .{ .header_bytes = 4096 },
     }) |limits| {
         try std.testing.expectError(error.LimitExceeded, support.readAll(allocator, source, .{ .retain_index = true, .limits = limits }));
-        for ([_]mzml.IndexedReader.Policy{ .open_embedded, .verify_embedded }) |policy| {
-            var index = try mzml.IndexedReader.build(allocator, .{ .bytes = source }, .{
-                .policy = policy,
-                .max_records = 16,
-                .reader = .{ .limits = limits },
-            });
-            defer index.deinit();
-            try std.testing.expectEqual(@as(usize, 16), index.entries.items.len);
-            var record = (try index.byId(allocator, "chromatogram=slof_zlib")).?;
-            defer record.deinit();
-            try std.testing.expectEqualStrings("chromatogram=slof_zlib", record.value.id);
-            try std.testing.expectEqual(@as(usize, 7), record.value.index);
-        }
+        var index = try mzml.IndexedReader.build(allocator, .{ .bytes = source }, .{
+            .max_records = 16,
+            .reader = .{ .limits = limits },
+        });
+        defer index.deinit();
+        try std.testing.expectEqual(@as(usize, 16), index.entries.items.len);
+        var record = (try index.byId(allocator, "chromatogram=slof_zlib")).?;
+        defer record.deinit();
+        try std.testing.expectEqualStrings("chromatogram=slof_zlib", record.value.id);
+        try std.testing.expectEqual(@as(usize, 7), record.value.index);
     }
-    for ([_]mzml.IndexedReader.Policy{ .open_embedded, .verify_embedded }) |policy| {
-        for ([_]mzml.IndexedReader.Options{
-            .{ .max_records = 15 },                               .{ .index_bytes = 1024 },
-            .{ .reader = .{ .limits = .{ .header_bytes = 1 } } }, .{ .reader = .{ .limits = .{ .nodes = 1 } } },
-            .{ .reader = .{ .limits = .{ .list_entries = 1 } } },
-        }) |options| {
-            var selected = options;
-            selected.policy = policy;
-            try std.testing.expectError(error.LimitExceeded, mzml.IndexedReader.build(allocator, .{ .bytes = source }, selected));
-        }
+    for ([_]mzml.IndexedReader.Options{
+        .{ .max_records = 15 },                               .{ .index_bytes = 1024 },
+        .{ .reader = .{ .limits = .{ .header_bytes = 1 } } }, .{ .reader = .{ .limits = .{ .nodes = 1 } } },
+        .{ .reader = .{ .limits = .{ .list_entries = 1 } } },
+    }) |options| {
+        try std.testing.expectError(error.LimitExceeded, mzml.IndexedReader.build(allocator, .{ .bytes = source }, options));
     }
     try std.testing.expectError(error.LimitExceeded, mzml.IndexedReader.build(allocator, .{ .bytes = source }, .{
+        .policy = .rebuild,
         .reader = .{ .limits = .{ .record_bytes = 1 } },
     }));
     var opened = try mzml.IndexedReader.build(allocator, .{ .bytes = source }, .{
@@ -800,49 +792,21 @@ test "[integration] - [mzML index]: separates trailer budgets from header and re
     try std.testing.expectError(error.LimitExceeded, opened.at(allocator, .spectrum, 0));
 }
 
-test "[property] - [mzML index]: preserves parser limits before reporting unmatched entries" {
-    const Parse = struct {
-        fn failure(bytes: []const u8, options: mzml.StreamReader.Options) ?mzml.StreamReader.Error {
-            var input = std.Io.Reader.fixed(bytes);
-            var reader = mzml.StreamReader.init(std.testing.allocator, &input, options) catch |err| return err;
-            defer reader.deinit();
-            while ((reader.nextRecord() catch |err| return err) != null) {}
-            return null;
-        }
-    };
-    const source = @embedFile("data/writer_indexed.mzML");
-    var bytes: [source.len]u8 = source.*;
-    const id = std.mem.indexOf(u8, &bytes, "idRef=\"scan=none\"").? + "idRef=\"".len;
-    bytes[id] = 'x';
-    for ([_]usize{ 0, 1, 2, 3, 4, 7, 8, 16, 24, 32, 39, 40, 64, 128, 1024, 4096, 8192 }) |limit| {
-        for ([_]mzml.StreamReader.Options{
-            .{ .limits = .{ .header_bytes = limit } },
-            .{ .limits = .{ .nodes = limit } },
-            .{ .limits = .{ .list_entries = limit } },
-            .{ .retain_index = true, .limits = .{ .binary_text_bytes = limit } },
-            .{ .retain_index = true, .limits = .{ .depth = @min(limit, 64) } },
-        }) |options| {
-            const expected = Parse.failure(&bytes, options) orelse error.InvalidIndex;
-            try std.testing.expectError(expected, mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = &bytes }, .{ .reader = options }));
-        }
-    }
-}
-
-test "[failure] - [mzML index]: checks the complete trailer before deferred matching errors" {
+test "[failure] - [mzML index]: rejects unusable and truncated indexes without rebuilding" {
     const source = @embedFile("data/writer_indexed.mzML");
     var bytes: [source.len]u8 = source.*;
     const target = std.mem.indexOf(u8, &bytes, "<offset idRef=\"scan=none\">").? + "<offset idRef=\"scan=none\">".len;
     const list_offset = std.mem.indexOf(u8, &bytes, "<indexListOffset>").? + "<indexListOffset>".len;
     bytes[target] = 'x';
     bytes[list_offset] = '0';
-    try std.testing.expectError(error.InvalidIndex, mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = &bytes }, .{}));
+    try std.testing.expectError(error.InvalidXml, mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = &bytes }, .{}));
     bytes[list_offset] = source[list_offset];
     try std.testing.expectError(error.InvalidValue, mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = &bytes }, .{}));
     const closing = std.mem.indexOf(u8, &bytes, "</fileChecksum>").?;
     bytes[closing + 2] = 'x';
-    try std.testing.expectError(error.InvalidXml, mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = &bytes }, .{}));
+    try std.testing.expectError(error.MissingIndex, mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = &bytes }, .{}));
     const trailer = std.mem.indexOf(u8, &bytes, "<indexList ").?;
-    try std.testing.expectError(error.InvalidXml, mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = bytes[0..trailer] }, .{}));
+    try std.testing.expectError(error.MissingIndex, mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = bytes[0..trailer] }, .{}));
 }
 
 test "[integration] - [mzML index]: builds plain files explicitly and rejects changed file sources" {
@@ -988,7 +952,7 @@ test "[failure] - [mzML indexed writer]: keeps record-limit and sink failures st
     try std.testing.expectError(error.FailedState, failed.finish());
 }
 
-test "[integration] - [mzML indexed writer]: verifies empty indexes and escaped IDs" {
+test "[integration] - [mzML indexed writer]: opens empty indexes and escaped IDs" {
     var input = std.Io.Reader.fixed(support.DOCUMENT);
     var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
     defer reader.deinit();
@@ -1009,9 +973,9 @@ test "[integration] - [mzML indexed writer]: verifies empty indexes and escaped 
         var index = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = sink.buffered() }, .{ .max_records = count });
         defer index.deinit();
         try std.testing.expectEqual(count, index.entries.items.len);
-        var opened = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = sink.buffered() }, .{ .policy = .open_embedded, .max_records = count });
-        defer opened.deinit();
-        try std.testing.expectEqual(count, opened.entries.items.len);
+        var rebuilt = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = sink.buffered() }, .{ .policy = .rebuild, .max_records = count });
+        defer rebuilt.deinit();
+        try std.testing.expectEqual(count, rebuilt.entries.items.len);
         if (try index.byId(std.testing.allocator, "native=a&b")) |copied| {
             var owner = copied;
             defer owner.deinit();

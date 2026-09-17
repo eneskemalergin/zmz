@@ -94,7 +94,7 @@ test "[integration] - [mzML references]: preserves unresolved and external links
             var rewritten = try mzml.StreamReader.init(std.testing.allocator, &rewritten_input, .{});
             defer rewritten.deinit();
             var index = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = sink.buffered() }, .{
-                .policy = if (indexed) .verify_embedded else .rebuild,
+                .policy = if (indexed) .open_embedded else .rebuild,
             });
             defer index.deinit();
             const header = try original.readHeader();
@@ -187,7 +187,7 @@ test "[integration] - [mzML prepared writing]: preserves primitive bytes across 
                     try support.writeSingleRecord(std.testing.allocator, &rewritten, header.*, decoded_record.node, indexed, &.{ reencoded, reencoded });
                     try std.testing.expectEqualSlices(u8, expected.buffered(), rewritten.buffered());
                     if (indexed) {
-                        var index = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = rewritten.buffered() }, .{ .policy = .verify_embedded });
+                        var index = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = rewritten.buffered() }, .{});
                         defer index.deinit();
                         try std.testing.expectEqual(@as(usize, 1), index.entries.items.len);
                         var fetched = (try index.atDecoded(std.testing.allocator, .spectrum, 0, &decoded_arrays)).?;
