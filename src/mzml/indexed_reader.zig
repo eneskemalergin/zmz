@@ -66,7 +66,7 @@ size: u64,
 stamp: ?std.Io.File.Stat = null,
 remaining: usize,
 entries: std.ArrayList(Entry) = .empty,
-ids: [2]std.StringHashMapUnmanaged(usize) = .{ .empty, .empty },
+ids: [2]std.HashMapUnmanaged(usize, void, IdContext, std.hash_map.default_max_load_percentage) = .{ .empty, .empty },
 metadata: ?owned.Header = null,
 contexts: [2]?FragmentAncestors = .{ null, null },
 counts: [2]usize = .{ 0, 0 },
@@ -134,9 +134,9 @@ pub fn build(allocator: std.mem.Allocator, source: Source, options: Options) Err
         if (self.contexts[k] == null) self.contexts[k] = try self.captureAncestors(&reader, k);
         try self.charge(@sizeOf(Entry) + @sizeOf(usize) * 4);
         const id = try self.copy(record.id);
-        const entry = try self.ids[k].getOrPut(allocator, id);
+        const entry = try self.ids[k].getOrPutContextAdapted(allocator, id, IdQuery{ .entries = self.entries.items }, .{ .entries = self.entries.items });
         if (entry.found_existing) return error.DuplicateId;
-        entry.value_ptr.* = self.entries.items.len;
+        entry.key_ptr.* = self.entries.items.len;
         try self.entries.ensureUnusedCapacity(allocator, 1);
         self.entries.appendAssumeCapacity(.{ .kind = record.node.kind, .id = id, .index = record.index, .start = record.node.start_offset, .end = record.node.end_offset });
     }
@@ -202,8 +202,9 @@ pub fn atDecoded(self: *IndexedReader, allocator: std.mem.Allocator, kind: model
 
 fn idPosition(self: *IndexedReader, id: []const u8) Error!?usize {
     try self.checkSource();
-    const spectrum = self.ids[0].get(id);
-    const chromatogram = self.ids[1].get(id);
+    const query: IdQuery = .{ .entries = self.entries.items };
+    const spectrum = self.ids[0].getKeyAdapted(id, query);
+    const chromatogram = self.ids[1].getKeyAdapted(id, query);
     if (spectrum != null and chromatogram != null) return error.AmbiguousId;
     return spectrum orelse chromatogram;
 }
@@ -445,9 +446,9 @@ fn readEmbeddedEntries(self: *IndexedReader, input: *std.Io.Reader, index_start:
             if (target <= previous or target >= index_start or target < minimum or
                 (endian != null and target % 2 != 0) or target > std.math.maxInt(i64)) return error.InvalidIndex;
             previous = target;
-            const entry = try self.ids[k].getOrPut(self.allocator, id);
+            const entry = try self.ids[k].getOrPutContextAdapted(self.allocator, id, IdQuery{ .entries = self.entries.items }, .{ .entries = self.entries.items });
             if (entry.found_existing) return error.DuplicateId;
-            entry.value_ptr.* = self.entries.items.len;
+            entry.key_ptr.* = self.entries.items.len;
             try self.entries.append(self.allocator, .{ .kind = kind, .id = id, .index = self.counts[k], .start = target, .end = index_start });
             self.counts[k] += 1;
         }
@@ -463,9 +464,14 @@ fn readEmbeddedEntries(self: *IndexedReader, input: *std.Io.Reader, index_start:
     try indexEnd(&cursor, .indexed_mzml);
     if (cursor.current != null) return error.InvalidStructure;
     // Each kind is already ordered. Rotate only when the two index elements are reversed.
-    if (self.counts[0] != 0 and self.counts[1] != 0 and self.entries.items[0].kind == .chromatogram)
+    if (self.counts[0] != 0 and self.counts[1] != 0 and self.entries.items[0].kind == .chromatogram) {
         std.mem.rotate(Entry, self.entries.items, self.counts[1]);
-    for (self.entries.items, 0..) |entry, i| self.ids[kindIndex(entry.kind)].getPtr(entry.id).?.* = i;
+        // Move positions with their entries so each stored hash still names the same ID.
+        var spectra = self.ids[0].keyIterator();
+        while (spectra.next()) |position| position.* -= self.counts[1];
+        var chromatograms = self.ids[1].keyIterator();
+        while (chromatograms.next()) |position| position.* += self.counts[0];
+    }
 }
 
 fn indexStart(cursor: *const xml.Cursor, kind: model.Kind, attributes: bool) Error!xml.Start {
@@ -552,6 +558,30 @@ fn encoding(self: *const IndexedReader) Error!?std.builtin.Endian {
     return if (signature[0] == 0xff or (signature[0] == '<' and signature[1] == 0)) .little else if (signature[0] == 0xfe or (signature[0] == 0 and signature[1] == '<')) .big else null;
 }
 
+const IdContext = struct {
+    entries: []const Entry,
+
+    pub fn hash(self: IdContext, position: usize) u64 {
+        return std.hash_map.hashString(self.entries[position].id);
+    }
+
+    pub fn eql(_: IdContext, left: usize, right: usize) bool {
+        return left == right;
+    }
+};
+
+const IdQuery = struct {
+    entries: []const Entry,
+
+    pub fn hash(_: IdQuery, id: []const u8) u64 {
+        return std.hash_map.hashString(id);
+    }
+
+    pub fn eql(self: IdQuery, id: []const u8, position: usize) bool {
+        return std.mem.eql(u8, id, self.entries[position].id);
+    }
+};
+
 const TrailerVerifier = struct {
     reader: *const IndexedReader,
     failure: ?Error = null,
@@ -581,7 +611,7 @@ const TrailerVerifier = struct {
         const target = try cv.parseInteger(u64, node.text);
         if (target == 0 or target <= self.previous or target >= index_start) return error.InvalidIndex;
         self.previous = target;
-        const position = self.reader.ids[kindIndex(self.kind)].get(node.attribute("idRef").?) orelse return error.InvalidIndex;
+        const position = self.reader.ids[kindIndex(self.kind)].getKeyAdapted(node.attribute("idRef").?, IdQuery{ .entries = self.reader.entries.items }) orelse return error.InvalidIndex;
         const entry = self.reader.entries.items[position];
         if (entry.kind != self.kind or entry.start != target) return error.InvalidIndex;
         self.total += 1;

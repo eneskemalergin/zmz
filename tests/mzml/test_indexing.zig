@@ -405,6 +405,84 @@ test "[regression] - [mzML indexed lookup]: reads a later target after a malform
     }
 }
 
+test "[property] - [mzML index]: preserves ID lookups across growth and reversed index lists" {
+    const Build = struct {
+        fn check(allocator: std.mem.Allocator, bytes: []const u8, policy: mzml.IndexedReader.Policy) !void {
+            var index = try mzml.IndexedReader.build(allocator, .{ .bytes = bytes }, .{ .policy = policy });
+            defer index.deinit();
+            try std.testing.expectEqual(@as(usize, 59), index.entries.items.len);
+        }
+    };
+    const allocator = std.testing.allocator;
+    const counts = [_]usize{ 40, 19 };
+    const kinds = [_]mzml.model.Kind{ .spectrum, .chromatogram };
+    for ([_]bool{ false, true }) |reversed| {
+        var source: std.Io.Writer.Allocating = .init(allocator);
+        defer source.deinit();
+        var offsets: [59]usize = undefined;
+        var position: usize = 0;
+        try source.writer.writeAll("<indexedmzML xmlns='http://psi.hupo.org/ms/mzml'>" ++ support.HEADER);
+        for (kinds, counts) |kind, count| {
+            const name = kind.xmlName();
+            try source.writer.print("<{s}List count='{d}' defaultDataProcessingRef='dp'>", .{ name, count });
+            for (0..count) |i| {
+                offsets[position] = source.written().len;
+                position += 1;
+                try source.writer.print("<{s} id='{s}&amp;{d:0>2}' index='{d}' defaultArrayLength='1'>" ++ support.ARRAYS ++ "</{s}>", .{ name, name, i, i, name });
+            }
+            try source.writer.print("</{s}List>", .{name});
+        }
+        try source.writer.writeAll("</run></mzML>");
+        const index_start = source.written().len;
+        try source.writer.writeAll("<indexList count='2'>");
+        for (0..2) |order| {
+            const k = if (reversed) 1 - order else order;
+            const name = kinds[k].xmlName();
+            try source.writer.print("<index name='{s}'>", .{name});
+            for (0..counts[k]) |i| {
+                try source.writer.print("<offset idRef='{s}&amp;{d:0>2}'>{d}</offset>", .{ name, i, offsets[i + if (k == 0) @as(usize, 0) else counts[0]] });
+            }
+            try source.writer.writeAll("</index>");
+        }
+        try source.writer.print("</indexList><indexListOffset>{d}</indexListOffset><fileChecksum>", .{index_start});
+        var digest: [20]u8 = undefined;
+        std.crypto.hash.Sha1.hash(source.written(), &digest, .{});
+        try source.writer.print("{s}</fileChecksum></indexedmzML>", .{std.fmt.bytesToHex(digest, .lower)});
+
+        for (std.enums.values(mzml.IndexedReader.Policy)) |policy| {
+            var retained = blk: {
+                var index = try mzml.IndexedReader.build(allocator, .{ .bytes = source.written() }, .{ .policy = policy });
+                defer index.deinit();
+                var first = (try index.byId(allocator, "spectrum&00")).?;
+                errdefer first.deinit();
+                for (kinds, counts) |kind, count| {
+                    for (0..count) |i| {
+                        var id: [64]u8 = undefined;
+                        const query = try std.fmt.bufPrint(&id, "{s}&{d:0>2}", .{ kind.xmlName(), i });
+                        var named = (try index.byId(allocator, query)).?;
+                        defer named.deinit();
+                        var ordinal = (try index.at(allocator, kind, i)).?;
+                        defer ordinal.deinit();
+                        try std.testing.expectEqualStrings(query, named.value.id);
+                        try std.testing.expectEqual(i, named.value.index);
+                        try std.testing.expectEqual(kind, named.value.node.kind);
+                        try std.testing.expectEqualDeep(ordinal.value, named.value);
+                    }
+                }
+                try std.testing.expectEqual(null, try index.byId(allocator, "spectrum&40"));
+                try std.testing.expectEqual(null, try index.byId(allocator, "chromatogram&19"));
+                break :blk first;
+            };
+            defer retained.deinit();
+            try std.testing.expectEqualStrings("spectrum&00", retained.value.id);
+            try std.testing.checkAllAllocationFailures(allocator, Build.check, .{ source.written(), policy });
+            const duplicate = try std.mem.replaceOwned(u8, allocator, source.written(), "spectrum&amp;39", "spectrum&amp;00");
+            defer allocator.free(duplicate);
+            try std.testing.expectError(error.DuplicateId, mzml.IndexedReader.build(allocator, .{ .bytes = duplicate }, .{ .policy = policy }));
+        }
+    }
+}
+
 test "[integration] - [mzML index]: opens embedded targets without claiming full verification" {
     var buffer: [32768]u8 = undefined;
     var sink = std.Io.Writer.fixed(&buffer);
