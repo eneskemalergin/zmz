@@ -2,7 +2,7 @@
 
 const std = @import("std");
 
-/// Stable mzML namespace used by checked reader and writer paths.
+/// Stable mzML namespace used by reader and writer paths.
 pub const NAMESPACE = "http://psi.hupo.org/ms/mzml";
 /// XML Schema instance namespace used only for `schemaLocation`.
 pub const XSI = "http://www.w3.org/2001/XMLSchema-instance";
@@ -63,20 +63,20 @@ const Codepoint = struct {
     end: u64,
 };
 
-/// A parsed QName with its resolved namespace URI when checked mode is active.
+/// A parsed QName with its resolved namespace URI.
 pub const ExpandedName = struct {
     prefix: ?[]const u8,
     local: []const u8,
     namespace_uri: ?[]const u8,
 };
 
-/// A source QName and optional expanded form borrowed until the next cursor event.
+/// A source QName and expanded form borrowed until the next cursor event.
 pub const Name = struct {
     raw: []const u8,
-    expanded: ?ExpandedName,
+    expanded: ExpandedName,
 
     pub fn eql(self: Name, namespace_uri: ?[]const u8, local: []const u8) bool {
-        const expanded = self.expanded orelse return false;
+        const expanded = self.expanded;
         if (!optionalSliceEql(expanded.namespace_uri, namespace_uri)) return false;
         return std.mem.eql(u8, expanded.local, local);
     }
@@ -85,26 +85,8 @@ pub const Name = struct {
 /// Alias used by indexed-reader helpers for a start-element event.
 pub const Start = StartElement;
 
-/// Returns the local part of a checked or minimal-mode name.
 pub fn localName(name: Name) []const u8 {
-    if (name.expanded) |expanded| return expanded.local;
-    return if (std.mem.indexOfScalar(u8, name.raw, ':')) |colon| name.raw[colon + 1 ..] else name.raw;
-}
-
-/// Resolves the minimal-mode attribute rules used by the mzML reader.
-pub fn attributeName(name: Name) Error!?ExpandedName {
-    if (name.expanded) |expanded| return expanded;
-    const raw = name.raw;
-    const parts = try qnameParts(raw);
-    const namespace_uri = if (parts.prefix) |_|
-        if (std.mem.eql(u8, parts.local, "schemaLocation")) XSI else ""
-    else
-        null;
-    return .{
-        .prefix = parts.prefix,
-        .local = parts.local,
-        .namespace_uri = namespace_uri,
-    };
+    return name.expanded.local;
 }
 
 /// A parsed non-namespace attribute borrowed until the next cursor event.
@@ -233,16 +215,6 @@ fn ordinaryAttributeRun(bytes: []const u8, quote: u8) usize {
         if (byte < 0x20 or byte >= 0x80 or byte == quote or byte == '&' or byte == '<') break;
     }
     return length;
-}
-
-fn qnameParts(raw: []const u8) Error!struct { prefix: ?[]const u8, local: []const u8 } {
-    const colon = std.mem.indexOfScalar(u8, raw, ':') orelse {
-        if (raw.len == 0) return error.InvalidXml;
-        return .{ .prefix = null, .local = raw };
-    };
-    if (colon == 0 or colon + 1 >= raw.len) return error.InvalidXml;
-    if (std.mem.indexOfScalarPos(u8, raw, colon + 1, ':') != null) return error.InvalidXml;
-    return .{ .prefix = raw[0..colon], .local = raw[colon + 1 ..] };
 }
 
 const Source = struct {
@@ -471,7 +443,6 @@ pub const Cursor = struct {
     max_depth: usize,
     max_attributes: usize,
     max_attribute_bytes: usize,
-    check_namespaces: bool,
     current: ?Event = null,
     offset: u64 = 0,
     document_started: bool = false,
@@ -502,7 +473,6 @@ pub const Cursor = struct {
         max_depth: usize,
         max_attributes: usize,
         max_attribute_bytes: usize,
-        check_namespaces: bool,
     ) Error!Cursor {
         if (max_depth == 0 or max_depth > MAX_XML_DEPTH or max_attributes == 0 or max_attribute_bytes == 0) {
             return error.InvalidOptions;
@@ -514,7 +484,6 @@ pub const Cursor = struct {
             .max_depth = max_depth,
             .max_attributes = max_attributes,
             .max_attribute_bytes = max_attribute_bytes,
-            .check_namespaces = check_namespaces,
         };
     }
 
@@ -627,10 +596,7 @@ pub const Cursor = struct {
                     if (document.version != .xml10) return error.UnsupportedVersion;
                 },
                 .start_element => |start| {
-                    if (self.check_namespaces) {
-                        const expanded = start.name.expanded orelse return error.WrongNamespace;
-                        if (!optionalSliceEql(expanded.namespace_uri, NAMESPACE)) return error.WrongNamespace;
-                    }
+                    if (!optionalSliceEql(start.name.expanded.namespace_uri, NAMESPACE)) return error.WrongNamespace;
                     self.current = event;
                     return;
                 },
@@ -1152,8 +1118,8 @@ pub const Cursor = struct {
 
         const binding_start = self.namespace_bindings.items.len;
         const namespace_bytes_start = self.namespace_bytes.items.len;
-        if (self.check_namespaces) try self.installNamespaces(binding_start);
-        const element_name = try self.makeName(bytes, name_range, self.check_namespaces);
+        try self.installNamespaces(binding_start);
+        const element_name = try self.makeName(bytes, name_range);
 
         const frame_name_start = self.open_names.items.len;
         try self.open_names.appendSlice(self.allocator, bytes[name_range.start..][0..name_range.len]);
@@ -1172,11 +1138,9 @@ pub const Cursor = struct {
         for (self.attribute_ranges.items) |attribute_range| {
             if (attribute_range.namespace_declaration) continue;
             const attribute_name = try self.makeAttributeName(bytes, attribute_range.name);
-            if (self.check_namespaces) {
-                const expanded = attribute_name.expanded.?;
-                for (self.attributes.items) |previous| {
-                    if (previous.name.eql(expanded.namespace_uri, expanded.local)) return error.InvalidXml;
-                }
+            const expanded = attribute_name.expanded;
+            for (self.attributes.items) |previous| {
+                if (previous.name.eql(expanded.namespace_uri, expanded.local)) return error.InvalidXml;
             }
             try self.attributes.append(self.allocator, .{
                 .name = attribute_name,
@@ -1237,9 +1201,8 @@ pub const Cursor = struct {
         return null;
     }
 
-    fn makeName(self: *const Cursor, bytes: []const u8, range: NameRange, resolve: bool) Error!Name {
+    fn makeName(self: *const Cursor, bytes: []const u8, range: NameRange) Error!Name {
         const raw = bytes[range.start..][0..range.len];
-        if (!resolve) return .{ .raw = raw, .expanded = null };
         const prefix = if (range.prefix_len == 0) null else raw[0..range.prefix_len];
         const local = if (range.prefix_len == 0) raw else raw[range.prefix_len + 1 ..];
         const namespace_uri = self.resolveNamespace(prefix);
@@ -1253,7 +1216,6 @@ pub const Cursor = struct {
 
     fn makeAttributeName(self: *const Cursor, bytes: []const u8, range: NameRange) Error!Name {
         const raw = bytes[range.start..][0..range.len];
-        if (!self.check_namespaces) return .{ .raw = raw, .expanded = null };
         const prefix = if (range.prefix_len == 0) null else raw[0..range.prefix_len];
         const local = if (range.prefix_len == 0) raw else raw[range.prefix_len + 1 ..];
         const namespace_uri = if (prefix) |value| self.resolveNamespace(value) else null;
@@ -1275,7 +1237,7 @@ pub const Cursor = struct {
         const raw = self.event_bytes.items[name_range.start..][0..name_range.len];
         const expected = self.open_names.items[frame.name_start..][0..frame.name_len];
         if (!std.mem.eql(u8, raw, expected)) return error.InvalidXml;
-        const name = try self.makeName(self.event_bytes.items, name_range, self.check_namespaces);
+        const name = try self.makeName(self.event_bytes.items, name_range);
         self.depth -= 1;
         self.open_names.items.len = frame.name_start;
         self.namespace_bindings.items.len = frame.binding_start;
@@ -1292,7 +1254,7 @@ pub const Cursor = struct {
         const frame = self.frames[self.depth - 1];
         self.event_bytes.clearRetainingCapacity();
         try self.event_bytes.appendSlice(self.allocator, self.open_names.items[frame.name_start..][0..frame.name_len]);
-        const name = try self.makeName(self.event_bytes.items, .{ .start = 0, .len = self.event_bytes.items.len, .prefix_len = frame.prefix_len }, self.check_namespaces);
+        const name = try self.makeName(self.event_bytes.items, .{ .start = 0, .len = self.event_bytes.items.len, .prefix_len = frame.prefix_len });
         self.pending_empty = false;
         self.depth -= 1;
         self.open_names.items.len = frame.name_start;
@@ -2009,7 +1971,7 @@ test "[unit] - [mzML XML cursor]: skips declarations, comments, processing instr
     const source = "<?xml version='1.0' encoding='UTF-8'?><?p?><p:mzML xmlns:p='" ++ NAMESPACE ++
         "'><p:child xmlns:q='" ++ XSI ++ "' q:schemaLocation='a&amp;b'>A&amp;B<![CDATA[<x>]]></p:child></p:mzML>";
     var input = std.Io.Reader.fixed(source);
-    var cursor = try Cursor.init(std.testing.allocator, &input, 64, 64, 1024, true);
+    var cursor = try Cursor.init(std.testing.allocator, &input, 64, 64, 1024);
     defer cursor.deinit();
 
     try cursor.advance(false);
@@ -2040,7 +2002,7 @@ test "[unit] - [mzML XML cursor]: rejects malformed names, namespace declaration
     };
     inline for (cases) |case| {
         var input = std.Io.Reader.fixed(case[0]);
-        var cursor = try Cursor.init(std.testing.allocator, &input, 64, 64, 1024, true);
+        var cursor = try Cursor.init(std.testing.allocator, &input, 64, 64, 1024);
         defer cursor.deinit();
         for (0..case[1]) |_| try cursor.advance(false);
         try std.testing.expectError(error.InvalidXml, cursor.advance(false));
@@ -2074,43 +2036,37 @@ test "[property] - [mzML XML cursor]: preserves qualified names and namespace re
             break :blk utf16[0..];
         } else source;
         for ([_]usize{ 4, 7, 16, 31, 64, buffer.len }) |size| {
-            for ([_]bool{ false, true }) |checked| {
-                var input: std.testing.Reader = .init(buffer[0..size], &.{.{ .buffer = bytes }});
-                input.artificial_limit = .limited(size);
-                var cursor = try Cursor.init(std.testing.allocator, &input.interface, 64, 64, 1024, checked);
-                defer cursor.deinit();
-                var child: usize = 0;
-                const scale: u64 = if (encoding != null) 2 else 1;
-                var offset: u64 = if (encoding != null) 2 else 0;
-                for (expected) |item| {
-                    try cursor.advance(false);
-                    const event = cursor.current.?;
-                    try std.testing.expectEqual(item.opening, event.data == .start_element);
-                    const name = if (item.opening) event.data.start_element.name else event.data.end_element.name;
-                    try std.testing.expectEqualStrings(item.raw, name.raw);
-                    try std.testing.expectEqualStrings(item.local, localName(name));
-                    if (checked) {
-                        try std.testing.expectEqualDeep(item.prefix, name.expanded.?.prefix);
-                        try std.testing.expectEqualStrings(NAMESPACE, name.expanded.?.namespace_uri.?);
-                    } else try std.testing.expectEqual(null, name.expanded);
-                    try std.testing.expectEqual(offset, event.span.start);
-                    offset += item.token.len * scale;
-                    try std.testing.expectEqual(offset, event.span.end);
-                    if (item.opening and std.mem.eql(u8, item.local, "child")) {
-                        const attribute = event.data.start_element.attributes[0];
-                        try std.testing.expectEqualStrings("a:value", attribute.name.raw);
-                        try std.testing.expectEqualStrings(([_][]const u8{ "one", "two", "three" })[child], attribute.value);
-                        if (checked) {
-                            try std.testing.expectEqualStrings("a", attribute.name.expanded.?.prefix.?);
-                            try std.testing.expectEqualStrings("value", attribute.name.expanded.?.local);
-                            try std.testing.expectEqualStrings(if (child == 1) "urn:inner" else "urn:outer", attribute.name.expanded.?.namespace_uri.?);
-                        }
-                        child += 1;
-                    }
-                }
+            var input: std.testing.Reader = .init(buffer[0..size], &.{.{ .buffer = bytes }});
+            input.artificial_limit = .limited(size);
+            var cursor = try Cursor.init(std.testing.allocator, &input.interface, 64, 64, 1024);
+            defer cursor.deinit();
+            var child: usize = 0;
+            const scale: u64 = if (encoding != null) 2 else 1;
+            var offset: u64 = if (encoding != null) 2 else 0;
+            for (expected) |item| {
                 try cursor.advance(false);
-                try std.testing.expectEqual(null, cursor.current);
+                const event = cursor.current.?;
+                try std.testing.expectEqual(item.opening, event.data == .start_element);
+                const name = if (item.opening) event.data.start_element.name else event.data.end_element.name;
+                try std.testing.expectEqualStrings(item.raw, name.raw);
+                try std.testing.expectEqualStrings(item.local, localName(name));
+                try std.testing.expectEqualDeep(item.prefix, name.expanded.prefix);
+                try std.testing.expectEqualStrings(NAMESPACE, name.expanded.namespace_uri.?);
+                try std.testing.expectEqual(offset, event.span.start);
+                offset += item.token.len * scale;
+                try std.testing.expectEqual(offset, event.span.end);
+                if (item.opening and std.mem.eql(u8, item.local, "child")) {
+                    const attribute = event.data.start_element.attributes[0];
+                    try std.testing.expectEqualStrings("a:value", attribute.name.raw);
+                    try std.testing.expectEqualStrings(([_][]const u8{ "one", "two", "three" })[child], attribute.value);
+                    try std.testing.expectEqualStrings("a", attribute.name.expanded.prefix.?);
+                    try std.testing.expectEqualStrings("value", attribute.name.expanded.local);
+                    try std.testing.expectEqualStrings(if (child == 1) "urn:inner" else "urn:outer", attribute.name.expanded.namespace_uri.?);
+                    child += 1;
+                }
             }
+            try cursor.advance(false);
+            try std.testing.expectEqual(null, cursor.current);
         }
     }
 }
@@ -2128,23 +2084,21 @@ test "[property] - [mzML XML cursor]: preserves attribute openings across refill
                 break :blk utf16[0 .. 2 + source.len * 2];
             } else source;
             for ([_]usize{ 4, 5, 7, 16, 64, buffer.len }) |size| {
-                for ([_]bool{ false, true }) |checked| {
-                    var input: std.testing.Reader = .init(buffer[0..size], &.{.{ .buffer = bytes }});
-                    input.artificial_limit = .limited(size);
-                    var cursor = try Cursor.init(std.testing.allocator, &input.interface, 64, 64, 1024, checked);
-                    defer cursor.deinit();
-                    try cursor.advance(false);
-                    const event = cursor.current.?;
-                    const start = event.data.start_element;
-                    try std.testing.expectEqualStrings("a", start.attributes[0].name.raw);
-                    try std.testing.expectEqualStrings("x&y", start.attributes[0].value);
-                    try std.testing.expectEqual(@as(u64, bytes.len), event.span.end);
-                    try cursor.advance(false);
-                    try std.testing.expectEqual(.end_element, std.meta.activeTag(cursor.current.?.data));
-                    try std.testing.expectEqual(@as(u64, bytes.len), cursor.current.?.span.end);
-                    try cursor.advance(false);
-                    try std.testing.expectEqual(null, cursor.current);
-                }
+                var input: std.testing.Reader = .init(buffer[0..size], &.{.{ .buffer = bytes }});
+                input.artificial_limit = .limited(size);
+                var cursor = try Cursor.init(std.testing.allocator, &input.interface, 64, 64, 1024);
+                defer cursor.deinit();
+                try cursor.advance(false);
+                const event = cursor.current.?;
+                const start = event.data.start_element;
+                try std.testing.expectEqualStrings("a", start.attributes[0].name.raw);
+                try std.testing.expectEqualStrings("x&y", start.attributes[0].value);
+                try std.testing.expectEqual(@as(u64, bytes.len), event.span.end);
+                try cursor.advance(false);
+                try std.testing.expectEqual(.end_element, std.meta.activeTag(cursor.current.?.data));
+                try std.testing.expectEqual(@as(u64, bytes.len), cursor.current.?.span.end);
+                try cursor.advance(false);
+                try std.testing.expectEqual(null, cursor.current);
             }
         }
     }
@@ -2201,9 +2155,9 @@ test "[property] - [mzML XML cursor]: buffered opening tags match incremental pa
             for ([_]usize{ 1, 4 }) |attributes| {
                 var input = std.Io.Reader.fixed(case[0]);
                 var reference_input = std.Io.Reader.fixed(case[0]);
-                var cursor = try Cursor.init(std.testing.allocator, &input, 64, attributes, limit, false);
+                var cursor = try Cursor.init(std.testing.allocator, &input, 64, attributes, limit);
                 defer cursor.deinit();
-                var reference = try Cursor.init(std.testing.allocator, &reference_input, 64, attributes, limit, false);
+                var reference = try Cursor.init(std.testing.allocator, &reference_input, 64, attributes, limit);
                 defer reference.deinit();
                 cursor.source.detected = true;
                 reference.source.detected = true;
@@ -2245,7 +2199,7 @@ test "[property] - [mzML XML cursor]: closing names survive consumed opening-buf
     const second = "<other value='two'/>";
     var bytes = (root ++ first ++ close ++ second ++ "</mzML>").*;
     var input = std.Io.Reader.fixed(&bytes);
-    var cursor = try Cursor.init(std.testing.allocator, &input, 64, 64, 1024, true);
+    var cursor = try Cursor.init(std.testing.allocator, &input, 64, 64, 1024);
     defer cursor.deinit();
     try cursor.advance(false);
     try cursor.advance(false);
@@ -2274,7 +2228,7 @@ test "[property] - [mzML XML cursor]: leaves QName delimiters unread at exact to
             for ([_]usize{ 4, 7, 31, buffer.len }) |size| {
                 for (name.len..name.len + 3) |limit| {
                     var input: std.testing.Reader = .init(buffer[0..size], &.{.{ .buffer = bytes }});
-                    var cursor = try Cursor.init(std.testing.allocator, &input.interface, 64, 64, limit, true);
+                    var cursor = try Cursor.init(std.testing.allocator, &input.interface, 64, 64, limit);
                     defer cursor.deinit();
                     try cursor.appendEventByte('z');
                     if (limit == name.len) {
@@ -2305,7 +2259,7 @@ test "[unit] - [mzML XML cursor]: enforces expanded names, document CDATA, text 
     };
     inline for (cases) |case| {
         var input = std.Io.Reader.fixed(case[0]);
-        var cursor = try Cursor.init(std.testing.allocator, &input, 64, 64, 1024, true);
+        var cursor = try Cursor.init(std.testing.allocator, &input, 64, 64, 1024);
         defer cursor.deinit();
         for (0..case[1]) |_| try cursor.advance(false);
         try std.testing.expectError(error.InvalidXml, cursor.advance(false));
@@ -2313,10 +2267,10 @@ test "[unit] - [mzML XML cursor]: enforces expanded names, document CDATA, text 
 
     const xml_attribute = "<mzML xmlns='" ++ NAMESPACE ++ "' xml:lang='en'/>";
     var input = std.Io.Reader.fixed(xml_attribute);
-    var cursor = try Cursor.init(std.testing.allocator, &input, 64, 64, 1024, true);
+    var cursor = try Cursor.init(std.testing.allocator, &input, 64, 64, 1024);
     defer cursor.deinit();
     try cursor.advance(false);
-    try std.testing.expectEqualStrings(XML_NAMESPACE, cursor.current.?.data.start_element.attribute(XML_NAMESPACE, "lang").?.name.expanded.?.namespace_uri.?);
+    try std.testing.expectEqualStrings(XML_NAMESPACE, cursor.current.?.data.start_element.attribute(XML_NAMESPACE, "lang").?.name.expanded.namespace_uri.?);
 }
 
 test "[property] - [mzML XML cursor]: ignores only XML whitespace when text is not requested" {
@@ -2346,7 +2300,7 @@ test "[property] - [mzML XML cursor]: ignores only XML whitespace when text is n
             } else source;
             for ([_]usize{ 4, 7, 31, buffer.len }) |size| {
                 var input: std.testing.Reader = .init(buffer[0..size], &.{.{ .buffer = bytes }});
-                var cursor = try Cursor.init(std.testing.allocator, &input.interface, 64, 64, 1024, true);
+                var cursor = try Cursor.init(std.testing.allocator, &input.interface, 64, 64, 1024);
                 defer cursor.deinit();
                 try cursor.advance(false);
                 if (case.whitespace) {
@@ -2376,7 +2330,7 @@ test "[property] - [mzML XML cursor]: discards complete buffered indentation wit
         for ([_]usize{ 0, 4, 31, buffer.len }) |size| {
             var fixed = std.Io.Reader.fixed(bytes);
             var chunks: std.testing.Reader = .init(buffer[0..size], &.{.{ .buffer = bytes }});
-            var cursor = try Cursor.init(allocator, if (size == 0) &fixed else &chunks.interface, 64, 64, 1024, true);
+            var cursor = try Cursor.init(allocator, if (size == 0) &fixed else &chunks.interface, 64, 64, 1024);
             defer cursor.deinit();
             try cursor.advance(false);
             try cursor.advance(false);
@@ -2408,7 +2362,7 @@ test "[unit] - [mzML XML cursor]: bounds borrowed ordinary text events" {
     @memcpy(source[prefix.len + text_length ..], suffix);
 
     var input = std.Io.Reader.fixed(source);
-    var cursor = try Cursor.init(std.testing.allocator, &input, 64, 64, 1024, true);
+    var cursor = try Cursor.init(std.testing.allocator, &input, 64, 64, 1024);
     defer cursor.deinit();
     try cursor.advance(false);
     try cursor.advance(true);
@@ -2431,7 +2385,7 @@ test "[regression] - [mzML XML cursor]: preserves text and attribute boundaries"
     @memcpy(source[prefix.len + text_length + 2 ..], suffix);
 
     var input = std.Io.Reader.fixed(source);
-    var cursor = try Cursor.init(std.testing.allocator, &input, 64, 64, 1024, true);
+    var cursor = try Cursor.init(std.testing.allocator, &input, 64, 64, 1024);
     defer cursor.deinit();
     try cursor.advance(false);
     const root = cursor.current.?.data.start_element;
@@ -2455,7 +2409,7 @@ test "[regression] - [mzML XML cursor]: keeps CDATA codepoints within text chunk
     @memcpy(source[prefix.len + text_length + 2 ..], suffix);
 
     var input = std.Io.Reader.fixed(source);
-    var cursor = try Cursor.init(std.testing.allocator, &input, 64, 64, 1024, true);
+    var cursor = try Cursor.init(std.testing.allocator, &input, 64, 64, 1024);
     defer cursor.deinit();
     try cursor.advance(false);
     try cursor.advance(true);

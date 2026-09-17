@@ -16,10 +16,7 @@ pub const StreamReader = struct {
 
     pub const ArraySelector = impl.ArraySelector;
 
-    /// Selects full structural checks or the explicitly reduced reader checks.
-    pub const Checks = impl.Checks;
-
-    /// Reader limits, payload policy, and check mode.
+    /// Reader limits, payload policy, and index retention.
     pub const Options = impl.Options;
 
     /// Includes decoding errors when numeric arrays are requested.
@@ -57,7 +54,7 @@ pub const StreamReader = struct {
     /// Reads a complete record and decodes every array into reusable output storage.
     /// Metadata borrows this reader as in nextRecord; binary text is not retained.
     /// Output slices last until output is reused, reset, or deinitialized. EOF and errors
-    /// clear its visible results. Requires checked mode and no array_selector; payload
+    /// clear its visible results. Requires no array_selector; payload
     /// does not affect this call. The first failure stops reading and sets the diagnostic;
     /// subsequent reads return FailedState. No automatic record skipping occurs.
     pub fn nextDecodedRecord(self: *Reader, output: *DecodedArrays) Error!?model.Record {

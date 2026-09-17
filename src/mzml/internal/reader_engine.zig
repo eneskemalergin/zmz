@@ -17,6 +17,23 @@ const ELEMENT_KINDS = std.StaticStringMap(model.Kind).initComptime(blk: {
     break :blk entries;
 });
 
+const CHILD_KINDS = blk: {
+    var result: std.EnumArray(model.Kind, struct {
+        allowed: std.EnumSet(model.Kind),
+        singular: std.EnumSet(model.Kind),
+    }) = undefined;
+    for (std.enums.values(model.Kind)) |parent| {
+        var allowed = std.EnumSet(model.Kind).initEmpty();
+        var singular = std.EnumSet(model.Kind).initEmpty();
+        for (schema.children(parent)) |rule| {
+            allowed.insert(rule.kind);
+            if (rule.maximum == 1) singular.insert(rule.kind);
+        }
+        result.set(parent, .{ .allowed = allowed, .singular = singular });
+    }
+    break :blk result;
+};
+
 const ParamAttributes = struct {
     ref: ?[]const u8 = null,
     cv_ref: ?[]const u8 = null,
@@ -59,20 +76,12 @@ pub const ArraySelector = struct {
     select: *const fn (?*anyopaque, usize, []const model.Attribute, []const cv.Entry) Payload,
 };
 
-/// Checked is the default. Minimal preserves valid mzML metadata but skips namespace resolution,
-/// and nested child cardinalities/order.
-/// XML parsing, attributes needed for returned fields, envelope order, and resource limits remain.
-/// In minimal mode, a prefixed schemaLocation is treated as XSI without resolving its prefix;
-/// other prefixed attributes fail. Unqualified node attributes remain retained in both modes.
-pub const Checks = enum { checked, minimal };
-
 pub const Options = struct {
     limits: Limits = .{},
     payload: Payload = .retain,
     /// Selects retained arrays without dropping metadata. Ignored when payload is skip.
     /// Does not classify encodings or resolve parameters on the caller's behalf.
     array_selector: ?ArraySelector = null,
-    checks: Checks = .checked,
     /// Retains the index trailer within header limits for StreamReader.indexTrailer().
     retain_index: bool = false,
 };
@@ -100,7 +109,6 @@ header_ready: bool = false,
 done: bool = false,
 failure: ?Diagnostic = null,
 active_list: ?model.Kind = null,
-run_sequence: schema.Sequence = .{ .rules = schema.children(.run) },
 current_kind: ?model.Kind = null,
 index_trailer: [3]model.Node = undefined,
 scopes: [3]Scope = undefined,
@@ -125,7 +133,7 @@ pub fn init(allocator: std.mem.Allocator, input: *std.Io.Reader, options: Option
         return error.InvalidOptions;
     return .{
         .allocator = allocator,
-        .cursor = try xml.Cursor.init(allocator, input, options.limits.depth, options.limits.attributes, options.limits.attribute_bytes, options.checks == .checked),
+        .cursor = try xml.Cursor.init(allocator, input, options.limits.depth, options.limits.attributes, options.limits.attribute_bytes),
         .options = options,
         .header_store = Storage.init(allocator, options.limits.header_bytes),
         .record_store = Storage.init(allocator, options.limits.record_bytes),
@@ -174,8 +182,7 @@ fn nextRecordFor(self: *StreamReader, comptime retention: Retention) Error!?mode
 pub fn nextDecodedRecord(self: *StreamReader, output: *DecodedArrays) Error!?model.Record {
     output.reset();
     errdefer output.reset();
-    if (self.options.checks != .checked or self.options.array_selector != null)
-        return error.InvalidOptions;
+    if (self.options.array_selector != null) return error.InvalidOptions;
     self.decoded_arrays = output;
     defer self.decoded_arrays = null;
     const record = try self.nextRecord() orelse return null;
@@ -293,7 +300,7 @@ pub fn parseFooter(allocator: std.mem.Allocator, bytes: []const u8, options: Opt
 pub fn resumeFollowingList(self: *StreamReader, input: *std.Io.Reader, ancestors: usize, physical_start: u64, prefix_length: usize) Error!void {
     if (self.active_list != .spectrum_list or
         ancestors != self.scope_count + 1 or physical_start < prefix_length) return error.InvalidOptions;
-    const replacement = try xml.Cursor.init(self.allocator, input, self.options.limits.depth, self.options.limits.attributes, self.options.limits.attribute_bytes, self.options.checks == .checked);
+    const replacement = try xml.Cursor.init(self.allocator, input, self.options.limits.depth, self.options.limits.attributes, self.options.limits.attribute_bytes);
     self.cursor.deinit();
     self.cursor = replacement;
     try self.cursor.advance(false);
@@ -355,7 +362,9 @@ fn readHeaderInner(self: *StreamReader) Error!void {
     var metadata: std.ArrayList(model.Node) = .empty;
     defer metadata.deinit(self.allocator);
     try metadata.ensureTotalCapacity(self.allocator, sections.len - 1);
+    var document_params: usize = 0;
     while (true) {
+        try self.parseParams(&self.header_store, true, &document_params);
         const kind_value = try self.kind();
         if (kind_value == .run) break;
         for (sections) |section| {
@@ -366,12 +375,17 @@ fn readHeaderInner(self: *StreamReader) Error!void {
         seen.insert(kind_value);
         try metadata.append(self.allocator, try self.parseNode(&self.header_store, 1, true, self.options.payload));
     }
+    document.params = try self.header_store.copy(cv.Entry, self.param_scratch.items);
+    self.param_scratch.clearRetainingCapacity();
     document.children = try self.header_store.copy(model.Node, metadata.items);
     var run = try self.startNode(&self.header_store, .run);
     self.scopes[self.scope_count] = try self.captureScope();
     self.scope_count += 1;
     try self.cursor.advance(false);
-    run.params = try self.parseParams(&self.header_store, true);
+    var param_count: usize = 0;
+    try self.parseParams(&self.header_store, true, &param_count);
+    run.params = try self.header_store.copy(cv.Entry, self.param_scratch.items);
+    self.param_scratch.clearRetainingCapacity();
     const group_list = document.child(.referenceable_param_group_list);
     const group_nodes = if (group_list) |list| list.children else &.{};
     const groups = try self.header_store.alloc(cv.Group, group_nodes.len);
@@ -387,7 +401,11 @@ fn openList(self: *StreamReader) Error!void {
     const event = self.cursor.current orelse return error.UnexpectedEnd;
     if (event.data == .end_element) return;
     const kind_value = try self.kind();
-    try self.run_sequence.accept(kind_value);
+    switch (kind_value) {
+        .spectrum_list => if (self.header.spectrum_list != null or self.header.chromatogram_list != null) return error.InvalidStructure,
+        .chromatogram_list => if (self.header.chromatogram_list != null) return error.InvalidStructure,
+        else => return error.InvalidStructure,
+    }
     const node = try self.startNode(&self.header_store, kind_value);
     const list: model.RecordList = .{
         .attributes = node.attributes,
@@ -426,7 +444,6 @@ fn nextRecordInner(self: *StreamReader, comptime retention: Retention) Error!?mo
             .default_array_length = try cv.parseInteger(usize, node.attribute("defaultArrayLength")),
         };
     }
-    try self.run_sequence.finish();
     try self.consumeEnd(.run, true);
     try self.consumeEnd(.mzml, false);
     if (self.header.indexed and !self.options.retain_index) {
@@ -459,7 +476,7 @@ fn consumeEnd(self: *StreamReader, kind_value: model.Kind, advance: bool) Error!
 fn kind(self: *StreamReader) Error!model.Kind {
     const event = self.cursor.current orelse return error.UnexpectedEnd;
     if (event.data != .start_element) return error.InvalidStructure;
-    // Cursor.advance checks start namespaces in checked mode; the XML cursor matches closing tags.
+    // The cursor resolves namespaces and matches closing tags.
     const name = xml.localName(event.data.start_element.name);
     const value = ELEMENT_KINDS.get(name) orelse return error.InvalidStructure;
     self.current_kind = value;
@@ -474,7 +491,7 @@ fn startNodeFor(self: *StreamReader, storage: *Storage, kind_value: model.Kind, 
     if (storage.nodes == self.options.limits.nodes) return error.LimitExceeded;
     storage.nodes += 1;
     const event = self.cursor.current orelse return error.UnexpectedEnd;
-    const attributes = try self.copyAttributes(
+    const attributes = try copyAttributes(
         storage,
         event.data.start_element,
         switch (kind_value) {
@@ -532,8 +549,11 @@ fn parseNodeFor(self: *StreamReader, storage: *Storage, depth: usize, advance_af
             if (self.decoded_arrays) |output| try output.finishArray();
         }
     } else {
-        if (schema.hasParams(kind_value))
-            node.params = try self.parseParams(storage, retention == .tree);
+        const params_start = self.param_scratch.items.len;
+        defer self.param_scratch.shrinkRetainingCapacity(params_start);
+        var param_count: usize = 0;
+        try self.parseParams(storage, retention == .tree, &param_count);
+        node.params = self.param_scratch.items[params_start..];
         var child_payload = payload;
         if (kind_value == .binary_data_array and storage == &self.record_store) {
             if (self.decoded_arrays) |output| {
@@ -548,10 +568,11 @@ fn parseNodeFor(self: *StreamReader, storage: *Storage, depth: usize, advance_af
                 child_payload = selector.select(selector.user_data, position, node.attributes, node.params);
             }
         }
-        var sequence: schema.Sequence = .{ .rules = schema.children(kind_value) };
+        const children = CHILD_KINDS.get(kind_value);
+        var seen = std.EnumSet(model.Kind).initEmpty();
         const children_start = self.child_scratch.items.len;
         defer self.child_scratch.shrinkRetainingCapacity(children_start);
-        if (retention == .tree and sequence.rules.len != 0)
+        if (retention == .tree and children.allowed.count() != 0)
             try self.child_scratch.ensureUnusedCapacity(self.allocator, @min(
                 4,
                 self.options.limits.list_entries,
@@ -560,16 +581,30 @@ fn parseNodeFor(self: *StreamReader, storage: *Storage, depth: usize, advance_af
         var child_count: usize = 0;
         while (self.cursor.current) |event| {
             if (event.data == .end_element) break;
+            if (event.data == .start_element and paramKind(event.data.start_element) != null) {
+                try self.parseParams(storage, retention == .tree, &param_count);
+                if (kind_value == .binary_data_array and self.decoded_arrays != null) {
+                    node.params = self.param_scratch.items[params_start..];
+                    // Late declarations must agree with the bytes already decoded.
+                    _ = try model.arrayEncoding(node, self.header.groups);
+                }
+                continue;
+            }
             const child_kind = try self.kind();
-            if (self.options.checks == .checked) try sequence.accept(child_kind);
+            if (!children.allowed.contains(child_kind)) return error.InvalidStructure;
+            // First-child helpers cannot return repeated singular containers.
+            if (children.singular.contains(child_kind) and seen.contains(child_kind)) return error.InvalidStructure;
+            seen.insert(child_kind);
             if (child_count == self.options.limits.list_entries) return error.LimitExceeded;
             const child = try self.parseNodeFor(storage, depth + 1, true, child_payload, if (retention == .tree) .tree else .none);
             if (retention == .tree) try self.child_scratch.append(self.allocator, child);
             child_count += 1;
         }
-        if (self.options.checks == .checked) try sequence.finish();
+        if (kind_value == .binary_data_array and self.decoded_arrays != null and !seen.contains(.binary))
+            return error.PayloadNotRetained;
         self.current_kind = kind_value;
         if (retention == .tree) {
+            node.params = try storage.copy(cv.Entry, self.param_scratch.items[params_start..]);
             node.children = try storage.copy(model.Node, self.child_scratch.items[children_start..]);
         }
     }
@@ -579,27 +614,23 @@ fn parseNodeFor(self: *StreamReader, storage: *Storage, depth: usize, advance_af
     return node;
 }
 
-fn parseParams(self: *StreamReader, storage: *Storage, comptime retain: bool) Error![]const cv.Entry {
-    self.param_scratch.clearRetainingCapacity();
+fn paramKind(start: xml.Start) ?u2 {
+    const local = xml.localName(start.name);
+    if (std.mem.eql(u8, local, "referenceableParamGroupRef")) return 0;
+    if (std.mem.eql(u8, local, "cvParam")) return 1;
+    if (std.mem.eql(u8, local, "userParam")) return 2;
+    return null;
+}
+
+fn parseParams(self: *StreamReader, storage: *Storage, comptime retain: bool, count: *usize) Error!void {
     const entries = &self.param_scratch;
-    if (retain) try entries.ensureTotalCapacity(self.allocator, @min(8, self.options.limits.list_entries));
-    var count: usize = 0;
     while (self.cursor.current) |event| {
         if (event.data != .start_element) break;
         const start = event.data.start_element;
-        const local = xml.localName(start.name);
-        const selected: u2 = if (std.mem.eql(u8, local, "referenceableParamGroupRef"))
-            0
-        else if (std.mem.eql(u8, local, "cvParam"))
-            1
-        else if (std.mem.eql(u8, local, "userParam"))
-            2
-        else
-            break;
-        if (count == self.options.limits.list_entries) return error.LimitExceeded;
-        const attrs = switch (self.options.checks) {
-            inline else => |checks| try copyParamAttributes(storage, start, selected, checks, retain),
-        };
+        const selected = paramKind(start) orelse break;
+        if (count.* == self.options.limits.list_entries) return error.LimitExceeded;
+        if (retain and count.* == 0) try entries.ensureUnusedCapacity(self.allocator, @min(8, self.options.limits.list_entries));
+        const attrs = try copyParamAttributes(storage, start, selected, retain);
         const unit: cv.Unit = .{
             .cv_ref = attrs.unit_cv_ref,
             .name = attrs.unit_name,
@@ -623,21 +654,19 @@ fn parseParams(self: *StreamReader, storage: *Storage, comptime retain: bool) Er
             else => unreachable,
         };
         if (retain) try entries.append(self.allocator, entry);
-        count += 1;
+        count.* += 1;
         try self.cursor.advance(false);
         const end = self.cursor.current orelse return error.UnexpectedEnd;
         if (end.data != .end_element) return error.InvalidStructure;
         try self.cursor.advance(false);
     }
-    if (retain) return storage.copy(cv.Entry, entries.items);
-    return &.{};
 }
 
-fn copyParamAttributes(storage: *Storage, start: xml.Start, selected: u2, comptime checks: Checks, comptime retain: bool) Error!ParamAttributes {
+fn copyParamAttributes(storage: *Storage, start: xml.Start, selected: u2, comptime retain: bool) Error!ParamAttributes {
     var result: ParamAttributes = .{};
     var unknown = false;
     for (start.attributes) |attribute| {
-        const name = if (checks == .checked) attribute.name.expanded.? else (try xml.attributeName(attribute.name)) orelse continue;
+        const name = attribute.name.expanded;
         if (name.namespace_uri) |uri| {
             if (!std.mem.eql(u8, uri, xml.XSI) or !std.mem.eql(u8, name.local, "schemaLocation")) unknown = true;
             continue;
@@ -674,33 +703,20 @@ fn copyParamAttributes(storage: *Storage, start: xml.Start, selected: u2, compti
 }
 
 fn copyAttributes(
-    self: *StreamReader,
     storage: *Storage,
     start: xml.Start,
     required: []const u8,
-    comptime retain: bool,
-) Error![]const model.Attribute {
-    return switch (self.options.checks) {
-        inline else => |checks| copyAttributesFor(storage, start, required, checks, retain),
-    };
-}
-
-fn copyAttributesFor(
-    storage: *Storage,
-    start: xml.Start,
-    required: []const u8,
-    comptime checks: Checks,
     comptime retain: bool,
 ) Error![]const model.Attribute {
     var names = std.mem.tokenizeScalar(u8, required, ' ');
     while (names.next()) |name| {
-        const attribute = if (checks == .checked) start.attribute(null, name) else start.attributeRaw(name);
+        const attribute = start.attribute(null, name);
         if (attribute == null) return error.MissingAttribute;
     }
     var byte_count: usize = 0;
     var attribute_count: usize = 0;
     for (start.attributes) |attribute| {
-        const name = if (checks == .checked) attribute.name.expanded.? else (try xml.attributeName(attribute.name)) orelse continue;
+        const name = attribute.name.expanded;
         if (name.namespace_uri) |uri| {
             if (!std.mem.eql(u8, uri, xml.XSI) or !std.mem.eql(u8, name.local, "schemaLocation"))
                 return error.UnknownAttribute;
@@ -717,7 +733,7 @@ fn copyAttributesFor(
     var offset: usize = 0;
     var position: usize = 0;
     for (start.attributes) |attribute| {
-        const name = if (checks == .checked) attribute.name.expanded.? else (try xml.attributeName(attribute.name)) orelse continue;
+        const name = attribute.name.expanded;
         const copied_name = bytes[offset..][0..name.local.len];
         @memcpy(copied_name, name.local);
         offset += name.local.len;

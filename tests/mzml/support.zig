@@ -327,14 +327,14 @@ pub fn writeSingleRecord(allocator: std.mem.Allocator, sink: *std.Io.Writer, hea
     try writer.finish();
 }
 
-pub fn expectMinimalRead(bytes: []const u8, payload: mzml.StreamReader.Payload) !void {
+pub fn expectFragmentedRead(bytes: []const u8, payload: mzml.StreamReader.Payload) !void {
     var expected_input = std.Io.Reader.fixed(bytes);
     var expected = try mzml.StreamReader.init(std.testing.allocator, &expected_input, .{ .payload = payload, .retain_index = true });
     defer expected.deinit();
     var buffer: [7]u8 = undefined;
     var actual_input: std.testing.Reader = .init(&buffer, &.{.{ .buffer = bytes }});
     actual_input.artificial_limit = .limited(buffer.len);
-    var actual = try mzml.StreamReader.init(std.testing.allocator, &actual_input.interface, .{ .checks = .minimal, .payload = payload, .retain_index = true });
+    var actual = try mzml.StreamReader.init(std.testing.allocator, &actual_input.interface, .{ .payload = payload, .retain_index = true });
     defer actual.deinit();
     const expected_header = try expected.readHeader();
     const actual_header = try actual.readHeader();

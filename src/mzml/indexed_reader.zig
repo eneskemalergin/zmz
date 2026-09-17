@@ -34,8 +34,7 @@ pub const Options = struct {
     record_span_bytes: usize = 256 * 1024 * 1024,
     /// Bounded backward search for indexListOffset when opening an embedded index.
     tail_bytes: usize = 64 * 1024,
-    /// Applies to returned records and open_embedded headers. Rebuilding and trailer
-    /// parsing use checked mode regardless of reader.checks.
+    /// Applies to headers and returned records; index building skips payload text.
     reader: PublicStreamReader.Options = .{},
 };
 
@@ -101,7 +100,6 @@ pub fn build(allocator: std.mem.Allocator, source: Source, options: Options) Err
         },
     };
     var reader_options = options.reader;
-    if (options.policy != .open_embedded) reader_options.checks = .checked;
     reader_options.payload = .skip;
     reader_options.retain_index = false;
     var reader = try StreamReader.init(allocator, input, reader_options);
@@ -165,14 +163,13 @@ pub fn at(self: *IndexedReader, allocator: std.mem.Allocator, kind: model.Kind, 
 }
 
 /// Returns independent metadata and decodes all arrays into caller-owned reusable storage.
-/// Binary text is omitted. Requires checked mode without an array selector; payload is ignored.
+/// Binary text is omitted. Requires no array selector; payload is ignored.
 /// Missing IDs and failures clear output. A failed lookup stops immediately; later lookups may retry.
 /// Numeric slices last until output is reused, reset, or deinitialized, independently of metadata.
 pub fn byIdDecoded(self: *IndexedReader, allocator: std.mem.Allocator, id: []const u8, output: *DecodedArrays) Error!?owned.Record {
     output.reset();
     errdefer output.reset();
-    if (self.options.reader.checks != .checked or self.options.reader.array_selector != null)
-        return error.InvalidOptions;
+    if (self.options.reader.array_selector != null) return error.InvalidOptions;
     const position = try self.idPosition(id) orelse return null;
     return try self.readDecodedEntry(allocator, self.entries.items[position], output);
 }
@@ -181,8 +178,7 @@ pub fn byIdDecoded(self: *IndexedReader, allocator: std.mem.Allocator, id: []con
 pub fn atDecoded(self: *IndexedReader, allocator: std.mem.Allocator, kind: model.Kind, ordinal: usize, output: *DecodedArrays) Error!?owned.Record {
     output.reset();
     errdefer output.reset();
-    if (self.options.reader.checks != .checked or self.options.reader.array_selector != null)
-        return error.InvalidOptions;
+    if (self.options.reader.array_selector != null) return error.InvalidOptions;
     const position = try self.ordinalPosition(kind, ordinal) orelse return null;
     return try self.readDecodedEntry(allocator, self.entries.items[position], output);
 }
@@ -322,7 +318,6 @@ fn openEmbedded(self: *IndexedReader, reader: *StreamReader) Error!void {
     var search_end = tail.len;
     var index_start: ?u64 = null;
     var trailer_options = self.options.reader;
-    trailer_options.checks = .checked;
     trailer_options.limits = self.trailerLimits();
     while (offsetTag(tail[0..search_end], endian)) |start| {
         search_end = start;
@@ -384,7 +379,7 @@ fn openEmbedded(self: *IndexedReader, reader: *StreamReader) Error!void {
 
 fn readEmbeddedEntries(self: *IndexedReader, input: *std.Io.Reader, index_start: u64, minimum: u64, endian: ?std.builtin.Endian) Error!void {
     const limits = self.options.reader.limits;
-    var cursor = try xml.Cursor.init(self.allocator, input, limits.depth, limits.attributes, limits.attribute_bytes, true);
+    var cursor = try xml.Cursor.init(self.allocator, input, limits.depth, limits.attributes, limits.attribute_bytes);
     defer cursor.deinit();
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(self.allocator);

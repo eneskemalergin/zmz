@@ -80,9 +80,7 @@ test "[integration] - [mzML references]: preserves unresolved and external links
     }) |reference| {
         const source = try std.mem.replaceOwned(u8, std.testing.allocator, support.REFERENCED_DOCUMENT, "spectrumRef='scan=2'", reference);
         defer std.testing.allocator.free(source);
-        for (std.enums.values(mzml.StreamReader.Checks)) |checks| {
-            try support.readAll(std.testing.allocator, source, .{ .checks = checks, .payload = .skip });
-        }
+        try support.readAll(std.testing.allocator, source, .{ .payload = .skip });
         for ([_]bool{ false, true }) |indexed| {
             var bytes: [16384]u8 = undefined;
             var sink = std.Io.Writer.fixed(&bytes);
