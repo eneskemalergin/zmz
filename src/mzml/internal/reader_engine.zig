@@ -60,7 +60,7 @@ pub const ArraySelector = struct {
 };
 
 /// Checked is the default. Minimal preserves valid mzML metadata but skips namespace resolution,
-/// nested child cardinalities/order, parameter order and group-reference placement.
+/// and nested child cardinalities/order.
 /// XML parsing, required attributes, envelope order, and resource limits remain.
 /// In minimal mode, a prefixed schemaLocation is treated as XSI without resolving its prefix;
 /// other prefixed attributes fail. Unrecognized unprefixed node attributes remain retained.
@@ -366,7 +366,7 @@ fn readHeaderInner(self: *StreamReader) Error!void {
     self.scopes[self.scope_count] = try self.captureScope();
     self.scope_count += 1;
     try self.cursor.advance(false);
-    run.params = try self.parseParams(&self.header_store, true, true);
+    run.params = try self.parseParams(&self.header_store, true);
     const group_list = document.child(.referenceable_param_group_list);
     const group_nodes = if (group_list) |list| list.children else &.{};
     const groups = try self.header_store.alloc(cv.Group, group_nodes.len);
@@ -525,7 +525,7 @@ fn parseNodeFor(self: *StreamReader, storage: *Storage, depth: usize, advance_af
         }
     } else {
         if (schema.hasParams(kind_value))
-            node.params = try self.parseParams(storage, kind_value != .referenceable_param_group, retention == .tree);
+            node.params = try self.parseParams(storage, retention == .tree);
         var child_payload = payload;
         if (kind_value == .binary_data_array and storage == &self.record_store) {
             if (self.decoded_arrays) |output| {
@@ -571,12 +571,11 @@ fn parseNodeFor(self: *StreamReader, storage: *Storage, depth: usize, advance_af
     return node;
 }
 
-fn parseParams(self: *StreamReader, storage: *Storage, allow_refs: bool, comptime retain: bool) Error![]const cv.Entry {
+fn parseParams(self: *StreamReader, storage: *Storage, comptime retain: bool) Error![]const cv.Entry {
     self.param_scratch.clearRetainingCapacity();
     const entries = &self.param_scratch;
     if (retain) try entries.ensureTotalCapacity(self.allocator, @min(8, self.options.limits.list_entries));
     var count: usize = 0;
-    var rank: u2 = 0;
     while (self.cursor.current) |event| {
         if (event.data != .start_element) break;
         const start = event.data.start_element;
@@ -589,8 +588,6 @@ fn parseParams(self: *StreamReader, storage: *Storage, allow_refs: bool, comptim
             2
         else
             break;
-        if (self.options.checks == .checked and (selected < rank or (selected == 0 and !allow_refs))) return error.InvalidStructure;
-        rank = selected;
         if (count == self.options.limits.list_entries) return error.LimitExceeded;
         const attrs = switch (self.options.checks) {
             inline else => |checks| try copyParamAttributes(storage, start, selected, checks, retain),
@@ -605,7 +602,7 @@ fn parseParams(self: *StreamReader, storage: *Storage, allow_refs: bool, comptim
             1 => .{ .cv = .{
                 .cv_ref = attrs.cv_ref,
                 .name = attrs.name,
-                .accession = .{ .raw = attrs.accession.? },
+                .accession = if (attrs.accession) |value| .{ .raw = value } else null,
                 .value = attrs.value,
                 .unit = unit,
             } },
@@ -645,10 +642,6 @@ fn copyParamAttributes(storage: *Storage, start: xml.Start, selected: u2, compti
             inline else => |tag| @field(result, @tagName(tag)) = attribute.value,
         }
     }
-    // Required-attribute failures retain precedence over unknown attributes.
-    if ((selected == 0 and result.ref == null) or
-        (selected == 1 and (result.cv_ref == null or result.accession == null or result.name == null)) or
-        (selected == 2 and result.name == null)) return error.MissingAttribute;
     if (unknown or (selected != 0 and result.ref != null) or
         (selected != 1 and (result.cv_ref != null or result.accession != null)) or
         (selected != 2 and result.value_type != null)) return error.UnknownAttribute;

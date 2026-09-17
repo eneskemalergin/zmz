@@ -126,6 +126,68 @@ fn decodedDocument(allocator: std.mem.Allocator, text: []const u8, encoded: usiz
         "</binaryDataArrayList></spectrum></spectrumList></run></mzML>", .{ length, encoded, codec, text });
 }
 
+test "[integration] - [mzML parameters]: preserves source order and absent fields" {
+    const params = "<userParam value=''/><cvParam accession='X:first'/>" ++
+        "<referenceableParamGroupRef ref='encoding'/><cvParam/><userParam name='' unitName=''/>" ++
+        "<referenceableParamGroupRef/>";
+    const expected = [_]mzml.cv.Entry{
+        .{ .user = .{ .value = "" } },
+        .{ .cv = .{ .accession = .{ .raw = "X:first" } } },
+        .{ .group_ref = "encoding" },
+        .{ .cv = .{} },
+        .{ .user = .{ .name = "", .unit = .{ .name = "" } } },
+        .{ .group_ref = null },
+    };
+    const source = support.HEADER ++ params ++ "<spectrumList count='1' defaultDataProcessingRef='dp'>" ++
+        "<spectrum id='x' index='0' defaultArrayLength='1'>" ++ params ++ support.ARRAYS ++
+        "</spectrum></spectrumList></run></mzML>";
+    for (std.enums.values(mzml.StreamReader.Checks)) |checks| {
+        var input = std.Io.Reader.fixed(source);
+        var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{ .checks = checks });
+        defer reader.deinit();
+        const header = try reader.readHeader();
+        try std.testing.expectEqualDeep(&expected, header.run.params);
+        const record = (try reader.nextRecord()).?;
+        try std.testing.expectEqualDeep(&expected, record.node.params);
+        try std.testing.expectEqual(null, try reader.nextRecord());
+    }
+    try compareDecoded(source, 1);
+    var index = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = source }, .{ .policy = .rebuild });
+    defer index.deinit();
+    var output = mzml.StreamReader.DecodedArrays.init(std.testing.allocator, .{});
+    defer output.deinit();
+    var record = (try index.atDecoded(std.testing.allocator, .spectrum, 0, &output)).?;
+    defer record.deinit();
+    try std.testing.expectEqualDeep(&expected, index.header().run.params);
+    try std.testing.expectEqualDeep(&expected, record.value.node.params);
+    try std.testing.expectEqual(@as(usize, 2), output.len());
+    for (0..output.len()) |i| try std.testing.expectEqualSlices(f64, &.{1}, output.get(i).?.values.float64);
+}
+
+test "[integration] - [mzML parameters]: defers group and encoding errors until requested" {
+    const cases = .{
+        .{ "<referenceableParamGroup id='encoding'>", "<referenceableParamGroup id='encoding'><referenceableParamGroupRef ref='other'/>", error.NestedGroup },
+        .{ "<referenceableParamGroupRef ref='encoding'/>", "<referenceableParamGroupRef/>", error.MissingGroup },
+        .{ "accession='MS:1000523'", "", error.MissingPrimitive },
+    };
+    inline for (cases) |case| {
+        const source = try std.mem.replaceOwned(u8, std.testing.allocator, support.DOCUMENT, case[0], case[1]);
+        defer std.testing.allocator.free(source);
+        try support.readAll(std.testing.allocator, source, .{});
+        try std.testing.expectError(case[2], readDecoded(std.testing.allocator, source, .{}));
+        var index = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = source }, .{ .policy = .rebuild });
+        defer index.deinit();
+        var ordinary = (try index.at(std.testing.allocator, .spectrum, 0)).?;
+        defer ordinary.deinit();
+        var arrays = ordinary.value.arrays(index.header().groups);
+        try std.testing.expectError(case[2], arrays.next());
+        var output = mzml.StreamReader.DecodedArrays.init(std.testing.allocator, .{});
+        defer output.deinit();
+        try std.testing.expectError(case[2], index.atDecoded(std.testing.allocator, .spectrum, 0, &output));
+        try std.testing.expectEqual(@as(usize, 0), output.len());
+    }
+}
+
 test "[integration] - [mzML decoded reading]: preserves metadata and values across fragments and codecs" {
     for ([_]usize{ 1, 7, 31 }) |chunk| try compareDecoded(support.DOCUMENT, chunk);
     var utf16: [support.DOCUMENT.len * 2 + 2]u8 = undefined;
@@ -754,8 +816,6 @@ test "[integration] - [mzML minimal checks]: distinguishes omitted checks from r
     const omitted = .{
         .{ "http://psi.hupo.org/ms/mzml", "urn:unchecked", error.WrongNamespace },
         .{ "<activation/>", "", error.InvalidStructure },
-        .{ "<userParam name='note' value=''/>", "<userParam name='note' value=''/><cvParam cvRef='MS' accession='X:future' name='later'/>", error.InvalidStructure },
-        .{ "<referenceableParamGroup id='encoding'>", "<referenceableParamGroup id='encoding'><referenceableParamGroupRef ref='other'/>", error.InvalidStructure },
         .{ "index='0'", "index='0' extra='source'", error.UnknownAttribute },
     };
     inline for (omitted) |case| {
@@ -775,7 +835,7 @@ test "[integration] - [mzML minimal checks]: distinguishes omitted checks from r
         .{ "<activation/>", "<future/>", error.InvalidStructure },
         .{ "<activation/>", "<activation xmlns:q='urn:foreign' q:value='x'/>", error.UnknownAttribute },
         .{ "<activation/>", "<activation></precursor>", error.InvalidXml },
-        .{ "name='note'", "", error.MissingAttribute },
+        .{ "name='note'", "extra='source'", error.UnknownAttribute },
         .{ "index='0'", "index='bad'", error.InvalidValue },
         .{ "defaultArrayLength='1'", "defaultArrayLength='-1'", error.Overflow },
         .{ "index='0'", "index='0' index='1'", error.InvalidXml },

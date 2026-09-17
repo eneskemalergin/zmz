@@ -83,7 +83,7 @@ pub const Entry = union(enum) {
     user: UserParam,
 };
 
-/// A borrowed group definition. Nested group references are invalid in mzML 1.1.
+/// A borrowed group definition. EffectiveIterator rejects nested references when expanded.
 pub const Group = struct {
     id: []const u8,
     entries: []const Entry,
