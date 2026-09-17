@@ -350,17 +350,22 @@ fn readHeaderInner(self: *StreamReader) Error!void {
     if (!std.mem.eql(u8, document.attribute("version").?, "1.1.0"))
         return error.UnsupportedVersion;
     try self.cursor.advance(false);
-    var sequence: schema.Sequence = .{ .rules = schema.children(.mzml) };
+    const sections = schema.children(.mzml);
+    var seen = std.EnumSet(model.Kind).initEmpty();
     var metadata: std.ArrayList(model.Node) = .empty;
     defer metadata.deinit(self.allocator);
-    try metadata.ensureTotalCapacity(self.allocator, sequence.rules.len - 1);
+    try metadata.ensureTotalCapacity(self.allocator, sections.len - 1);
     while (true) {
         const kind_value = try self.kind();
-        try sequence.accept(kind_value);
         if (kind_value == .run) break;
+        for (sections) |section| {
+            if (section.kind == kind_value) break;
+        } else return error.InvalidStructure;
+        // Header consumers select one container of each kind.
+        if (seen.contains(kind_value)) return error.InvalidStructure;
+        seen.insert(kind_value);
         try metadata.append(self.allocator, try self.parseNode(&self.header_store, 1, true, self.options.payload));
     }
-    try sequence.finish();
     document.children = try self.header_store.copy(model.Node, metadata.items);
     var run = try self.startNode(&self.header_store, .run);
     self.scopes[self.scope_count] = try self.captureScope();
@@ -404,8 +409,6 @@ fn nextRecordInner(self: *StreamReader, comptime retention: Retention) Error!?mo
         const list = if (list_kind == .spectrum_list) &self.header.spectrum_list.? else &self.header.chromatogram_list.?;
         if (event.data == .end_element) {
             self.current_kind = list_kind;
-            if (self.options.checks == .checked and list_kind == .chromatogram_list and list.observed_count == 0)
-                return error.InvalidStructure;
             self.active_list = null;
             try self.cursor.advance(false);
             try self.openList();

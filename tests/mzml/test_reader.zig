@@ -590,6 +590,96 @@ test "[integration] - [mzML reader]: reuses storage across growing and shrinking
     try compareDecoded(source.written(), 7);
 }
 
+test "[integration] - [mzML header]: preserves present sections without requiring schema order" {
+    const group = "<referenceableParamGroupList><referenceableParamGroup id='encoding'>" ++
+        "<cvParam accession='MS:1000523'/><cvParam accession='MS:1000576'/>" ++
+        "</referenceableParamGroup></referenceableParamGroupList>";
+    const software = "<softwareList><software id='sw'/></softwareList>";
+    inline for (.{
+        .{ group, &[_]mzml.model.Kind{.referenceable_param_group_list} },
+        .{ software ++ group, &[_]mzml.model.Kind{ .software_list, .referenceable_param_group_list } },
+    }) |case| {
+        const source = "<mzML xmlns='http://psi.hupo.org/ms/mzml' version='1.1.0'>" ++ case[0] ++
+            "<run><spectrumList count='1'>" ++ support.SPECTRUM ++ "</spectrumList></run></mzML>";
+        for (std.enums.values(mzml.StreamReader.Checks)) |checks| {
+            var input = std.Io.Reader.fixed(source);
+            var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{ .checks = checks });
+            defer reader.deinit();
+            const header = try reader.readHeader();
+            try std.testing.expectEqual(null, header.document.child(.cv_list));
+            try std.testing.expectEqual(case[1].len, header.document.children.len);
+            for (case[1], header.document.children) |expected, node| try std.testing.expectEqual(expected, node.kind);
+            try std.testing.expectEqualStrings("encoding", header.groups[0].id);
+            try std.testing.expectEqual(@as(usize, 2), header.groups[0].entries.len);
+            const record = (try reader.nextRecord()).?;
+            try std.testing.expectEqualStrings("native=a&b", record.id);
+            try std.testing.expectEqual(@as(usize, 2), record.binaryArrays().len);
+            try std.testing.expectEqual(null, try reader.nextRecord());
+        }
+        try compareDecoded(source, 1);
+        var index = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = source }, .{ .policy = .rebuild });
+        defer index.deinit();
+        var output = mzml.StreamReader.DecodedArrays.init(std.testing.allocator, .{});
+        defer output.deinit();
+        var record = (try index.atDecoded(std.testing.allocator, .spectrum, 0, &output)).?;
+        defer record.deinit();
+        try std.testing.expectEqualStrings("native=a&b", record.value.id);
+        try std.testing.expectEqual(@as(usize, 2), output.len());
+        for (0..output.len()) |i| try std.testing.expectEqualSlices(f64, &.{1}, output.get(i).?.values.float64);
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, readDecodedRecord, .{ source, mzml.arrays.Limits{} });
+    }
+    const opening = "<mzML xmlns='http://psi.hupo.org/ms/mzml' version='1.1.0'>";
+    inline for (.{ group ++ group ++ "<run/>", "<spectrum id='x' index='0' defaultArrayLength='0'/><run/>", software }) |body| {
+        try std.testing.expectError(error.InvalidStructure, support.readAll(std.testing.allocator, opening ++ body ++ "</mzML>", .{}));
+    }
+}
+
+test "[integration] - [mzML lists]: reads absent and empty lists without requiring records" {
+    const Case = struct { xml: []const u8, spectra: ?usize = null, chromatograms: ?usize = null };
+    inline for ([_]Case{
+        .{ .xml = "" },
+        .{ .xml = "<spectrumList count='0'/>", .spectra = 0 },
+        .{ .xml = "<chromatogramList count='0'/>", .chromatograms = 0 },
+        .{ .xml = "<spectrumList count='8'/><chromatogramList count='3'/>", .spectra = 8, .chromatograms = 3 },
+    }) |case| {
+        const source = support.HEADER ++ case.xml ++ "</run></mzML>";
+        for (std.enums.values(mzml.StreamReader.Checks)) |checks| {
+            var input = std.Io.Reader.fixed(source);
+            var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{ .checks = checks });
+            defer reader.deinit();
+            const header = try reader.readHeader();
+            try std.testing.expectEqual(null, try reader.nextRecord());
+            try std.testing.expectEqual(case.spectra != null, header.spectrum_list != null);
+            try std.testing.expectEqual(case.chromatograms != null, header.chromatogram_list != null);
+            if (header.spectrum_list) |list| {
+                try std.testing.expectEqual(case.spectra.?, list.declared_count);
+                try std.testing.expectEqual(@as(usize, 0), list.observed_count);
+            }
+            if (header.chromatogram_list) |list| {
+                try std.testing.expectEqual(case.chromatograms.?, list.declared_count);
+                try std.testing.expectEqual(@as(usize, 0), list.observed_count);
+            }
+        }
+        try readDecoded(std.testing.allocator, source, .{});
+        var index = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = source }, .{ .policy = .rebuild });
+        defer index.deinit();
+        try std.testing.expectEqual(@as(usize, 0), index.entries.items.len);
+        try std.testing.expectEqual(null, try index.at(std.testing.allocator, .chromatogram, 0));
+    }
+    const prefix = "<indexedmzML xmlns='http://psi.hupo.org/ms/mzml'><mzML version='1.1.0'>" ++
+        "<run><chromatogramList count='0'/></run></mzML>";
+    var buffer: [512]u8 = undefined;
+    const indexed = try std.fmt.bufPrint(&buffer, prefix ++ "<indexList><index name='chromatogram'/></indexList>" ++
+        "<indexListOffset>{d}</indexListOffset><fileChecksum/></indexedmzML>", .{prefix.len});
+    for (std.enums.values(mzml.IndexedReader.Policy)) |policy| {
+        var index = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = indexed }, .{ .policy = policy });
+        defer index.deinit();
+        try std.testing.expectEqual(@as(usize, 0), index.entries.items.len);
+        try std.testing.expectEqual(@as(usize, 0), index.header().chromatogram_list.?.declared_count);
+    }
+    try support.readAll(std.testing.allocator, indexed, .{ .retain_index = true });
+}
+
 test "[integration] - [mzML attributes]: preserves extras without requiring unused fields" {
     const source = "<mzML xmlns='http://psi.hupo.org/ms/mzml' version='1.1.0' extra='document'>" ++
         "<cvList><cv/></cvList><fileDescription><fileContent/><sourceFileList><sourceFile/></sourceFileList></fileDescription>" ++

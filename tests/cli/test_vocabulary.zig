@@ -56,3 +56,20 @@ test "[cli] - [vocabulary scan]: reports unresolved source metadata without modi
     var buffer: [2048]u8 = undefined;
     try std.testing.expectEqualStrings(xml, try dir.dir.readFile(std.testing.io, "input.mzML", &buffer));
 }
+
+test "[cli] - [vocabulary scan]: reads a header without CV declarations" {
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    const executable = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, options.executable, std.testing.allocator);
+    defer std.testing.allocator.free(executable);
+    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "input.mzML", .data = "<mzML xmlns='http://psi.hupo.org/ms/mzml' version='1.1.0'><run/></mzML>" });
+    const result = try std.process.run(std.testing.allocator, std.testing.io, .{
+        .argv = &.{ executable, "scan", "input.mzML" },
+        .cwd = .{ .dir = dir.dir },
+    });
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqualStrings("", result.stderr);
+    try std.testing.expectEqualStrings("{\"format_version\":2,\"kind\":\"scan\",\"resource\":\"\",\"accession\":\"input.mzML\",\"before\":null,\"after\":{\"records\":0,\"parameters\":0,\"resolved\":0,\"missing_references\":0,\"unknown_resources\":0,\"unknown_accessions\":0,\"stale_names\":0,\"obsolete\":0,\"units\":0,\"resolved_units\":0,\"partial_units\":0,\"disallowed_units\":0}}\n", result.stdout);
+}

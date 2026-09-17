@@ -156,7 +156,7 @@ fn scan(allocator: std.mem.Allocator, io: std.Io, path: []const u8, output: *std
     var reader = try mzml.StreamReader.init(allocator, &input.interface, .{ .payload = .skip });
     defer reader.deinit();
     const header = try reader.readHeader();
-    const nodes = header.document.child(.cv_list).?.children;
+    const nodes = if (header.document.child(.cv_list)) |list| list.children else &.{};
     const declarations = try allocator.alloc(mzml.cv.Declaration, nodes.len);
     defer allocator.free(declarations);
     for (declarations, nodes) |*declaration, node| declaration.* = .{

@@ -60,7 +60,7 @@ fn checkFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Totals
         reportReaderFailure(&reader, err);
         return err;
     };
-    const cv_nodes = header.document.child(.cv_list).?.children;
+    const cv_nodes = if (header.document.child(.cv_list)) |list| list.children else &.{};
     const declarations = try allocator.alloc(mzml.cv.Declaration, cv_nodes.len);
     defer allocator.free(declarations);
     for (declarations, cv_nodes) |*declaration, node| declaration.* = .{
