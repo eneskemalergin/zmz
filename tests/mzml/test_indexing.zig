@@ -523,7 +523,7 @@ test "[integration] - [mzML index]: opens embedded targets without checking unre
     try std.testing.expectError(error.InvalidIndex, opened.at(std.testing.allocator, .spectrum, 0));
 }
 
-test "[integration] - [mzML index]: opens encoded trailers and restores list namespace declarations" {
+test "[integration] - [mzML index]: opens indented encoded targets and restores list namespaces" {
     const FailedRead = struct {
         start: u64,
         stop: u64,
@@ -561,13 +561,15 @@ test "[integration] - [mzML index]: opens encoded trailers and restores list nam
                 try source.writer.writeAll("<p:indexedmzML xmlns:p='http://psi.hupo.org/ms/mzml'>" ++ support.HEADER);
                 try source.writer.print("<spectrumList count='{d}' defaultDataProcessingRef='dp'>", .{spectra});
                 const spectrum_start = bom + width * source.written().len;
-                if (spectra != 0) try source.writer.writeAll("<spectrum id='a&amp;b' index='0' defaultArrayLength='0'/>");
+                if (spectra != 0) try source.writer.writeAll("\r\n \t<spectrum id='a&amp;b' index='0' defaultArrayLength='0'/>");
                 try source.writer.writeAll(spaces[0..padding]);
                 try source.writer.writeAll("</spectrumList><chromatogramList xmlns:q='http://psi.hupo.org/ms/mzml' count='1' defaultDataProcessingRef='dp'>");
                 const chromatogram_start = bom + width * source.written().len;
-                try source.writer.writeAll("<q:chromatogram id='tic' index='0' defaultArrayLength='1'>" ++ support.ARRAYS ++ "</q:chromatogram></chromatogramList></run></mzML>");
+                try source.writer.writeAll(spaces[0..padding]);
+                try source.writer.writeAll("\r\n \t<q:chromatogram id='tic' index='0' defaultArrayLength='1'>" ++ support.ARRAYS ++ "</q:chromatogram></chromatogramList></run></mzML>");
                 const index_start = bom + width * source.written().len;
-                try source.writer.print("<p:indexList count='2'><p:index name='chromatogram'><p:offset idRef='tic'>{d}</p:offset></p:index><p:index name='spectrum'>", .{chromatogram_start});
+                try source.writer.writeAll(spaces[0..padding]);
+                try source.writer.print("\r\n \t<p:indexList count='2'><p:index name='chromatogram'><p:offset idRef='tic'>{d}</p:offset></p:index><p:index name='spectrum'>", .{chromatogram_start});
                 try source.writer.writeAll(spaces[0..padding]);
                 if (spectra != 0) try source.writer.print("<p:offset idRef='a&amp;b'>{d}</p:offset>", .{spectrum_start});
                 try source.writer.print("</p:index></p:indexList><p:indexListOffset>{d}</p:indexListOffset><p:fileChecksum>0000000000000000000000000000000000000000</p:fileChecksum></p:indexedmzML><!-- <indexListOffset>fake -->", .{index_start});
@@ -630,14 +632,15 @@ test "[integration] - [mzML index]: opens encoded trailers and restores list nam
                         for ([_]bool{ false, true }) |malformed| {
                             var name: [2]u8 = .{ 'x', 0 };
                             if (endian) |order| std.mem.writeInt(u16, &name, 'x', order);
-                            if (malformed) try file.writePositionalAll(std.testing.io, name[0..width], start + width);
+                            const damage_offset = start + "\r\n \t<".len * width;
+                            if (malformed) try file.writePositionalAll(std.testing.io, name[0..width], damage_offset);
                             for ([_]bool{ false, true }) |truncated| {
                                 var failure: FailedRead = .{ .start = start, .stop = start + 65536, .truncated = truncated };
                                 const io: std.Io = .{ .userdata = &failure, .vtable = &vtable };
                                 try std.testing.expectError(if (truncated) error.TruncatedSource else error.InputOutput, mzml.IndexedReader.build(allocator, .{ .file = .{ .handle = file, .io = io } }, .{ .policy = .open_embedded }));
                                 try std.testing.expect(failure.failed);
                             }
-                            try file.writePositionalAll(std.testing.io, bytes[start + width ..][0..width], start + width);
+                            try file.writePositionalAll(std.testing.io, bytes[damage_offset..][0..width], damage_offset);
                         }
                     }
                 }

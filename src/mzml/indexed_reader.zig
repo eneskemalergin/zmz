@@ -41,7 +41,7 @@ pub const Options = struct {
 };
 
 /// Physical span and source identity, borrowed from this index. With open_embedded,
-/// end is an upper bound at the next target or trailer, not the record's closing tag.
+/// start may precede XML whitespace and end bounds the span at the next target or trailer.
 pub const Entry = struct { kind: model.Kind, id: []const u8, index: usize, start: u64, end: u64 };
 
 pub const Error = PublicStreamReader.Error || owned.Error || std.Io.File.StatError || std.Io.File.ReadPositionalError || error{
@@ -237,9 +237,10 @@ fn readEntry(self: *IndexedReader, allocator: std.mem.Allocator, entry: Entry, o
     errdefer record.deinit();
     try input.finishSpan();
     if (record.value.node.kind != entry.kind or !std.mem.eql(u8, record.value.id, entry.id) or
-        record.value.index != entry.index or record.value.node.start_offset != entry.start or
+        record.value.index != entry.index or
         record.value.node.end_offset > entry.end or
-        (self.options.policy != .open_embedded and record.value.node.end_offset != entry.end)) return error.InvalidIndex;
+        (self.options.policy == .rebuild and
+            (record.value.node.start_offset != entry.start or record.value.node.end_offset != entry.end))) return error.InvalidIndex;
     try self.checkSource();
     self.lookup_kind = entry.kind;
     return record;
@@ -368,7 +369,7 @@ fn openEmbedded(self: *IndexedReader, reader: *StreamReader) Error!void {
     const bytes_len = std.math.add(usize, prefix_len, trailer_len) catch return error.LimitExceeded;
     var buffer: [64 * 1024]u8 = undefined;
     var input = FragmentInput.init(self, prefix, start, trailer_len, &.{}, buffer[0..@max(4, @min(buffer.len, bytes_len))]);
-    self.readEmbeddedEntries(&input.interface, start, prefix_len, final_scope.end, endian) catch |err| {
+    self.readEmbeddedEntries(&input.interface, start, final_scope.end, endian) catch |err| {
         try input.finishSpan();
         return err;
     };
@@ -409,7 +410,7 @@ fn openEmbedded(self: *IndexedReader, reader: *StreamReader) Error!void {
     }
 }
 
-fn readEmbeddedEntries(self: *IndexedReader, input: *std.Io.Reader, index_start: u64, prefix_len: usize, minimum: u64, endian: ?std.builtin.Endian) Error!void {
+fn readEmbeddedEntries(self: *IndexedReader, input: *std.Io.Reader, index_start: u64, minimum: u64, endian: ?std.builtin.Endian) Error!void {
     const limits = self.options.reader.limits;
     var cursor = try xml.Cursor.init(self.allocator, input, limits.depth, limits.attributes, limits.attribute_bytes, true);
     defer cursor.deinit();
@@ -419,7 +420,6 @@ fn readEmbeddedEntries(self: *IndexedReader, input: *std.Io.Reader, index_start:
     _ = try indexStart(&cursor, .indexed_mzml, false);
     try cursor.advance(false);
     const list = try indexStart(&cursor, .index_list, true);
-    if (cursor.current.?.span.start != prefix_len) return error.InvalidIndex;
     const declared = try cv.parseInteger(usize, list.attribute(null, "count").?.value);
     var seen = [_]bool{ false, false };
     var indexes: usize = 0;
