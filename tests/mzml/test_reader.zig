@@ -823,15 +823,37 @@ test "[integration] - [mzML lists]: reads absent and empty lists without requiri
     const prefix = "<indexedmzML xmlns='http://psi.hupo.org/ms/mzml'><mzML version='1.1.0'>" ++
         "<run><chromatogramList count='0'/></run></mzML>";
     var buffer: [512]u8 = undefined;
-    const indexed = try std.fmt.bufPrint(&buffer, prefix ++ "<indexList><index name='chromatogram'/></indexList>" ++
-        "<indexListOffset>{d}</indexListOffset><fileChecksum/></indexedmzML>", .{prefix.len});
-    for (std.enums.values(mzml.IndexedReader.Policy)) |policy| {
-        var index = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = indexed }, .{ .policy = policy });
-        defer index.deinit();
-        try std.testing.expectEqual(@as(usize, 0), index.entries.items.len);
-        try std.testing.expectEqual(@as(usize, 0), index.header().chromatogram_list.?.declared_count);
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    for ([_][]const u8{
+        "<indexList/>",
+        "<indexList count='0'></indexList>",
+        "<indexList><index name='chromatogram'/></indexList>",
+    }) |trailer| {
+        const indexed = try std.fmt.bufPrint(&buffer, prefix ++ "{s}" ++
+            "<indexListOffset>{d}</indexListOffset><fileChecksum/></indexedmzML>", .{ trailer, prefix.len });
+        try support.readAll(std.testing.allocator, indexed, .{ .retain_index = true });
+        const file = try directory.dir.createFile(std.testing.io, "empty.mzML", .{ .read = true });
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, indexed);
+        for ([_]mzml.IndexedReader.Source{ .{ .bytes = indexed }, .{ .file = .{ .handle = file, .io = std.testing.io } } }) |source| {
+            for (std.enums.values(mzml.IndexedReader.Policy)) |policy| {
+                var index = try mzml.IndexedReader.build(std.testing.allocator, source, .{ .policy = policy, .max_records = 0 });
+                defer index.deinit();
+                try std.testing.expectEqual(@as(usize, 0), index.entries.items.len);
+                try std.testing.expectEqualDeep([_]usize{ 0, 0 }, index.counts);
+                try std.testing.expectEqual(@as(usize, 0), index.header().chromatogram_list.?.declared_count);
+                try std.testing.expectEqual(null, try index.byId(std.testing.allocator, "missing"));
+                try std.testing.expectEqual(null, try index.at(std.testing.allocator, .spectrum, 0));
+                try std.testing.expectEqual(null, try index.at(std.testing.allocator, .chromatogram, 0));
+                var output = mzml.StreamReader.DecodedArrays.init(std.testing.allocator, .{});
+                defer output.deinit();
+                try std.testing.expectEqual(null, try index.byIdDecoded(std.testing.allocator, "missing", &output));
+                try std.testing.expectEqual(null, try index.atDecoded(std.testing.allocator, .chromatogram, 0, &output));
+                try std.testing.expectEqual(@as(usize, 0), output.len());
+            }
+        }
     }
-    try support.readAll(std.testing.allocator, indexed, .{ .retain_index = true });
 }
 
 test "[integration] - [mzML attributes]: preserves extras without requiring unused fields" {

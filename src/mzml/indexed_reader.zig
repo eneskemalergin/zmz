@@ -388,7 +388,6 @@ fn readEmbeddedEntries(self: *IndexedReader, input: *std.Io.Reader, index_start:
     try cursor.advance(false);
     _ = try indexStart(&cursor, .index_list);
     var seen = [_]bool{ false, false };
-    var indexes: usize = 0;
     try cursor.advance(false);
     while ((cursor.current orelse return error.UnexpectedEnd).data == .start_element) {
         const index = try indexStart(&cursor, .index);
@@ -397,7 +396,6 @@ fn readEmbeddedEntries(self: *IndexedReader, input: *std.Io.Reader, index_start:
         const k = kindIndex(kind);
         if (seen[k]) return error.InvalidIndex;
         seen[k] = true;
-        indexes += 1;
         var previous: u64 = 0;
         try cursor.advance(false);
         while ((cursor.current orelse return error.UnexpectedEnd).data == .start_element) {
@@ -418,7 +416,6 @@ fn readEmbeddedEntries(self: *IndexedReader, input: *std.Io.Reader, index_start:
         }
         try indexEnd(&cursor, .index);
     }
-    if (indexes == 0) return error.InvalidStructure;
     try indexEnd(&cursor, .index_list);
     _ = try indexStart(&cursor, .index_list_offset);
     if (try cv.parseInteger(u64, try self.indexText(&cursor, &text, .index_list_offset)) != index_start) return error.InvalidIndex;
