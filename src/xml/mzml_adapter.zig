@@ -1629,7 +1629,6 @@ pub const Writer = struct {
     /// Writes one supported default or `xsi` namespace declaration.
     pub fn namespace(self: *Writer, prefix: ?[]const u8, uri: []const u8) WriterError!void {
         try self.check(.start_tag);
-        validateValue(uri) catch |err| return self.fail(err);
         if (prefix) |value| {
             if (!std.mem.eql(u8, value, "xsi") or !std.mem.eql(u8, uri, XSI)) return self.fail(error.InvalidNamespace);
         } else if (!std.mem.eql(u8, uri, NAMESPACE)) {
@@ -1665,7 +1664,6 @@ pub const Writer = struct {
             return self.fail(error.InvalidNamespace);
         if (std.mem.indexOfScalar(u8, name, ':') != null and !std.mem.eql(u8, name, "xsi:schemaLocation"))
             return self.fail(error.InvalidNamespace);
-        validateValue(value) catch |err| return self.fail(err);
         const frame = &self.frames[self.frame_count - 1];
         var position = frame.attribute_start;
         while (position < self.attribute_names.items.len) {
@@ -1688,13 +1686,11 @@ pub const Writer = struct {
     pub fn text(self: *Writer, value: []const u8) WriterError!void {
         try self.checkAny();
         if (self.state != .start_tag and self.state != .content) return self.fail(error.InvalidState);
-        const trailing = validateText(value, self.text_brackets) catch |err| return self.fail(err);
         if (self.state == .start_tag) {
             try self.writeByte('>');
             self.state = .content;
         }
         try self.writeEscapedText(value);
-        self.text_brackets = trailing;
     }
 
     pub fn binary(self: *Writer, wire: []const u8) WriterError!void {
@@ -1787,22 +1783,20 @@ pub const Writer = struct {
         var plain_start: usize = 0;
         var index: usize = 0;
         while (index < value.len) {
-            const byte = value[index];
-            const replacement: []const u8 = switch (byte) {
+            const start = index;
+            const codepoint = decodeValue(value, &index) catch |err| return self.fail(err);
+            if (!isXmlChar(codepoint)) return self.fail(error.InvalidCharacter);
+            const replacement: []const u8 = switch (codepoint) {
                 '&' => "&amp;",
                 '<' => "&lt;",
                 '"' => "&quot;",
                 '\t' => "&#x9;",
                 '\n' => "&#xA;",
                 '\r' => "&#xD;",
-                else => {
-                    index += 1;
-                    continue;
-                },
+                else => continue,
             };
-            if (plain_start != index) try self.writeBytes(value[plain_start..index]);
+            if (plain_start != start) try self.writeBytes(value[plain_start..start]);
             try self.writeBytes(replacement);
-            index += 1;
             plain_start = index;
         }
         if (plain_start != value.len) try self.writeBytes(value[plain_start..]);
@@ -1820,33 +1814,33 @@ pub const Writer = struct {
                     continue;
                 }
             }
-            const byte = value[index];
+            const start = index;
+            const codepoint = decodeValue(value, &index) catch |err| return self.fail(err);
+            if (!isXmlChar(codepoint)) return self.fail(error.InvalidCharacter);
             var replacement: ?[]const u8 = null;
-            if (byte == '&') {
+            if (codepoint == '&') {
                 replacement = "&amp;";
                 brackets = 0;
-            } else if (byte == '<') {
+            } else if (codepoint == '<') {
                 replacement = "&lt;";
                 brackets = 0;
-            } else if (byte == '\r') {
+            } else if (codepoint == '\r') {
                 replacement = "&#xD;";
                 brackets = 0;
-            } else if (byte == ']') {
+            } else if (codepoint == ']') {
                 if (brackets < 2) brackets += 1;
             } else {
-                if (byte == '>' and brackets == 2) replacement = "&gt;";
+                if (codepoint == '>' and brackets == 2) replacement = "&gt;";
                 brackets = 0;
             }
             if (replacement) |escaped| {
-                if (plain_start != index) try self.writeBytes(value[plain_start..index]);
+                if (plain_start != start) try self.writeBytes(value[plain_start..start]);
                 try self.writeBytes(escaped);
-                index += 1;
                 plain_start = index;
-            } else {
-                index += 1;
             }
         }
         if (plain_start != value.len) try self.writeBytes(value[plain_start..]);
+        self.text_brackets = brackets;
     }
 };
 
@@ -1882,35 +1876,6 @@ fn decodeValue(value: []const u8, index: *usize) WriterError!u21 {
     const codepoint = std.unicode.utf8Decode(value[index.* .. index.* + length]) catch return error.InvalidCharacter;
     index.* += length;
     return codepoint;
-}
-
-fn validateValue(value: []const u8) WriterError!void {
-    var index: usize = 0;
-    while (index < value.len) {
-        const codepoint = try decodeValue(value, &index);
-        if (!isXmlChar(codepoint)) return error.InvalidCharacter;
-    }
-}
-
-fn validateText(value: []const u8, initial_brackets: u2) WriterError!u2 {
-    var index: usize = 0;
-    var brackets = initial_brackets;
-    while (index < value.len) {
-        const length = ordinaryTextRun(value[index..], value.len - index);
-        if (length != 0) {
-            index += length;
-            brackets = 0;
-            continue;
-        }
-        const codepoint = try decodeValue(value, &index);
-        if (!isXmlChar(codepoint)) return error.InvalidCharacter;
-        if (codepoint == ']') {
-            if (brackets < 2) brackets += 1;
-        } else {
-            brackets = 0;
-        }
-    }
-    return brackets;
 }
 
 fn writeBinaryCase(writer: *Writer, wire: []const u8, direct: bool, prefix: []const u8) WriterError!void {
@@ -2443,16 +2408,20 @@ test "[property] - [mzML XML writer]: preserves text runs, split brackets, and l
             try std.testing.expectEqual(@as(?u64, expected.len), writer.byteOffset());
         }
         for ([_][]const u8{ "\x00", "\x01", "\xc0\x80", "\xed\xa0\x80", "\xf4\x90\x80\x80", "\xef\xbf\xbe", "\xc2" }) |invalid| {
-            const bad = try std.fmt.bufPrint(&value_buffer, "{s}{s}", .{ ordinary[0..length], invalid });
-            var sink = std.Io.Writer.fixed(&output);
-            var writer = try Writer.init(std.testing.allocator, &sink, .{});
-            defer writer.deinit();
-            try writer.startDocument();
-            try writer.startElement("binary");
-            try std.testing.expectError(error.InvalidCharacter, writer.text(bad));
-            try std.testing.expectEqualStrings(opening, sink.buffered());
-            try std.testing.expectEqual(@as(?u64, opening.len), writer.byteOffset());
-            try std.testing.expectError(error.InvalidCharacter, writer.text("later"));
+            const bad = try std.fmt.bufPrint(&value_buffer, "{s}&{s}", .{ ordinary[0..length], invalid });
+            for ([_]bool{ false, true }) |attribute| {
+                var sink = std.Io.Writer.fixed(&output);
+                var writer = try Writer.init(std.testing.allocator, &sink, .{});
+                defer writer.deinit();
+                try writer.startDocument();
+                try writer.startElement("binary");
+                try std.testing.expectError(error.InvalidCharacter, if (attribute) writer.attribute("id", bad) else writer.text(bad));
+                const partial = try std.fmt.bufPrint(&expected_buffer, opening ++ "{s}{s}&amp;", .{ if (attribute) " id=\"" else ">", ordinary[0..length] });
+                try std.testing.expectEqualStrings(partial, sink.buffered());
+                try std.testing.expectEqual(@as(?u64, partial.len), writer.byteOffset());
+                try std.testing.expectError(error.InvalidCharacter, writer.text("later"));
+                try std.testing.expectError(error.InvalidCharacter, writer.attribute("more", "later"));
+            }
         }
     }
 }
@@ -2466,12 +2435,12 @@ test "[unit] - [mzML XML writer]: emits escaped values and flushes empty text" {
     try writer.startDocument();
     try writer.startElement("mzML");
     try writer.namespace(null, NAMESPACE);
-    try writer.attribute("id", "a&\"b");
+    try writer.attribute("id", "a&\"b\t\n\r\xc2\xb5\xe2\x82\xac\xf0\x9f\x98\x80");
     try writer.text("]]> &<\r");
     try writer.endElement();
     try writer.endDocument();
     try std.testing.expectEqualStrings(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><mzML xmlns=\"" ++ NAMESPACE ++ "\" id=\"a&amp;&quot;b\">]]&gt; &amp;&lt;&#xD;</mzML>",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><mzML xmlns=\"" ++ NAMESPACE ++ "\" id=\"a&amp;&quot;b&#x9;&#xA;&#xD;\xc2\xb5\xe2\x82\xac\xf0\x9f\x98\x80\">]]&gt; &amp;&lt;&#xD;</mzML>",
         sink.buffered(),
     );
     try std.testing.expectEqual(@as(?u64, sink.buffered().len), writer.byteOffset());
