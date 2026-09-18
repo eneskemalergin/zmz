@@ -164,11 +164,18 @@ fn writeRecordInner(self: *Writer, node: model.Node, comptime replace_arrays: bo
         if (state.entries.items.len == state.limits.records or id.len > state.limits.id_bytes -| state.id_bytes)
             return error.LimitExceeded;
         const copied = try state.arena.allocator().dupe(u8, id);
-        const found = try state.ids[if (node.kind == .spectrum) @as(usize, 0) else 1].getOrPut(state.allocator, copied);
+        const found = try state.ids[if (node.kind == .spectrum) @as(usize, 0) else 1].getOrPutContextAdapted(
+            state.allocator,
+            copied,
+            IdQuery{ .entries = state.entries.items },
+            .{ .entries = state.entries.items },
+        );
         if (found.found_existing) return error.DuplicateId;
+        found.key_ptr.* = state.entries.items.len;
         state.id_bytes += id.len;
         try state.entries.ensureUnusedCapacity(state.allocator, 1);
-        state.entries.appendAssumeCapacity(.{ .kind = node.kind, .id = copied, .offset = offset });
+        state.entries.appendAssumeCapacity(.{ .id = copied, .offset = offset });
+        if (node.kind == .spectrum) state.spectra += 1;
     }
     var remaining = wire_arrays;
     var budget = self.limits.nodes;
@@ -202,19 +209,16 @@ pub fn finish(self: *Writer) Error!void {
 fn writeIndex(self: *Writer, state: *IndexState) Error!void {
     const offset = self.engine.byteOffset() orelse return error.LimitExceeded;
     if (offset > std.math.maxInt(i64)) return error.LimitExceeded;
-    var spectrum = state.entries.items.len == 0;
-    var chromatogram = false;
-    for (state.entries.items) |entry| {
-        if (entry.kind == .spectrum) spectrum = true else chromatogram = true;
-    }
+    const spectrum = state.spectra != 0 or state.entries.items.len == 0;
+    const chromatogram = state.spectra != state.entries.items.len;
     try self.engine.startElement("indexList");
     try self.engine.attribute("count", if (spectrum and chromatogram) "2" else "1");
     inline for (.{ model.Kind.spectrum, model.Kind.chromatogram }) |kind| {
         if (if (kind == .spectrum) spectrum else chromatogram) {
             try self.engine.startElement("index");
             try self.engine.attribute("name", kind.xmlName());
-            for (state.entries.items) |entry| {
-                if (entry.kind != kind) continue;
+            const entries = if (kind == .spectrum) state.entries.items[0..state.spectra] else state.entries.items[state.spectra..];
+            for (entries) |entry| {
                 try self.engine.startElement("offset");
                 try self.engine.attribute("idRef", entry.id);
                 var text: [32]u8 = undefined;
@@ -325,14 +329,41 @@ fn optionalAttribute(self: *Writer, name: []const u8, value: ?[]const u8) Error!
     if (value) |text| try self.engine.attribute(name, text);
 }
 
+const IndexEntry = struct { id: []const u8, offset: u64 };
+
 const IndexState = struct {
     allocator: std.mem.Allocator,
     hashed: ChecksumWriter,
     arena: std.heap.ArenaAllocator,
     limits: IndexLimits,
-    entries: std.ArrayList(struct { kind: model.Kind, id: []const u8, offset: u64 }) = .empty,
-    ids: [2]std.StringHashMapUnmanaged(void) = .{ .empty, .empty },
+    entries: std.ArrayList(IndexEntry) = .empty,
+    ids: [2]std.HashMapUnmanaged(usize, void, IdContext, std.hash_map.default_max_load_percentage) = .{ .empty, .empty },
+    spectra: usize = 0,
     id_bytes: usize = 0,
+};
+
+const IdContext = struct {
+    entries: []const IndexEntry,
+
+    pub fn hash(self: IdContext, position: usize) u64 {
+        return std.hash_map.hashString(self.entries[position].id);
+    }
+
+    pub fn eql(_: IdContext, left: usize, right: usize) bool {
+        return left == right;
+    }
+};
+
+const IdQuery = struct {
+    entries: []const IndexEntry,
+
+    pub fn hash(_: IdQuery, id: []const u8) u64 {
+        return std.hash_map.hashString(id);
+    }
+
+    pub fn eql(self: IdQuery, id: []const u8, position: usize) bool {
+        return std.mem.eql(u8, id, self.entries[position].id);
+    }
 };
 
 const ChecksumWriter = struct {

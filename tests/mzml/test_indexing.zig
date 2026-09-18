@@ -1182,3 +1182,71 @@ test "[integration] - [mzML indexed writer]: opens empty indexes and escaped IDs
         } else try std.testing.expectEqual(@as(usize, 0), count);
     }
 }
+
+test "[property] - [mzML indexed writer]: preserves IDs and offsets across index growth" {
+    const Growing = struct {
+        fn write(allocator: std.mem.Allocator, sink: *std.Io.Writer, counts: [2]usize, duplicate: bool) !void {
+            var writer = try mzml.Writer.initIndexed(allocator, sink, .{}, .{});
+            defer writer.deinit();
+            try writer.writeHeader(.{
+                .document = .{ .kind = .mzml, .attributes = &.{.{ .name = "version", .value = "1.1.0" }} },
+                .run = .{ .kind = .run },
+            });
+            for ([_]mzml.model.Kind{ .spectrum, .chromatogram }, counts) |kind, count| {
+                if (count == 0) continue;
+                try writer.beginList(if (kind == .spectrum) .spectrum_list else .chromatogram_list, count, "dp");
+                for (0..count) |position| {
+                    var id: [32]u8 = undefined;
+                    var ordinal: [32]u8 = undefined;
+                    const node: mzml.model.Node = .{ .kind = kind, .attributes = &.{
+                        .{ .name = "id", .value = try std.fmt.bufPrint(&id, "id&{d}", .{if (duplicate and position == count - 1) 0 else position}) },
+                        .{ .name = "index", .value = try std.fmt.bufPrint(&ordinal, "{d}", .{position}) },
+                        .{ .name = "defaultArrayLength", .value = "0" },
+                    } };
+                    writer.writeRecord(node) catch |err| {
+                        try std.testing.expectError(error.FailedState, writer.finish());
+                        return err;
+                    };
+                }
+                try writer.endList();
+            }
+            try writer.finish();
+        }
+
+        fn allocated(allocator: std.mem.Allocator) !void {
+            var bytes: [16384]u8 = undefined;
+            var sink = std.Io.Writer.fixed(&bytes);
+            try write(allocator, &sink, .{ 40, 19 }, false);
+        }
+    };
+    for ([_][2]usize{ .{ 40, 0 }, .{ 0, 19 }, .{ 40, 19 } }) |counts| {
+        var bytes: [16384]u8 = undefined;
+        var sink = std.Io.Writer.fixed(&bytes);
+        try Growing.write(std.testing.allocator, &sink, counts, false);
+        var index = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = sink.buffered() }, .{});
+        defer index.deinit();
+        try std.testing.expectEqualDeep(counts, index.counts);
+        for ([_]mzml.model.Kind{ .spectrum, .chromatogram }, counts) |kind, count| {
+            for (0..count) |position| {
+                var id: [32]u8 = undefined;
+                const expected = try std.fmt.bufPrint(&id, "id&{d}", .{position});
+                var found = (try index.at(std.testing.allocator, kind, position)).?;
+                defer found.deinit();
+                try std.testing.expectEqualStrings(expected, found.value.id);
+                try std.testing.expectEqual(kind, found.value.node.kind);
+                try std.testing.expectEqual(position, found.value.index);
+                const entry = index.entries.items[position + if (kind == .spectrum) @as(usize, 0) else counts[0]];
+                try std.testing.expectEqual(entry.start, found.value.node.start_offset);
+            }
+        }
+        if (counts[0] != 0 and counts[1] != 0) try std.testing.expectError(error.AmbiguousId, index.byId(std.testing.allocator, "id&0"));
+        const checksum_start = std.mem.indexOf(u8, sink.buffered(), "<fileChecksum>").? + "<fileChecksum>".len;
+        var digest: [20]u8 = undefined;
+        std.crypto.hash.Sha1.hash(sink.buffered()[0..checksum_start], &digest, .{});
+        try std.testing.expectEqualStrings(&std.fmt.bytesToHex(digest, .lower), sink.buffered()[checksum_start..][0..40]);
+        var failed_bytes: [16384]u8 = undefined;
+        var failed_sink = std.Io.Writer.fixed(&failed_bytes);
+        try std.testing.expectError(error.DuplicateId, Growing.write(std.testing.allocator, &failed_sink, counts, true));
+    }
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Growing.allocated, .{});
+}
