@@ -13,7 +13,7 @@ const Writer = @This();
 pub const Limits = schema.Limits;
 
 /// Writer failures are sticky. No error permits treating partially written output as complete.
-pub const Error = xml.WriterError || cv.ValueError || schema.Error || error{
+pub const Error = xml.WriterError || cv.ValueError || base64.Error || schema.Error || error{
     InvalidStructure,
     MissingAttribute,
     UnknownAttribute,
@@ -34,8 +34,7 @@ allocator: std.mem.Allocator,
 limits: Limits,
 phase: enum { initial, run, list, done } = .initial,
 failed: bool = false,
-sequence: schema.Sequence = .{ .rules = schema.children(.run) },
-list_kind: model.Kind = .spectrum_list,
+list_kind: ?model.Kind = null,
 expected_count: usize = 0,
 written_count: usize = 0,
 index_state: ?*IndexState = null,
@@ -78,7 +77,7 @@ pub fn writeHeader(self: *Writer, header: model.Header) Error!void {
     if (self.failed) return error.FailedState;
     errdefer self.failed = true;
     if (self.phase != .initial) return error.InvalidState;
-    try schema.checkHeader(header, self.limits);
+    try schema.checkHeader(header);
     try self.engine.startDocument();
     if (self.index_state != null) {
         try self.engine.startElement("indexedmzML");
@@ -88,8 +87,10 @@ pub fn writeHeader(self: *Writer, header: model.Header) Error!void {
     try self.engine.namespace(null, xml.NAMESPACE);
     try self.engine.namespace("xsi", xml.XSI);
     try self.writeAttributes(header.document.attributes);
+    try self.writeParams(header.document.params);
     var no_arrays: []const []const u8 = &.{};
-    for (header.document.children) |node| try self.writeNode(node, false, &no_arrays);
+    var budget = self.limits.nodes;
+    try self.writeChildren(header.document, false, &no_arrays, self.limits.depth, &budget);
     try self.engine.startElement("run");
     try self.writeAttributes(header.run.attributes);
     try self.writeParams(header.run.params);
@@ -103,8 +104,7 @@ pub fn beginList(self: *Writer, kind: model.Kind, count: usize, processing_ref: 
     errdefer self.failed = true;
     if (self.phase != .run) return error.InvalidState;
     if (kind != .spectrum_list and kind != .chromatogram_list) return error.InvalidStructure;
-    if (kind == .chromatogram_list and count == 0) return error.InvalidStructure;
-    try self.sequence.accept(kind);
+    if (self.list_kind == kind or self.list_kind == .chromatogram_list) return error.InvalidStructure;
     var buffer: [32]u8 = undefined;
     const text = std.fmt.bufPrint(&buffer, "{d}", .{count}) catch return error.LimitExceeded;
     try self.engine.startElement(kind.xmlName());
@@ -117,7 +117,7 @@ pub fn beginList(self: *Writer, kind: model.Kind, count: usize, processing_ref: 
 }
 
 /// Writes a complete source record with retained encoded arrays, without retaining it afterward.
-/// This checks structure and encoded character counts, not CV semantics or compressed payloads.
+/// Text is escaped as XML, without checking Base64 or interpreting encodedLength.
 /// Numeric array construction uses the separate arrays encoder before this call.
 pub fn writeRecord(self: *Writer, node: model.Node) Error!void {
     return self.writeRecordInner(node, false, &.{});
@@ -139,27 +139,28 @@ fn writeRecordInner(self: *Writer, node: model.Node, comptime replace_arrays: bo
     if (node.kind != expected) return error.InvalidStructure;
     if (self.written_count == self.expected_count) return error.CountMismatch;
     if (replace_arrays) {
-        try schema.checkMetadataNode(node, self.limits);
         const list = node.child(.binary_data_array_list);
         const arrays = if (list) |value| value.children else &.{};
         if (arrays.len != wire_arrays.len) return error.CountMismatch;
         const sink = if (self.index_state) |state| state.hashed.out else self.engine.sink;
         if (overlaps(sink.buffer, std.mem.sliceAsBytes(wire_arrays))) return error.OverlappingBuffers;
         for (arrays, wire_arrays) |array, wire| {
+            if (array.kind != .binary_data_array or array.children.len != 1 or
+                array.children[0].kind != .binary) return error.InvalidStructure;
             if (overlaps(sink.buffer, wire)) return error.OverlappingBuffers;
             const length = try base64.encodedSize(wire.len);
             if (length > self.limits.text_bytes) return error.LimitExceeded;
             if (try cv.parseInteger(usize, array.attribute("encodedLength")) != length)
                 return error.EncodedLengthMismatch;
         }
-    } else try schema.checkNode(node, self.limits);
+    }
     if (try cv.parseInteger(usize, node.attribute("index")) != self.written_count)
         return error.InvalidIndex;
     if (self.index_state) |state| {
         try self.engine.text("");
         const offset = self.engine.byteOffset() orelse return error.LimitExceeded;
         if (offset > std.math.maxInt(i64)) return error.LimitExceeded;
-        const id = node.attribute("id").?;
+        const id = node.attribute("id") orelse return error.MissingAttribute;
         if (state.entries.items.len == state.limits.records or id.len > state.limits.id_bytes -| state.id_bytes)
             return error.LimitExceeded;
         const copied = try state.arena.allocator().dupe(u8, id);
@@ -170,8 +171,9 @@ fn writeRecordInner(self: *Writer, node: model.Node, comptime replace_arrays: bo
         state.entries.appendAssumeCapacity(.{ .kind = node.kind, .id = copied, .offset = offset });
     }
     var remaining = wire_arrays;
-    try self.writeNode(node, replace_arrays, &remaining);
-    std.debug.assert(remaining.len == 0);
+    var budget = self.limits.nodes;
+    try self.writeNode(node, replace_arrays, &remaining, self.limits.depth, &budget);
+    if (remaining.len != 0) return error.CountMismatch;
     self.written_count += 1;
 }
 
@@ -190,7 +192,6 @@ pub fn finish(self: *Writer) Error!void {
     if (self.failed) return error.FailedState;
     errdefer self.failed = true;
     if (self.phase != .run) return error.InvalidState;
-    try self.sequence.finish();
     try self.engine.endElement();
     try self.engine.endElement();
     if (self.index_state) |state| try self.writeIndex(state);
@@ -236,16 +237,38 @@ fn writeIndex(self: *Writer, state: *IndexState) Error!void {
     try self.engine.endElement();
 }
 
-fn writeNode(self: *Writer, node: model.Node, comptime replace_arrays: bool, remaining: *[]const []const u8) Error!void {
+fn writeNode(self: *Writer, node: model.Node, comptime replace_arrays: bool, remaining: *[]const []const u8, depth: usize, budget: *usize) Error!void {
+    if (depth == 0 or budget.* == 0) return error.LimitExceeded;
+    budget.* -= 1;
+    if (node.kind == .binary) {
+        if (node.params.len != 0) return error.InvalidStructure;
+        if (!replace_arrays and node.text == null) return error.PayloadNotRetained;
+    } else if (node.text != null) return error.InvalidStructure;
     try self.engine.startElement(node.kind.xmlName());
     try self.writeAttributes(node.attributes);
     try self.writeParams(node.params);
     if (replace_arrays and node.kind == .binary) {
+        if (remaining.len == 0) return error.CountMismatch;
         try self.engine.binary(remaining.*[0]);
         remaining.* = remaining.*[1..];
-    } else if (node.text) |text| try self.engine.text(text);
-    for (node.children) |child| try self.writeNode(child, replace_arrays, remaining);
+    } else if (node.text) |text| {
+        if (text.len > self.limits.text_bytes) return error.LimitExceeded;
+        try self.engine.text(text);
+    }
+    try self.writeChildren(node, replace_arrays, remaining, depth - 1, budget);
     try self.engine.endElement();
+}
+
+fn writeChildren(self: *Writer, node: model.Node, comptime replace_arrays: bool, remaining: *[]const []const u8, depth: usize, budget: *usize) Error!void {
+    const rules = schema.CHILD_KINDS.get(node.kind);
+    var seen = std.EnumSet(model.Kind).initEmpty();
+    for (node.children) |child| {
+        if (!rules.allowed.contains(child.kind) or (node.kind == .mzml and child.kind == .run))
+            return error.InvalidStructure;
+        if (rules.singular.contains(child.kind) and seen.contains(child.kind)) return error.InvalidStructure;
+        seen.insert(child.kind);
+        try self.writeNode(child, replace_arrays, remaining, depth, budget);
+    }
 }
 
 fn overlaps(a: []const u8, b: []const u8) bool {
@@ -257,6 +280,10 @@ fn overlaps(a: []const u8, b: []const u8) bool {
 
 fn writeAttributes(self: *Writer, attrs: []const model.Attribute) Error!void {
     for (attrs) |attr| {
+        if (attr.namespace_uri) |uri| {
+            if (!std.mem.eql(u8, uri, xml.XSI) or !std.mem.eql(u8, attr.name, "schemaLocation"))
+                return error.UnknownAttribute;
+        }
         try self.engine.attribute(if (attr.namespace_uri != null) "xsi:schemaLocation" else attr.name, attr.value);
     }
 }
@@ -266,19 +293,19 @@ fn writeParams(self: *Writer, params: []const cv.Entry) Error!void {
         switch (entry) {
             .group_ref => |ref| {
                 try self.engine.startElement("referenceableParamGroupRef");
-                try self.engine.attribute("ref", ref.?);
+                try self.optionalAttribute("ref", ref);
             },
             .cv => |param| {
                 try self.engine.startElement("cvParam");
-                try self.engine.attribute("cvRef", param.cv_ref.?);
-                try self.engine.attribute("accession", param.accession.?.raw);
-                try self.engine.attribute("name", param.name.?);
+                try self.optionalAttribute("cvRef", param.cv_ref);
+                try self.optionalAttribute("accession", if (param.accession) |accession| accession.raw else null);
+                try self.optionalAttribute("name", param.name);
                 try self.optionalAttribute("value", param.value);
                 try self.writeUnit(param.unit);
             },
             .user => |param| {
                 try self.engine.startElement("userParam");
-                try self.engine.attribute("name", param.name.?);
+                try self.optionalAttribute("name", param.name);
                 try self.optionalAttribute("value", param.value);
                 try self.optionalAttribute("type", param.value_type);
                 try self.writeUnit(param.unit);

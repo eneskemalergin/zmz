@@ -21,7 +21,6 @@ const Builder = @This();
 /// Construction checks, codec errors, and bounded allocation failures.
 pub const Error = owned.Error || schema.Error || arrays.Error || model.EncodingError || model.LookupError || error{
     InvalidDeclaration,
-    InvalidUnit,
     InvalidRecord,
     InvalidArrayLength,
 };
@@ -68,10 +67,9 @@ pub fn reset(self: *Builder) void {
     self.remaining = self.limits.bytes;
 }
 
-/// Copies a source hierarchy after checking its structure.
+/// Copies source fields within the byte and depth limits, without interpreting payloads.
 pub fn node(self: *Builder, source: model.Node) Error!model.Node {
-    if (self.limits.depth > 64) return error.LimitExceeded;
-    try schema.checkNode(source, .{ .depth = self.limits.depth, .text_bytes = self.limits.bytes });
+    if (self.limits.depth == 0 or self.limits.depth > 64) return error.LimitExceeded;
     var copier = self.makeCopier();
     defer self.remaining = copier.remaining;
     return copier.node(source, self.limits.depth);
@@ -102,7 +100,6 @@ pub fn vocabulary(self: *Builder, declaration: cv.Declaration) Error!model.Node 
 /// Formats a floating parameter using XML Schema spellings, preserving explicit units.
 /// The caller supplies the accession and label; this does not resolve or type-check the term.
 pub fn number(self: *Builder, parameter: cv.Param, value: f64) Error!cv.Param {
-    if (!parameter.unit.isAbsent() and !parameter.unit.isComplete()) return error.InvalidUnit;
     var buffer: [64]u8 = undefined;
     var param = parameter;
     param.value = if (std.math.isNan(value)) "NaN" else if (std.math.isInf(value))
@@ -114,7 +111,7 @@ pub fn number(self: *Builder, parameter: cv.Param, value: f64) Error!cv.Param {
 }
 
 /// Encodes actual values and emits their primitive, codec, and encodedLength.
-/// Default arrays omit arrayLength and dataProcessingRef; auxiliary arrays carry arrayLength.
+/// Default arrays omit arrayLength; auxiliary arrays carry arrayLength.
 /// Output and scratch are caller-owned disjoint buffers; encoded bytes are copied into this owner.
 /// Role labels and units are supplied explicitly, not looked up in an ontology.
 pub fn binaryArray(
@@ -135,12 +132,11 @@ pub fn prepareArray(self: *Builder, comptime T: type, values: []const T, options
 }
 
 fn buildArray(self: *Builder, comptime T: type, values: []const T, options: ArrayOptions, output: []u8, scratch: arrays.Scratch, compressor: ?*zlib.Compressor, comptime prepared: bool) Error!PreparedArray {
+    if (self.limits.depth < 2 or self.limits.depth > 64) return error.LimitExceeded;
     if (options.cv_ref.len == 0 or options.role.cv_ref == null or options.role.accession == null or
         options.role.name == null) return error.InvalidDeclaration;
-    if (!options.role.unit.isAbsent() and !options.role.unit.isComplete()) return error.InvalidUnit;
     const role = options.role.accession.?;
     const is_default = role.eql(model.Terms.MZ_ARRAY) or role.eql(model.Terms.INTENSITY_ARRAY) or role.eql(model.Terms.TIME_ARRAY);
-    if (is_default and options.data_processing_ref != null) return error.InvalidDeclaration;
     const primitive = encoding.primitiveTerm(switch (T) {
         f32 => .float32,
         f64 => .float64,
@@ -159,6 +155,11 @@ fn buildArray(self: *Builder, comptime T: type, values: []const T, options: Arra
         .{ .name = "arrayLength", .value = std.fmt.bufPrint(&count, "{d}", .{values.len}) catch return error.LimitExceeded },
         .{ .name = "dataProcessingRef", .value = options.data_processing_ref orelse "" },
     };
+    var attribute_count: usize = if (is_default) 1 else 2;
+    if (options.data_processing_ref != null) {
+        attrs[attribute_count] = attrs[2];
+        attribute_count += 1;
+    }
     const params = [_]cv.Entry{
         .{ .cv = options.role },
         .{ .cv = .{ .cv_ref = options.cv_ref, .accession = .{ .raw = primitive.accession }, .name = primitive.name } },
@@ -166,18 +167,12 @@ fn buildArray(self: *Builder, comptime T: type, values: []const T, options: Arra
     };
     const result: model.Node = .{
         .kind = .binary_data_array,
-        .attributes = attrs[0..if (is_default) @as(usize, 1) else if (options.data_processing_ref == null) 2 else 3],
+        .attributes = attrs[0..attribute_count],
         .params = &params,
         .children = &.{.{ .kind = .binary, .text = encoded }},
     };
     _ = try model.arrayEncoding(result, &.{});
-    const copied = if (prepared) blk: {
-        if (self.limits.depth > 64) return error.LimitExceeded;
-        try schema.checkMetadataNode(result, .{ .depth = self.limits.depth, .text_bytes = self.limits.bytes });
-        var copier = self.makeCopier();
-        defer self.remaining = copier.remaining;
-        break :blk try copier.node(result, self.limits.depth);
-    } else try self.node(result);
+    const copied = try self.node(result);
     return .{ .array = .{ .node = copied, .length = values.len, .is_default = is_default, .owner = self }, .wire = wire };
 }
 
@@ -203,23 +198,17 @@ pub fn preparedRecord(self: *Builder, kind: model.Kind, id: []const u8, index: u
 }
 
 fn recordInner(self: *Builder, kind: model.Kind, id: []const u8, index: usize, default_length: usize, params: []const cv.Entry, children: []const model.Node, binary_arrays: []const Array, comptime prepared: bool) Error!model.Record {
+    if (self.limits.depth == 0 or self.limits.depth > 64 or
+        (binary_arrays.len != 0 and self.limits.depth < 4)) return error.LimitExceeded;
     if ((kind != .spectrum and kind != .chromatogram) or id.len == 0) return error.InvalidRecord;
     for (children) |child| if (child.kind == .binary_data_array_list) return error.InvalidRecord;
     for (binary_arrays) |array| {
         if (array.owner != self) return error.InvalidRecord;
         if (array.is_default and array.length != default_length) return error.InvalidArrayLength;
-    }
-    if (binary_arrays.len != 0) {
-        var primary: usize = 0;
-        var intensity: usize = 0;
-        for (binary_arrays) |array| {
-            const expected = if (kind == .spectrum) model.Terms.MZ_ARRAY else model.Terms.TIME_ARRAY;
-            if (try array.node.parameter(&.{}, expected) != null) primary += 1;
-            if (try array.node.parameter(&.{}, model.Terms.INTENSITY_ARRAY) != null) intensity += 1;
-            const wrong = if (kind == .spectrum) model.Terms.TIME_ARRAY else model.Terms.MZ_ARRAY;
-            if (try array.node.parameter(&.{}, wrong) != null) return error.InvalidRecord;
+        if (!prepared) {
+            const binary = array.node.child(.binary) orelse return error.PayloadNotRetained;
+            if (binary.text == null) return error.PayloadNotRetained;
         }
-        if (primary != 1 or intensity != 1) return error.InvalidRecord;
     }
     const child_count = std.math.add(usize, children.len, @intFromBool(binary_arrays.len != 0)) catch return error.LimitExceeded;
     var copier = self.makeCopier();
@@ -249,40 +238,26 @@ fn recordInner(self: *Builder, kind: model.Kind, id: []const u8, index: usize, d
         .{ .name = "defaultArrayLength", .value = std.fmt.bufPrint(&length_text, "{d}", .{default_length}) catch return error.LimitExceeded },
     }, .params = params }, self.limits.depth);
     result.children = record_children;
-    if (prepared) {
-        try schema.checkMetadataNode(result, .{ .depth = self.limits.depth, .text_bytes = self.limits.bytes });
-    } else try schema.checkNode(result, .{ .depth = self.limits.depth, .text_bytes = self.limits.bytes });
     return .{ .node = result, .id = result.attribute("id").?, .index = index, .default_array_length = default_length };
 }
 
-/// Copies a complete metadata header after checking its structure and unit fields.
+/// Copies header metadata and derives group entries from the copied definitions.
 pub fn header(self: *Builder, source: model.Header) Error!model.Header {
-    if (self.limits.depth > 64) return error.LimitExceeded;
-    try schema.checkHeader(source, .{ .depth = self.limits.depth });
-    try checkUnits(source.document);
-    try checkUnits(source.run);
+    if (self.limits.depth == 0 or self.limits.depth > 64) return error.LimitExceeded;
+    try schema.checkHeader(source);
     var copier = self.makeCopier();
     defer self.remaining = copier.remaining;
     const document = try copier.node(source.document, self.limits.depth);
     const run = try copier.node(source.run, self.limits.depth);
     const group_nodes = if (document.child(.referenceable_param_group_list)) |groups| groups.children else &.{};
     const groups = try copier.alloc(cv.Group, group_nodes.len);
-    for (group_nodes, groups) |group, *destination| destination.* = .{ .id = group.attribute("id").?, .entries = group.params };
+    for (group_nodes, groups) |group, *destination| destination.* = .{
+        .id = group.attribute("id") orelse return error.MissingAttribute,
+        .entries = group.params,
+    };
     return .{ .document = document, .run = run, .groups = groups };
 }
 
 fn makeCopier(self: *Builder) copy.Copier {
     return .{ .allocator = self.arena.allocator(), .remaining = self.remaining };
-}
-
-fn checkUnits(source: model.Node) Error!void {
-    for (source.params) |entry| {
-        const unit: cv.Unit = switch (entry) {
-            .cv => |param| param.unit,
-            .user => |param| param.unit,
-            .group_ref => continue,
-        };
-        if (!unit.isAbsent() and !unit.isComplete()) return error.InvalidUnit;
-    }
-    for (source.children) |child| try checkUnits(child);
 }

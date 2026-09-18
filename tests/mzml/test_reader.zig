@@ -918,29 +918,21 @@ test "[failure] - [mzML attributes]: rejects missing returned fields and misplac
 }
 
 test "[integration] - [mzML numeric attributes]: reads source text and checks numbers when used" {
-    const cases = .{
-        .{ "word", error.InvalidValue },
-        .{ "1_0", error.InvalidValue },
-        .{ "-1", error.Overflow },
-    };
+    const cases = .{ "word", "1_0", "-1" };
     var builder = mzml.Builder.init(std.testing.allocator, .{});
     defer builder.deinit();
     inline for (cases) |case| {
-        const source = try std.mem.replaceOwned(u8, std.testing.allocator, support.DOCUMENT, "order='0'", "order='" ++ case[0] ++ "'");
+        const source = try std.mem.replaceOwned(u8, std.testing.allocator, support.DOCUMENT, "order='0'", "order='" ++ case ++ "'");
         defer std.testing.allocator.free(source);
         var input = std.Io.Reader.fixed(source);
         var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
         defer reader.deinit();
         const method = (try reader.readHeader()).document.child(.data_processing_list).?.children[0].children[0];
-        try std.testing.expectEqualStrings(case[0], method.attribute("order").?);
+        try std.testing.expectEqualStrings(case, method.attribute("order").?);
         while (try reader.nextRecord()) |_| {}
-        try std.testing.expectError(case[1], builder.node(.{
-            .kind = .processing_method,
-            .attributes = &.{ .{ .name = "order", .value = case[0] }, .{ .name = "softwareRef", .value = "sw" } },
-        }));
+        try support.expectNode(method, try builder.node(method));
     }
     inline for (.{ "2147483648", "-2147483649", "1.5" }) |value| {
-        const expected = if (std.mem.eql(u8, value, "1.5")) error.InvalidValue else error.Overflow;
         const components = "<instrumentConfiguration id='ic'><componentList count='3'>" ++
             "<source order='" ++ value ++ "'/><analyzer order='1'/><detector order='2'/>" ++
             "</componentList></instrumentConfiguration>";
@@ -952,10 +944,7 @@ test "[integration] - [mzML numeric attributes]: reads source text and checks nu
         const component = (try reader.readHeader()).document.child(.instrument_configuration_list).?.children[0].child(.component_list).?.children[0];
         try std.testing.expectEqualStrings(value, component.attribute("order").?);
         while (try reader.nextRecord()) |_| {}
-        try std.testing.expectError(expected, builder.node(.{
-            .kind = .source,
-            .attributes = &.{.{ .name = "order", .value = value }},
-        }));
+        try support.expectNode(component, try builder.node(component));
     }
     inline for (.{ "-2147483648", "-1", "-0", "+2147483647" }) |value| {
         _ = try builder.node(.{ .kind = .source, .attributes = &.{.{ .name = "order", .value = value }} });
@@ -970,14 +959,15 @@ test "[integration] - [mzML numeric attributes]: reads source text and checks nu
             .limits = .{ .list_entries = std.math.maxInt(usize), .header_bytes = 8192, .record_bytes = 8192 },
         });
     }
-    try std.testing.expectError(error.Overflow, builder.record(.spectrum, "scan=1", 0, 2147483648, &.{}, &.{}, &.{}));
+    const large = try builder.record(.spectrum, "scan=1", 0, 2147483648, &.{}, &.{}, &.{});
+    try std.testing.expectEqual(@as(usize, 2147483648), large.default_array_length);
 
-    const record_cases = [_]struct { length: []const u8, index: []const u8, read_error: ?mzml.cv.ValueError, build_error: ?mzml.cv.ValueError }{
-        .{ .length = "2147483648", .index = "bad", .read_error = error.InvalidValue, .build_error = error.InvalidValue },
-        .{ .length = "-1", .index = "bad", .read_error = error.InvalidValue, .build_error = error.Overflow },
-        .{ .length = "-1", .index = "0", .read_error = error.Overflow, .build_error = error.Overflow },
-        .{ .length = "2147483648", .index = "0", .read_error = null, .build_error = error.Overflow },
-        .{ .length = " +2147483647 ", .index = "0", .read_error = null, .build_error = null },
+    const record_cases = [_]struct { length: []const u8, index: []const u8, read_error: ?mzml.cv.ValueError }{
+        .{ .length = "2147483648", .index = "bad", .read_error = error.InvalidValue },
+        .{ .length = "-1", .index = "bad", .read_error = error.InvalidValue },
+        .{ .length = "-1", .index = "0", .read_error = error.Overflow },
+        .{ .length = "2147483648", .index = "0", .read_error = null },
+        .{ .length = " +2147483647 ", .index = "0", .read_error = null },
     };
     for (record_cases) |case| {
         const source = try std.fmt.allocPrint(std.testing.allocator, support.HEADER ++
@@ -998,12 +988,7 @@ test "[integration] - [mzML numeric attributes]: reads source text and checks nu
             try std.testing.expectEqual(try mzml.cv.parseInteger(usize, case.length), record.default_array_length);
             try std.testing.expectEqualStrings(case.length, record.node.attribute("defaultArrayLength").?);
         }
-        if (case.build_error) |failure| {
-            try std.testing.expectError(failure, builder.node(node));
-        } else {
-            const copied = try builder.node(node);
-            try std.testing.expectEqualStrings(case.length, copied.attribute("defaultArrayLength").?);
-        }
+        try support.expectNode(node, try builder.node(node));
     }
     const bad_length = try std.mem.replaceOwned(u8, std.testing.allocator, support.DOCUMENT, "arrayLength='1'", "arrayLength='bad'");
     defer std.testing.allocator.free(bad_length);

@@ -52,10 +52,12 @@ test "[integration] - [prepared construction]: keeps builder and writer failure 
     try std.testing.expectError(error.PayloadNotRetained, builder.record(.spectrum, "scan=1", 0, 1, &.{}, &.{}, &.{ a.array, b.array }));
     try std.testing.expectError(error.InvalidRecord, other.preparedRecord(.spectrum, "scan=1", 0, 1, &.{}, &.{}, &.{ a.array, b.array }));
     try std.testing.expectError(error.InvalidArrayLength, builder.preparedRecord(.spectrum, "scan=1", 0, 2, &.{}, &.{}, &.{ a.array, b.array }));
-    try std.testing.expectError(error.InvalidRecord, builder.preparedRecord(.spectrum, "scan=1", 0, 1, &.{}, &.{}, &.{a.array}));
+    const single = try builder.preparedRecord(.spectrum, "scan=1", 0, 1, &.{}, &.{}, &.{a.array});
+    try std.testing.expectEqual(@as(usize, 1), single.binaryArrays().len);
     var bad = options;
     bad.role.unit.cv_ref = "UO";
-    try std.testing.expectError(error.InvalidUnit, builder.prepareArray(f64, &.{1}, bad, scratch, null));
+    const partial = try builder.prepareArray(f64, &.{1}, bad, scratch, null);
+    try std.testing.expectEqualDeep(bad.role.unit, partial.array.node.params[0].cv.unit);
     bad = options;
     bad.encoding.pipeline = .zlib;
     try std.testing.expectError(error.MissingCompressor, builder.prepareArray(f64, &.{1}, bad, scratch, null));
@@ -177,10 +179,66 @@ test "[integration] - [mzML construction]: cleans failed allocations and preserv
     try std.testing.expectError(error.InvalidArrayLength, builder.record(.spectrum, "scan=1", 0, 2, &.{}, &.{}, &.{array}));
     var bad = options;
     bad.data_processing_ref = "dp";
-    try std.testing.expectError(error.InvalidDeclaration, builder.binaryArray(f64, &.{1}, bad, &encoded, .{ .transport = &transport, .transformed = &transformed }, null));
+    const processing = try builder.binaryArray(f64, &.{1}, bad, &encoded, .{ .transport = &transport, .transformed = &transformed }, null);
+    try std.testing.expectEqualStrings("dp", processing.node.attribute("dataProcessingRef").?);
+    try std.testing.expectEqual(null, processing.node.attribute("arrayLength"));
     bad = options;
     bad.encoding.pipeline = .pic;
     try std.testing.expectError(error.TypeMismatch, builder.binaryArray(f32, &.{1}, bad, &encoded, .{ .transport = &transport, .transformed = &transformed }, null));
+}
+
+test "[failure] - [mzML construction]: rejects depth options before copying or encoding" {
+    for ([_]usize{ 0, 65 }) |depth| {
+        var empty = std.heap.FixedBufferAllocator.init(&.{});
+        var builder = mzml.Builder.init(empty.allocator(), .{ .depth = depth });
+        defer builder.deinit();
+        try std.testing.expectError(error.LimitExceeded, builder.record(.spectrum, "one", 0, 0, &.{}, &.{}, &.{}));
+        try std.testing.expectError(error.LimitExceeded, builder.preparedRecord(.spectrum, "one", 0, 0, &.{}, &.{}, &.{}));
+        const options: mzml.Builder.ArrayOptions = .{ .cv_ref = "MS", .role = .{ .cv_ref = "MS", .accession = mzml.model.Terms.MZ_ARRAY, .name = "m/z" } };
+        const scratch: mzml.arrays.Scratch = .{ .transport = &.{}, .transformed = &.{} };
+        try std.testing.expectError(error.LimitExceeded, builder.binaryArray(f64, &.{1}, options, &.{}, scratch, null));
+        try std.testing.expectError(error.LimitExceeded, builder.prepareArray(f64, &.{1}, options, scratch, null));
+    }
+}
+
+test "[integration] - [mzML construction]: preserves partial fields and supplied array order" {
+    var builder = mzml.Builder.init(std.testing.allocator, .{});
+    defer builder.deinit();
+    const source: mzml.model.Header = .{
+        .document = .{ .kind = .mzml, .attributes = &.{.{ .name = "version", .value = "1.1.0" }} },
+        .run = .{ .kind = .run, .params = &.{ .{ .user = .{ .unit = .{ .name = "partial" } } }, .{ .cv = .{} }, .{ .group_ref = null } } },
+    };
+    const header = try builder.header(source);
+    try support.expectNode(source.document, header.document);
+    try support.expectNode(source.run, header.run);
+    const number = try builder.number(.{ .unit = .{ .name = "partial" } }, 2.5);
+    try std.testing.expectEqual(@as(f64, 2.5), try mzml.cv.parseFloat(f64, number.value));
+    try std.testing.expectEqualStrings("partial", number.unit.name.?);
+    try std.testing.expectEqual(null, number.name);
+    var arrays: [3]mzml.Builder.Array = undefined;
+    var output: [64]u8 = undefined;
+    for ([_]mzml.cv.Accession{ mzml.model.Terms.INTENSITY_ARRAY, mzml.model.Terms.TIME_ARRAY, mzml.model.Terms.MZ_ARRAY }, &arrays, 0..) |role, *array, position| {
+        array.* = try builder.binaryArray(f64, &.{@floatFromInt(position + 1)}, .{ .cv_ref = "MS", .role = .{ .cv_ref = "MS", .accession = role, .name = "caller role" } }, &output, .{ .transport = &.{}, .transformed = &.{} }, null);
+    }
+    const record = try builder.record(.spectrum, "one", 0, 1, &.{}, &.{}, &arrays);
+    for (arrays, record.binaryArrays()) |array, copied| try support.expectNode(array.node, copied);
+    var xml: [4096]u8 = undefined;
+    var sink = std.Io.Writer.fixed(&xml);
+    try support.writeSingleRecord(std.testing.allocator, &sink, header, record.node, false, null);
+    var input = std.Io.Reader.fixed(sink.buffered());
+    var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+    defer reader.deinit();
+    var decoded = mzml.StreamReader.DecodedArrays.init(std.testing.allocator, .{});
+    defer decoded.deinit();
+    const actual = (try reader.nextDecodedRecord(&decoded)).?;
+    try std.testing.expectEqual(@as(usize, 3), decoded.len());
+    for (arrays, actual.binaryArrays(), 0..) |array, copied, position| {
+        try std.testing.expectEqualDeep(array.node.params, copied.params);
+        try std.testing.expectEqual(@as(f64, @floatFromInt(position + 1)), decoded.get(position).?.values.float64[0]);
+    }
+    var missing = source;
+    missing.document.children = &.{.{ .kind = .referenceable_param_group_list, .children = &.{.{ .kind = .referenceable_param_group }} }};
+    try std.testing.expectError(error.MissingAttribute, builder.header(missing));
 }
 
 test "[integration] - [mzML construction]: preserves primitive bits through emitted declarations" {

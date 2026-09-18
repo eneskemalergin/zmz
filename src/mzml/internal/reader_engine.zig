@@ -17,23 +17,6 @@ const ELEMENT_KINDS = std.StaticStringMap(model.Kind).initComptime(blk: {
     break :blk entries;
 });
 
-const CHILD_KINDS = blk: {
-    var result: std.EnumArray(model.Kind, struct {
-        allowed: std.EnumSet(model.Kind),
-        singular: std.EnumSet(model.Kind),
-    }) = undefined;
-    for (std.enums.values(model.Kind)) |parent| {
-        var allowed = std.EnumSet(model.Kind).initEmpty();
-        var singular = std.EnumSet(model.Kind).initEmpty();
-        for (schema.children(parent)) |rule| {
-            allowed.insert(rule.kind);
-            if (rule.maximum == 1) singular.insert(rule.kind);
-        }
-        result.set(parent, .{ .allowed = allowed, .singular = singular });
-    }
-    break :blk result;
-};
-
 const ParamAttributes = struct {
     ref: ?[]const u8 = null,
     cv_ref: ?[]const u8 = null,
@@ -568,7 +551,7 @@ fn parseNodeFor(self: *StreamReader, storage: *Storage, depth: usize, advance_af
                 child_payload = selector.select(selector.user_data, position, node.attributes, node.params);
             }
         }
-        const children = CHILD_KINDS.get(kind_value);
+        const children = schema.CHILD_KINDS.get(kind_value);
         var seen = std.EnumSet(model.Kind).initEmpty();
         const children_start = self.child_scratch.items.len;
         defer self.child_scratch.shrinkRetainingCapacity(children_start);
