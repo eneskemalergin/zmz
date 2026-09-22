@@ -17,20 +17,21 @@ const library_test_specs = [_]LibraryTest{
     .{ .root_source_file = "tests/mzml/test_ownership.zig" },
     .{ .root_source_file = "tests/mzml/test_writing.zig" },
     .{ .root_source_file = "tests/mzml/test_reader.zig", .add_gates_support = true },
-    .{ .root_source_file = "src/xml/mzml_adapter.zig" },
 };
 
 fn configureLibraryModule(
     module: *std.Build.Module,
     numpress_options: *std.Build.Step.Options,
+    base64_options: *std.Build.Step.Options,
     use_glibc_vector: bool,
 ) void {
     module.addOptions("numpress_math_options", numpress_options);
+    module.addOptions("base64_options", base64_options);
     if (use_glibc_vector) module.linkSystemLibrary("mvec", .{ .use_pkg_config = .no });
 }
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    const target = b.standardTargetOptions(.{ .default_target = .{ .cpu_model = .baseline } });
     const optimize = b.standardOptimizeOption(.{});
     const strip = optimize == .ReleaseFast or optimize == .ReleaseSmall;
     const numpress_slof_math_backend = b.option(
@@ -51,7 +52,9 @@ pub fn build(b: *std.Build) void {
         "slof_math_backend",
         @tagName(numpress_slof_math_backend),
     );
-    configureLibraryModule(zmz, numpress_options, use_glibc_vector);
+    const base64_options = b.addOptions();
+    base64_options.addOption(bool, "simd", b.option(bool, "base64_simd", "Select AVX2 at runtime when available; false forces scalar") orelse true);
+    configureLibraryModule(zmz, numpress_options, base64_options, use_glibc_vector);
 
     const test_step = b.step("test", "Run library tests");
     const gates_test_support = b.createModule(.{
@@ -80,7 +83,7 @@ pub fn build(b: *std.Build) void {
         .strip = strip,
         .link_libc = link_libc,
     });
-    configureLibraryModule(package_tests_module, numpress_options, use_glibc_vector);
+    configureLibraryModule(package_tests_module, numpress_options, base64_options, use_glibc_vector);
     const package_tests = b.addTest(.{ .root_module = package_tests_module });
     test_step.dependOn(&b.addRunArtifact(package_tests).step);
 

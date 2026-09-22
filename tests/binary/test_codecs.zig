@@ -29,6 +29,85 @@ fn expectSlofBound(expected: []const f64, actual: []const f64, fixed_point: f64)
 
 // --- Base64 ---
 
+test "[property] - [base64]: streaming encoding matches independent bytes with reusable output" {
+    var source: [1025]u8 = undefined;
+    var random = std.Random.DefaultPrng.init(std.testing.random_seed);
+    random.random().bytes(&source);
+    var expected: [1368]u8 = undefined;
+    var actual: [1368]u8 = undefined;
+    var output: [1368]u8 = undefined;
+    for ([_]usize{ 0, 1, 2, 3, 23, 24, 25, 31, 32, 33, 103, 104, 105, 127, 128, 129, 1023, 1024, 1025 }) |length| {
+        const reference = std.base64.standard.Encoder.encode(&expected, source[0..length]);
+        for ([_]usize{ 1, 2, 3, 4, 23, 24, 31, 32, 33, 95, 96, 103, 104, 127, 128, 1025 }) |chunk| {
+            var encoder: base64.Encoder = .{};
+            var position: usize = 0;
+            var used: usize = 0;
+            while (position < length) {
+                try std.testing.expectEqual(@as(usize, 0), (try encoder.update(&output, "")).len);
+                const end = @min(length, position + chunk);
+                const result = try encoder.update(&output, source[position..end]);
+                @memcpy(actual[used..][0..result.len], result);
+                used += result.len;
+                position = end;
+            }
+            const tail = try encoder.finish(&output);
+            @memcpy(actual[used..][0..tail.len], tail);
+            used += tail.len;
+            try std.testing.expectEqualSlices(u8, reference, actual[0..used]);
+            try std.testing.expectError(error.AlreadyFinished, encoder.update(&output, ""));
+            try std.testing.expectError(error.AlreadyFinished, encoder.finish(&output));
+        }
+    }
+}
+
+test "[failure] - [base64]: encoding retries leave carry and output unchanged" {
+    var output = [_]u8{0xa5} ** 8;
+    var encoder: base64.Encoder = .{};
+    try std.testing.expectEqual(@as(usize, 0), (try encoder.update(&.{}, "f")).len);
+    try std.testing.expectError(error.OutputTooSmall, encoder.update(output[0..3], "oo"));
+    try std.testing.expectError(error.OverlappingBuffers, encoder.update(&output, output[0..2]));
+    try std.testing.expectError(error.OutputTooSmall, encoder.finish(output[0..3]));
+    try std.testing.expectEqualSlices(u8, &([_]u8{0xa5} ** 8), &output);
+    try std.testing.expectEqualStrings("Zm9v", try encoder.update(output[0..4], "oo"));
+    try std.testing.expectEqual(@as(usize, 0), (try encoder.update(&.{}, "ba")).len);
+    try std.testing.expectError(error.OutputTooSmall, encoder.finish(output[0..3]));
+    try std.testing.expectEqualStrings("YmE=", try encoder.finish(output[0..4]));
+}
+
+test "[property] - [base64]: exact unaligned slices match independent encoding and decoding" {
+    var source: [321]u8 = undefined;
+    var random = std.Random.DefaultPrng.init(std.testing.random_seed);
+    random.random().bytes(&source);
+    for (0..258) |length| {
+        for (0..32) |offset| {
+            var encoded = [_]u8{0xa5} ** 416;
+            var decoded = [_]u8{0xa5} ** 321;
+            var reference: [344]u8 = undefined;
+            const input = source[offset..][0..length];
+            const expected = std.base64.standard.Encoder.encode(&reference, input);
+            const text = try base64.encode(encoded[offset..][0..expected.len], input);
+            try std.testing.expectEqualSlices(u8, expected, text);
+            const counts = try base64.decode(decoded[offset..][0..length], text, .{});
+            try std.testing.expectEqual(length, counts.decoded_bytes);
+            try std.testing.expectEqualSlices(u8, input, decoded[offset..][0..length]);
+            try std.testing.expect(std.mem.allEqual(u8, encoded[0..offset], 0xa5));
+            try std.testing.expect(std.mem.allEqual(u8, encoded[offset + expected.len ..], 0xa5));
+            try std.testing.expect(std.mem.allEqual(u8, decoded[0..offset], 0xa5));
+            try std.testing.expect(std.mem.allEqual(u8, decoded[offset + length ..], 0xa5));
+        }
+    }
+}
+
+test "[property] - [base64]: every byte in vector blocks follows XML decoding rules" {
+    for (0..128) |position| {
+        for (0..256) |value| {
+            var text = [_]u8{'A'} ** 132;
+            text[position] = @intCast(value);
+            try compareBase64Updates(&text, .{}, 99);
+        }
+    }
+}
+
 test "[property] - [base64]: matches RFC 4648 vectors across every text split" {
     const cases = .{
         .{ "", "" },

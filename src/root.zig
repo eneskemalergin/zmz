@@ -2,3 +2,8 @@
 
 /// Reads and writes mzML files.
 pub const mzml = @import("mzml/mzml.zig");
+
+test {
+    _ = @import("binary/base64.zig");
+    _ = @import("xml/mzml_adapter.zig");
+}

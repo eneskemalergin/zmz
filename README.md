@@ -53,6 +53,8 @@ zig build test --summary all
 zig build test -Doptimize=ReleaseFast --summary all
 ```
 
+Base64 uses runtime AVX2 selection in LLVM x86-64 builds and scalar fallback elsewhere. `-Dbase64_simd=false` forces scalar. Builds default to the baseline CPU; `-Dcpu=native` explicitly targets the build machine. Zig 0.16's self-hosted Debug backend uses scalar; ReleaseFast uses LLVM and runtime selection.
+
 The public entry point is [`src/root.zig`](src/root.zig). Vocabulary resources and their source notices are described in [`vocabularies/README.md`](vocabularies/README.md).
 
 ## Peer readers and benchmarks

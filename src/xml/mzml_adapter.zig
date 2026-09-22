@@ -1,6 +1,7 @@
 //! Small XML scanner and writer for the XML constructs used by mzML.
 
 const std = @import("std");
+const base64 = @import("../binary/base64.zig");
 
 /// Stable mzML namespace used by reader and writer paths.
 pub const NAMESPACE = "http://psi.hupo.org/ms/mzml";
@@ -1703,9 +1704,20 @@ pub const Writer = struct {
         var encoded: [4096]u8 = undefined;
         var offset: usize = 0;
         while (offset < wire.len) {
+            const available = self.sink.unusedCapacitySlice();
+            const direct_length = @min(wire.len - offset, available.len / 4 * 3);
+            if (direct_length != 0) {
+                const required = base64.encodedSize(direct_length) catch return self.fail(error.WriterLimit);
+                const next = std.math.add(u64, self.logical_offset, @intCast(required)) catch return self.fail(error.WriterLimit);
+                const value = base64.encode(available, wire[offset..][0..direct_length]) catch return self.fail(error.WriterLimit);
+                self.sink.advance(value.len);
+                self.logical_offset = next;
+                offset += direct_length;
+                continue;
+            }
             const length = @min(wire.len - offset, encoded.len / 4 * 3);
             // The encoder emits ASCII without XML metacharacters.
-            const value = std.base64.standard.Encoder.encode(&encoded, wire[offset..][0..length]);
+            const value = base64.encode(&encoded, wire[offset..][0..length]) catch return self.fail(error.WriterLimit);
             try self.writeBytes(value);
             offset += length;
         }

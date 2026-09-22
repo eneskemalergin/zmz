@@ -1,6 +1,15 @@
-//! Encodes padded Base64 and decodes fragmented XML text into caller-owned storage.
+//! Streams padded Base64 through caller-owned buffers without allocation.
+//!
+//! The decoder accepts fragmented XML text and retains only an incomplete quartet;
+//! the encoder carries at most two input bytes between updates. CPU and OS detection
+//! selects bounded AVX2 blocks on x86-64, with scalar handling elsewhere and for tails.
+//! Input and output must be disjoint. SIMD never needs padding outside either slice.
 
 const std = @import("std");
+const builtin = @import("builtin");
+const options = @import("base64_options");
+// Zig's self-hosted x86 backend cannot assemble vector memory operands yet.
+const USE_AVX2 = builtin.cpu.arch == .x86_64 and options.simd and builtin.zig_backend == .stage2_llvm;
 
 /// Checked lexical, capacity, and state failures. Output after failure is unspecified.
 pub const Error = error{
@@ -42,7 +51,7 @@ pub fn encode(output: []u8, source: []const u8) Error![]u8 {
     if (overlaps(output, source)) return error.OverlappingBuffers;
     const required = try encodedSize(source.len);
     if (output.len < required) return error.OutputTooSmall;
-    _ = std.base64.standard.Encoder.encode(output[0..required], source);
+    encodeInto(output[0..required], source);
     return output[0..required];
 }
 
@@ -61,6 +70,54 @@ pub fn validate(source: []const u8, limits: Limits) Error!Counts {
     try decoder.update(source);
     return decoder.finish();
 }
+
+/// Encodes arbitrary chunks into reusable output, retaining only an incomplete triple.
+/// Consume each returned slice before reusing output. Short output or overlap leaves
+/// state unchanged for retry. finish emits padding and ends the array; no allocation occurs.
+pub const Encoder = struct {
+    carry: [3]u8 = undefined,
+    carry_len: u2 = 0,
+    finished: bool = false,
+
+    pub fn update(self: *Encoder, output: []u8, source: []const u8) Error![]u8 {
+        if (self.finished) return error.AlreadyFinished;
+        if (overlaps(output, source)) return error.OverlappingBuffers;
+        const total = std.math.add(usize, source.len, self.carry_len) catch return error.LengthOverflow;
+        const required = std.math.mul(usize, total / 3, 4) catch return error.LengthOverflow;
+        if (output.len < required) return error.OutputTooSmall;
+        var position: usize = 0;
+        var written: usize = 0;
+        if (self.carry_len != 0) {
+            while (self.carry_len < 3 and position < source.len) : (position += 1) {
+                self.carry[self.carry_len] = source[position];
+                self.carry_len += 1;
+            }
+            if (self.carry_len == 3) {
+                encodeTriple(output[0..4], &self.carry);
+                written = 4;
+                self.carry_len = 0;
+            }
+        }
+        const complete = (source.len - position) / 3 * 3;
+        if (complete != 0) {
+            encodeInto(output[written..required], source[position..][0..complete]);
+            position += complete;
+        }
+        while (position < source.len) : (position += 1) {
+            self.carry[self.carry_len] = source[position];
+            self.carry_len += 1;
+        }
+        return output[0..required];
+    }
+
+    pub fn finish(self: *Encoder, output: []u8) Error![]u8 {
+        if (self.finished) return error.AlreadyFinished;
+        const result = try encode(output, self.carry[0..self.carry_len]);
+        self.carry_len = 0;
+        self.finished = true;
+        return result;
+    }
+};
 
 /// A bounded decoder borrowing its destination until finish or abandonment.
 /// Input slices need remain alive only during update and must not overlap the destination.
@@ -92,6 +149,10 @@ pub const Decoder = struct {
         const total = std.math.add(usize, self.counts.text_bytes, text.len) catch
             return error.LengthOverflow;
         if (total > self.limits.text_bytes) return error.LimitExceeded;
+        return self.updateParts(text);
+    }
+
+    fn updateParts(self: *Decoder, text: []const u8) Error!void {
         var index: usize = 0;
         while (index < text.len) {
             const consumed = self.decodeRun(text[index..]);
@@ -118,24 +179,23 @@ pub const Decoder = struct {
     }
 
     fn decodeRun(self: *Decoder, text: []const u8) usize {
-        if (self.quartet_len != 0 or self.padded or text.len < 32) return 0;
-        var length: usize = @min(text.len, 256) / 4 * 4;
-        if (text[length - 1] == '=') length -= 4;
-        var decoded: usize = length / 4 * 3;
-        if (length > self.limits.significant_bytes -| self.counts.significant_bytes or
-            decoded > self.limits.decoded_bytes -| self.counts.decoded_bytes) return 0;
+        if (self.quartet_len != 0 or self.padded or text.len < 4) return 0;
         var discarded: [192]u8 = undefined;
-        const output = if (self.discard_output) discarded[0..decoded] else blk: {
-            if (decoded > self.output.len -| self.counts.decoded_bytes) return 0;
-            break :blk self.output[self.counts.decoded_bytes..][0..decoded];
-        };
-        // A failed attempt leaves counters unchanged. The quartet path owns whitespace,
-        // padding, limits, and exact diagnostics, including errors after partial progress.
-        std.base64.standard_no_pad.Decoder.decode(output, text[0..length]) catch {
-            length = @call(.never_inline, decodePrefix, .{ output, text[0..length] });
-            if (length == 0) return 0;
-            decoded = length / 4 * 3;
-        };
+        const output = if (self.discard_output) &discarded else self.output[self.counts.decoded_bytes..];
+        const capacity = @min(output.len, self.limits.decoded_bytes -| self.counts.decoded_bytes);
+        const input = text[0..@min(text.len, self.limits.significant_bytes -| self.counts.significant_bytes)];
+        const has_tail = input.len >= 4 and input.len % 4 == 0 and input[input.len - 1] == '=';
+        const plain_length = input.len - @as(usize, if (has_tail) 4 else 0);
+        var length = decodePrefix(output[0..capacity], input[0..plain_length]);
+        var decoded = length / 4 * 3;
+        if (has_tail and length == plain_length) tail: {
+            const group = decodeQuartet(input[length..][0..4].*) catch break :tail;
+            if (group.len > capacity - decoded) break :tail;
+            @memcpy(output[decoded..][0..group.len], group.bytes[0..group.len]);
+            length += 4;
+            decoded += group.len;
+            self.padded = true;
+        }
         self.counts.text_bytes += length;
         self.counts.significant_bytes += length;
         self.counts.decoded_bytes += decoded;
@@ -156,42 +216,143 @@ pub const Decoder = struct {
     }
 
     fn flushQuartet(self: *Decoder) Error!void {
-        const q = self.quartet;
-        const a = alphabet(q[0]) orelse return error.InvalidPadding;
-        const b = alphabet(q[1]) orelse return error.InvalidPadding;
-        const c = alphabet(q[2]);
-        const d = alphabet(q[3]);
-        var count: usize = 3;
-        if (q[2] == '=') {
-            if (q[3] != '=') return error.InvalidPadding;
-            if (b & 15 != 0) return error.NonCanonicalTail;
-            count = 1;
-        } else if (q[3] == '=') {
-            if (c.? & 3 != 0) return error.NonCanonicalTail;
-            count = 2;
-        }
-        const end = std.math.add(usize, self.counts.decoded_bytes, count) catch
+        const group = try decodeQuartet(self.quartet);
+        const end = std.math.add(usize, self.counts.decoded_bytes, group.len) catch
             return error.LengthOverflow;
         if (end > self.limits.decoded_bytes) return error.LimitExceeded;
         if (!self.discard_output) {
             if (end > self.output.len) return error.OutputTooSmall;
-            const destination = self.output[self.counts.decoded_bytes..end];
-            destination[0] = a << 2 | b >> 4;
-            if (count >= 2) destination[1] = b << 4 | c.? >> 2;
-            if (count == 3) destination[2] = c.? << 6 | d.?;
+            @memcpy(self.output[self.counts.decoded_bytes..end], group.bytes[0..group.len]);
         }
         self.counts.decoded_bytes = end;
         self.quartet_len = 0;
-        self.padded = count != 3;
+        self.padded = group.len != 3;
     }
 };
 
-fn decodePrefix(output: []u8, text: []const u8) usize {
-    const stop = std.mem.findAny(u8, text, " \t\r\n") orelse return 0;
-    const length = stop / 4 * 4;
-    if (length == 0) return 0;
-    std.base64.standard_no_pad.Decoder.decode(output[0 .. length / 4 * 3], text[0..length]) catch return 0;
-    return length;
+// --- Scalar groups ---
+
+const ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const ENCODE_PAIRS: [4096]u16 = blk: {
+    @setEvalBranchQuota(10000);
+    var table: [4096]u16 = undefined;
+    for (&table, 0..) |*pair, index|
+        pair.* = @as(u16, ALPHABET[index >> 6]) | (@as(u16, ALPHABET[index & 63]) << 8);
+    break :blk table;
+};
+const DECODE_TABLE: [256]u8 = blk: {
+    var table = [_]u8{0xff} ** 256;
+    for (ALPHABET, 0..) |byte, index| table[byte] = @intCast(index);
+    break :blk table;
+};
+const DECODE_WORDS: [4][256]u32 = blk: {
+    @setEvalBranchQuota(4000);
+    var table = [_][256]u32{[_]u32{0x01000000} ** 256} ** 4;
+    for (ALPHABET, 0..) |byte, index| {
+        const value: u32 = @intCast(index);
+        table[0][byte] = value << 2;
+        table[1][byte] = (value >> 4) | ((value & 15) << 12);
+        table[2][byte] = ((value >> 2) << 8) | ((value & 3) << 22);
+        table[3][byte] = value << 16;
+    }
+    break :blk table;
+};
+
+fn encodeInto(output: []u8, source: []const u8) void {
+    var position: usize = 0;
+    var written: usize = 0;
+    if (comptime USE_AVX2) {
+        if (source.len >= 32 and hasAvx2()) {
+            position = encodeAvx2(source, output);
+            written = position / 3 * 4;
+        }
+    }
+    if (source.len - position >= 32) {
+        while (source.len - position >= 3) {
+            const bits = std.mem.readInt(u24, source[position..][0..3], .big);
+            std.mem.writeInt(u16, output[written..][0..2], ENCODE_PAIRS[bits >> 12], .little);
+            std.mem.writeInt(u16, output[written + 2 ..][0..2], ENCODE_PAIRS[bits & 4095], .little);
+            position += 3;
+            written += 4;
+        }
+    }
+    while (source.len - position >= 3) {
+        encodeTriple(output[written..][0..4], source[position..][0..3]);
+        position += 3;
+        written += 4;
+    }
+    const remaining = source.len - position;
+    if (remaining == 0) return;
+    const first = source[position];
+    output[written] = ALPHABET[first >> 2];
+    if (remaining == 1) {
+        output[written + 1] = ALPHABET[(first & 3) << 4];
+        output[written + 2] = '=';
+    } else {
+        const second = source[position + 1];
+        output[written + 1] = ALPHABET[(first & 3) << 4 | second >> 4];
+        output[written + 2] = ALPHABET[(second & 15) << 2];
+    }
+    output[written + 3] = '=';
+}
+
+fn encodeTriple(output: *[4]u8, source: *const [3]u8) void {
+    output[0] = ALPHABET[source[0] >> 2];
+    output[1] = ALPHABET[(source[0] & 3) << 4 | source[1] >> 4];
+    output[2] = ALPHABET[(source[1] & 15) << 2 | source[2] >> 6];
+    output[3] = ALPHABET[source[2] & 63];
+}
+
+fn decodePrefix(output: []u8, source: []const u8) usize {
+    const length = @min(source.len / 4, output.len / 3) * 4;
+    var position: usize = 0;
+    if (comptime USE_AVX2) {
+        if (length >= 32 and hasAvx2()) position = decodeAvx2(source[0..length], output);
+    }
+    if (length - position >= 32) {
+        while (position < length) : (position += 4) {
+            const group = source[position..][0..4];
+            const bits = DECODE_WORDS[0][group[0]] | DECODE_WORDS[1][group[1]] |
+                DECODE_WORDS[2][group[2]] | DECODE_WORDS[3][group[3]];
+            if (bits & 0x01000000 != 0) break;
+            std.mem.writeInt(u24, output[position / 4 * 3 ..][0..3], @truncate(bits), .little);
+        }
+    } else {
+        while (position < length) : (position += 4) {
+            const group = source[position..][0..4];
+            const a = DECODE_TABLE[group[0]];
+            const b = DECODE_TABLE[group[1]];
+            const c = DECODE_TABLE[group[2]];
+            const d = DECODE_TABLE[group[3]];
+            if ((a | b | c | d) & 0x80 != 0) break;
+            const destination = output[position / 4 * 3 ..][0..3];
+            destination[0] = a << 2 | b >> 4;
+            destination[1] = b << 4 | c >> 2;
+            destination[2] = c << 6 | d;
+        }
+    }
+    return position;
+}
+
+fn decodeQuartet(q: [4]u8) Error!struct { bytes: [3]u8, len: usize } {
+    const a = alphabet(q[0]) orelse return error.InvalidPadding;
+    const b = alphabet(q[1]) orelse return error.InvalidPadding;
+    var bytes: [3]u8 = undefined;
+    bytes[0] = a << 2 | b >> 4;
+    if (q[2] == '=') {
+        if (q[3] != '=') return error.InvalidPadding;
+        if (b & 15 != 0) return error.NonCanonicalTail;
+        return .{ .bytes = bytes, .len = 1 };
+    }
+    const c = alphabet(q[2]) orelse return error.InvalidCharacter;
+    bytes[1] = b << 4 | c >> 2;
+    if (q[3] == '=') {
+        if (c & 3 != 0) return error.NonCanonicalTail;
+        return .{ .bytes = bytes, .len = 2 };
+    }
+    const d = alphabet(q[3]) orelse return error.InvalidCharacter;
+    bytes[2] = c << 6 | d;
+    return .{ .bytes = bytes, .len = 3 };
 }
 
 fn alphabet(byte: u8) ?u8 {
@@ -214,4 +375,266 @@ fn overlaps(output: []u8, source: []const u8) bool {
     const a = @intFromPtr(output.ptr);
     const b = @intFromPtr(source.ptr);
     return if (a <= b) b - a < output.len else a - b < source.len;
+}
+
+// --- CPU selection and AVX2 ---
+
+const AVX_STATE: u32 = (1 << 26) | (1 << 27) | (1 << 28);
+var avx2_cached = std.atomic.Value(u8).init(0);
+
+fn hasAvx2() bool {
+    if (comptime !USE_AVX2) return false;
+    const saved = avx2_cached.load(.monotonic);
+    if (saved != 0) return saved == 2;
+    const available = detectAvx2();
+    avx2_cached.store(if (available) 2 else 1, .monotonic);
+    return available;
+}
+
+fn detectAvx2() bool {
+    if (cpuid(0, 0).eax < 7) return false;
+    const leaf1 = cpuid(1, 0).ecx;
+    if (leaf1 & AVX_STATE != AVX_STATE) return false;
+    const leaf7 = cpuid(7, 0).ebx;
+    if (leaf7 & (1 << 5) == 0) return false;
+    const xcr0 = asm volatile (
+        \\xgetbv
+        : [_] "={eax}" (-> u32),
+        : [_] "{ecx}" (@as(u32, 0)),
+        : .{ .edx = true });
+    return avx2Usable(leaf1, leaf7, xcr0);
+}
+
+fn avx2Usable(leaf1: u32, leaf7: u32, xcr0: u32) bool {
+    return leaf1 & AVX_STATE == AVX_STATE and leaf7 & (1 << 5) != 0 and xcr0 & 6 == 6;
+}
+
+fn cpuid(leaf: u32, subleaf: u32) struct { eax: u32, ebx: u32, ecx: u32 } {
+    var eax: u32 = undefined;
+    var ebx: u32 = undefined;
+    var ecx: u32 = undefined;
+    asm volatile ("cpuid"
+        : [_] "={eax}" (eax),
+          [_] "={ebx}" (ebx),
+          [_] "={ecx}" (ecx),
+        : [_] "{eax}" (leaf),
+          [_] "{ecx}" (subleaf),
+        : .{ .edx = true });
+    return .{ .eax = eax, .ebx = ebx, .ecx = ecx };
+}
+
+const AVX2_ENCODE: [8][32]u8 align(32) = .{
+    [_]u8{ 1, 0, 2, 1, 4, 3, 5, 4, 7, 6, 8, 7, 10, 9, 11, 10 } ** 2,
+    @bitCast([_]u32{0x0fc0fc00} ** 8),
+    @bitCast([_]u32{0x003f03f0} ** 8),
+    @bitCast([_]u32{0x04000040} ** 8),
+    @bitCast([_]u32{0x01000010} ** 8),
+    [_]u8{ 65, 71, 0xfc, 0xfc, 0xfc, 0xfc, 0xfc, 0xfc, 0xfc, 0xfc, 0xfc, 0xfc, 0xed, 0xf0, 0, 0 } ** 2,
+    @splat(51),
+    @splat(25),
+};
+
+const AVX2_DECODE: [8][32]u8 align(32) = .{
+    [_]u8{ 0x15, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x13, 0x1a, 0x1b, 0x1b, 0x1b, 0x1a } ** 2,
+    [_]u8{ 0x10, 0x10, 0x01, 0x02, 0x04, 0x08, 0x04, 0x08, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10 } ** 2,
+    [_]u8{ 0, 16, 19, 4, 0xbf, 0xbf, 0xb9, 0xb9, 0, 0, 0, 0, 0, 0, 0, 0 } ** 2,
+    @splat(0x2f),
+    @bitCast([_]u16{0x0140} ** 16),
+    @bitCast([_]u32{0x00011000} ** 8),
+    [_]u8{ 2, 1, 0, 6, 5, 4, 10, 9, 8, 14, 13, 12, 0xff, 0xff, 0xff, 0xff } ** 2,
+    @bitCast([_]u32{ 0, 1, 2, 4, 5, 6, 3, 7 }),
+};
+
+// Pointer-only assembly keeps AVX instructions out of the baseline calling convention.
+// Each encoding block reads 28 bytes for 24 input bytes; the loop requires 32 remaining.
+noinline fn encodeAvx2(input: []const u8, output: []u8) usize {
+    const groups = (input.len - 8) / 24;
+    var source: usize = undefined;
+    var destination: usize = undefined;
+    var remaining: usize = undefined;
+    const block =
+        \\vmovdqu (%[source]), %%xmm0
+        \\vinserti128 $1, 12(%[source]), %%ymm0, %%ymm0
+        \\vpshufb %%ymm4, %%ymm0, %%ymm0
+        \\vpand %%ymm5, %%ymm0, %%ymm1
+        \\vpand %%ymm6, %%ymm0, %%ymm2
+        \\vpmulhuw %%ymm7, %%ymm1, %%ymm1
+        \\vpmullw %%ymm8, %%ymm2, %%ymm2
+        \\vpor %%ymm2, %%ymm1, %%ymm0
+        \\vpsubusb %%ymm10, %%ymm0, %%ymm1
+        \\vpcmpgtb %%ymm11, %%ymm0, %%ymm2
+        \\vpsubb %%ymm2, %%ymm1, %%ymm1
+        \\vpshufb %%ymm1, %%ymm9, %%ymm1
+        \\vpaddb %%ymm0, %%ymm1, %%ymm0
+        \\vmovdqu %%ymm0, (%[destination])
+        \\add $24, %[source]
+        \\add $32, %[destination]
+        \\
+    ;
+    asm volatile (
+        \\vmovdqa 0(%[tables]), %%ymm4
+        \\vmovdqa 32(%[tables]), %%ymm5
+        \\vmovdqa 64(%[tables]), %%ymm6
+        \\vmovdqa 96(%[tables]), %%ymm7
+        \\vmovdqa 128(%[tables]), %%ymm8
+        \\vmovdqa 160(%[tables]), %%ymm9
+        \\vmovdqa 192(%[tables]), %%ymm10
+        \\vmovdqa 224(%[tables]), %%ymm11
+        \\cmp $4, %[remaining]
+        \\jb 2f
+        \\1:
+        \\
+    ++ block ++ block ++ block ++ block ++
+        \\sub $4, %[remaining]
+        \\cmp $4, %[remaining]
+        \\jae 1b
+        \\2:
+        \\test %[remaining], %[remaining]
+        \\jz 4f
+        \\3:
+        \\
+    ++ block ++
+        \\dec %[remaining]
+        \\jnz 3b
+        \\4:
+        \\vzeroupper
+        : [source] "=&r" (source),
+          [destination] "=&r" (destination),
+          [remaining] "=&r" (remaining),
+        : [_] "0" (@intFromPtr(input.ptr)),
+          [_] "1" (@intFromPtr(output.ptr)),
+          [_] "2" (groups),
+          [tables] "r" (&AVX2_ENCODE),
+        : .{
+          .ymm0 = true,
+          .ymm1 = true,
+          .ymm2 = true,
+          .ymm4 = true,
+          .ymm5 = true,
+          .ymm6 = true,
+          .ymm7 = true,
+          .ymm8 = true,
+          .ymm9 = true,
+          .ymm10 = true,
+          .ymm11 = true,
+          .cc = true,
+          .memory = true,
+        });
+    return groups * 24;
+}
+
+// A failed block writes nothing. The scalar prefix handles its first exceptional group.
+// The two stores write exactly 24 bytes, including when output ends at that block.
+noinline fn decodeAvx2(input: []const u8, output: []u8) usize {
+    var source: usize = undefined;
+    var destination: usize = undefined;
+    var remaining: usize = undefined;
+    const groups = input.len / 32;
+    const block =
+        \\vmovdqu (%[source]), %%ymm0
+        \\vpsrld $4, %%ymm0, %%ymm1
+        \\vpand %%ymm7, %%ymm1, %%ymm1
+        \\vpand %%ymm7, %%ymm0, %%ymm2
+        \\vpshufb %%ymm1, %%ymm5, %%ymm3
+        \\vpshufb %%ymm2, %%ymm4, %%ymm2
+        \\vptest %%ymm3, %%ymm2
+        \\jnz 4f
+        \\vpcmpeqb %%ymm7, %%ymm0, %%ymm2
+        \\vpaddb %%ymm2, %%ymm1, %%ymm1
+        \\vpshufb %%ymm1, %%ymm6, %%ymm1
+        \\vpaddb %%ymm1, %%ymm0, %%ymm0
+        \\vpmaddubsw %%ymm8, %%ymm0, %%ymm0
+        \\vpmaddwd %%ymm9, %%ymm0, %%ymm0
+        \\vpshufb %%ymm10, %%ymm0, %%ymm0
+        \\vpermd %%ymm0, %%ymm11, %%ymm0
+        \\vmovdqu %%xmm0, (%[destination])
+        \\vextracti128 $1, %%ymm0, %%xmm1
+        \\vmovq %%xmm1, 16(%[destination])
+        \\add $32, %[source]
+        \\add $24, %[destination]
+        \\dec %[remaining]
+        \\
+    ;
+    asm volatile (
+        \\vmovdqa 0(%[tables]), %%ymm4
+        \\vmovdqa 32(%[tables]), %%ymm5
+        \\vmovdqa 64(%[tables]), %%ymm6
+        \\vmovdqa 96(%[tables]), %%ymm7
+        \\vmovdqa 128(%[tables]), %%ymm8
+        \\vmovdqa 160(%[tables]), %%ymm9
+        \\vmovdqa 192(%[tables]), %%ymm10
+        \\vmovdqa 224(%[tables]), %%ymm11
+        \\cmp $4, %[remaining]
+        \\jb 2f
+        \\1:
+        \\
+    ++ block ++ block ++ block ++ block ++
+        \\cmp $4, %[remaining]
+        \\jae 1b
+        \\2:
+        \\test %[remaining], %[remaining]
+        \\jz 4f
+        \\3:
+        \\
+    ++ block ++
+        \\jnz 3b
+        \\4:
+        \\vzeroupper
+        : [source] "=&r" (source),
+          [destination] "=&r" (destination),
+          [remaining] "=&r" (remaining),
+        : [_] "0" (@intFromPtr(input.ptr)),
+          [_] "1" (@intFromPtr(output.ptr)),
+          [_] "2" (groups),
+          [tables] "r" (&AVX2_DECODE),
+        : .{
+          .ymm0 = true,
+          .ymm1 = true,
+          .ymm2 = true,
+          .ymm3 = true,
+          .ymm4 = true,
+          .ymm5 = true,
+          .ymm6 = true,
+          .ymm7 = true,
+          .ymm8 = true,
+          .ymm9 = true,
+          .ymm10 = true,
+          .ymm11 = true,
+          .cc = true,
+          .memory = true,
+        });
+    return (groups - remaining) * 32;
+}
+
+test "[property] - [base64 dispatch]: requires hardware and OS vector state" {
+    try std.testing.expect(avx2Usable(AVX_STATE, 1 << 5, 6));
+    for ([_]u5{ 26, 27, 28 }) |bit|
+        try std.testing.expect(!avx2Usable(AVX_STATE & ~(@as(u32, 1) << bit), 1 << 5, 6));
+    try std.testing.expect(!avx2Usable(AVX_STATE, 0, 6));
+    for ([_]u32{ 0, 2, 4 }) |state|
+        try std.testing.expect(!avx2Usable(AVX_STATE, 1 << 5, state));
+}
+
+test "[unit] - [base64 dispatch]: agrees with host detection on repeated calls" {
+    const expected = if (comptime USE_AVX2)
+        (try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_model = .native })).cpu.has(.x86, .avx2)
+    else
+        false;
+    try std.testing.expectEqual(expected, hasAvx2());
+    try std.testing.expectEqual(expected, hasAvx2());
+}
+
+test "[property] - [base64 dispatch]: cached scalar fallback preserves both directions" {
+    const saved = avx2_cached.swap(1, .monotonic);
+    defer avx2_cached.store(saved, .monotonic);
+    try std.testing.expect(!hasAvx2());
+    var source: [257]u8 = undefined;
+    for (&source, 0..) |*byte, i| byte.* = @truncate(i);
+    var expected: [344]u8 = undefined;
+    var encoded: [344]u8 = undefined;
+    var decoded: [257]u8 = undefined;
+    const text = try encode(&encoded, &source);
+    try std.testing.expectEqualSlices(u8, std.base64.standard.Encoder.encode(&expected, &source), text);
+    const counts = try decode(&decoded, text, .{});
+    try std.testing.expectEqualSlices(u8, &source, decoded[0..counts.decoded_bytes]);
 }
