@@ -37,6 +37,7 @@ The package imports as `zmz`. The mzML API is available under `@import("zmz").mz
 The near-term design aims for:
 
 - a small, fast reader and writer for large mzML files;
+- keeping up with mzML format revisions while retaining backward compatibility with historical mzML files;
 - clear rules for borrowed data, retained data, and who frees allocated memory;
 - an XML engine focused on the forms required by mzML;
 - separate modules for additional mass-spectrometry file formats if the project grows in that direction;
@@ -56,6 +57,8 @@ zig build test -Doptimize=ReleaseFast --summary all
 Base64 uses runtime AVX2 selection in LLVM x86-64 builds and scalar fallback elsewhere. `-Dbase64_simd=false` forces scalar. Builds default to the baseline CPU; `-Dcpu=native` explicitly targets the build machine. Zig 0.16's self-hosted Debug backend uses scalar; ReleaseFast uses LLVM and runtime selection.
 
 The public entry point is [`src/root.zig`](src/root.zig). Vocabulary resources and their source notices are described in [`vocabularies/README.md`](vocabularies/README.md).
+
+[Complete, compiled examples](examples/README.md) show streamed reading, selected decoding, indexed access, array construction, and payload rewriting, with cleanup and buffer lifetimes. Build them with `zig build examples -Doptimize=ReleaseFast`. Their checks also run under `zig build test`.
 
 ## Peer readers and benchmarks
 

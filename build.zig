@@ -1,4 +1,4 @@
-//! Defines the zmz package module and verification step.
+//! Defines the zmz package module, compiled examples, and test steps.
 
 const std = @import("std");
 
@@ -86,6 +86,35 @@ pub fn build(b: *std.Build) void {
     configureLibraryModule(package_tests_module, numpress_options, base64_options, use_glibc_vector);
     const package_tests = b.addTest(.{ .root_module = package_tests_module });
     test_step.dependOn(&b.addRunArtifact(package_tests).step);
+
+    const examples_step = b.step("examples", "Build and install the mzML usage examples");
+    const example_test_options = b.addOptions();
+    for ([_][]const u8{ "stream", "select", "indexed", "write", "rewrite" }) |name| {
+        const executable = b.addExecutable(.{
+            .name = b.fmt("mzml-{s}", .{name}),
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(b.fmt("examples/{s}.zig", .{name})),
+                .target = target,
+                .optimize = optimize,
+                .strip = strip,
+                .imports = &.{.{ .name = "zmz", .module = zmz }},
+            }),
+        });
+        examples_step.dependOn(&b.addInstallArtifact(executable, .{}).step);
+        example_test_options.addOptionPath(name, executable.getEmittedBin());
+    }
+    const example_tests_module = b.createModule(.{
+        .root_source_file = b.path("tests/mzml/test_examples.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = strip,
+        .imports = &.{.{ .name = "zmz", .module = zmz }},
+    });
+    example_tests_module.addOptions("example_test_options", example_test_options);
+    const example_tests = b.addTest(.{ .root_module = example_tests_module });
+    const example_test_run = b.addRunArtifact(example_tests);
+    test_step.dependOn(&example_test_run.step);
+    b.step("test-examples", "Run the compiled mzML examples on small fixtures").dependOn(&example_test_run.step);
 
     const file_check = b.addExecutable(.{
         .name = "check-mzml",
