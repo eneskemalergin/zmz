@@ -769,9 +769,7 @@ const Storage = struct {
     }
 };
 
-// --- Tests ---
-
-test "fragment parsing preserves text boundaries and physical offsets" {
+test "[integration] - [mzML fragment parsing]: preserves text boundaries and physical offsets" {
     const prefix = "<mzML xmlns='http://psi.hupo.org/ms/mzml'>";
     const cases = [_]struct { text: []const u8, failure: ?Error }{
         .{ .text = "e\u{301}", .failure = null },
@@ -802,7 +800,7 @@ test "fragment parsing preserves text boundaries and physical offsets" {
     }
 }
 
-test "fragment parsing retains offsets beyond 32-bit positions" {
+test "[edge] - [mzML fragment parsing]: retains offsets beyond 32-bit positions" {
     const prefix = "<mzML xmlns='http://psi.hupo.org/ms/mzml'>";
     var record = try parseFragment(
         std.testing.allocator,
