@@ -51,11 +51,12 @@ pub const StreamReader = struct {
         return self.inner.nextRecord();
     }
 
-    /// Reads a complete record and decodes every array into reusable output storage.
+    /// Reads a complete record and decodes selected arrays into reusable output storage.
+    /// Without array_selector, decodes every array. Skipped arrays keep their metadata.
     /// Metadata borrows this reader as in nextRecord; binary text is not retained.
     /// Output slices last until output is reused, reset, or deinitialized. EOF and errors
-    /// clear its visible results. Requires no array_selector; payload
-    /// does not affect this call. The first failure stops reading and sets the diagnostic;
+    /// clear its visible results. Payload does not affect this call.
+    /// The first failure stops reading and sets the diagnostic;
     /// subsequent reads return FailedState. No automatic record skipping occurs.
     pub fn nextDecodedRecord(self: *Reader, output: *DecodedArrays) Error!?model.Record {
         return self.inner.nextDecodedRecord(output);

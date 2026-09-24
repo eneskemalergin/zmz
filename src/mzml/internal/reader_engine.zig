@@ -47,22 +47,27 @@ pub const Limits = struct {
     binary_text_bytes: usize = 256 * 1024 * 1024,
 };
 
-/// Retention and skipping parse XML without interpreting array bytes or encodedLength.
+/// Ordinary reads retain or skip text; decoded reads decode or skip array bytes.
 pub const Payload = enum { retain, skip };
 
-/// Chooses text retention after an array's leading parameters and before its binary text.
+/// Chooses arrays after their leading parameters and before their binary text.
 /// The callback receives its zero-based array position within the record, source attributes,
 /// and unexpanded parameters. All slices borrow only for the call. Keep user_data valid
 /// while reading; it can hold header groups. Do not reenter the reader. Later checks can fail.
 pub const ArraySelector = struct {
     user_data: ?*anyopaque = null,
     select: *const fn (?*anyopaque, usize, []const model.Attribute, []const cv.Entry) Payload,
+    /// Called once before the array list with the record kind, attributes, and parameters
+    /// read so far. Returning skip skips every array without calling select. Neither
+    /// callback sees later parameters; selection never removes record or array metadata.
+    select_record: ?*const fn (?*anyopaque, model.Kind, []const model.Attribute, []const cv.Entry) Payload = null,
 };
 
 pub const Options = struct {
     limits: Limits = .{},
     payload: Payload = .retain,
-    /// Selects retained arrays without dropping metadata. Ignored when payload is skip.
+    /// Selects retained text or decoded arrays without dropping metadata.
+    /// Ignored by ordinary reads when payload is skip; decoded reads ignore payload.
     /// Does not classify encodings or resolve parameters on the caller's behalf.
     array_selector: ?ArraySelector = null,
     /// Retains the index trailer within header limits for StreamReader.indexTrailer().
@@ -100,6 +105,7 @@ list_scopes: [2]?Scope = .{ null, null },
 child_scratch: std.ArrayList(model.Node) = .empty,
 param_scratch: std.ArrayList(cv.Entry) = .empty,
 decoded_arrays: ?*DecodedArrays = null,
+decode_binary: bool = false,
 fragment_ancestors: ?xml.Ancestors = null,
 
 pub const Scope = struct { start: u64, end: u64, name: []const u8 };
@@ -165,7 +171,6 @@ fn nextRecordFor(self: *StreamReader, comptime retention: Retention) Error!?mode
 pub fn nextDecodedRecord(self: *StreamReader, output: *DecodedArrays) Error!?model.Record {
     output.reset();
     errdefer output.reset();
-    if (self.options.array_selector != null) return error.InvalidOptions;
     self.decoded_arrays = output;
     defer self.decoded_arrays = null;
     const record = try self.nextRecord() orelse return null;
@@ -502,8 +507,12 @@ fn parseNodeFor(self: *StreamReader, storage: *Storage, depth: usize, advance_af
     if (depth > self.options.limits.depth) return error.LimitExceeded;
     const kind_value = try self.kind();
     var node = try self.startNodeFor(storage, kind_value, retention != .none);
+    var child_payload = payload;
     if (storage == &self.record_store and depth == 1) {
-        if (self.decoded_arrays) |output| try output.startRecord(node);
+        if (self.decoded_arrays) |output| {
+            try output.startRecord(node);
+            child_payload = .retain;
+        }
     }
     const has_text = kind_value == .binary or kind_value == .offset or kind_value == .index_list_offset or kind_value == .file_checksum;
     try self.cursor.advance(has_text);
@@ -515,9 +524,7 @@ fn parseNodeFor(self: *StreamReader, storage: *Storage, depth: usize, advance_af
             const bytes = event.data.text.bytes;
             text_size = std.math.add(usize, text_size, bytes.len) catch return error.LimitExceeded;
             if (text_size > self.options.limits.binary_text_bytes) return error.LimitExceeded;
-            if (kind_value == .binary and storage == &self.record_store) {
-                if (self.decoded_arrays) |output| try output.text(bytes);
-            }
+            if (kind_value == .binary and self.decode_binary) try self.decoded_arrays.?.text(bytes);
             if (payload == .retain or kind_value != .binary) {
                 if (text_size > storage.limit -| storage.used) return error.LimitExceeded;
                 try text.appendSlice(storage.arena.allocator(), bytes);
@@ -528,29 +535,31 @@ fn parseNodeFor(self: *StreamReader, storage: *Storage, depth: usize, advance_af
             storage.used += text.items.len;
             node.text = text.items;
         }
-        if (kind_value == .binary and storage == &self.record_store) {
-            if (self.decoded_arrays) |output| try output.finishArray();
-        }
+        if (kind_value == .binary and self.decode_binary) try self.decoded_arrays.?.finishArray();
     } else {
         const params_start = self.param_scratch.items.len;
         defer self.param_scratch.shrinkRetainingCapacity(params_start);
         var param_count: usize = 0;
         try self.parseParams(storage, retention == .tree, &param_count);
         node.params = self.param_scratch.items[params_start..];
-        var child_payload = payload;
+        var decode_array = false;
         if (kind_value == .binary_data_array and storage == &self.record_store) {
+            const position = storage.arrays;
+            storage.arrays += 1;
+            if (child_payload == .retain) {
+                if (self.options.array_selector) |selector|
+                    child_payload = selector.select(selector.user_data, position, node.attributes, node.params);
+            }
             if (self.decoded_arrays) |output| {
-                try output.beginArray(node, self.header.groups);
+                decode_array = child_payload == .retain;
+                if (decode_array) try output.beginArray(node, self.header.groups, position);
                 child_payload = .skip;
             }
+            self.decode_binary = decode_array;
         }
-        if (kind_value == .binary_data_array and storage == &self.record_store and self.options.payload == .retain) {
-            if (self.options.array_selector) |selector| {
-                const position = storage.arrays;
-                storage.arrays += 1;
-                child_payload = selector.select(selector.user_data, position, node.attributes, node.params);
-            }
-        }
+        defer if (decode_array) {
+            self.decode_binary = false;
+        };
         const children = schema.CHILD_KINDS.get(kind_value);
         var seen = std.EnumSet(model.Kind).initEmpty();
         const children_start = self.child_scratch.items.len;
@@ -566,7 +575,7 @@ fn parseNodeFor(self: *StreamReader, storage: *Storage, depth: usize, advance_af
             if (event.data == .end_element) break;
             if (event.data == .start_element and paramKind(event.data.start_element) != null) {
                 try self.parseParams(storage, retention == .tree, &param_count);
-                if (kind_value == .binary_data_array and self.decoded_arrays != null) {
+                if (decode_array) {
                     node.params = self.param_scratch.items[params_start..];
                     // Late declarations must agree with the bytes already decoded.
                     _ = try model.arrayEncoding(node, self.header.groups);
@@ -579,11 +588,17 @@ fn parseNodeFor(self: *StreamReader, storage: *Storage, depth: usize, advance_af
             if (children.singular.contains(child_kind) and seen.contains(child_kind)) return error.InvalidStructure;
             seen.insert(child_kind);
             if (child_count == self.options.limits.list_entries) return error.LimitExceeded;
+            if (child_kind == .binary_data_array_list and storage == &self.record_store and child_payload == .retain) {
+                if (self.options.array_selector) |selector| {
+                    if (selector.select_record) |select|
+                        child_payload = select(selector.user_data, kind_value, node.attributes, self.param_scratch.items[params_start..]);
+                }
+            }
             const child = try self.parseNodeFor(storage, depth + 1, true, child_payload, if (retention == .tree) .tree else .none);
             if (retention == .tree) try self.child_scratch.append(self.allocator, child);
             child_count += 1;
         }
-        if (kind_value == .binary_data_array and self.decoded_arrays != null and !seen.contains(.binary))
+        if (decode_array and !seen.contains(.binary))
             return error.PayloadNotRetained;
         self.current_kind = kind_value;
         if (retention == .tree) {

@@ -2,6 +2,7 @@
 //!
 //! Each array keeps its source primitive, except Numpress output is always f64. Numeric
 //! buffers and shared wire scratch grow as needed and are reused between records.
+//! Selected results stay in source order; source_position indexes record.binaryArrays().
 //! Results become visible only after the complete record succeeds. Returned slices last
 //! until the next decoded read using this owner, reset, or deinit; ordinary reads do not
 //! invalidate them. No source metadata is borrowed by this owner.
@@ -22,7 +23,7 @@ pub const Values = union(model.Primitive) {
     int32: []const i32,
     int64: []const i64,
 };
-pub const Array = struct { encoding: model.Encoding, values: Values };
+pub const Array = struct { source_position: usize, encoding: model.Encoding, values: Values };
 
 allocator: std.mem.Allocator,
 limits: arrays.Limits,
@@ -60,6 +61,7 @@ pub fn get(self: *const DecodedArrays, position: usize) ?Array {
     if (position >= self.len()) return null;
     const output = &self.outputs.items[position];
     return .{
+        .source_position = output.source_position,
         .encoding = output.encoding,
         .values = switch (output.primitive()) {
             .float32 => .{ .float32 = output.values(f32) },
@@ -95,11 +97,12 @@ pub fn complete(self: *DecodedArrays) void {
     self.ready = true;
 }
 
-pub fn beginArray(self: *DecodedArrays, node: model.Node, groups: []const cv.Group) Error!void {
+pub fn beginArray(self: *DecodedArrays, node: model.Node, groups: []const cv.Group, source_position: usize) Error!void {
     const array = try model.BinaryArray.init(node, self.default_length, groups);
     if (self.count == self.outputs.items.len) try self.outputs.append(self.allocator, .{});
     const output = &self.outputs.items[self.count];
     self.count += 1;
+    output.source_position = source_position;
     output.encoding = array.encoding;
     output.length = array.length;
     const width: usize = switch (output.primitive()) {
@@ -136,6 +139,7 @@ pub fn finishArray(self: *DecodedArrays) Error!void {
 
 const Output = struct {
     words: std.ArrayList(u64) = .empty,
+    source_position: usize = 0,
     encoding: model.Encoding = undefined,
     length: usize = 0,
 

@@ -14,6 +14,8 @@ The executables go in `zig-out/bin/`. `zig build test-examples` compiles and run
 zig-out/bin/mzml-stream input.mzML
 zig-out/bin/mzml-stream input.mzML --metadata
 zig-out/bin/mzml-select input.mzML MS:1000514
+zig-out/bin/mzml-select input.mzML MS:1000515 --stream
+zig-out/bin/mzml-select input.mzML MS:1000514 --ms1
 ```
 
 [stream.zig](stream.zig) reads spectra and chromatograms until the reader returns null, regardless of declared list counts. By default it decodes every array and matches the returned numeric union. `--metadata` skips binary text and numeric decoding. MS level is optional and queried only on spectra. Scan times keep their source units; the example does not convert them.
@@ -24,7 +26,9 @@ The live header pointer lasts until reader destruction; list descriptors and obs
 
 [select.zig](select.zig) selects a role after the complete record is read. `MS:1000514` selects m/z, `MS:1000515` intensity, and `MS:1000595` time. A missing role is skipped; repeated matches return `RepeatedArray`. It handles the four primitive types and all existing compression combinations, with Numpress decoded to `f64`. Unrequested codecs are not interpreted.
 
-This selection route retains the current record's binary text and allocates typed output and scratch only for the requested array. It does not use `array_selector`: that callback runs before the complete array metadata is available. All-array numeric streaming cannot currently select individual arrays.
+By default, this example retains the current record's binary text and allocates typed output and scratch only for the requested array. `--stream` instead uses `array_selector` with `nextDecodedRecord`: it selects from leading array parameters and decodes into reusable buffers without retaining Base64. `--ms1` also uses `select_record` to skip decoding outside MS1 spectra. Record selection sees the kind, attributes, and record-level parameters read before the array list; array selection sees attributes and leading parameters. Neither callback sees later parameters. Use the default retained-text route when selection needs complete metadata.
+
+Selected numeric results are compact and stay in source order. Each `DecodedArrays.Array.source_position` indexes the returned record's `binaryArrays()`, whose metadata includes unselected arrays. An empty selection returns the record with zero decoded arrays, not EOF. Without a selector, numeric reads still decode every array.
 
 ## Indexed access
 
@@ -36,6 +40,8 @@ zig-out/bin/mzml-indexed plain.mzML 'scan=1' --rebuild
 [indexed.zig](indexed.zig) opens the embedded index by default. `--rebuild` explicitly scans records to construct one; there is no automatic fallback. Keep the input file open and unchanged until the index is destroyed. Each lookup returns independently owned metadata and uses separate reusable numeric storage. Missing IDs return null; this example prints `not found`. An ID shared by a spectrum and chromatogram returns `AmbiguousId`.
 
 For ordinal access, use `at` or `atDecoded` with the record kind. Their ordinal is zero-based within that kind, not the source `Record.index` field.
+
+`byIdDecoded` and `atDecoded` also use `reader.array_selector`, including `select_record`, with the same metadata availability and source positions as forward reads. Index building does not call selectors. Set them when building the index; keep their user data alive until the last lookup.
 
 ## Construct and write arrays
 

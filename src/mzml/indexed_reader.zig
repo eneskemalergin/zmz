@@ -162,14 +162,14 @@ pub fn at(self: *IndexedReader, allocator: std.mem.Allocator, kind: model.Kind, 
     return try self.readEntry(allocator, self.entries.items[position], null);
 }
 
-/// Returns independent metadata and decodes all arrays into caller-owned reusable storage.
-/// Binary text is omitted. Requires no array selector; payload is ignored.
+/// Returns independent metadata and decodes selected arrays into caller-owned reusable storage.
+/// Without reader.array_selector, decodes every array. All array metadata remains available.
+/// Binary text is omitted; payload is ignored.
 /// Missing IDs and failures clear output. A failed lookup stops immediately; later lookups may retry.
 /// Numeric slices last until output is reused, reset, or deinitialized, independently of metadata.
 pub fn byIdDecoded(self: *IndexedReader, allocator: std.mem.Allocator, id: []const u8, output: *DecodedArrays) Error!?owned.Record {
     output.reset();
     errdefer output.reset();
-    if (self.options.reader.array_selector != null) return error.InvalidOptions;
     const position = try self.idPosition(id) orelse return null;
     return try self.readDecodedEntry(allocator, self.entries.items[position], output);
 }
@@ -178,7 +178,6 @@ pub fn byIdDecoded(self: *IndexedReader, allocator: std.mem.Allocator, id: []con
 pub fn atDecoded(self: *IndexedReader, allocator: std.mem.Allocator, kind: model.Kind, ordinal: usize, output: *DecodedArrays) Error!?owned.Record {
     output.reset();
     errdefer output.reset();
-    if (self.options.reader.array_selector != null) return error.InvalidOptions;
     const position = try self.ordinalPosition(kind, ordinal) orelse return null;
     return try self.readDecodedEntry(allocator, self.entries.items[position], output);
 }

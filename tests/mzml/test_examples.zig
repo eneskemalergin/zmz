@@ -39,6 +39,11 @@ test "[integration] - [mzML examples]: streams all codecs and retains group-base
     defer std.testing.allocator.free(selected);
     try std.testing.expectEqual(@as(usize, 8), std.mem.count(u8, selected, "type=f64 count=3"));
     try std.testing.expect(std.mem.indexOf(u8, selected, "chromatogram=") == null);
+    for ([_][]const u8{ "--stream", "--ms1" }) |mode| {
+        const streamed = try run(dir.dir, options.select, &.{ "input.mzML", "MS:1000514", mode }, 0);
+        defer std.testing.allocator.free(streamed);
+        try std.testing.expectEqualStrings(selected, streamed);
+    }
 }
 
 test "[integration] - [mzML examples]: selected decoding leaves unrequested codecs uninterpreted" {
@@ -69,6 +74,15 @@ test "[integration] - [mzML examples]: selected decoding leaves unrequested code
     var record = (try index.byId(std.testing.allocator, "scan=1")).?;
     defer record.deinit();
     try std.testing.expectEqualStrings("AAAA", record.value.binaryArrays()[1].child(.binary).?.text.?);
+    const late = try run(dir.dir, options.select, &.{ "input.mzML", "MS:1000514", "--stream" }, 0);
+    defer std.testing.allocator.free(late);
+    try std.testing.expectEqualStrings("", late);
+    const leading = try std.mem.replaceOwned(u8, std.testing.allocator, source, "<binary>AAAAAAAA8D8=</binary><cvParam cvRef='MS' accession='MS:1000514' name='m/z array'/>", "<cvParam cvRef='MS' accession='MS:1000514' name='m/z array'/><binary>AAAAAAAA8D8=</binary>");
+    defer std.testing.allocator.free(leading);
+    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "leading.mzML", .data = leading });
+    const streamed = try run(dir.dir, options.select, &.{ "leading.mzML", "MS:1000514", "--stream" }, 0);
+    defer std.testing.allocator.free(streamed);
+    try std.testing.expectEqualStrings(selected, streamed);
 }
 
 test "[integration] - [mzML examples]: selects integer arrays and empty arrays with explicit types" {
@@ -89,6 +103,9 @@ test "[integration] - [mzML examples]: selects integer arrays and empty arrays w
         const selected = try run(dir.dir, options.select, &.{ "input.mzML", "MS:1000514" }, 0);
         defer std.testing.allocator.free(selected);
         try std.testing.expectEqualStrings("scan=1 MS:1000514 " ++ case[5], selected);
+        const streamed = try run(dir.dir, options.select, &.{ "input.mzML", "MS:1000514", "--stream" }, 0);
+        defer std.testing.allocator.free(streamed);
+        try std.testing.expectEqualStrings(selected, streamed);
     }
 }
 
@@ -115,6 +132,9 @@ test "[integration] - [mzML examples]: writes mixed primitive arrays and retriev
         const selected = try run(dir.dir, options.select, &.{ path, "MS:1000515" }, 0);
         defer std.testing.allocator.free(selected);
         try std.testing.expectEqualStrings("scan=1 MS:1000515 type=f32 count=3 first=10\n", selected);
+        const streamed = try run(dir.dir, options.select, &.{ path, "MS:1000515", "--stream" }, 0);
+        defer std.testing.allocator.free(streamed);
+        try std.testing.expectEqualStrings(selected, streamed);
     }
     const missing = try run(dir.dir, options.indexed, &.{ "indexed.mzML", "missing" }, 0);
     defer std.testing.allocator.free(missing);
