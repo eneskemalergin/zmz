@@ -201,3 +201,68 @@ test "[failure] - [mzML examples]: failed rewrites remove partial output and nev
     var buffer: [4096]u8 = undefined;
     try std.testing.expectEqualStrings(source, try dir.dir.readFile(std.testing.io, "input.mzML", &buffer));
 }
+
+test "[integration] - [mzML examples]: filters spectra in one pass while preserving payloads and references" {
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    const source = support.HEADER ++ "<spectrumList count='3' defaultDataProcessingRef='dp'>" ++
+        "<spectrum id='scan=0' index='0' defaultArrayLength='0'><cvParam accession='MS:1000511' value='2'/></spectrum>" ++
+        "<spectrum id='scan=1' index='1' defaultArrayLength='1' dataProcessingRef='dp' spotID='kept'>" ++
+        "<cvParam accession='MS:1000511' value='1'/>" ++ support.ARRAYS ++ "</spectrum>" ++
+        "<spectrum id='scan=2' index='2' defaultArrayLength='1'><cvParam accession='MS:1000511' value='1'/>" ++
+        "<scanList count='1'><scan spectrumRef='scan=0'/></scanList>" ++ support.ARRAYS ++ "</spectrum>" ++
+        "</spectrumList><chromatogramList count='1' defaultDataProcessingRef='dp'>" ++
+        "<chromatogram id='tic' index='0' defaultArrayLength='1'>" ++ support.ARRAYS ++
+        "</chromatogram></chromatogramList></run></mzML>";
+    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "input.mzML", .data = source });
+    const stdout = try run(dir.dir, options.rewrite, &.{ "input.mzML", "ms1.mzML", "--ms1" }, 0);
+    defer std.testing.allocator.free(stdout);
+    try std.testing.expectEqualStrings("", stdout);
+    const bytes = try dir.dir.readFileAlloc(std.testing.io, "ms1.mzML", std.testing.allocator, .limited(16 * 1024));
+    defer std.testing.allocator.free(bytes);
+    var index = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = bytes }, .{ .policy = .open_embedded });
+    defer index.deinit();
+    try std.testing.expectEqualDeep([2]usize{ 2, 1 }, index.counts);
+    try std.testing.expectEqual(@as(usize, 2), index.header().spectrum_list.?.declared_count);
+    try std.testing.expectEqual(null, try index.byId(std.testing.allocator, "scan=0"));
+    var input = std.Io.Reader.fixed(source);
+    var original = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+    defer original.deinit();
+    const header = try original.readHeader();
+    var known_bytes: [8192]u8 = undefined;
+    var known_sink = std.Io.Writer.fixed(&known_bytes);
+    var known = try mzml.Writer.init(std.testing.allocator, &known_sink, .{});
+    defer known.deinit();
+    try known.writeHeader(header.*);
+    try known.beginList(.spectrum_list, 2, "dp");
+    _ = try original.nextRecord();
+    for ([_][]const u8{ "0", "1" }) |ordinal| {
+        const record = (try original.nextRecord()).?;
+        var expected = record.node;
+        const attributes = try std.testing.allocator.dupe(mzml.model.Attribute, expected.attributes);
+        defer std.testing.allocator.free(attributes);
+        for (attributes) |*attribute| {
+            if (std.mem.eql(u8, attribute.name, "index")) attribute.value = ordinal;
+        }
+        expected.attributes = attributes;
+        try known.writeRecord(expected);
+        var found = (try index.byId(std.testing.allocator, record.id)).?;
+        defer found.deinit();
+        try support.expectNode(expected, found.value.node);
+    }
+    try known.endList();
+    try known.beginList(.chromatogram_list, 1, "dp");
+    const chromatogram = (try original.nextRecord()).?;
+    try known.writeRecord(chromatogram.node);
+    try known.endList();
+    try known.finish();
+    var before_input = std.Io.Reader.fixed(known_sink.buffered());
+    var before = try mzml.StreamReader.init(std.testing.allocator, &before_input, .{});
+    defer before.deinit();
+    var after_input = std.Io.Reader.fixed(bytes);
+    var after = try mzml.StreamReader.init(std.testing.allocator, &after_input, .{});
+    defer after.deinit();
+    while (try before.nextRecord()) |record|
+        try support.expectNode(record.node, (try after.nextRecord()).?.node);
+    try std.testing.expectEqual(null, try after.nextRecord());
+}

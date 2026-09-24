@@ -1,4 +1,6 @@
-//! Writes plain or indexed mzML without retaining records or a run.
+//! Writes plain or indexed mzML without retaining records or a run. Forward-only
+//! sinks require list counts up front. File-backed output can patch unknown counts
+//! when lists close; indexed file output hashes the completed prefix at finish.
 
 const std = @import("std");
 const cv = @import("../cv/source.zig");
@@ -8,12 +10,13 @@ const xml = @import("../xml/mzml_adapter.zig");
 const base64 = @import("../binary/base64.zig");
 
 const Writer = @This();
+const COUNT_PLACEHOLDER = "0" ** std.fmt.comptimePrint("{d}", .{std.math.maxInt(usize)}).len;
 
 /// Explicit bounds for caller-supplied node hierarchies.
 pub const Limits = schema.Limits;
 
 /// Writer failures are sticky. No error permits treating partially written output as complete.
-pub const Error = xml.WriterError || cv.ValueError || base64.Error || schema.Error || error{
+pub const Error = xml.WriterError || cv.ValueError || base64.Error || schema.Error || std.Io.File.WritePositionalError || std.Io.File.ReadPositionalError || error{
     InvalidStructure,
     MissingAttribute,
     UnknownAttribute,
@@ -27,6 +30,7 @@ pub const Error = xml.WriterError || cv.ValueError || base64.Error || schema.Err
     FailedState,
     DuplicateId,
     InvalidOptions,
+    UnexpectedEndOfFile,
 };
 
 engine: xml.Writer,
@@ -38,6 +42,8 @@ list_kind: ?model.Kind = null,
 expected_count: usize = 0,
 written_count: usize = 0,
 index_state: ?*IndexState = null,
+file_sink: ?*std.Io.File.Writer = null,
+count_offset: ?u64 = null,
 
 /// Bounds retained index entries and ID bytes for indexed output.
 pub const IndexLimits = struct { records: usize = 1_000_000, id_bytes: usize = 64 * 1024 * 1024 };
@@ -57,6 +63,22 @@ pub fn initIndexed(allocator: std.mem.Allocator, sink: *std.Io.Writer, limits: L
     errdefer allocator.destroy(state);
     state.* = .{ .allocator = allocator, .hashed = .{ .out = sink }, .arena = .init(allocator), .limits = index_limits };
     return .{ .engine = try xml.Writer.init(allocator, &state.hashed.writer, .{}), .allocator = allocator, .limits = limits, .index_state = state };
+}
+
+/// Borrows a positional file writer at offset zero on an empty file. Do not write
+/// through it independently until finish. Null index_limits selects plain mzML.
+/// Indexed output needs a readable file and reads its prefix once for the checksum.
+/// Counts may be null in beginList. The caller must still flush the final bytes.
+pub fn initFile(allocator: std.mem.Allocator, sink: *std.Io.File.Writer, limits: Limits, index_limits: ?IndexLimits) Error!Writer {
+    if (sink.logicalPos() != 0 or (sink.mode != .positional and sink.mode != .positional_simple))
+        return error.InvalidOptions;
+    var writer = if (index_limits) |index|
+        try initIndexed(allocator, &sink.interface, limits, index)
+    else
+        try init(allocator, &sink.interface, limits);
+    writer.engine.sink = &sink.interface;
+    writer.file_sink = sink;
+    return writer;
 }
 
 /// Releases XML writer storage without finishing or flushing output.
@@ -97,21 +119,27 @@ pub fn writeHeader(self: *Writer, header: model.Header) Error!void {
     self.phase = .run;
 }
 
-/// Opens a spectrum or chromatogram list with an exact forward-only count and processing ref.
+/// Opens a spectrum or chromatogram list. A null count requires initFile and is
+/// filled in by endList; other writers require an exact count before writing.
 /// Spectra precede chromatograms, and each list can occur at most once.
-pub fn beginList(self: *Writer, kind: model.Kind, count: usize, processing_ref: []const u8) Error!void {
+pub fn beginList(self: *Writer, kind: model.Kind, count: ?usize, processing_ref: []const u8) Error!void {
     if (self.failed) return error.FailedState;
     errdefer self.failed = true;
     if (self.phase != .run) return error.InvalidState;
     if (kind != .spectrum_list and kind != .chromatogram_list) return error.InvalidStructure;
     if (self.list_kind == kind or self.list_kind == .chromatogram_list) return error.InvalidStructure;
+    if (count == null and self.file_sink == null) return error.InvalidOptions;
     var buffer: [32]u8 = undefined;
-    const text = std.fmt.bufPrint(&buffer, "{d}", .{count}) catch return error.LimitExceeded;
+    const text = if (count) |value| std.fmt.bufPrint(&buffer, "{d}", .{value}) catch return error.LimitExceeded else COUNT_PLACEHOLDER;
     try self.engine.startElement(kind.xmlName());
     try self.engine.attribute("count", text);
+    self.count_offset = if (count == null)
+        (self.engine.byteOffset() orelse return error.LimitExceeded) - 1 - COUNT_PLACEHOLDER.len
+    else
+        null;
     try self.engine.attribute("defaultDataProcessingRef", processing_ref);
     self.list_kind = kind;
-    self.expected_count = count;
+    self.expected_count = count orelse std.math.maxInt(usize);
     self.written_count = 0;
     self.phase = .list;
 }
@@ -184,17 +212,28 @@ fn writeRecordInner(self: *Writer, node: model.Node, comptime replace_arrays: bo
     self.written_count += 1;
 }
 
-/// Closes the active list only after exactly its declared number of records were written.
+/// Closes the active list, checking a supplied count or patching an unknown count.
+/// Patching flushes pending file bytes but does not change the output position.
 pub fn endList(self: *Writer) Error!void {
     if (self.failed) return error.FailedState;
     errdefer self.failed = true;
     if (self.phase != .list) return error.InvalidState;
-    if (self.written_count != self.expected_count) return error.CountMismatch;
+    if (self.count_offset == null and self.written_count != self.expected_count) return error.CountMismatch;
     try self.engine.endElement();
+    if (self.count_offset) |offset| {
+        const sink = self.file_sink.?;
+        try sink.interface.flush();
+        var buffer: [32]u8 = undefined;
+        const text = std.fmt.bufPrint(&buffer, "{d}", .{self.written_count}) catch return error.LimitExceeded;
+        var count = COUNT_PLACEHOLDER.*;
+        @memcpy(count[count.len - text.len ..], text);
+        try sink.file.writePositionalAll(sink.io, &count, offset);
+    }
     self.phase = .run;
 }
 
-/// Closes the run and document. Does not flush the caller's sink. Can succeed only once.
+/// Closes the run and document. Indexed file output flushes and reads the checksum
+/// prefix, but the caller must flush the final bytes. Can succeed only once.
 pub fn finish(self: *Writer) Error!void {
     if (self.failed) return error.FailedState;
     errdefer self.failed = true;
@@ -235,7 +274,22 @@ fn writeIndex(self: *Writer, state: *IndexState) Error!void {
     try self.engine.endElement();
     try self.engine.startElement("fileChecksum");
     try self.engine.text("");
-    const checksum = std.fmt.bytesToHex(state.hashed.hasher.finalResult(), .lower);
+    const digest = if (self.file_sink) |sink| digest: {
+        try sink.interface.flush();
+        const end = self.engine.byteOffset() orelse return error.LimitExceeded;
+        var hasher = std.crypto.hash.Sha1.init(.{});
+        var buffer: [64 * 1024]u8 = undefined;
+        var position: u64 = 0;
+        while (position < end) {
+            const capacity: usize = @intCast(@min(buffer.len, end - position));
+            const length = try sink.file.readPositional(sink.io, &.{buffer[0..capacity]}, position);
+            if (length == 0) return error.UnexpectedEndOfFile;
+            hasher.update(buffer[0..length]);
+            position += length;
+        }
+        break :digest hasher.finalResult();
+    } else state.hashed.hasher.finalResult();
+    const checksum = std.fmt.bytesToHex(digest, .lower);
     try self.engine.text(&checksum);
     try self.engine.endElement();
     try self.engine.endElement();

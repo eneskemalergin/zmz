@@ -388,3 +388,230 @@ test "[integration] - [mzML writer]: leaves the final sink flush to its caller" 
     try std.testing.expect(std.mem.endsWith(u8, sink.buffered(), "</mzML>"));
     try std.testing.expectError(error.WriteFailed, sink.flush());
 }
+
+test "[integration] - [mzML file writer]: patches counts without changing records or indexed offsets" {
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    const cases = [_]struct { counts: [2]usize, unknown: [2]bool, buffer_size: usize }{
+        .{ .counts = .{ 0, 0 }, .unknown = .{ true, true }, .buffer_size = 1 },
+        .{ .counts = .{ 1, 12 }, .unknown = .{ false, true }, .buffer_size = 137 },
+        .{ .counts = .{ 100, 1 }, .unknown = .{ true, false }, .buffer_size = 8192 },
+        .{ .counts = .{ 1, 1 }, .unknown = .{ false, false }, .buffer_size = 8192 },
+    };
+    for ([_]bool{ false, true }) |indexed| {
+        for (cases) |case| {
+            const file = try dir.dir.createFile(std.testing.io, "out.mzML", .{ .read = indexed });
+            defer file.close(std.testing.io);
+            var buffer: [8192]u8 = undefined;
+            var sink = file.writer(std.testing.io, buffer[0..case.buffer_size]);
+            var writer = try mzml.Writer.initFile(std.testing.allocator, &sink, .{}, if (indexed) .{} else null);
+            defer writer.deinit();
+            var expected = std.Io.Writer.Allocating.init(std.testing.allocator);
+            defer expected.deinit();
+            var known = try mzml.Writer.init(std.testing.allocator, &expected.writer, .{});
+            defer known.deinit();
+            var input = std.Io.Reader.fixed(support.DOCUMENT);
+            var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+            defer reader.deinit();
+            const header = try reader.readHeader();
+            try writer.writeHeader(header.*);
+            try known.writeHeader(header.*);
+            for ([_]mzml.model.Kind{ .spectrum_list, .chromatogram_list }, 0..) |kind, list_index| {
+                const record = (try reader.nextRecord()).?;
+                var node = record.node;
+                var attributes: [3]mzml.model.Attribute = undefined;
+                @memcpy(&attributes, node.attributes);
+                node.attributes = &attributes;
+                try writer.beginList(kind, if (case.unknown[list_index]) null else case.counts[list_index], "dp");
+                try known.beginList(kind, case.counts[list_index], "dp");
+                for (0..case.counts[list_index]) |position| {
+                    var index_text: [32]u8 = undefined;
+                    var id_text: [64]u8 = undefined;
+                    attributes[0].value = try std.fmt.bufPrint(&id_text, "{s}&{d}", .{ kind.xmlName(), position });
+                    attributes[1].value = try std.fmt.bufPrint(&index_text, "{d}", .{position});
+                    try known.writeRecord(node);
+                    if (position % 2 == 0) {
+                        try writer.writeRecord(node);
+                    } else {
+                        const one = [_]u8{ 0, 0, 0, 0, 0, 0, 0xf0, 0x3f };
+                        try writer.writeRecordWithArrays(node, &.{ &one, &one });
+                    }
+                }
+                try known.endList();
+                try writer.endList();
+                try std.testing.expectEqual(sink.logicalPos(), writer.engine.byteOffset().?);
+            }
+            try known.finish();
+            try writer.finish();
+            try sink.interface.flush();
+            const bytes = try dir.dir.readFileAlloc(std.testing.io, "out.mzML", std.testing.allocator, .limited(256 * 1024));
+            defer std.testing.allocator.free(bytes);
+            var before_input = std.Io.Reader.fixed(expected.written());
+            var before = try mzml.StreamReader.init(std.testing.allocator, &before_input, .{});
+            defer before.deinit();
+            var after_input = std.Io.Reader.fixed(bytes);
+            var after = try mzml.StreamReader.init(std.testing.allocator, &after_input, .{});
+            defer after.deinit();
+            const after_header = try after.readHeader();
+            while (try before.nextRecord()) |record|
+                try support.expectNode(record.node, (try after.nextRecord()).?.node);
+            try std.testing.expectEqual(null, try after.nextRecord());
+            try std.testing.expectEqual(case.counts[0], after_header.spectrum_list.?.declared_count);
+            try std.testing.expectEqual(case.counts[1], after_header.chromatogram_list.?.declared_count);
+            for ([_]?mzml.model.RecordList{ after_header.spectrum_list, after_header.chromatogram_list }, 0..) |list, i| {
+                if (case.unknown[i]) {
+                    const opening: mzml.model.Node = .{ .kind = .spectrum_list, .attributes = list.?.attributes };
+                    const text = opening.attribute("count").?;
+                    try std.testing.expectEqual(std.fmt.comptimePrint("{d}", .{std.math.maxInt(usize)}).len, text.len);
+                    for (text) |byte| try std.testing.expect(byte >= '0' and byte <= '9');
+                }
+            }
+            if (indexed) {
+                var index = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = bytes }, .{ .policy = .open_embedded });
+                defer index.deinit();
+                try std.testing.expectEqualDeep(case.counts, index.counts);
+                for (index.entries.items) |entry| {
+                    var found = (try index.byId(std.testing.allocator, entry.id)).?;
+                    defer found.deinit();
+                    try std.testing.expectEqual(entry.start, found.value.node.start_offset);
+                    try std.testing.expectEqualStrings(entry.id, found.value.id);
+                    try std.testing.expectEqualStrings("AAAAAAAA8D8=", found.value.binaryArrays()[0].child(.binary).?.text.?);
+                }
+                const checksum_start = std.mem.indexOf(u8, bytes, "<fileChecksum>").? + "<fileChecksum>".len;
+                var digest: [20]u8 = undefined;
+                std.crypto.hash.Sha1.hash(bytes[0..checksum_start], &digest, .{});
+                try std.testing.expectEqualStrings(&std.fmt.bytesToHex(digest, .lower), bytes[checksum_start .. checksum_start + 40]);
+            }
+        }
+    }
+}
+
+test "[failure] - [mzML file writer]: unknown counts need a file and do not bypass record indexes" {
+    var input = std.Io.Reader.fixed(support.DOCUMENT);
+    var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+    defer reader.deinit();
+    const header = try reader.readHeader();
+    for ([_]bool{ false, true }) |indexed| {
+        var buffer: [4096]u8 = undefined;
+        var sink = std.Io.Writer.fixed(&buffer);
+        var writer = if (indexed) try mzml.Writer.initIndexed(std.testing.allocator, &sink, .{}, .{}) else try mzml.Writer.init(std.testing.allocator, &sink, .{});
+        defer writer.deinit();
+        try writer.writeHeader(header.*);
+        const before = sink.buffered().len;
+        try std.testing.expectError(error.InvalidOptions, writer.beginList(.spectrum_list, null, "dp"));
+        try std.testing.expectEqual(before, sink.buffered().len);
+        try std.testing.expectError(error.FailedState, writer.finish());
+    }
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    const file = try dir.dir.createFile(std.testing.io, "out.mzML", .{});
+    defer file.close(std.testing.io);
+    var buffer: [4096]u8 = undefined;
+    var sink = file.writer(std.testing.io, &buffer);
+    var writer = try mzml.Writer.initFile(std.testing.allocator, &sink, .{}, null);
+    defer writer.deinit();
+    try writer.writeHeader(header.*);
+    try writer.beginList(.spectrum_list, null, "dp");
+    const record = (try reader.nextRecord()).?;
+    try writer.writeRecord(record.node);
+    try std.testing.expectError(error.InvalidIndex, writer.writeRecord(record.node));
+    try std.testing.expectError(error.FailedState, writer.endList());
+    try std.testing.expectError(error.InvalidOptions, mzml.Writer.initFile(std.testing.allocator, &sink, .{}, null));
+    var streaming = file.writerStreaming(std.testing.io, &buffer);
+    try std.testing.expectError(error.InvalidOptions, mzml.Writer.initFile(std.testing.allocator, &streaming, .{}, null));
+}
+
+test "[failure] - [mzML file writer]: flush, count patch, and checksum read failures remain sticky" {
+    const Failure = enum { flush, patch, unseekable, read, eof };
+    const Sink = struct {
+        failure: Failure,
+        active: bool = false,
+        end: u64 = 0,
+        patched: bool = false,
+
+        fn write(data: ?*anyopaque, file: std.Io.File, header: []const u8, slices: []const []const u8, splat: usize, offset: u64) std.Io.File.WritePositionalError!usize {
+            const self: *@This() = @ptrCast(@alignCast(data.?));
+            if (self.active and self.failure == .flush) return error.NoSpaceLeft;
+            if (offset < self.end) {
+                if (self.failure == .unseekable) return error.Unseekable;
+                if (self.failure == .patch) {
+                    if (self.patched) return error.NoSpaceLeft;
+                    self.patched = true;
+                    return file.writePositional(std.testing.io, &.{slices[0][0..1]}, offset);
+                }
+            }
+            const length = try std.testing.io.vtable.fileWritePositional(std.testing.io.userdata, file, header, slices, splat, offset);
+            self.end = @max(self.end, offset + length);
+            return length;
+        }
+
+        fn read(data: ?*anyopaque, file: std.Io.File, slices: []const []u8, offset: u64) std.Io.File.ReadPositionalError!usize {
+            const self: *@This() = @ptrCast(@alignCast(data.?));
+            if (offset != 0) {
+                if (self.failure == .read) return error.InputOutput;
+                if (self.failure == .eof) return 0;
+            }
+            return file.readPositional(std.testing.io, &.{slices[0][0..@min(slices[0].len, 17)]}, offset);
+        }
+    };
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    for (std.meta.tags(Failure)) |failure| {
+        const file = try dir.dir.createFile(std.testing.io, "out.mzML", .{ .read = true });
+        defer file.close(std.testing.io);
+        var injected: Sink = .{ .failure = failure };
+        var vtable = std.Io.failing.vtable.*;
+        vtable.fileWritePositional = Sink.write;
+        vtable.fileReadPositional = Sink.read;
+        const io: std.Io = .{ .userdata = &injected, .vtable = &vtable };
+        var buffer: [8192]u8 = undefined;
+        var sink = file.writer(io, &buffer);
+        var writer = try mzml.Writer.initFile(std.testing.allocator, &sink, .{}, .{});
+        defer writer.deinit();
+        var input = std.Io.Reader.fixed(support.DOCUMENT);
+        var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+        defer reader.deinit();
+        try writer.writeHeader((try reader.readHeader()).*);
+        try writer.beginList(.spectrum_list, null, "dp");
+        try writer.writeRecord((try reader.nextRecord()).?.node);
+        injected.active = true;
+        switch (failure) {
+            .flush => try std.testing.expectError(error.WriteFailed, writer.endList()),
+            .patch => try std.testing.expectError(error.NoSpaceLeft, writer.endList()),
+            .unseekable => try std.testing.expectError(error.Unseekable, writer.endList()),
+            .read, .eof => {
+                try writer.endList();
+                try std.testing.expectError(if (failure == .read) error.InputOutput else error.UnexpectedEndOfFile, writer.finish());
+            },
+        }
+        try std.testing.expectError(error.FailedState, writer.endList());
+        try std.testing.expectError(error.FailedState, writer.finish());
+    }
+}
+
+test "[failure] - [mzML file writer]: releases partial allocations with unknown counts" {
+    const Check = struct {
+        fn write(allocator: std.mem.Allocator, file: std.Io.File, indexed: bool) !void {
+            try file.setLength(std.testing.io, 0);
+            var buffer: [4096]u8 = undefined;
+            var sink = file.writer(std.testing.io, &buffer);
+            var writer = try mzml.Writer.initFile(allocator, &sink, .{}, if (indexed) .{} else null);
+            defer writer.deinit();
+            var input = std.Io.Reader.fixed(support.DOCUMENT);
+            var reader = try mzml.StreamReader.init(allocator, &input, .{});
+            defer reader.deinit();
+            try writer.writeHeader((try reader.readHeader()).*);
+            try writer.beginList(.spectrum_list, null, "dp");
+            try writer.writeRecord((try reader.nextRecord()).?.node);
+            try writer.endList();
+            try writer.finish();
+            try sink.interface.flush();
+        }
+    };
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    const file = try dir.dir.createFile(std.testing.io, "out.mzML", .{ .read = true });
+    defer file.close(std.testing.io);
+    for ([_]bool{ false, true }) |indexed|
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.write, .{ file, indexed });
+}

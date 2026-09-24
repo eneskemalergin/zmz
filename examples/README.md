@@ -62,13 +62,18 @@ Builder reset releases its metadata. The example resets only after the header or
 
 ```sh
 zig-out/bin/mzml-rewrite input.mzML copy.mzML
+zig-out/bin/mzml-rewrite input.mzML ms1.mzML --ms1
 ```
 
 [rewrite.zig](rewrite.zig) writes a new indexed file while retaining source record metadata and binary text. It does not decode or re-encode arrays, so an unfamiliar codec can be copied. XML spelling and the old index wrapper are not reproduced.
 
-This example requires accurate declared list counts, consecutive zero-based record indexes, and a present `defaultDataProcessingRef` on each list. It handles empty or absent lists. The current `beginList` call cannot carry other list attributes or an absent processing reference; the example reports `ListAttributesNotWritable` instead of silently losing them. Errors remove the new partial output, and an existing destination is never overwritten.
+The default copy requires accurate declared list counts and consecutive zero-based record indexes. `--ms1` keeps spectra whose MS level is 1, skips spectra without an MS level, and keeps all chromatograms. It reads the input once and assigns consecutive output spectrum indexes while preserving all other record attributes, IDs, references, and binary text. References to removed spectra remain unchanged; choosing how to handle them is the caller's decision.
 
-For filtering, determine the output counts before calling `beginList`. Changing the cached `Record.id`, `index`, or `default_array_length` fields does not change the node attributes that the writer emits. `Builder.record` constructs new record attributes; it does not automatically carry every source attribute. Array replacement likewise needs to preserve unrelated source parameters and update the primitive, compression, and encoded-length declarations. These examples do not supply a general editing helper.
+Filtering uses `Writer.initFile` and a null spectrum count in `beginList`. `endList` patches a fixed-width, zero-padded decimal count without moving any records. Plain file output needs write access; indexed file output also needs read access because `finish` reads the written prefix once to compute its checksum. This adds an output read, not another input scan or a retained copy of the file. `init` and `initIndexed` still need exact counts and work with forward-only sinks. Pass null index limits to `initFile` for plain output or `.{}` for indexed output.
+
+Both modes handle empty or absent lists and require a present `defaultDataProcessingRef` on each list. `beginList` cannot carry other list attributes or an absent processing reference; the example reports `ListAttributesNotWritable` instead of silently losing them. Errors remove the new partial output, and an existing destination is never overwritten.
+
+Changing the cached `Record.id`, `index`, or `default_array_length` fields does not change the node attributes that the writer emits. `Builder.record` constructs new record attributes; it does not automatically carry every source attribute. Array replacement likewise needs to preserve unrelated source parameters and update the primitive, compression, and encoded-length declarations. These examples do not supply a general editing helper.
 
 ## Use from a separate package
 
