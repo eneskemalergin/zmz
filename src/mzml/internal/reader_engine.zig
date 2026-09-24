@@ -342,8 +342,6 @@ fn readHeaderInner(self: *StreamReader) Error!void {
     self.scopes[self.scope_count] = try self.captureScope();
     self.scope_count += 1;
     var document = try self.startNode(&self.header_store, .mzml);
-    if (!std.mem.eql(u8, document.attribute("version").?, "1.1.0"))
-        return error.UnsupportedVersion;
     try self.cursor.advance(false);
     const sections = schema.children(.mzml);
     var seen = std.EnumSet(model.Kind).initEmpty();
@@ -483,7 +481,6 @@ fn startNodeFor(self: *StreamReader, storage: *Storage, kind_value: model.Kind, 
         storage,
         event.data.start_element,
         switch (kind_value) {
-            .mzml => "version",
             .referenceable_param_group => "id",
             .spectrum, .chromatogram => "id index defaultArrayLength",
             .spectrum_list, .chromatogram_list => "count",

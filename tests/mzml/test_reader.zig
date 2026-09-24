@@ -1043,7 +1043,7 @@ test "[integration] - [mzML attributes]: preserves extras without requiring unus
 
 test "[failure] - [mzML attributes]: rejects missing returned fields and misplaced groups" {
     for ([_][]const u8{
-        "version='1.1.0'", "id='encoding'", "id='native=a&amp;b'", "index='0'", "defaultArrayLength='1'",
+        "id='encoding'", "id='native=a&amp;b'", "index='0'", "defaultArrayLength='1'",
     }) |attribute| {
         const removed = try std.mem.replaceOwned(u8, std.testing.allocator, support.DOCUMENT, attribute, "");
         defer std.testing.allocator.free(removed);
@@ -1177,6 +1177,38 @@ test "[integration] - [mzML chunks]: retains values across short reads and UTF-1
     }
 }
 
+test "[integration] - [mzML reader]: decodes Latin-1 metadata without changing physical offsets or numeric arrays" {
+    const source = "<?xml version='1.0' encoding='iSo-8859-1'?>" ++ support.HEADER ++
+        "<spectrumList count='1' defaultDataProcessingRef='dp'>" ++
+        "<spectrum id='scan=\xe9' index='0' defaultArrayLength='1'>" ++
+        "<userParam name='\xb5' value='\xff&#x20AC;'/><scanList count='1'><scan spectrumRef='scan=\xe9'/></scanList>" ++
+        support.ARRAYS ++ "</spectrum></spectrumList></run></mzML>";
+    var buffer: [4096]u8 = undefined;
+    for ([_]usize{ 1, 7, buffer.len }) |size| {
+        for ([_]bool{ false, true }) |numeric| {
+            var input: std.testing.Reader = .init(buffer[0..size], &.{.{ .buffer = source }});
+            input.artificial_limit = .limited(size);
+            var reader = try mzml.StreamReader.init(std.testing.allocator, &input.interface, .{});
+            defer reader.deinit();
+            var output = mzml.StreamReader.DecodedArrays.init(std.testing.allocator, .{});
+            defer output.deinit();
+            const record = (if (numeric) try reader.nextDecodedRecord(&output) else try reader.nextRecord()).?;
+            try std.testing.expectEqualStrings("scan=\xc3\xa9", record.id);
+            try std.testing.expectEqualStrings("\xc2\xb5", record.node.params[0].user.name.?);
+            try std.testing.expectEqualStrings("\xc3\xbf\xe2\x82\xac", record.node.params[0].user.value.?);
+            try std.testing.expectEqualStrings(record.id, record.node.child(.scan_list).?.children[0].attribute("spectrumRef").?);
+            try std.testing.expectEqual(@as(u64, std.mem.indexOf(u8, source, "<spectrum id").?), record.node.start_offset);
+            if (numeric) {
+                try std.testing.expectEqual(@as(usize, 2), output.len());
+                try std.testing.expectEqualSlices(f64, &.{1}, output.get(0).?.values.float64);
+            } else {
+                try std.testing.expectEqualStrings("AAAAAAAA8D8=", record.binaryArrays()[0].child(.binary).?.text.?);
+            }
+            try std.testing.expectEqual(null, try reader.nextRecord());
+        }
+    }
+}
+
 test "[integration] - [mzML reader]: retains hierarchy parameters and decodes grouped arrays" {
     var input = std.Io.Reader.fixed(support.DOCUMENT);
     var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
@@ -1304,7 +1336,7 @@ test "[failure] - [mzML reader]: rejects unsafe XML wrong namespaces and malform
     const cases = .{
         .{ "<!DOCTYPE mzML>" ++ support.DOCUMENT, error.DtdForbidden },
         .{ "<mzML xmlns='wrong' version='1.1.0'/>", error.WrongNamespace },
-        .{ "<mzML xmlns='http://psi.hupo.org/ms/mzml' version='1.0.0'/>", error.UnsupportedVersion },
+        .{ "<mzML xmlns='http://psi.hupo.org/ms/mzml' version='1.0.0'/>", error.InvalidStructure },
         .{ "<?xml version='1.1'?>" ++ support.DOCUMENT, error.UnsupportedVersion },
         .{ "<mzML xmlns='http://psi.hupo.org/ms/mzml' version='1.1.0'/>", error.InvalidStructure },
     };

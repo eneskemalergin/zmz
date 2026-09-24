@@ -25,7 +25,6 @@ pub const Error = xml.WriterError || cv.ValueError || base64.Error || schema.Err
     PayloadNotRetained,
     InvalidIndex,
     InvalidState,
-    UnsupportedVersion,
     LimitExceeded,
     FailedState,
     DuplicateId,

@@ -530,6 +530,65 @@ test "[integration] - [mzML index]: restores inherited namespaces across repeate
     }
 }
 
+test "[integration] - [mzML index]: reads Latin-1 offsets and rewrites metadata as UTF-8" {
+    const allocator = std.testing.allocator;
+    var source: std.Io.Writer.Allocating = .init(allocator);
+    defer source.deinit();
+    try source.writer.writeAll("<?xml version='1.0' encoding='ISO-8859-1'?><indexedmzML xmlns='http://psi.hupo.org/ms/mzml'>" ++
+        support.HEADER ++ "<spectrumList count='2' defaultDataProcessingRef='dp'>");
+    var offsets: [2]usize = undefined;
+    for ([_]u8{ 0xe9, 0xff }, 0..) |byte, i| {
+        offsets[i] = source.written().len;
+        try source.writer.print("<spectrum id='scan={c}' index='{d}' defaultArrayLength='1'><userParam name='note' value='\xb5'/>" ++
+            support.ARRAYS ++ "</spectrum>", .{ byte, i });
+    }
+    try source.writer.writeAll("</spectrumList></run></mzML>");
+    const index_offset = source.written().len;
+    try source.writer.print("<indexList count='1'><index name='spectrum'>" ++
+        "<offset idRef='scan=\xe9'>{d}</offset><offset idRef='scan=\xff'>{d}</offset>" ++
+        "</index></indexList><indexListOffset>{d}</indexListOffset><fileChecksum/></indexedmzML>", .{ offsets[0], offsets[1], index_offset });
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    const file = try directory.dir.createFile(std.testing.io, "latin1.mzML", .{ .read = true });
+    defer file.close(std.testing.io);
+    try file.writeStreamingAll(std.testing.io, source.written());
+    for ([_]mzml.IndexedReader.Source{ .{ .bytes = source.written() }, .{ .file = .{ .handle = file, .io = std.testing.io } } }) |input| {
+        for (std.enums.values(mzml.IndexedReader.Policy)) |policy| {
+            var index = try mzml.IndexedReader.build(allocator, input, .{ .policy = policy });
+            defer index.deinit();
+            var output = mzml.StreamReader.DecodedArrays.init(allocator, .{});
+            defer output.deinit();
+            for ([_]usize{ 0, 1, 0, 1 }) |position| {
+                const id = ([_][]const u8{ "scan=\xc3\xa9", "scan=\xc3\xbf" })[position];
+                var retained = (try index.byId(allocator, id)).?;
+                defer retained.deinit();
+                try std.testing.expectEqual(@as(u64, offsets[position]), retained.value.node.start_offset);
+                try std.testing.expectEqualStrings("\xc2\xb5", retained.value.node.params[0].user.value.?);
+                var decoded = (try index.byIdDecoded(allocator, id, &output)).?;
+                defer decoded.deinit();
+                try expectDecodedRecord(retained.value, index.header().groups, decoded.value, &output);
+            }
+        }
+    }
+    for ([_]bool{ false, true }) |indexed| {
+        var rewritten: std.Io.Writer.Allocating = .init(allocator);
+        defer rewritten.deinit();
+        try support.rewriteDocument(allocator, source.written(), &rewritten.writer, indexed);
+        try std.testing.expect(std.mem.startsWith(u8, rewritten.written(), "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"));
+        var index = try mzml.IndexedReader.build(allocator, .{ .bytes = rewritten.written() }, .{ .policy = if (indexed) .open_embedded else .rebuild });
+        defer index.deinit();
+        var input = std.Io.Reader.fixed(source.written());
+        var reader = try mzml.StreamReader.init(allocator, &input, .{});
+        defer reader.deinit();
+        try support.expectNode((try reader.readHeader()).document, index.header().document);
+        while (try reader.nextRecord()) |expected| {
+            var actual = (try index.byId(allocator, expected.id)).?;
+            defer actual.deinit();
+            try support.expectNode(expected.node, actual.value.node);
+        }
+    }
+}
+
 test "[integration] - [mzML indexed lookup]: retains records and recovers after caller allocation failure" {
     try support.checkLookupAllocator(std.testing.allocator);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, support.checkLookupAllocator, .{});

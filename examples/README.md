@@ -125,6 +125,6 @@ This uses a local package dependency, including the library's build options. It 
 
 ## Current input limits
 
-These examples expose existing library behavior, not broader format compatibility. Reading and writing currently accept mzML `1.1.0` in the stable namespace. UTF-8 and UTF-16 XML are handled; ISO-8859-1 and genuine mzML 1.0 structures are not. XML and mzML version failures both use `UnsupportedVersion`; a legacy namespace can return `WrongNamespace`. A schema filename alone does not establish that the input is readable.
+The reader handles XML 1.0 in UTF-8, UTF-16, and declared ISO-8859-1. Returned text and written XML use UTF-8; source offsets count original bytes. The mzML version attribute is preserved, including empty or absent values, without rejecting its value. The stable namespace and modeled elements still determine what can be read. Genuine mzML 1.0.0 namespaces and structures remain unsupported. `UnsupportedVersion` concerns the XML declaration; a legacy namespace returns `WrongNamespace`. A schema filename alone does not establish that the input is readable.
 
 The stream example prints the reader's first error, byte offset, and element when available, then returns the error. No example prechecks the whole file or silently skips a failed record. Whole-file gzip is not handled here.

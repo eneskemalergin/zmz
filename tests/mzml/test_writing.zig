@@ -615,3 +615,36 @@ test "[failure] - [mzML file writer]: releases partial allocations with unknown 
     for ([_]bool{ false, true }) |indexed|
         try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.write, .{ file, indexed });
 }
+
+test "[integration] - [mzML declarations]: preserves version metadata across reading construction and writing" {
+    for ([_]?[]const u8{ null, "", "1.0", "1.0.0", "1.1.0", "1.1.1", "1.2.0" }) |version| {
+        var attribute: [64]u8 = undefined;
+        const declaration = if (version) |value| try std.fmt.bufPrint(&attribute, "version='{s}'", .{value}) else "";
+        const source = try std.mem.replaceOwned(u8, std.testing.allocator, support.DOCUMENT, "version='1.1.0'", declaration);
+        defer std.testing.allocator.free(source);
+        var input = std.Io.Reader.fixed(source);
+        var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+        defer reader.deinit();
+        const header = try reader.readHeader();
+        try std.testing.expectEqualDeep(version, header.document.attribute("version"));
+        var builder = mzml.Builder.init(std.testing.allocator, .{});
+        defer builder.deinit();
+        try support.expectNode(header.document, (try builder.header(header.*)).document);
+        for ([_]bool{ false, true }) |indexed| {
+            var bytes: [8192]u8 = undefined;
+            var sink = std.Io.Writer.fixed(&bytes);
+            try support.rewriteDocument(std.testing.allocator, source, &sink, indexed);
+            var index = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = sink.buffered() }, .{
+                .policy = if (indexed) .open_embedded else .rebuild,
+            });
+            defer index.deinit();
+            try std.testing.expectEqualDeep(version, index.header().document.attribute("version"));
+            try std.testing.expectEqualDeep([2]usize{ 1, 1 }, index.counts);
+            var decoded = mzml.StreamReader.DecodedArrays.init(std.testing.allocator, .{});
+            defer decoded.deinit();
+            var record = (try index.byIdDecoded(std.testing.allocator, "native=a&b", &decoded)).?;
+            defer record.deinit();
+            try std.testing.expectEqualSlices(f64, &.{1}, decoded.get(0).?.values.float64);
+        }
+    }
+}

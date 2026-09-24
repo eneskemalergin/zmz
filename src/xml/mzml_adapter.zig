@@ -43,6 +43,7 @@ pub const XmlVersion = enum {
 
 const Encoding = enum {
     utf8,
+    latin1,
     utf16_le,
     utf16_be,
 };
@@ -346,7 +347,7 @@ const Source = struct {
         }
 
         const first = try self.readByte();
-        if (first < 0x80) return .{ .value = first, .start = start, .end = self.position };
+        if (first < 0x80 or self.encoding == .latin1) return .{ .value = first, .start = start, .end = self.position };
         const length: usize = std.unicode.utf8ByteSequenceLength(first) catch return error.InvalidEncoding;
         if (length < 2 or length > 4) return error.InvalidEncoding;
         var bytes: [4]u8 = undefined;
@@ -389,9 +390,10 @@ const Source = struct {
         self.borrowed_len = 0;
     }
 
-    fn peekUtf8(self: *Source) ParserError!?[]const u8 {
+    fn peekSingleByte(self: *Source) ParserError!?[]const u8 {
         try self.ensureDetected();
-        if (self.encoding != .utf8 or self.probe_pos != self.probe_len or self.pending_len != 0) return null;
+        if ((self.encoding != .utf8 and self.encoding != .latin1) or
+            self.probe_pos != self.probe_len or self.pending_len != 0) return null;
         const reader = self.reader orelse return error.EndOfStream;
         return reader.peekGreedy(1) catch |err| switch (err) {
             error.EndOfStream => null,
@@ -653,7 +655,7 @@ pub const Cursor = struct {
     }
 
     fn skipBufferedWhitespace(self: *Cursor) void {
-        if (self.source.encoding != .utf8 or self.source.probe_pos != self.source.probe_len or
+        if ((self.source.encoding != .utf8 and self.source.encoding != .latin1) or self.source.probe_pos != self.source.probe_len or
             self.source.pending_len != 0) return;
         const reader = self.source.reader orelse return;
         const bytes = reader.buffered();
@@ -809,7 +811,7 @@ pub const Cursor = struct {
 
     fn skipWhitespace(self: *Cursor) Error!void {
         while (true) {
-            if (try self.source.peekUtf8()) |bytes| {
+            if (try self.source.peekSingleByte()) |bytes| {
                 var length: usize = 0;
                 while (length < bytes.len and isXmlWhitespace(bytes[length])) : (length += 1) {}
                 if (length != 0) {
@@ -835,7 +837,7 @@ pub const Cursor = struct {
         var segment_start = true;
         while (true) {
             if (have_character and !segment_start) {
-                if (try self.source.peekUtf8()) |bytes| {
+                if (try self.source.peekSingleByte()) |bytes| {
                     const bound = @min(bytes.len, self.max_attribute_bytes -| self.event_bytes.items.len);
                     var length: usize = 0;
                     while (length < bound and isAsciiNameChar(bytes[length])) : (length += 1) {}
@@ -888,7 +890,7 @@ pub const Cursor = struct {
     fn parseAttributeValue(self: *Cursor, quote: u21) Error!Range {
         const start = self.event_bytes.items.len;
         while (true) {
-            if (try self.source.peekUtf8()) |bytes| {
+            if (try self.source.peekSingleByte()) |bytes| {
                 const bound = @min(bytes.len, self.max_attribute_bytes -| self.event_bytes.items.len);
                 var length: usize = 0;
                 while (length < bound) : (length += 1) {
@@ -986,7 +988,7 @@ pub const Cursor = struct {
     }
 
     fn readBufferedStartElement(self: *Cursor, start_offset: u64) Error!?Event {
-        if (self.source.encoding != .utf8 or self.source.probe_pos != self.source.probe_len or
+        if ((self.source.encoding != .utf8 and self.source.encoding != .latin1) or self.source.probe_pos != self.source.probe_len or
             self.source.pending_len != 0) return null;
         const reader = self.source.reader orelse return null;
         const bytes = reader.buffered();
@@ -1072,7 +1074,7 @@ pub const Cursor = struct {
             if (self.attribute_ranges.items.len == self.max_attributes) return error.LimitExceeded;
             const attribute_name = try self.parseQName();
             const quote: u21 = opening: {
-                if (try self.source.peekUtf8()) |bytes| {
+                if (try self.source.peekSingleByte()) |bytes| {
                     if (bytes.len >= 2 and bytes[0] == '=' and (bytes[1] == '\'' or bytes[1] == '"')) {
                         const value = bytes[1];
                         self.source.borrowed_len = 2;
@@ -1277,7 +1279,7 @@ pub const Cursor = struct {
         const start = self.source.currentOffset();
         while (self.text_bytes.items.len < TEXT_CHUNK_BYTES) {
             if (self.normal_text_brackets == 0) {
-                if (try self.source.peekUtf8()) |bytes| {
+                if (try self.source.peekSingleByte()) |bytes| {
                     const length = ordinaryTextRun(bytes, TEXT_CHUNK_BYTES - self.text_bytes.items.len);
                     if (length != 0) {
                         // Keep logical text chunks unchanged across input refills.
@@ -1504,7 +1506,11 @@ pub const Cursor = struct {
             if (std.ascii.eqlIgnoreCase(value, "UTF-8")) {
                 if (self.source.encoding != .utf8) return error.InvalidEncoding;
             } else if (std.ascii.eqlIgnoreCase(value, "UTF-16")) {
-                if (self.source.encoding == .utf8) return error.InvalidEncoding;
+                if (self.source.encoding != .utf16_le and self.source.encoding != .utf16_be) return error.InvalidEncoding;
+            } else if (std.ascii.eqlIgnoreCase(value, "ISO-8859-1")) {
+                if (self.source.encoding != .utf8 or
+                    std.mem.startsWith(u8, self.source.probe[0..self.source.probe_len], "\xef\xbb\xbf")) return error.InvalidEncoding;
+                self.source.encoding = .latin1;
             } else {
                 return error.UnsupportedEncoding;
             }
@@ -1969,6 +1975,62 @@ test "[unit] - [mzML XML cursor]: skips declarations, comments, processing instr
     try std.testing.expectEqualStrings("p:mzML", cursor.current.?.data.end_element.name.raw);
     try cursor.advance(false);
     try std.testing.expectEqual(@as(?Event, null), cursor.current);
+}
+
+test "[property] - [mzML XML cursor]: decodes Latin-1 attributes text and CDATA across refills" {
+    var latin1: [128]u8 = undefined;
+    var utf8: [256]u8 = undefined;
+    for (&latin1, 0..) |*byte, i| {
+        byte.* = @intCast(128 + i);
+        utf8[2 * i] = 0xc2 + @as(u8, @intCast(i / 64));
+        utf8[2 * i + 1] = 0x80 + @as(u8, @intCast(i % 64));
+    }
+    const source = try std.fmt.allocPrint(std.testing.allocator, "<?xml version='1.0' encoding='ISO-8859-1'?><mzML xmlns='" ++ NAMESPACE ++
+        "' value='{s}'>{s}<![CDATA[{s}]]></mzML>", .{ latin1, latin1, latin1 });
+    defer std.testing.allocator.free(source);
+    var buffer: [4096]u8 = undefined;
+    for ([_]usize{ 1, 7, buffer.len }) |size| {
+        var input: std.testing.Reader = .init(buffer[0..size], &.{.{ .buffer = source }});
+        input.artificial_limit = .limited(size);
+        var cursor = try Cursor.init(std.testing.allocator, &input.interface, 64, 64, 1024);
+        defer cursor.deinit();
+        try cursor.advance(false);
+        try std.testing.expectEqualStrings(&utf8, cursor.current.?.data.start_element.attributeRaw("value").?.value);
+        try cursor.advance(true);
+        try std.testing.expectEqualStrings(&utf8, cursor.current.?.data.text.bytes);
+        try std.testing.expectEqual(@as(u64, latin1.len), cursor.current.?.span.end - cursor.current.?.span.start);
+        try cursor.advance(true);
+        try std.testing.expectEqualStrings(&utf8, cursor.current.?.data.text.bytes);
+        try cursor.advance(false);
+        try std.testing.expectEqual(@as(u64, source.len - "</mzML>".len), cursor.current.?.span.start);
+        try cursor.advance(false);
+        try std.testing.expectEqual(null, cursor.current);
+    }
+}
+
+test "[failure] - [mzML XML cursor]: keeps encoding errors distinct from Latin-1 decoding" {
+    const cases = .{
+        .{ "<?xml version='1.0' encoding='windows-1252'?><mzML/>", error.UnsupportedEncoding },
+        .{ "\xef\xbb\xbf<?xml version='1.0' encoding='ISO-8859-1'?><mzML/>", error.InvalidEncoding },
+        .{ "<?xml version='1.0' encoding='UTF-8'?><mzML value='\xe9'/>", error.InvalidEncoding },
+        .{ "<?xml version='1.0' encoding='ISO-8859-1'?><mzML value='\x00'/>", error.InvalidXml },
+    };
+    inline for (cases) |case| {
+        var input = std.Io.Reader.fixed(case[0]);
+        var cursor = try Cursor.init(std.testing.allocator, &input, 64, 64, 1024);
+        defer cursor.deinit();
+        try std.testing.expectError(case[1], cursor.advance(false));
+    }
+    const declaration = "<?xml version='1.0' encoding='ISO-8859-1'?><mzML/>";
+    var bytes: [2 + declaration.len * 2]u8 = undefined;
+    for ([_]std.builtin.Endian{ .little, .big }) |endian| {
+        std.mem.writeInt(u16, bytes[0..2], 0xfeff, endian);
+        for (declaration, 0..) |byte, i| std.mem.writeInt(u16, bytes[2 + i * 2 ..][0..2], byte, endian);
+        var input = std.Io.Reader.fixed(&bytes);
+        var cursor = try Cursor.init(std.testing.allocator, &input, 64, 64, 1024);
+        defer cursor.deinit();
+        try std.testing.expectError(error.InvalidEncoding, cursor.advance(false));
+    }
 }
 
 test "[unit] - [mzML XML cursor]: rejects malformed names, namespace declarations, and XML targets" {

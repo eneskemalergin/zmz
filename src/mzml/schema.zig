@@ -88,7 +88,6 @@ pub const Error = error{
     InvalidStructure,
     MissingAttribute,
     PayloadNotRetained,
-    UnsupportedVersion,
     LimitExceeded,
     InvalidOptions,
 };
@@ -96,8 +95,6 @@ pub const Error = error{
 pub fn checkHeader(header: model.Header) Error!void {
     if (header.document.kind != .mzml or header.run.kind != .run or header.run.children.len != 0)
         return error.InvalidStructure;
-    if (!std.mem.eql(u8, header.document.attribute("version") orelse "", "1.1.0"))
-        return error.UnsupportedVersion;
     if (header.document.text != null or header.run.text != null) return error.InvalidStructure;
 }
 
