@@ -315,6 +315,9 @@ pub const RecordList = struct {
 };
 
 /// A spectrum or chromatogram with exact source identity and its complete child hierarchy.
+/// Identity and length fields are parsed snapshots, not setters for node.attributes.
+/// Writers consume node; arrays() uses default_array_length. Edit caller-owned node views
+/// for writing, and keep cached fields consistent if using the edited Record for reading.
 pub const Record = struct {
     node: Node,
     id: []const u8,

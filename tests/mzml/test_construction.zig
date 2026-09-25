@@ -4,6 +4,149 @@ const std = @import("std");
 const mzml = @import("zmz").mzml;
 const support = @import("support.zig");
 
+fn replaceArrayAllocated(allocator: std.mem.Allocator) !void {
+    const params = [_]mzml.cv.Entry{
+        .{ .cv = .{ .cv_ref = "MS", .accession = mzml.model.Terms.INTENSITY_ARRAY, .name = "intensity", .unit = .{ .name = "source unit" } } },
+        .{ .cv = .{ .cv_ref = "MS", .accession = .{ .raw = "MS:1000523" }, .name = "64-bit float" } },
+        .{ .cv = .{ .cv_ref = "MS", .accession = .{ .raw = "MS:1000576" }, .name = "no compression" } },
+        .{ .user = .{ .name = "group note", .value = "keep" } },
+    };
+    const groups = [_]mzml.cv.Group{.{ .id = "encoding", .entries = &params }};
+    const source: mzml.model.Node = .{
+        .kind = .binary_data_array,
+        .attributes = &.{
+            .{ .name = "dataProcessingRef", .value = "array-processing" },
+            .{ .name = "arrayLength", .value = "3" },
+            .{ .name = "extra", .value = "keep" },
+        },
+        .params = &.{ .{ .group_ref = "encoding" }, .{ .user = .{ .name = "local note", .value = "" } } },
+        .children = &.{.{ .kind = .binary, .attributes = &.{.{ .name = "extra", .value = "binary" }}, .text = "A" ** 8192 }},
+    };
+    var builder = mzml.Builder.init(allocator, .{ .bytes = 4096 });
+    defer builder.deinit();
+    var compressor = try mzml.zlib.Compressor.init(allocator, .fastest);
+    defer compressor.deinit();
+    try std.testing.expectError(error.MissingCompressor, builder.prepareArrayFrom(f32, &.{1}, source, &groups, .{ .pipeline = .zlib }, .{ .transport = &.{}, .transformed = &.{} }, null));
+    var retry_scratch: [16]u8 = undefined;
+    for (0..2) |_| try std.testing.expectError(error.OutputTooSmall, builder.prepareArrayFrom(f32, &.{1}, source, &groups, .{ .pipeline = .zlib }, .{ .transport = &.{}, .transformed = &retry_scratch }, &compressor));
+    for ([_]mzml.arrays.Pipeline{ .none, .zlib }) |pipeline| {
+        for ([_]usize{ 0, 2 }) |length| {
+            builder.reset();
+            const values = [_]f32{ 2, 4 };
+            var wire: [128]u8 = undefined;
+            var scratch: [128]u8 = undefined;
+            const result = try builder.prepareArrayFrom(f32, values[0..length], source, &groups, .{ .pipeline = pipeline }, .{
+                .transport = &wire,
+                .transformed = &scratch,
+            }, &compressor);
+            try std.testing.expectEqual(length, result.array.length);
+            try std.testing.expect(result.array.is_default);
+            try std.testing.expectEqual(null, result.array.node.child(.binary).?.text);
+            try std.testing.expectEqualDeep(source.children[0].attributes, result.array.node.children[0].attributes);
+            try std.testing.expectEqualStrings("array-processing", result.array.node.attribute("dataProcessingRef").?);
+            try std.testing.expect(source.attribute("dataProcessingRef").?.ptr != result.array.node.attribute("dataProcessingRef").?.ptr);
+            try std.testing.expectEqualStrings("keep", result.array.node.attribute("extra").?);
+            try std.testing.expectEqual(length, try mzml.cv.parseInteger(usize, result.array.node.attribute("arrayLength")));
+            try std.testing.expectEqual(try mzml.base64.encodedSize(result.wire.len), try mzml.cv.parseInteger(usize, result.array.node.attribute("encodedLength")));
+            try std.testing.expectEqualDeep(mzml.model.Encoding{ .primitive = .float32, .pipeline = pipeline }, try mzml.model.arrayEncoding(result.array.node, &.{}));
+            try std.testing.expectEqual(@as(usize, 5), result.array.node.params.len);
+            try std.testing.expectEqualDeep(params[0], result.array.node.params[0]);
+            try std.testing.expectEqualDeep(params[3], result.array.node.params[3]);
+            try std.testing.expectEqualDeep(source.params[1], result.array.node.params[4]);
+            try std.testing.expectEqualStrings("MS:1000576", groups[0].entries[2].cv.accession.?.raw);
+            var decoded: [2]f32 = undefined;
+            try mzml.arrays.decodeWire(f32, decoded[0..length], result.wire, pipeline, &.{}, .{});
+            try std.testing.expectEqualSlices(f32, values[0..length], decoded[0..length]);
+        }
+    }
+}
+
+test "[integration] - [array replacement]: preserves source metadata while changing values and encoding" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, replaceArrayAllocated, .{});
+}
+
+test "[integration] - [array replacement]: returns metadata and allocation errors without dropping children" {
+    var input = std.Io.Reader.fixed(support.DOCUMENT);
+    var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+    defer reader.deinit();
+    const header = try reader.readHeader();
+    const source = (try reader.nextRecord()).?.binaryArrays()[0];
+    var builder = mzml.Builder.init(std.testing.allocator, .{});
+    defer builder.deinit();
+    const scratch: mzml.arrays.Scratch = .{ .transport = &.{}, .transformed = &.{} };
+    try std.testing.expectError(error.MissingGroup, builder.prepareArrayFrom(f64, &.{1}, source, &.{}, .{}, scratch, null));
+    var extra_child = source;
+    extra_child.children = &.{ source.children[0], .{ .kind = .binary } };
+    try std.testing.expectError(error.InvalidStructure, builder.prepareArrayFrom(f64, &.{1}, extra_child, header.groups, .{}, scratch, null));
+    var limited = mzml.Builder.init(std.testing.allocator, .{ .bytes = 1 });
+    defer limited.deinit();
+    try std.testing.expectError(error.LimitExceeded, limited.prepareArrayFrom(f64, &.{1}, source, header.groups, .{}, scratch, null));
+}
+
+test "[integration] - [record editing]: changes values and length while retaining source references" {
+    const source = support.HEADER ++ "<spectrumList count='1' defaultDataProcessingRef='dp'>" ++
+        "<spectrum id='scan=1' index='0' defaultArrayLength='1' dataProcessingRef='special' sourceFileRef='source' spotID='spot'>" ++
+        "<userParam name='record note' value='keep'/><binaryDataArrayList count='1' extra='kept'>" ++
+        "<binaryDataArray encodedLength='12' dataProcessingRef='array-processing'>" ++
+        "<referenceableParamGroupRef ref='encoding'/>" ++
+        "<cvParam cvRef='MS' accession='MS:1000515' name='intensity array'/>" ++
+        "<userParam name='array note' value='keep'/><binary>AAAAAAAA8D8=</binary>" ++
+        "</binaryDataArray></binaryDataArrayList></spectrum></spectrumList></run></mzML>";
+    var input = std.Io.Reader.fixed(source);
+    var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+    defer reader.deinit();
+    const header = try reader.readHeader();
+    var decoded = mzml.StreamReader.DecodedArrays.init(std.testing.allocator, .{});
+    defer decoded.deinit();
+    const original = (try reader.nextDecodedRecord(&decoded)).?;
+    const values = [_]f64{ decoded.get(0).?.values.float64[0] * 2, 3 };
+    const old_array = original.binaryArrays()[0];
+    var builder = mzml.Builder.init(std.testing.allocator, .{});
+    defer builder.deinit();
+    var compressor = try mzml.zlib.Compressor.init(std.testing.allocator, .fastest);
+    defer compressor.deinit();
+    var wire_storage: [128]u8 = undefined;
+    var transformed: [16]u8 = undefined;
+    const prepared = try builder.prepareArrayFrom(f64, &values, old_array, header.groups, .{ .pipeline = .zlib }, .{
+        .transport = &wire_storage,
+        .transformed = &transformed,
+    }, &compressor);
+    try std.testing.expectEqual(null, prepared.array.node.attribute("arrayLength"));
+    try std.testing.expectError(error.InvalidArrayLength, builder.preparedRecord(.spectrum, original.id, 0, 1, &.{}, &.{}, &.{prepared.array}));
+    var attributes: [6]mzml.model.Attribute = undefined;
+    @memcpy(&attributes, original.node.attributes);
+    for (&attributes) |*attribute| {
+        if (std.mem.eql(u8, attribute.name, "defaultArrayLength")) attribute.value = "2";
+    }
+    var changed_list = original.node.child(.binary_data_array_list).?;
+    changed_list.children = &.{prepared.array.node};
+    var changed_record = original.node;
+    changed_record.attributes = &attributes;
+    changed_record.children = &.{changed_list};
+    var sink: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer sink.deinit();
+    var writer = try mzml.Writer.initIndexed(std.testing.allocator, &sink.writer, .{}, .{});
+    defer writer.deinit();
+    try writer.writeHeader(header.*);
+    try writer.beginList(.spectrum_list, 1, "dp");
+    try writer.writeRecordWithArrays(changed_record, &.{prepared.wire});
+    try writer.endList();
+    try writer.finish();
+    var index = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = sink.written() }, .{});
+    defer index.deinit();
+    var fetched = (try index.byIdDecoded(std.testing.allocator, "scan=1", &decoded)).?;
+    defer fetched.deinit();
+    try std.testing.expectEqualSlices(f64, &.{ 2, 3 }, decoded.get(0).?.values.float64);
+    try std.testing.expectEqual(.zlib, decoded.get(0).?.encoding.pipeline);
+    try std.testing.expectEqual(@as(usize, 2), fetched.value.default_array_length);
+    try std.testing.expectEqualDeep(changed_record.attributes, fetched.value.node.attributes);
+    try std.testing.expectEqualDeep(original.node.params, fetched.value.node.params);
+    try std.testing.expectEqualDeep(changed_list.attributes, fetched.value.node.child(.binary_data_array_list).?.attributes);
+    try std.testing.expectEqualStrings("array-processing", fetched.value.binaryArrays()[0].attribute("dataProcessingRef").?);
+    try std.testing.expectEqualDeep(old_array.params[2], fetched.value.binaryArrays()[0].params[3]);
+    try std.testing.expectEqualDeep(header.groups, index.header().groups);
+}
+
 test "[integration] - [prepared construction]: retains metadata and borrows primitive wire" {
     var builder = mzml.Builder.init(std.testing.allocator, .{});
     defer builder.deinit();

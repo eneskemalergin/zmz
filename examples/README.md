@@ -58,22 +58,27 @@ zig-out/bin/mzml-indexed example-indexed.mzML 'scan=1'
 
 Builder reset releases its metadata. The example resets only after the header or record has been written. `Writer.finish` closes the document and emits the optional index; the caller must then flush the sink. `deinit` does neither. Output creation refuses an existing path, and a failed write removes its newly created partial output.
 
-## Copy retained payloads
+## Copy, filter, or reencode
 
 ```sh
 zig-out/bin/mzml-rewrite input.mzML copy.mzML
 zig-out/bin/mzml-rewrite input.mzML ms1.mzML --ms1
+zig-out/bin/mzml-rewrite input.mzML zlib.mzML --zlib
 ```
 
-[rewrite.zig](rewrite.zig) writes a new indexed file while retaining source record metadata and binary text. It does not decode or re-encode arrays, so an unfamiliar codec can be copied. XML spelling and the old index wrapper are not reproduced.
+[rewrite.zig](rewrite.zig) writes a new indexed file. The default and `--ms1` modes retain source record metadata and binary text without decoding arrays, so an unfamiliar codec can be copied. XML spelling and the old index wrapper are not reproduced.
 
 The default copy requires accurate declared list counts and consecutive zero-based record indexes. `--ms1` keeps spectra whose MS level is 1, skips spectra without an MS level, and keeps all chromatograms. It reads the input once and assigns consecutive output spectrum indexes while preserving all other record attributes, IDs, references, and binary text. References to removed spectra remain unchanged; choosing how to handle them is the caller's decision.
 
 Filtering uses `Writer.initFile` and a null spectrum count in `beginList`. `endList` patches a fixed-width, zero-padded decimal count without moving any records. Plain file output needs write access; indexed file output also needs read access because `finish` reads the written prefix once to compute its checksum. This adds an output read, not another input scan or a retained copy of the file. `init` and `initIndexed` still need exact counts and work with forward-only sinks. Pass null index limits to `initFile` for plain output or `.{}` for indexed output.
 
-Both modes handle empty or absent lists and require a present `defaultDataProcessingRef` on each list. `beginList` cannot carry other list attributes or an absent processing reference; the example reports `ListAttributesNotWritable` instead of silently losing them. Errors remove the new partial output, and an existing destination is never overwritten.
+`--zlib` streams decoded arrays through `Builder.prepareArrayFrom` and `writeRecordWithArrays`. It keeps all numeric values, record attributes, references, and unrelated array parameters. Numpress values are written as decoded `f64` values with zlib, without another lossy conversion. Reencoded arrays expand group references into local parameters; the header's groups remain unchanged. Each compressed destination stays alive until its record is written and is reused on later records. Buffer growth is capped at `arrays.Limits.array_bytes` (192 MiB by default).
 
-Changing the cached `Record.id`, `index`, or `default_array_length` fields does not change the node attributes that the writer emits. `Builder.record` constructs new record attributes; it does not automatically carry every source attribute. Array replacement likewise needs to preserve unrelated source parameters and update the primitive, compression, and encoded-length declarations. These examples do not supply a general editing helper.
+All modes handle empty or absent lists and require a present `defaultDataProcessingRef` on each list. `beginList` cannot carry other list attributes or an absent processing reference; the example reports `ListAttributesNotWritable` instead of silently losing them. Errors remove the new partial output, and an existing destination is never overwritten.
+
+For metadata edits, copy the affected attribute or child slices into caller-owned storage and give the resulting node to the writer, as `--ms1` does for indexes. Changing the cached `Record.id`, `index`, or `default_array_length` fields alone does not change emitted XML. `Builder.record` and `preparedRecord` construct new record attributes; they are not source-record editors.
+
+For numeric edits, supply your changed values to `prepareArrayFrom`. It copies the source array's metadata without its old payload, replaces primitive/codec declarations, and updates lengths. If a default array omits `arrayLength`, update the record's `defaultArrayLength` when resizing it. Update any scientific summary parameters affected by your edit yourself; reencoding alone does not change those values. Keep cached fields consistent too if you use the edited `Record` for reading.
 
 ## Use from a separate package
 

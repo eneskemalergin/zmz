@@ -2,6 +2,8 @@
 //! With --ms1, filters spectra in one input pass and fills in the surviving count.
 //! Chromatograms are kept. Record IDs and references stay unchanged; only surviving
 //! spectrum indexes are reassigned. Lists need count and defaultDataProcessingRef.
+//! With --zlib, decodes all arrays and reencodes their values losslessly with zlib.
+//! Source metadata is kept; array group references become local parameters.
 
 const std = @import("std");
 const mzml = @import("zmz").mzml;
@@ -9,8 +11,9 @@ const mzml = @import("zmz").mzml;
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     const ms1 = args.len == 4 and std.mem.eql(u8, args[3], "--ms1");
-    if (args.len != 3 and !ms1) {
-        try std.Io.File.stderr().writeStreamingAll(init.io, "usage: mzml-rewrite INPUT.mzML OUTPUT.mzML [--ms1]\n");
+    const reencode = args.len == 4 and std.mem.eql(u8, args[3], "--zlib");
+    if (args.len != 3 and !ms1 and !reencode) {
+        try std.Io.File.stderr().writeStreamingAll(init.io, "usage: mzml-rewrite INPUT.mzML OUTPUT.mzML [--ms1|--zlib]\n");
         return error.InvalidArguments;
     }
     const dir = std.Io.Dir.cwd();
@@ -33,8 +36,12 @@ pub fn main(init: std.process.Init) !void {
     defer writer.deinit();
     var attributes: std.ArrayList(mzml.model.Attribute) = .empty;
     defer attributes.deinit(init.gpa);
+    var decoded = mzml.StreamReader.DecodedArrays.init(init.gpa, .{});
+    defer decoded.deinit();
+    var encoder: ?Reencoder = if (reencode) try Reencoder.init(init.gpa) else null;
+    defer if (encoder) |*value| value.deinit();
     try writer.writeHeader(header.*);
-    var current = try reader.nextRecord();
+    var current = if (reencode) try reader.nextDecodedRecord(&decoded) else try reader.nextRecord();
     inline for (.{ mzml.model.Kind.spectrum_list, mzml.model.Kind.chromatogram_list }) |kind| {
         const descriptor = if (kind == .spectrum_list) header.spectrum_list else header.chromatogram_list;
         if (descriptor) |list| {
@@ -63,10 +70,13 @@ pub fn main(init: std.process.Init) !void {
                         }
                         emitted.attributes = attributes.items;
                     }
-                    try writer.writeRecord(emitted);
+                    if (encoder) |*value|
+                        try value.write(&writer, emitted, &decoded, header.groups)
+                    else
+                        try writer.writeRecord(emitted);
                     written += 1;
                 }
-                current = try reader.nextRecord();
+                current = if (reencode) try reader.nextDecodedRecord(&decoded) else try reader.nextRecord();
             }
             try writer.endList();
         }
@@ -75,3 +85,74 @@ pub fn main(init: std.process.Init) !void {
     try writer.finish();
     try output.interface.flush();
 }
+
+const Reencoder = struct {
+    allocator: std.mem.Allocator,
+    builder: mzml.Builder,
+    compressor: mzml.zlib.Compressor,
+    storage: std.ArrayList(std.ArrayList(u8)) = .empty,
+    transformed: std.ArrayList(u8) = .empty,
+    arrays: std.ArrayList(mzml.model.Node) = .empty,
+    children: std.ArrayList(mzml.model.Node) = .empty,
+    wires: std.ArrayList([]const u8) = .empty,
+
+    fn init(allocator: std.mem.Allocator) !Reencoder {
+        return .{ .allocator = allocator, .builder = .init(allocator, .{}), .compressor = try .init(allocator, .fastest) };
+    }
+
+    fn deinit(self: *Reencoder) void {
+        for (self.storage.items) |*buffer| buffer.deinit(self.allocator);
+        self.storage.deinit(self.allocator);
+        self.transformed.deinit(self.allocator);
+        self.arrays.deinit(self.allocator);
+        self.children.deinit(self.allocator);
+        self.wires.deinit(self.allocator);
+        self.compressor.deinit();
+        self.builder.deinit();
+    }
+
+    fn write(self: *Reencoder, writer: *mzml.Writer, source: mzml.model.Node, decoded: *const mzml.StreamReader.DecodedArrays, groups: []const mzml.cv.Group) !void {
+        self.builder.reset();
+        const source_arrays = if (source.child(.binary_data_array_list)) |list| list.children else &.{};
+        try self.storage.ensureTotalCapacity(self.allocator, source_arrays.len);
+        while (self.storage.items.len < source_arrays.len) self.storage.appendAssumeCapacity(.empty);
+        try self.arrays.resize(self.allocator, source_arrays.len);
+        try self.wires.resize(self.allocator, source_arrays.len);
+        for (source_arrays, self.arrays.items, self.wires.items, 0..) |array, *node, *wire, i| {
+            const prepared = switch (decoded.get(i).?.values) {
+                inline else => |values| try self.prepare(@typeInfo(@TypeOf(values)).pointer.child, values, array, groups, &self.storage.items[i]),
+            };
+            node.* = prepared.array.node;
+            wire.* = prepared.wire;
+        }
+        try self.children.resize(self.allocator, source.children.len);
+        @memcpy(self.children.items, source.children);
+        for (self.children.items) |*child| {
+            if (child.kind == .binary_data_array_list) child.children = self.arrays.items;
+        }
+        var record = source;
+        record.children = self.children.items;
+        try writer.writeRecordWithArrays(record, self.wires.items);
+    }
+
+    fn prepare(self: *Reencoder, comptime T: type, values: []const T, source: mzml.model.Node, groups: []const mzml.cv.Group, storage: *std.ArrayList(u8)) !mzml.Builder.PreparedArray {
+        const byte_limit = (mzml.arrays.Limits{}).array_bytes;
+        const bound = try mzml.arrays.wireBound(T, values.len, .zlib);
+        if (bound > byte_limit) return error.LimitExceeded;
+        if (@import("builtin").cpu.arch.endian() == .big) try self.transformed.resize(self.allocator, bound);
+        if (storage.items.len < @max(bound, 1)) try storage.resize(self.allocator, @max(bound, 1));
+        while (true) {
+            return self.builder.prepareArrayFrom(T, values, source, groups, .{ .pipeline = .zlib }, .{
+                .transport = storage.items,
+                .transformed = self.transformed.items,
+            }, &self.compressor) catch |err| switch (err) {
+                error.OutputTooSmall => {
+                    if (storage.items.len == byte_limit) return error.LimitExceeded;
+                    try storage.resize(self.allocator, @min(storage.items.len * 2, byte_limit));
+                    continue;
+                },
+                else => return err,
+            };
+        }
+    }
+};

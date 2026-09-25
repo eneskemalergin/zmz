@@ -89,6 +89,7 @@ test "[integration] - [mzML examples]: selects integer arrays and empty arrays w
     var dir = std.testing.tmpDir(.{});
     defer dir.cleanup();
     inline for (.{
+        .{ "MS:1000521", "32-bit float", "AACAPw==", "8", "1", "type=f32 count=1 first=1\n" },
         .{ "MS:1000519", "32-bit integer", "AQAAAA==", "8", "1", "type=i32 count=1 first=1\n" },
         .{ "MS:1000522", "64-bit integer", "AQAAAAAAAAA=", "12", "1", "type=i64 count=1 first=1\n" },
         .{ "MS:1000523", "64-bit float", "", "0", "0", "type=f64 count=0\n" },
@@ -106,6 +107,12 @@ test "[integration] - [mzML examples]: selects integer arrays and empty arrays w
         const streamed = try run(dir.dir, options.select, &.{ "input.mzML", "MS:1000514", "--stream" }, 0);
         defer std.testing.allocator.free(streamed);
         try std.testing.expectEqualStrings(selected, streamed);
+        const rewritten = try run(dir.dir, options.rewrite, &.{ "input.mzML", "zlib.mzML", "--zlib" }, 0);
+        defer std.testing.allocator.free(rewritten);
+        const fetched = try run(dir.dir, options.select, &.{ "zlib.mzML", "MS:1000514", "--stream" }, 0);
+        defer std.testing.allocator.free(fetched);
+        try std.testing.expectEqualStrings(selected, fetched);
+        try dir.dir.deleteFile(std.testing.io, "zlib.mzML");
     }
 }
 
@@ -200,6 +207,75 @@ test "[failure] - [mzML examples]: failed rewrites remove partial output and nev
     defer std.testing.allocator.free(same_path);
     var buffer: [4096]u8 = undefined;
     try std.testing.expectEqualStrings(source, try dir.dir.readFile(std.testing.io, "input.mzML", &buffer));
+    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "bad.mzML", .data = support.HEADER ++
+        "<spectrumList count='1' defaultDataProcessingRef='dp'><spectrum index='0' id='scan=1' defaultArrayLength='1'>" ++
+        "<binaryDataArrayList count='1'><binaryDataArray encodedLength='4'><referenceableParamGroupRef ref='encoding'/>" ++
+        "<binary>!!!!</binary></binaryDataArray></binaryDataArrayList></spectrum></spectrumList></run></mzML>" });
+    const bad = try run(dir.dir, options.rewrite, &.{ "bad.mzML", "failed.mzML", "--zlib" }, 1);
+    defer std.testing.allocator.free(bad);
+    try std.testing.expectError(error.FileNotFound, dir.dir.openFile(std.testing.io, "failed.mzML", .{}));
+}
+
+test "[cli] - [mzML examples]: reencodes all codecs without changing values or record metadata" {
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    for ([_][]const u8{ @embedFile("data/writer_plain.mzML"), support.REFERENCED_DOCUMENT }) |source| {
+        try dir.dir.writeFile(std.testing.io, .{ .sub_path = "input.mzML", .data = source });
+        const stdout = try run(dir.dir, options.rewrite, &.{ "input.mzML", "zlib.mzML", "--zlib" }, 0);
+        defer std.testing.allocator.free(stdout);
+        try std.testing.expectEqualStrings("", stdout);
+        const bytes = try dir.dir.readFileAlloc(std.testing.io, "zlib.mzML", std.testing.allocator, .limited(64 * 1024));
+        defer std.testing.allocator.free(bytes);
+        var index = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = bytes }, .{});
+        defer index.deinit();
+        var input = std.Io.Reader.fixed(source);
+        var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+        defer reader.deinit();
+        const header = try reader.readHeader();
+        try support.expectNode(header.document, index.header().document);
+        try support.expectNode(header.run, index.header().run);
+        var before = mzml.StreamReader.DecodedArrays.init(std.testing.allocator, .{});
+        defer before.deinit();
+        var after = mzml.StreamReader.DecodedArrays.init(std.testing.allocator, .{});
+        defer after.deinit();
+        var ordinals = [_]usize{ 0, 0 };
+        while (try reader.nextDecodedRecord(&before)) |record| {
+            const kind: usize = if (record.node.kind == .spectrum) 0 else 1;
+            var found = (try index.atDecoded(std.testing.allocator, record.node.kind, ordinals[kind], &after)).?;
+            defer found.deinit();
+            ordinals[kind] += 1;
+            const actual = found.value;
+            try std.testing.expectEqualDeep(record.node.attributes, actual.node.attributes);
+            try std.testing.expectEqualDeep(record.node.params, actual.node.params);
+            try std.testing.expectEqual(record.node.children.len, actual.node.children.len);
+            for (record.node.children, actual.node.children) |a, b| {
+                if (a.kind != .binary_data_array_list) {
+                    try support.expectNode(a, b);
+                } else try std.testing.expectEqualDeep(a.attributes, b.attributes);
+            }
+            try std.testing.expectEqual(before.len(), after.len());
+            for (0..before.len()) |i| {
+                const left = before.get(i).?;
+                const right = after.get(i).?;
+                try std.testing.expectEqual(.zlib, right.encoding.pipeline);
+                try std.testing.expectEqual(std.meta.activeTag(left.values), std.meta.activeTag(right.values));
+                switch (left.values) {
+                    inline else => |values, tag| try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(values), std.mem.sliceAsBytes(@field(right.values, @tagName(tag)))),
+                }
+                var entries: mzml.cv.EffectiveIterator = .{ .entries = record.binaryArrays()[i].params, .groups = header.groups };
+                var position: usize = 0;
+                while (try entries.next()) |entry| : (position += 1) {
+                    const changed = actual.binaryArrays()[i].params[position];
+                    if (changed == .cv and changed.cv.accession != null and changed.cv.accession.?.eql(.{ .raw = "MS:1000574" })) {
+                        try std.testing.expectEqualStrings("zlib compression", changed.cv.name.?);
+                    } else try std.testing.expectEqualDeep(entry, changed);
+                }
+                try std.testing.expectEqual(position, actual.binaryArrays()[i].params.len);
+            }
+        }
+        try std.testing.expectEqualDeep(ordinals, index.counts);
+        try dir.dir.deleteFile(std.testing.io, "zlib.mzML");
+    }
 }
 
 test "[integration] - [mzML examples]: filters spectra in one pass while preserving payloads and references" {

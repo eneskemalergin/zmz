@@ -131,19 +131,99 @@ pub fn prepareArray(self: *Builder, comptime T: type, values: []const T, options
     return self.buildArray(T, values, options, &.{}, scratch, compressor, true);
 }
 
+/// Reencodes values using copied source metadata, without copying the old payload.
+/// Group references on this array become local parameters; header groups stay unchanged.
+/// Replaces primitive/codec terms and lengths, preserving other fields and parameter order.
+/// If a default array omits arrayLength, the caller must update the enclosing record's
+/// defaultArrayLength when changing its length. Wire borrows values or caller scratch.
+pub fn prepareArrayFrom(
+    self: *Builder,
+    comptime T: type,
+    values: []const T,
+    source: model.Node,
+    groups: []const cv.Group,
+    options: arrays.EncodeOptions,
+    scratch: arrays.Scratch,
+    compressor: ?*zlib.Compressor,
+) Error!PreparedArray {
+    if (self.limits.depth < 2 or self.limits.depth > 64) return error.LimitExceeded;
+    const previous = try model.arrayEncoding(source, groups);
+    if (source.children.len != 1 or source.children[0].kind != .binary) return error.InvalidStructure;
+    const old_primitive = encoding.primitiveTerm(previous.primitive);
+    const old_codec = encoding.codecTerm(previous.pipeline);
+    const primitive = encoding.primitiveTerm(primitiveFor(T));
+    const codec = encoding.codecTerm(options.pipeline);
+    var iterator: cv.EffectiveIterator = .{ .entries = source.params, .groups = groups };
+    var count: usize = 0;
+    while (try iterator.next()) |_| {
+        if (count == self.remaining / @sizeOf(cv.Entry)) return error.LimitExceeded;
+        count += 1;
+    }
+    const wire = try arrays.encodeWire(T, values, options, scratch, compressor);
+    var copier = self.makeCopier();
+    defer self.remaining = copier.remaining;
+    const params = try copier.alloc(cv.Entry, count);
+    var is_default = false;
+    iterator = .{ .entries = source.params, .groups = groups };
+    for (params) |*entry| {
+        entry.* = (try iterator.next()).?;
+        if (entry.* != .cv) continue;
+        const accession = entry.cv.accession orelse continue;
+        is_default = is_default or accession.eql(model.Terms.MZ_ARRAY) or
+            accession.eql(model.Terms.INTENSITY_ARRAY) or accession.eql(model.Terms.TIME_ARRAY);
+        const term = if (std.mem.eql(u8, accession.raw, old_primitive.accession)) primitive else if (std.mem.eql(u8, accession.raw, old_codec.accession)) codec else continue;
+        if (std.mem.eql(u8, accession.raw, term.accession)) continue;
+        entry.cv.accession = .{ .raw = term.accession };
+        entry.cv.name = term.name;
+    }
+    var encoded_length: [32]u8 = undefined;
+    var array_length: [32]u8 = undefined;
+    const encoded_text = std.fmt.bufPrint(&encoded_length, "{d}", .{try base64.encodedSize(wire.len)}) catch return error.LimitExceeded;
+    const length_text = std.fmt.bufPrint(&array_length, "{d}", .{values.len}) catch return error.LimitExceeded;
+    const attributes = try copier.alloc(model.Attribute, std.math.add(usize, source.attributes.len, 2) catch return error.LimitExceeded);
+    @memcpy(attributes[0..source.attributes.len], source.attributes);
+    var has_encoded_length = false;
+    var has_array_length = false;
+    for (attributes[0..source.attributes.len]) |*attribute| {
+        if (attribute.namespace_uri != null) continue;
+        if (std.mem.eql(u8, attribute.name, "encodedLength")) {
+            attribute.value = encoded_text;
+            has_encoded_length = true;
+        } else if (std.mem.eql(u8, attribute.name, "arrayLength")) {
+            attribute.value = length_text;
+            has_array_length = true;
+        }
+    }
+    var attribute_count = source.attributes.len;
+    if (!has_encoded_length) {
+        attributes[attribute_count] = .{ .name = "encodedLength", .value = encoded_text };
+        attribute_count += 1;
+    }
+    if (!has_array_length and !is_default) {
+        attributes[attribute_count] = .{ .name = "arrayLength", .value = length_text };
+        attribute_count += 1;
+    }
+    var binary = source.children[0];
+    binary.text = null;
+    var result = source;
+    result.attributes = attributes[0..attribute_count];
+    result.params = params;
+    result.children = &.{binary};
+    return .{ .array = .{
+        .node = try copier.node(result, self.limits.depth),
+        .length = values.len,
+        .is_default = is_default,
+        .owner = self,
+    }, .wire = wire };
+}
+
 fn buildArray(self: *Builder, comptime T: type, values: []const T, options: ArrayOptions, output: []u8, scratch: arrays.Scratch, compressor: ?*zlib.Compressor, comptime prepared: bool) Error!PreparedArray {
     if (self.limits.depth < 2 or self.limits.depth > 64) return error.LimitExceeded;
     if (options.cv_ref.len == 0 or options.role.cv_ref == null or options.role.accession == null or
         options.role.name == null) return error.InvalidDeclaration;
     const role = options.role.accession.?;
     const is_default = role.eql(model.Terms.MZ_ARRAY) or role.eql(model.Terms.INTENSITY_ARRAY) or role.eql(model.Terms.TIME_ARRAY);
-    const primitive = encoding.primitiveTerm(switch (T) {
-        f32 => .float32,
-        f64 => .float64,
-        i32 => .int32,
-        i64 => .int64,
-        else => @compileError("binaryArray requires f32, f64, i32, or i64"),
-    });
+    const primitive = encoding.primitiveTerm(primitiveFor(T));
     const codec = encoding.codecTerm(options.encoding.pipeline);
     const wire = if (prepared) try arrays.encodeWire(T, values, options.encoding, scratch, compressor) else &.{};
     const encoded: ?[]const u8 = if (prepared) null else try arrays.encode(T, output, values, options.encoding, scratch, compressor);
@@ -179,6 +259,7 @@ fn buildArray(self: *Builder, comptime T: type, values: []const T, options: Arra
 /// Creates a spectrum or chromatogram with generated numeric attributes and copied children.
 /// Arrays must belong to this builder; their storage is reused, not copied.
 /// Other input slices are copied. Default arrays must match default_length.
+/// This constructs new record attributes; use source node views to preserve existing ones.
 pub fn record(
     self: *Builder,
     kind: model.Kind,
@@ -260,4 +341,14 @@ pub fn header(self: *Builder, source: model.Header) Error!model.Header {
 
 fn makeCopier(self: *Builder) copy.Copier {
     return .{ .allocator = self.arena.allocator(), .remaining = self.remaining };
+}
+
+fn primitiveFor(comptime T: type) encoding.Primitive {
+    return switch (T) {
+        f32 => .float32,
+        f64 => .float64,
+        i32 => .int32,
+        i64 => .int64,
+        else => @compileError("array construction requires f32, f64, i32, or i64"),
+    };
 }
