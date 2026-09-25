@@ -67,7 +67,7 @@ pub fn initIndexed(allocator: std.mem.Allocator, sink: *std.Io.Writer, limits: L
 /// Borrows a positional file writer at offset zero on an empty file. Do not write
 /// through it independently until finish. Null index_limits selects plain mzML.
 /// Indexed output needs a readable file and reads its prefix once for the checksum.
-/// Counts may be null in beginList. The caller must still flush the final bytes.
+/// List counts may be null. The caller must still flush the final bytes.
 pub fn initFile(allocator: std.mem.Allocator, sink: *std.Io.File.Writer, limits: Limits, index_limits: ?IndexLimits) Error!Writer {
     if (sink.logicalPos() != 0 or (sink.mode != .positional and sink.mode != .positional_simple))
         return error.InvalidOptions;
@@ -122,6 +122,13 @@ pub fn writeHeader(self: *Writer, header: model.Header) Error!void {
 /// filled in by endList; other writers require an exact count before writing.
 /// Spectra precede chromatograms, and each list can occur at most once.
 pub fn beginList(self: *Writer, kind: model.Kind, count: ?usize, processing_ref: []const u8) Error!void {
+    return self.beginListWithAttributes(kind, count, &.{.{ .name = "defaultDataProcessingRef", .value = processing_ref }});
+}
+
+/// Opens a list using source attributes borrowed until return. Writes the supplied count
+/// first, ignoring source count attributes; other attributes keep their order and values.
+/// An absent processing reference stays absent. Null count and list order follow beginList.
+pub fn beginListWithAttributes(self: *Writer, kind: model.Kind, count: ?usize, attributes: []const model.Attribute) Error!void {
     if (self.failed) return error.FailedState;
     errdefer self.failed = true;
     if (self.phase != .run) return error.InvalidState;
@@ -136,7 +143,10 @@ pub fn beginList(self: *Writer, kind: model.Kind, count: ?usize, processing_ref:
         (self.engine.byteOffset() orelse return error.LimitExceeded) - 1 - COUNT_PLACEHOLDER.len
     else
         null;
-    try self.engine.attribute("defaultDataProcessingRef", processing_ref);
+    for (attributes) |attribute| {
+        if (attribute.namespace_uri == null and std.mem.eql(u8, attribute.name, "count")) continue;
+        try self.writeAttributes(&.{attribute});
+    }
     self.list_kind = kind;
     self.expected_count = count orelse std.math.maxInt(usize);
     self.written_count = 0;

@@ -157,11 +157,13 @@ test "[integration] - [mzML examples]: writes mixed primitive arrays and retriev
     try std.testing.expectEqualStrings(original, after);
 }
 
-test "[integration] - [mzML examples]: rewrites metadata and empty lists without decoding payloads" {
+test "[cli] - [mzML examples]: rewrites list attributes and records without decoding payloads" {
     var dir = std.testing.tmpDir(.{});
     defer dir.cleanup();
     inline for (.{
         support.REFERENCED_DOCUMENT,
+        support.HEADER ++ "<spectrumList count='1' sourceNote='A&amp;B' xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance' xsi:schemaLocation='urn:example list.xsd'>" ++
+            support.SPECTRUM ++ "</spectrumList><chromatogramList count='0' defaultDataProcessingRef='' sourceNote=''/></run></mzML>",
         support.HEADER ++ "<spectrumList count='0' defaultDataProcessingRef='dp'/><chromatogramList count='0' defaultDataProcessingRef='dp'/></run></mzML>",
         support.HEADER ++ "<spectrumList count='0' defaultDataProcessingRef='dp'/><chromatogramList count='1' defaultDataProcessingRef='dp'>" ++
             "<chromatogram id='tic' index='0' defaultArrayLength='1'>" ++ support.ARRAYS ++ "</chromatogram></chromatogramList></run></mzML>",
@@ -195,10 +197,10 @@ test "[integration] - [mzML examples]: rewrites metadata and empty lists without
     }
 }
 
-test "[failure] - [mzML examples]: failed rewrites remove partial output and never overwrite input" {
+test "[cli] - [mzML examples]: failed rewrites remove partial output and never overwrite input" {
     var dir = std.testing.tmpDir(.{});
     defer dir.cleanup();
-    const source = support.HEADER ++ "<spectrumList count='0' extra='kept' defaultDataProcessingRef='dp'/></run></mzML>";
+    const source = support.HEADER ++ "<spectrumList count='1' defaultDataProcessingRef='dp'/></run></mzML>";
     try dir.dir.writeFile(std.testing.io, .{ .sub_path = "input.mzML", .data = source });
     const failed = try run(dir.dir, options.rewrite, &.{ "input.mzML", "failed.mzML" }, 1);
     defer std.testing.allocator.free(failed);
@@ -219,7 +221,12 @@ test "[failure] - [mzML examples]: failed rewrites remove partial output and nev
 test "[cli] - [mzML examples]: reencodes all codecs without changing values or record metadata" {
     var dir = std.testing.tmpDir(.{});
     defer dir.cleanup();
-    for ([_][]const u8{ @embedFile("data/writer_plain.mzML"), support.REFERENCED_DOCUMENT }) |source| {
+    for ([_][]const u8{
+        @embedFile("data/writer_plain.mzML"),
+        support.REFERENCED_DOCUMENT,
+        support.HEADER ++ "<spectrumList count='1' sourceNote='keep'>" ++ support.SPECTRUM ++
+            "</spectrumList><chromatogramList count='0' defaultDataProcessingRef=''/></run></mzML>",
+    }) |source| {
         try dir.dir.writeFile(std.testing.io, .{ .sub_path = "input.mzML", .data = source });
         const stdout = try run(dir.dir, options.rewrite, &.{ "input.mzML", "zlib.mzML", "--zlib" }, 0);
         defer std.testing.allocator.free(stdout);
@@ -274,20 +281,34 @@ test "[cli] - [mzML examples]: reencodes all codecs without changing values or r
             }
         }
         try std.testing.expectEqualDeep(ordinals, index.counts);
+        var output = std.Io.Reader.fixed(bytes);
+        var written = try mzml.StreamReader.init(std.testing.allocator, &output, .{ .payload = .skip });
+        defer written.deinit();
+        const written_header = try written.readHeader();
+        while (try written.nextRecord()) |_| {}
+        inline for (.{ "spectrum_list", "chromatogram_list" }) |field| {
+            const expected = @field(header.*, field);
+            const actual = @field(written_header.*, field);
+            try std.testing.expectEqual(expected == null, actual == null);
+            if (expected) |list| {
+                try std.testing.expectEqualDeep(list.attributes, actual.?.attributes);
+                try std.testing.expectEqual(list.declared_count, actual.?.declared_count);
+            }
+        }
         try dir.dir.deleteFile(std.testing.io, "zlib.mzML");
     }
 }
 
-test "[integration] - [mzML examples]: filters spectra in one pass while preserving payloads and references" {
+test "[cli] - [mzML examples]: filters spectra while retaining list attributes and references" {
     var dir = std.testing.tmpDir(.{});
     defer dir.cleanup();
-    const source = support.HEADER ++ "<spectrumList count='3' defaultDataProcessingRef='dp'>" ++
+    const source = support.HEADER ++ "<spectrumList count='3' sourceNote='A&amp;B'>" ++
         "<spectrum id='scan=0' index='0' defaultArrayLength='0'><cvParam accession='MS:1000511' value='2'/></spectrum>" ++
         "<spectrum id='scan=1' index='1' defaultArrayLength='1' dataProcessingRef='dp' spotID='kept'>" ++
         "<cvParam accession='MS:1000511' value='1'/>" ++ support.ARRAYS ++ "</spectrum>" ++
         "<spectrum id='scan=2' index='2' defaultArrayLength='1'><cvParam accession='MS:1000511' value='1'/>" ++
         "<scanList count='1'><scan spectrumRef='scan=0'/></scanList>" ++ support.ARRAYS ++ "</spectrum>" ++
-        "</spectrumList><chromatogramList count='1' defaultDataProcessingRef='dp'>" ++
+        "</spectrumList><chromatogramList count='1' defaultDataProcessingRef='' sourceNote=''>" ++
         "<chromatogram id='tic' index='0' defaultArrayLength='1'>" ++ support.ARRAYS ++
         "</chromatogram></chromatogramList></run></mzML>";
     try dir.dir.writeFile(std.testing.io, .{ .sub_path = "input.mzML", .data = source });
@@ -310,7 +331,7 @@ test "[integration] - [mzML examples]: filters spectra in one pass while preserv
     var known = try mzml.Writer.init(std.testing.allocator, &known_sink, .{});
     defer known.deinit();
     try known.writeHeader(header.*);
-    try known.beginList(.spectrum_list, 2, "dp");
+    try known.beginListWithAttributes(.spectrum_list, 2, header.spectrum_list.?.attributes);
     _ = try original.nextRecord();
     for ([_][]const u8{ "0", "1" }) |ordinal| {
         const record = (try original.nextRecord()).?;
@@ -327,8 +348,8 @@ test "[integration] - [mzML examples]: filters spectra in one pass while preserv
         try support.expectNode(expected, found.value.node);
     }
     try known.endList();
-    try known.beginList(.chromatogram_list, 1, "dp");
     const chromatogram = (try original.nextRecord()).?;
+    try known.beginListWithAttributes(.chromatogram_list, 1, header.chromatogram_list.?.attributes);
     try known.writeRecord(chromatogram.node);
     try known.endList();
     try known.finish();
@@ -341,4 +362,9 @@ test "[integration] - [mzML examples]: filters spectra in one pass while preserv
     while (try before.nextRecord()) |record|
         try support.expectNode(record.node, (try after.nextRecord()).?.node);
     try std.testing.expectEqual(null, try after.nextRecord());
+    inline for (.{ "spectrum_list", "chromatogram_list" }) |field| {
+        const expected = @field(header.*, field).?;
+        const actual = @field(index.header().*, field).?;
+        try std.testing.expectEqualDeep(expected.attributes[1..], actual.attributes[1..]);
+    }
 }

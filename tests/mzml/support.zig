@@ -99,8 +99,7 @@ pub fn rewriteDocument(allocator: std.mem.Allocator, source: []const u8, sink: *
     inline for (.{ mzml.model.Kind.spectrum_list, mzml.model.Kind.chromatogram_list }) |kind| {
         const list = if (kind == .spectrum_list) header.spectrum_list else header.chromatogram_list;
         if (list) |descriptor| {
-            const opening: mzml.model.Node = .{ .kind = kind, .attributes = descriptor.attributes };
-            try writer.beginList(kind, descriptor.declared_count, opening.attribute("defaultDataProcessingRef").?);
+            try writer.beginListWithAttributes(kind, descriptor.declared_count, descriptor.attributes);
             while (current) |record| {
                 if (record.node.kind != (if (kind == .spectrum_list) mzml.model.Kind.spectrum else .chromatogram)) break;
                 try writer.writeRecord(record.node);

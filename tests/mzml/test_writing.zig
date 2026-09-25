@@ -4,6 +4,73 @@ const std = @import("std");
 const mzml = @import("zmz").mzml;
 const support = @import("support.zig");
 
+test "[integration] - [mzML lists]: retains attributes and uses the requested output count" {
+    inline for (.{
+        .{ "", "" },
+        .{ " defaultDataProcessingRef=''", " defaultDataProcessingRef=\"\"" },
+        .{ " defaultDataProcessingRef='dp&amp;source'", " defaultDataProcessingRef=\"dp&amp;source\"" },
+    }) |reference| {
+        const source = support.HEADER ++ "<spectrumList sourceNote='A&amp;B&#9;&quot;'" ++ reference[0] ++
+            " xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance' xsi:schemaLocation='urn:list list.xsd' count='9'/>" ++
+            "<chromatogramList count='0'/></run></mzML>";
+        var input = std.Io.Reader.fixed(source);
+        var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+        defer reader.deinit();
+        const header = try reader.readHeader();
+        try std.testing.expectEqual(null, try reader.nextRecord());
+        for ([_]bool{ false, true }) |indexed| {
+            var buffer: [4096]u8 = undefined;
+            var sink = std.Io.Writer.fixed(&buffer);
+            var writer = if (indexed) try mzml.Writer.initIndexed(std.testing.allocator, &sink, .{}, .{}) else try mzml.Writer.init(std.testing.allocator, &sink, .{});
+            defer writer.deinit();
+            try writer.writeHeader(header.*);
+            try writer.beginListWithAttributes(.spectrum_list, 0, header.spectrum_list.?.attributes);
+            try writer.endList();
+            try writer.beginListWithAttributes(.chromatogram_list, 0, &.{});
+            try writer.endList();
+            try writer.finish();
+            const bytes = sink.buffered();
+            const start = std.mem.indexOf(u8, bytes, "<spectrumList").?;
+            const end = std.mem.indexOfPos(u8, bytes, start, "</run>").?;
+            try std.testing.expectEqualStrings("<spectrumList count=\"0\" sourceNote=\"A&amp;B&#x9;&quot;\"" ++ reference[1] ++
+                " xsi:schemaLocation=\"urn:list list.xsd\"/><chromatogramList count=\"0\"/>", bytes[start..end]);
+            var output = std.Io.Reader.fixed(bytes);
+            var after = try mzml.StreamReader.init(std.testing.allocator, &output, .{});
+            defer after.deinit();
+            const result = try after.readHeader();
+            try std.testing.expectEqual(null, try after.nextRecord());
+            try std.testing.expectEqual(@as(usize, 0), result.spectrum_list.?.declared_count);
+            var position: usize = 1;
+            for (header.spectrum_list.?.attributes) |attribute| {
+                if (std.mem.eql(u8, attribute.name, "count")) continue;
+                try std.testing.expectEqualDeep(attribute, result.spectrum_list.?.attributes[position]);
+                position += 1;
+            }
+            try std.testing.expectEqual(position, result.spectrum_list.?.attributes.len);
+            try std.testing.expectEqualDeep(header.chromatogram_list, result.chromatogram_list);
+        }
+    }
+}
+
+test "[failure] - [mzML lists]: attribute errors leave the writer failed" {
+    const cases = [_]struct { attributes: []const mzml.model.Attribute, err: mzml.Writer.Error }{
+        .{ .attributes = &.{ .{ .name = "note", .value = "a" }, .{ .name = "note", .value = "b" } }, .err = error.DuplicateAttribute },
+        .{ .attributes = &.{.{ .name = "note", .value = "a\x00b" }}, .err = error.InvalidCharacter },
+        .{ .attributes = &.{.{ .name = "bad name", .value = "a" }}, .err = error.InvalidName },
+        .{ .attributes = &.{.{ .name = "count", .namespace_uri = "urn:other", .value = "9" }}, .err = error.UnknownAttribute },
+    };
+    for (cases) |case| {
+        var bytes: [4096]u8 = undefined;
+        var sink = std.Io.Writer.fixed(&bytes);
+        var writer = try mzml.Writer.init(std.testing.allocator, &sink, .{});
+        defer writer.deinit();
+        try writer.writeHeader(.{ .document = .{ .kind = .mzml }, .run = .{ .kind = .run } });
+        try std.testing.expectError(case.err, writer.beginListWithAttributes(.spectrum_list, 0, case.attributes));
+        try std.testing.expectError(error.FailedState, writer.beginListWithAttributes(.spectrum_list, 0, &.{}));
+        try std.testing.expectError(error.FailedState, writer.finish());
+    }
+}
+
 test "[integration] - [mzML writer]: preserves metadata and records through a plain rewrite" {
     var bytes: [8192]u8 = undefined;
     var sink = std.Io.Writer.fixed(&bytes);
@@ -422,8 +489,15 @@ test "[integration] - [mzML file writer]: patches counts without changing record
                 var attributes: [3]mzml.model.Attribute = undefined;
                 @memcpy(&attributes, node.attributes);
                 node.attributes = &attributes;
-                try writer.beginList(kind, if (case.unknown[list_index]) null else case.counts[list_index], "dp");
-                try known.beginList(kind, case.counts[list_index], "dp");
+                const list_attributes: []const mzml.model.Attribute = if (kind == .spectrum_list) &.{
+                    .{ .name = "sourceNote", .value = "A&B\t\"" },
+                    .{ .name = "count", .value = "999" },
+                } else &.{
+                    .{ .name = "defaultDataProcessingRef", .value = "" },
+                    .{ .name = "sourceNote", .value = "" },
+                };
+                try writer.beginListWithAttributes(kind, if (case.unknown[list_index]) null else case.counts[list_index], list_attributes);
+                try known.beginListWithAttributes(kind, case.counts[list_index], list_attributes);
                 for (0..case.counts[list_index]) |position| {
                     var index_text: [32]u8 = undefined;
                     var id_text: [64]u8 = undefined;
@@ -449,6 +523,7 @@ test "[integration] - [mzML file writer]: patches counts without changing record
             var before_input = std.Io.Reader.fixed(expected.written());
             var before = try mzml.StreamReader.init(std.testing.allocator, &before_input, .{});
             defer before.deinit();
+            const before_header = try before.readHeader();
             var after_input = std.Io.Reader.fixed(bytes);
             var after = try mzml.StreamReader.init(std.testing.allocator, &after_input, .{});
             defer after.deinit();
@@ -459,6 +534,8 @@ test "[integration] - [mzML file writer]: patches counts without changing record
             try std.testing.expectEqual(case.counts[0], after_header.spectrum_list.?.declared_count);
             try std.testing.expectEqual(case.counts[1], after_header.chromatogram_list.?.declared_count);
             for ([_]?mzml.model.RecordList{ after_header.spectrum_list, after_header.chromatogram_list }, 0..) |list, i| {
+                const expected_list = if (i == 0) before_header.spectrum_list.? else before_header.chromatogram_list.?;
+                try std.testing.expectEqualDeep(expected_list.attributes[1..], list.?.attributes[1..]);
                 if (case.unknown[i]) {
                     const opening: mzml.model.Node = .{ .kind = .spectrum_list, .attributes = list.?.attributes };
                     const text = opening.attribute("count").?;

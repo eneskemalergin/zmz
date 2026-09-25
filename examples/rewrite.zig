@@ -1,7 +1,7 @@
 //! Copies retained record metadata and binary text to a new indexed mzML file.
 //! With --ms1, filters spectra in one input pass and fills in the surviving count.
 //! Chromatograms are kept. Record IDs and references stay unchanged; only surviving
-//! spectrum indexes are reassigned. Lists need count and defaultDataProcessingRef.
+//! spectrum indexes are reassigned. Other list attributes stay unchanged.
 //! With --zlib, decodes all arrays and reencodes their values losslessly with zlib.
 //! Source metadata is kept; array group references become local parameters.
 
@@ -45,16 +45,8 @@ pub fn main(init: std.process.Init) !void {
     inline for (.{ mzml.model.Kind.spectrum_list, mzml.model.Kind.chromatogram_list }) |kind| {
         const descriptor = if (kind == .spectrum_list) header.spectrum_list else header.chromatogram_list;
         if (descriptor) |list| {
-            // beginList cannot preserve additional attributes or an absent processing reference.
-            for (list.attributes) |attribute| {
-                if (attribute.namespace_uri != null or
-                    (!std.mem.eql(u8, attribute.name, "count") and !std.mem.eql(u8, attribute.name, "defaultDataProcessingRef")))
-                    return error.ListAttributesNotWritable;
-            }
-            const node: mzml.model.Node = .{ .kind = kind, .attributes = list.attributes };
-            const processing_ref = node.attribute("defaultDataProcessingRef") orelse return error.ListAttributesNotWritable;
             const filter = ms1 and kind == .spectrum_list;
-            try writer.beginList(kind, if (filter) null else list.declared_count, processing_ref);
+            try writer.beginListWithAttributes(kind, if (filter) null else list.declared_count, list.attributes);
             var written: usize = 0;
             while (current) |record| {
                 if (record.node.kind != (if (kind == .spectrum_list) mzml.model.Kind.spectrum else .chromatogram)) break;
