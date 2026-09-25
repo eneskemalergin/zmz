@@ -435,13 +435,13 @@ fn readEmbeddedEntries(self: *IndexedReader, input: *std.Io.Reader, index_start:
 
 fn indexStart(cursor: *const xml.Cursor, kind: model.Kind) Error!xml.Start {
     const event = cursor.current orelse return error.UnexpectedEnd;
-    if (event.data != .start_element or !event.data.start_element.name.eql(xml.NAMESPACE, kind.xmlName())) return error.InvalidStructure;
+    if (event.data != .start_element or !event.data.start_element.name.eql(cursor.mzml_namespace, kind.xmlName())) return error.InvalidStructure;
     return event.data.start_element;
 }
 
 fn indexEnd(cursor: *xml.Cursor, kind: model.Kind) Error!void {
     const event = cursor.current orelse return error.UnexpectedEnd;
-    if (event.data != .end_element or !event.data.end_element.name.eql(xml.NAMESPACE, kind.xmlName())) return error.InvalidStructure;
+    if (event.data != .end_element or !event.data.end_element.name.eql(cursor.mzml_namespace, kind.xmlName())) return error.InvalidStructure;
     try cursor.advance(false);
 }
 

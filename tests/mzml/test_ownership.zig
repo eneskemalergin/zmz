@@ -4,6 +4,39 @@ const std = @import("std");
 const mzml = @import("zmz").mzml;
 const support = @import("support.zig");
 
+test "[integration] - [mzML 1.0 copies]: keeps header and record metadata after reader reuse" {
+    const Check = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var builder = mzml.Builder.init(allocator, .{});
+            defer builder.deinit();
+            var header: mzml.owned.Header = undefined;
+            var record: mzml.owned.Record = undefined;
+            const built = blk: {
+                var input = std.Io.Reader.fixed(support.HISTORICAL);
+                var reader = try mzml.StreamReader.init(allocator, &input, .{});
+                defer reader.deinit();
+                const source = try reader.readHeader();
+                header = try mzml.owned.Header.init(allocator, source.*, .{});
+                errdefer header.deinit();
+                const copied = try builder.header(source.*);
+                record = try mzml.owned.Record.init(allocator, (try reader.nextRecord()).?, .{});
+                errdefer record.deinit();
+                while (try reader.nextRecord()) |_| {}
+                break :blk copied;
+            };
+            defer header.deinit();
+            defer record.deinit();
+            try std.testing.expectEqualStrings("http://psi.hupo.org/schema_revision/mzML_1.0.0", header.value.namespace_uri);
+            try std.testing.expectEqualStrings(header.value.namespace_uri, built.namespace_uri);
+            try support.expectNode(header.value.document, built.document);
+            try support.expectNode(header.value.run, built.run);
+            try std.testing.expectEqual(mzml.model.Polarity.positive, (try record.value.polarity(header.value.groups)).?);
+            try std.testing.expectEqualStrings("19", record.value.node.attribute("nativeID").?);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
 test "[integration] - [mzML ownership]: retains grouped records after reader closure and cleans failed copies" {
     try support.copyRetained(std.testing.allocator);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, support.copyRetained, .{});

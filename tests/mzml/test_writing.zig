@@ -4,6 +4,29 @@ const std = @import("std");
 const mzml = @import("zmz").mzml;
 const support = @import("support.zig");
 
+test "[integration] - [mzML 1.0 writing]: retains the namespace hierarchy and payloads" {
+    for ([_]bool{ false, true }) |indexed| {
+        var sink: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer sink.deinit();
+        try support.rewriteDocument(std.testing.allocator, support.HISTORICAL, &sink.writer, indexed);
+        const bytes = sink.written();
+        try std.testing.expect(std.mem.indexOf(u8, bytes, "xmlns=\"http://psi.hupo.org/schema_revision/mzML_1.0.0\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, bytes, "<softwareParam cvRef=\"MS\" accession=\"MS:1000615\" name=\"ProteoWizard\" version=\"1.0\"/>") != null);
+        try std.testing.expect(std.mem.indexOf(u8, bytes, "<binary>AAAAAAAACEAAAAAAAAAQQA==</binary>") != null);
+        var original = std.Io.Reader.fixed(support.HISTORICAL);
+        var copied = std.Io.Reader.fixed(bytes);
+        var a = try mzml.StreamReader.init(std.testing.allocator, &original, .{});
+        defer a.deinit();
+        var b = try mzml.StreamReader.init(std.testing.allocator, &copied, .{});
+        defer b.deinit();
+        try std.testing.expectEqualStrings((try a.readHeader()).namespace_uri, (try b.readHeader()).namespace_uri);
+        try support.expectNode((try a.readHeader()).document, (try b.readHeader()).document);
+        try support.expectNode((try a.readHeader()).run, (try b.readHeader()).run);
+        while (try a.nextRecord()) |record| try support.expectNode(record.node, (try b.nextRecord()).?.node);
+        try std.testing.expectEqual(null, try b.nextRecord());
+    }
+}
+
 test "[integration] - [mzML lists]: retains attributes and uses the requested output count" {
     inline for (.{
         .{ "", "" },

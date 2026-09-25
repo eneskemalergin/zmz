@@ -336,7 +336,7 @@ pub fn header(self: *Builder, source: model.Header) Error!model.Header {
         .id = group.attribute("id") orelse return error.MissingAttribute,
         .entries = group.params,
     };
-    return .{ .document = document, .run = run, .groups = groups };
+    return .{ .document = document, .run = run, .namespace_uri = try copier.text(source.namespace_uri), .groups = groups };
 }
 
 fn makeCopier(self: *Builder) copy.Copier {

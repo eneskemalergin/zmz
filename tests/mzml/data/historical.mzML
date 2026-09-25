@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="ISO-8859-1"?>
+<!-- Reduced structures from https://raw.githubusercontent.com/ProteoWizard/pwiz/master/example_data/tiny.pwiz.1.0.mzML.
+     Acquisition metadata follows https://sbeams.systemsbiology.net/tmp/mzML1.0.0.html.
+     IDs, metadata, and arrays are constructed for exact tests, not experimental data. -->
+<mzML xmlns="http://psi.hupo.org/schema_revision/mzML_1.0.0" version="1.0" id="historical">
+  <cvList count="1"><cv id="MS" fullName="PSI-MS" URI="urn:test"/></cvList>
+  <fileDescription><fileContent/><sourceFileList count="1"><sourceFile id="sf1" name="small.RAW" location="file:///data"/></sourceFileList></fileDescription>
+  <referenceableParamGroupList count="1"><referenceableParamGroup id="positive"><cvParam cvRef="MS" accession="MS:1000130" name="positive scan"/></referenceableParamGroup></referenceableParamGroupList>
+  <instrumentConfigurationList count="1"><instrumentConfiguration id="ic"><softwareRef ref="pwiz"/></instrumentConfiguration></instrumentConfigurationList>
+  <softwareList count="1"><software id="pwiz"><softwareParam cvRef="MS" accession="MS:1000615" name="ProteoWizard" version="1.0"/></software></softwareList>
+  <dataProcessingList count="1"><dataProcessing id="dp" softwareRef="pwiz"><processingMethod order="0"><cvParam cvRef="MS" accession="MS:1000544" name="Conversion to mzML"/></processingMethod></dataProcessing></dataProcessingList>
+  <acquisitionSettingsList count="1"><acquisitionSettings id="as1" instrumentConfigurationRef="ic"><sourceFileRefList count="1"><sourceFileRef ref="sf1"/></sourceFileRefList><targetList count="1"><target><cvParam cvRef="MS" accession="MS:1000040" name="m/z" value="445.34"/></target></targetList></acquisitionSettings></acquisitionSettingsList>
+  <run id="run" defaultInstrumentConfigurationRef="ic">
+    <sourceFileRefList count="1"><sourceFileRef ref="sf1"/></sourceFileRefList>
+    <spectrumList count="2">
+      <spectrum id="S19" nativeID="19" index="0" defaultArrayLength="2">
+        <cvParam cvRef="MS" accession="MS:1000511" name="ms level" value="1"/>
+        <spectrumDescription>
+          <cvParam cvRef="MS" accession="MS:1000128" name="profile mass spectrum"/>
+          <scan instrumentConfigurationRef="ic"><referenceableParamGroupRef ref="positive"/><cvParam cvRef="MS" accession="MS:1000016" name="scan time" value="5.8905" unitCvRef="UO" unitAccession="UO:0000031" unitName="minute"/><scanWindowList count="1"><scanWindow><cvParam cvRef="MS" accession="MS:1000501" name="scan m/z lower limit" value="400"/></scanWindow></scanWindowList></scan>
+        </spectrumDescription>
+        <binaryDataArrayList count="2">
+          <binaryDataArray encodedLength="24" dataProcessingRef="dp"><cvParam cvRef="MS" accession="MS:1000523" name="64-bit float"/><cvParam cvRef="MS" accession="MS:1000576" name="no compression"/><cvParam cvRef="MS" accession="MS:1000514" name="m/z array"/><binary>AAAAAAAA8D8AAAAAAAAAQA==</binary></binaryDataArray>
+          <binaryDataArray encodedLength="24"><cvParam cvRef="MS" accession="MS:1000523" name="64-bit float"/><cvParam cvRef="MS" accession="MS:1000576" name="no compression"/><cvParam cvRef="MS" accession="MS:1000515" name="intensity array"/><binary>AAAAAAAACEAAAAAAAAAQQA==</binary></binaryDataArray>
+        </binaryDataArrayList>
+      </spectrum>
+      <spectrum id="S20" nativeID="20" spotID="A1" index="1" defaultArrayLength="0" sourceFileRef="sf1">
+        <cvParam cvRef="MS" accession="MS:1000511" name="ms level" value="2"/>
+        <spectrumDescription>
+          <cvParam cvRef="MS" accession="MS:1000127" name="centroid mass spectrum"/>
+          <acquisitionList count="2"><cvParam cvRef="MS" accession="MS:1000571" name="sum of spectra"/><acquisition number="1" spectrumRef="S19"/><acquisition number="2" sourceFileRef="sf1" externalNativeID="18" externalSpectrumID="S18"><userParam name="note" value="keep"/></acquisition></acquisitionList>
+          <precursorList count="1"><precursor spectrumRef="S19" sourceFileRef="sf1" externalNativeID="19" externalSpectrumID="S19"><selectedIonList count="1"><selectedIon><cvParam cvRef="MS" accession="MS:1000040" name="m/z" value="445.34"/><cvParam cvRef="MS" accession="MS:1000041" name="charge state" value="2"/><cvParam cvRef="MS" accession="MS:1000042" name="intensity" value="120053"/></selectedIon></selectedIonList><activation/></precursor></precursorList>
+          <scan><cvParam cvRef="MS" accession="MS:1000129" name="negative scan"/></scan>
+        </spectrumDescription>
+        <binaryDataArrayList count="0"/>
+      </spectrum>
+    </spectrumList>
+    <chromatogramList count="1">
+      <chromatogram id="tic" nativeID="tic native" index="0" defaultArrayLength="2" dataProcessingRef="dp">
+        <binaryDataArrayList count="1"><binaryDataArray encodedLength="24"><cvParam cvRef="MS" accession="MS:1000523" name="64-bit float"/><cvParam cvRef="MS" accession="MS:1000576" name="no compression"/><cvParam cvRef="MS" accession="MS:1000595" name="time array"/><binary>AAAAAAAA8D8AAAAAAAAAQA==</binary></binaryDataArray></binaryDataArrayList>
+      </chromatogram>
+    </chromatogramList>
+  </run>
+</mzML>

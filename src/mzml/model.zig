@@ -11,7 +11,7 @@ const arrays = @import("../binary/arrays.zig");
 
 // --- Source hierarchy ---
 
-/// Stable mzML 1.1 element identities; parameter entries are represented separately.
+/// mzML element identities; parameter entries are represented separately.
 pub const Kind = enum {
     mzml,
     cv_list,
@@ -27,6 +27,9 @@ pub const Kind = enum {
     sample,
     software_list,
     software,
+    software_param,
+    acquisition_settings_list,
+    acquisition_settings,
     scan_settings_list,
     scan_settings,
     source_file_ref_list,
@@ -46,6 +49,9 @@ pub const Kind = enum {
     run,
     spectrum_list,
     spectrum,
+    spectrum_description,
+    acquisition_list,
+    acquisition,
     scan_list,
     scan,
     scan_window_list,
@@ -87,6 +93,9 @@ pub const Kind = enum {
             .sample => "sample",
             .software_list => "softwareList",
             .software => "software",
+            .software_param => "softwareParam",
+            .acquisition_settings_list => "acquisitionSettingsList",
+            .acquisition_settings => "acquisitionSettings",
             .scan_settings_list => "scanSettingsList",
             .scan_settings => "scanSettings",
             .source_file_ref_list => "sourceFileRefList",
@@ -106,6 +115,9 @@ pub const Kind = enum {
             .run => "run",
             .spectrum_list => "spectrumList",
             .spectrum => "spectrum",
+            .spectrum_description => "spectrumDescription",
+            .acquisition_list => "acquisitionList",
+            .acquisition => "acquisition",
             .scan_list => "scanList",
             .scan => "scan",
             .scan_window_list => "scanWindowList",
@@ -216,11 +228,11 @@ pub const Node = struct {
     }
 
     /// Parses this selected ion's independent fields; no missing field is inferred.
-    /// Charge uses signed xs:int range. Source parameters remain available on this node.
+    /// Falls back to historical m/z term MS:1000040; charge uses signed xs:int range.
     pub fn selectedIonValues(self: Node, groups: []const cv.Group) MetadataError!SelectedIon {
         if (self.kind != .selected_ion) return error.UnexpectedElement;
         return .{
-            .mz = try self.number(groups, Terms.SELECTED_ION_MZ),
+            .mz = try self.number(groups, Terms.SELECTED_ION_MZ) orelse try self.number(groups, .{ .raw = "MS:1000040" }),
             .charge = try self.integer(i32, groups, Terms.CHARGE_STATE),
             .intensity = try self.number(groups, Terms.PEAK_INTENSITY),
         };
@@ -298,6 +310,8 @@ pub const Terms = struct {
 pub const Header = struct {
     document: Node,
     run: Node,
+    /// Source namespace, independent of the document's version attribute.
+    namespace_uri: []const u8 = "http://psi.hupo.org/ms/mzml",
     groups: []const cv.Group = &.{},
     /// An indexed wrapper was observed; its index and checksum have not been verified.
     indexed: bool = false,
@@ -331,33 +345,39 @@ pub const Record = struct {
         return self.node.integer(i32, groups, Terms.MS_LEVEL);
     }
 
-    /// Reads recognized polarity flags on this spectrum or chromatogram only.
+    /// Reads record polarity, or the single scan's polarity in an mzML 1.0 description.
     /// Absence of both flags returns null; repeats and opposing flags return distinct errors.
     pub fn polarity(self: Record, groups: []const cv.Group) MetadataError!?Polarity {
         if (self.node.kind != .spectrum and self.node.kind != .chromatogram)
             return error.UnexpectedElement;
-        const positive = try exclusiveFlags(self.node, groups, Terms.POSITIVE_SCAN, Terms.NEGATIVE_SCAN) orelse return null;
+        const node = if (self.node.child(.spectrum_description)) |description| description.child(.scan) orelse return null else self.node;
+        const positive = try exclusiveFlags(node, groups, Terms.POSITIVE_SCAN, Terms.NEGATIVE_SCAN) orelse return null;
         return if (positive) .positive else .negative;
     }
 
-    /// Reads centroid/profile flags without interpreting their absent or empty values.
-    /// Unknown terms stay in node.params.
+    /// Reads centroid/profile flags from the record or its mzML 1.0 description.
     pub fn representation(self: Record, groups: []const cv.Group) MetadataError!?Representation {
         if (self.node.kind != .spectrum) return error.UnexpectedElement;
-        const centroid = try exclusiveFlags(self.node, groups, Terms.CENTROID_SPECTRUM, Terms.PROFILE_SPECTRUM) orelse return null;
+        const node = self.node.child(.spectrum_description) orelse self.node;
+        const centroid = try exclusiveFlags(node, groups, Terms.CENTROID_SPECTRUM, Terms.PROFILE_SPECTRUM) orelse return null;
         return if (centroid) .centroid else .profile;
     }
 
     /// Returns all scans in source order. Chromatograms have no scan list.
     /// Like binaryArrays, list access borrows a structurally valid record hierarchy.
     pub fn scans(self: Record) []const Node {
+        if (self.node.child(.spectrum_description)) |description| {
+            for (description.children, 0..) |child, i|
+                if (child.kind == .scan) return description.children[i .. i + 1];
+            return &.{};
+        }
         return listItems(self.node, .scan_list);
     }
 
     /// Returns all spectrum precursors or the optional direct chromatogram precursor.
     /// No first-precursor selection, copying, or parameter interpretation occurs.
     pub fn precursors(self: Record) []const Node {
-        return recordChildren(self.node, .precursor_list, .precursor);
+        return recordChildren(self.node.child(.spectrum_description) orelse self.node, .precursor_list, .precursor);
     }
 
     /// Returns all spectrum products or the optional direct chromatogram product.

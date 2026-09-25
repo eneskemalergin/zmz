@@ -372,13 +372,18 @@ fn readHeaderInner(self: *StreamReader) Error!void {
     try self.parseParams(&self.header_store, true, &param_count);
     run.params = try self.header_store.copy(cv.Entry, self.param_scratch.items);
     self.param_scratch.clearRetainingCapacity();
+    const event = self.cursor.current orelse return error.UnexpectedEnd;
+    if (event.data == .start_element and try self.kind() == .source_file_ref_list) {
+        const refs = try self.parseNode(&self.header_store, 1, true, self.options.payload);
+        run.children = try self.header_store.copy(model.Node, &.{refs});
+    }
     const group_list = document.child(.referenceable_param_group_list);
     const group_nodes = if (group_list) |list| list.children else &.{};
     const groups = try self.header_store.alloc(cv.Group, group_nodes.len);
     for (group_nodes, groups) |node, *group| {
         group.* = .{ .id = node.attribute("id") orelse return error.MissingAttribute, .entries = node.params };
     }
-    self.header = .{ .document = document, .run = run, .groups = groups, .indexed = indexed };
+    self.header = .{ .document = document, .run = run, .namespace_uri = self.cursor.mzml_namespace, .groups = groups, .indexed = indexed };
     self.header_ready = true;
     try self.openList();
 }

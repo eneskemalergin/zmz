@@ -4,6 +4,54 @@ const std = @import("std");
 const mzml = @import("zmz").mzml;
 const support = @import("support.zig");
 
+test "[integration] - [mzML 1.0 metadata]: reads historical fields without moving source nodes" {
+    var input = std.Io.Reader.fixed(support.HISTORICAL);
+    var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+    defer reader.deinit();
+    const header = try reader.readHeader();
+    try std.testing.expectEqualStrings("http://psi.hupo.org/schema_revision/mzML_1.0.0", header.namespace_uri);
+    try std.testing.expectEqualStrings("1.0", header.document.attribute("version").?);
+    const software = header.document.child(.software_list).?.children[0].child(.software_param).?;
+    try std.testing.expectEqualStrings("1.0", software.attribute("version").?);
+    try std.testing.expectEqualStrings("MS:1000615", software.attribute("accession").?);
+    const settings = header.document.child(.acquisition_settings_list).?.children[0];
+    try std.testing.expectEqualStrings("ic", settings.attribute("instrumentConfigurationRef").?);
+    try std.testing.expectEqualStrings("sf1", settings.child(.source_file_ref_list).?.children[0].attribute("ref").?);
+    try std.testing.expectEqualStrings("sf1", header.run.child(.source_file_ref_list).?.children[0].attribute("ref").?);
+    const first = (try reader.nextRecord()).?;
+    try std.testing.expectEqualStrings("S19", first.id);
+    try std.testing.expectEqualStrings("19", first.node.attribute("nativeID").?);
+    try std.testing.expectEqual(@as(?i32, 1), try first.msLevel(header.groups));
+    try std.testing.expectEqual(mzml.model.Polarity.positive, (try first.polarity(header.groups)).?);
+    try std.testing.expectEqual(mzml.model.Representation.profile, (try first.representation(header.groups)).?);
+    try std.testing.expectEqual(@as(usize, 1), first.scans().len);
+    const time = (try first.scans()[0].scanStartTime(header.groups)).?;
+    try std.testing.expectEqual(@as(f64, 5.8905), time.value);
+    try std.testing.expectEqualStrings("UO:0000031", time.parameter.unit.accession.?.raw);
+    try std.testing.expectEqual(null, first.node.child(.scan_list));
+    const second = (try reader.nextRecord()).?;
+    try std.testing.expectEqual(@as(?i32, 2), try second.msLevel(header.groups));
+    try std.testing.expectEqual(mzml.model.Polarity.negative, (try second.polarity(header.groups)).?);
+    try std.testing.expectEqual(mzml.model.Representation.centroid, (try second.representation(header.groups)).?);
+    const acquisitions = second.node.child(.spectrum_description).?.child(.acquisition_list).?.children;
+    try std.testing.expectEqual(@as(usize, 2), acquisitions.len);
+    try std.testing.expectEqualStrings("S19", acquisitions[0].attribute("spectrumRef").?);
+    try std.testing.expectEqualStrings("18", acquisitions[1].attribute("externalNativeID").?);
+    try std.testing.expectEqualStrings("keep", acquisitions[1].params[0].user.value.?);
+    const precursors = second.precursors();
+    try std.testing.expectEqual(@as(usize, 1), precursors.len);
+    try std.testing.expectEqualStrings("S19", precursors[0].attribute("spectrumRef").?);
+    const ion = try (try precursors[0].selectedIons())[0].selectedIonValues(header.groups);
+    try std.testing.expectEqual(@as(f64, 445.34), ion.mz.?.value);
+    try std.testing.expectEqualStrings("MS:1000040", ion.mz.?.parameter.accession.?.raw);
+    try std.testing.expectEqual(@as(?i32, 2), ion.charge);
+    try std.testing.expectEqual(@as(f64, 120053), ion.intensity.?.value);
+    const chromatogram = (try reader.nextRecord()).?;
+    try std.testing.expectEqualStrings("tic native", chromatogram.node.attribute("nativeID").?);
+    try std.testing.expectEqual(@as(usize, 0), chromatogram.scans().len);
+    try std.testing.expectEqual(null, try reader.nextRecord());
+}
+
 test "[property] - [mzML scientific metadata]: distinguishes absent repeated and contradictory record fields" {
     const model = mzml.model;
     var record: model.Record = .{ .node = .{ .kind = .spectrum }, .id = "scan=1", .index = 0, .default_array_length = 0 };

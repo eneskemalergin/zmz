@@ -3,6 +3,8 @@
 const std = @import("std");
 const mzml = @import("zmz").mzml;
 
+pub const HISTORICAL = @embedFile("data/historical.mzML");
+
 pub const HEADER =
     "<mzML xmlns='http://psi.hupo.org/ms/mzml' version='1.1.0' id='example'>" ++
     "<cvList count='1'><cv id='MS' fullName='PSI-MS' URI='urn:test' version=''/></cvList>" ++

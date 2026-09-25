@@ -44,7 +44,7 @@ index_state: ?*IndexState = null,
 file_sink: ?*std.Io.File.Writer = null,
 count_offset: ?u64 = null,
 
-/// Bounds retained index entries and ID bytes for indexed output.
+/// Bounds retained index entries and ID bytes, including historical native/spot IDs.
 pub const IndexLimits = struct { records: usize = 1_000_000, id_bytes: usize = 64 * 1024 * 1024 };
 
 /// Borrows the sink; finish closes XML but the caller must flush and close its own sink.
@@ -85,6 +85,7 @@ pub fn deinit(self: *Writer) void {
     self.engine.deinit();
     if (self.index_state) |state| {
         state.entries.deinit(state.allocator);
+        state.historical_ids.deinit(state.allocator);
         for (&state.ids) |*ids| ids.deinit(state.allocator);
         state.arena.deinit();
         state.allocator.destroy(state);
@@ -100,12 +101,13 @@ pub fn writeHeader(self: *Writer, header: model.Header) Error!void {
     if (self.phase != .initial) return error.InvalidState;
     try schema.checkHeader(header);
     try self.engine.startDocument();
-    if (self.index_state != null) {
+    if (self.index_state) |state| {
+        state.historical = std.mem.eql(u8, header.namespace_uri, xml.NAMESPACE_1_0);
         try self.engine.startElement("indexedmzML");
-        try self.engine.namespace(null, xml.NAMESPACE);
+        try self.engine.namespace(null, header.namespace_uri);
     }
     try self.engine.startElement("mzML");
-    try self.engine.namespace(null, xml.NAMESPACE);
+    try self.engine.namespace(null, header.namespace_uri);
     try self.engine.namespace("xsi", xml.XSI);
     try self.writeAttributes(header.document.attributes);
     try self.writeParams(header.document.params);
@@ -115,6 +117,7 @@ pub fn writeHeader(self: *Writer, header: model.Header) Error!void {
     try self.engine.startElement("run");
     try self.writeAttributes(header.run.attributes);
     try self.writeParams(header.run.params);
+    try self.writeChildren(header.run, false, &no_arrays, self.limits.depth, &budget);
     self.phase = .run;
 }
 
@@ -198,9 +201,8 @@ fn writeRecordInner(self: *Writer, node: model.Node, comptime replace_arrays: bo
         const offset = self.engine.byteOffset() orelse return error.LimitExceeded;
         if (offset > std.math.maxInt(i64)) return error.LimitExceeded;
         const id = node.attribute("id") orelse return error.MissingAttribute;
-        if (state.entries.items.len == state.limits.records or id.len > state.limits.id_bytes -| state.id_bytes)
-            return error.LimitExceeded;
-        const copied = try state.arena.allocator().dupe(u8, id);
+        if (state.entries.items.len == state.limits.records) return error.LimitExceeded;
+        const copied = try state.copyId(id);
         const found = try state.ids[if (node.kind == .spectrum) @as(usize, 0) else 1].getOrPutContextAdapted(
             state.allocator,
             copied,
@@ -209,7 +211,11 @@ fn writeRecordInner(self: *Writer, node: model.Node, comptime replace_arrays: bo
         );
         if (found.found_existing) return error.DuplicateId;
         found.key_ptr.* = state.entries.items.len;
-        state.id_bytes += id.len;
+        if (state.historical) {
+            const native_id = if (node.attribute("nativeID")) |value| try state.copyId(value) else null;
+            const spot_id = if (node.attribute("spotID")) |value| try state.copyId(value) else null;
+            try state.historical_ids.append(state.allocator, .{ .native_id = native_id, .spot_id = spot_id });
+        }
         try state.entries.ensureUnusedCapacity(state.allocator, 1);
         state.entries.appendAssumeCapacity(.{ .id = copied, .offset = offset });
         if (node.kind == .spectrum) state.spectra += 1;
@@ -266,9 +272,13 @@ fn writeIndex(self: *Writer, state: *IndexState) Error!void {
             try self.engine.startElement("index");
             try self.engine.attribute("name", kind.xmlName());
             const entries = if (kind == .spectrum) state.entries.items[0..state.spectra] else state.entries.items[state.spectra..];
-            for (entries) |entry| {
+            for (entries, if (kind == .spectrum) @as(usize, 0) else state.spectra..) |entry, i| {
                 try self.engine.startElement("offset");
                 try self.engine.attribute("idRef", entry.id);
+                if (state.historical) {
+                    try self.optionalAttribute("nativeID", state.historical_ids.items[i].native_id);
+                    try self.optionalAttribute("spotID", state.historical_ids.items[i].spot_id);
+                }
                 var text: [32]u8 = undefined;
                 try self.engine.text(std.fmt.bufPrint(&text, "{d}", .{entry.offset}) catch return error.LimitExceeded);
                 try self.engine.endElement();
@@ -400,9 +410,18 @@ const IndexState = struct {
     arena: std.heap.ArenaAllocator,
     limits: IndexLimits,
     entries: std.ArrayList(IndexEntry) = .empty,
+    historical: bool = false,
+    historical_ids: std.ArrayList(struct { native_id: ?[]const u8, spot_id: ?[]const u8 }) = .empty,
     ids: [2]std.HashMapUnmanaged(usize, void, IdContext, std.hash_map.default_max_load_percentage) = .{ .empty, .empty },
     spectra: usize = 0,
     id_bytes: usize = 0,
+
+    fn copyId(self: *IndexState, text: []const u8) Error![]const u8 {
+        if (text.len > self.limits.id_bytes -| self.id_bytes) return error.LimitExceeded;
+        const result = try self.arena.allocator().dupe(u8, text);
+        self.id_bytes += text.len;
+        return result;
+    }
 };
 
 const IdContext = struct {

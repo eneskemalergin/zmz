@@ -5,6 +5,34 @@ const mzml = @import("zmz").mzml;
 const options = @import("example_test_options");
 const support = @import("support.zig");
 
+test "[integration] - [mzML 1.0 examples]: selects and reencodes through the ordinary API" {
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "input.mzML", .data = support.HISTORICAL });
+    const selected = try run(dir.dir, options.select, &.{ "input.mzML", "MS:1000515", "--ms1" }, 0);
+    defer std.testing.allocator.free(selected);
+    try std.testing.expectEqualStrings("S19 MS:1000515 type=f64 count=2 first=3\n", selected);
+    const rewritten = try run(dir.dir, options.rewrite, &.{ "input.mzML", "zlib.mzML", "--zlib" }, 0);
+    defer std.testing.allocator.free(rewritten);
+    const file = try dir.dir.openFile(std.testing.io, "zlib.mzML", .{});
+    defer file.close(std.testing.io);
+    var index = try mzml.IndexedReader.build(std.testing.allocator, .{ .file = .{ .handle = file, .io = std.testing.io } }, .{});
+    defer index.deinit();
+    try std.testing.expectEqualStrings("http://psi.hupo.org/schema_revision/mzML_1.0.0", index.header().namespace_uri);
+    var decoded = mzml.StreamReader.DecodedArrays.init(std.testing.allocator, .{});
+    defer decoded.deinit();
+    var first = (try index.byIdDecoded(std.testing.allocator, "S19", &decoded)).?;
+    defer first.deinit();
+    try std.testing.expectEqualSlices(f64, &.{ 1, 2 }, decoded.get(0).?.values.float64);
+    try std.testing.expectEqualSlices(f64, &.{ 3, 4 }, decoded.get(1).?.values.float64);
+    try std.testing.expectEqual(mzml.arrays.Pipeline.zlib, decoded.get(0).?.encoding.pipeline);
+    try std.testing.expectEqual(mzml.model.Representation.profile, (try first.value.representation(index.header().groups)).?);
+    var second = (try index.byId(std.testing.allocator, "S20")).?;
+    defer second.deinit();
+    try std.testing.expectEqualStrings("A1", second.value.node.attribute("spotID").?);
+    try std.testing.expectEqual(@as(usize, 2), second.value.node.child(.spectrum_description).?.child(.acquisition_list).?.children.len);
+}
+
 fn run(dir: std.Io.Dir, executable: []const u8, args: []const []const u8, exit_code: u8) ![]u8 {
     const allocator = std.testing.allocator;
     const path = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, executable, allocator);

@@ -6,6 +6,49 @@ const mzml = zmz.mzml;
 const gates = @import("gates_test_support");
 const support = @import("support.zig");
 
+test "[integration] - [mzML 1.0 reading]: streams exact values and selections across refills" {
+    for ([_]usize{ 1, 7, 31 }) |chunk| {
+        try compareDecoded(support.HISTORICAL, chunk);
+        try compareDecodedWithSelection(support.HISTORICAL, chunk, true);
+    }
+    var input = std.Io.Reader.fixed(support.HISTORICAL);
+    var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+    defer reader.deinit();
+    var output = mzml.StreamReader.DecodedArrays.init(std.testing.allocator, .{});
+    defer output.deinit();
+    const first = (try reader.nextDecodedRecord(&output)).?;
+    try std.testing.expectEqualSlices(f64, &.{ 1, 2 }, output.get(0).?.values.float64);
+    try std.testing.expectEqualSlices(f64, &.{ 3, 4 }, output.get(1).?.values.float64);
+    const start = std.mem.indexOf(u8, support.HISTORICAL, "<spectrum id=\"S19\"").?;
+    try std.testing.expectEqual(@as(u64, start), first.node.start_offset);
+    _ = (try reader.nextDecodedRecord(&output)).?;
+    try std.testing.expectEqual(@as(usize, 0), output.len());
+    _ = (try reader.nextDecodedRecord(&output)).?;
+    try std.testing.expectEqualSlices(f64, &.{ 1, 2 }, output.get(0).?.values.float64);
+    try std.testing.expectEqual(null, try reader.nextDecodedRecord(&output));
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, support.readAll, .{ support.HISTORICAL, mzml.StreamReader.Options{} });
+}
+
+test "[failure] - [mzML 1.0 reading]: stops at truncated historical metadata or payload" {
+    for ([_][]const u8{ "<softwareParam", "<sourceFileRef ref=", "<spectrumDescription>", "<acquisition number=", "<binary>" }) |marker| {
+        const end = std.mem.indexOf(u8, support.HISTORICAL, marker).? + marker.len;
+        var input = std.Io.Reader.fixed(support.HISTORICAL[0..end]);
+        var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+        defer reader.deinit();
+        var output = mzml.StreamReader.DecodedArrays.init(std.testing.allocator, .{});
+        defer output.deinit();
+        while (reader.nextDecodedRecord(&output)) |record| {
+            try std.testing.expect(record != null);
+        } else |err| {
+            try std.testing.expectEqual(error.InvalidXml, err);
+            try std.testing.expectEqual(@as(usize, 0), output.len());
+            try std.testing.expectError(error.FailedState, reader.nextRecord());
+            continue;
+        }
+        return error.TestUnexpectedResult;
+    }
+}
+
 const Selection = struct {
     mode: enum { second, named, group, all, none },
     groups: []const mzml.cv.Group = &.{},

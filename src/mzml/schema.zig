@@ -11,8 +11,8 @@ pub fn children(kind: model.Kind) []const Rule {
             .{ .kind = .cv_list },                        .{ .kind = .file_description },
             .{ .kind = .referenceable_param_group_list }, .{ .kind = .sample_list },
             .{ .kind = .software_list },                  .{ .kind = .scan_settings_list },
-            .{ .kind = .instrument_configuration_list },  .{ .kind = .data_processing_list },
-            .{ .kind = .run },
+            .{ .kind = .acquisition_settings_list },      .{ .kind = .instrument_configuration_list },
+            .{ .kind = .data_processing_list },           .{ .kind = .run },
         },
         .file_description => &.{
             .{ .kind = .file_content },             .{ .kind = .source_file_list },
@@ -23,6 +23,9 @@ pub fn children(kind: model.Kind) []const Rule {
         .referenceable_param_group_list => &.{.{ .kind = .referenceable_param_group, .maximum = MANY }},
         .sample_list => &.{.{ .kind = .sample, .maximum = MANY }},
         .software_list => &.{.{ .kind = .software, .maximum = MANY }},
+        .software => &.{.{ .kind = .software_param }},
+        .acquisition_settings_list => &.{.{ .kind = .acquisition_settings, .maximum = MANY }},
+        .acquisition_settings => &.{ .{ .kind = .source_file_ref_list }, .{ .kind = .target_list } },
         .scan_settings_list => &.{.{ .kind = .scan_settings, .maximum = MANY }},
         .scan_settings => &.{ .{ .kind = .source_file_ref_list }, .{ .kind = .target_list } },
         .source_file_ref_list => &.{.{ .kind = .source_file_ref, .maximum = MANY }},
@@ -36,11 +39,14 @@ pub fn children(kind: model.Kind) []const Rule {
         },
         .data_processing_list => &.{.{ .kind = .data_processing, .maximum = MANY }},
         .data_processing => &.{.{ .kind = .processing_method, .maximum = MANY }},
-        .run => &.{ .{ .kind = .spectrum_list }, .{ .kind = .chromatogram_list } },
+        .run => &.{ .{ .kind = .source_file_ref_list }, .{ .kind = .spectrum_list }, .{ .kind = .chromatogram_list } },
         .spectrum_list => &.{.{ .kind = .spectrum, .maximum = MANY }},
         .chromatogram_list => &.{.{ .kind = .chromatogram, .maximum = MANY }},
         .spectrum => &.{
-            .{ .kind = .scan_list },              .{ .kind = .precursor_list }, .{ .kind = .product_list },
+            .{ .kind = .spectrum_description },
+            .{ .kind = .scan_list },
+            .{ .kind = .precursor_list },
+            .{ .kind = .product_list },
             .{ .kind = .binary_data_array_list },
         },
         .chromatogram => &.{
@@ -48,6 +54,8 @@ pub fn children(kind: model.Kind) []const Rule {
             .{ .kind = .binary_data_array_list },
         },
         .scan_list => &.{.{ .kind = .scan, .maximum = MANY }},
+        .spectrum_description => &.{ .{ .kind = .acquisition_list }, .{ .kind = .precursor_list }, .{ .kind = .scan } },
+        .acquisition_list => &.{.{ .kind = .acquisition, .maximum = MANY }},
         .scan => &.{.{ .kind = .scan_window_list }},
         .scan_window_list => &.{.{ .kind = .scan_window, .maximum = MANY }},
         .precursor_list => &.{.{ .kind = .precursor, .maximum = MANY }},
@@ -67,6 +75,7 @@ pub fn children(kind: model.Kind) []const Rule {
 }
 
 pub const CHILD_KINDS = blk: {
+    @setEvalBranchQuota(2000);
     var result: std.EnumArray(model.Kind, struct {
         allowed: std.EnumSet(model.Kind),
         singular: std.EnumSet(model.Kind),
@@ -93,8 +102,9 @@ pub const Error = error{
 };
 
 pub fn checkHeader(header: model.Header) Error!void {
-    if (header.document.kind != .mzml or header.run.kind != .run or header.run.children.len != 0)
+    if (header.document.kind != .mzml or header.run.kind != .run)
         return error.InvalidStructure;
+    for (header.run.children) |child| if (child.kind != .source_file_ref_list) return error.InvalidStructure;
     if (header.document.text != null or header.run.text != null) return error.InvalidStructure;
 }
 

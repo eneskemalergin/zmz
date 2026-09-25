@@ -55,6 +55,7 @@ pub const Header = struct {
         errdefer arena.deinit();
         var copier: copy.Copier = .{ .allocator = arena.allocator(), .remaining = limits.bytes };
         var value = source;
+        value.namespace_uri = try copier.text(source.namespace_uri);
         value.document = try copier.node(source.document, limits.depth);
         value.run = try copier.node(source.run, limits.depth);
         const groups = try copier.alloc(cv.Group, source.groups.len);

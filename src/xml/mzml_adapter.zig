@@ -5,6 +5,7 @@ const base64 = @import("../binary/base64.zig");
 
 /// Stable mzML namespace used by reader and writer paths.
 pub const NAMESPACE = "http://psi.hupo.org/ms/mzml";
+pub const NAMESPACE_1_0 = "http://psi.hupo.org/schema_revision/mzML_1.0.0";
 /// XML Schema instance namespace used only for `schemaLocation`.
 pub const XSI = "http://www.w3.org/2001/XMLSchema-instance";
 const XML_NAMESPACE = "http://www.w3.org/XML/1998/namespace";
@@ -436,6 +437,7 @@ pub const Ancestors = struct {
     bindings: usize,
     encoding: Encoding,
     version: XmlVersion,
+    mzml_namespace: []const u8,
     pending_empty: bool,
 };
 
@@ -457,6 +459,7 @@ pub const Cursor = struct {
     cdata_brackets: u2 = 0,
     normal_text_brackets: u2 = 0,
     effective_version: XmlVersion = .xml10,
+    mzml_namespace: []const u8 = NAMESPACE,
     frames: [MAX_XML_DEPTH]Frame = undefined,
     pending_empty: bool = false,
     event_bytes: std.ArrayList(u8) = .empty,
@@ -528,6 +531,7 @@ pub const Cursor = struct {
             .bindings = self.namespace_bindings.items.len,
             .encoding = self.source.encoding,
             .version = self.effective_version,
+            .mzml_namespace = self.mzml_namespace,
             .pending_empty = self.pending_empty,
         };
     }
@@ -548,6 +552,7 @@ pub const Cursor = struct {
         self.namespace_bytes.items = self.namespace_bytes.allocatedSlice()[0..saved.namespace_bytes];
         self.namespace_bindings.items = self.namespace_bindings.allocatedSlice()[0..saved.bindings];
         self.effective_version = saved.version;
+        self.mzml_namespace = saved.mzml_namespace;
         self.pending_empty = saved.pending_empty;
     }
 
@@ -563,6 +568,7 @@ pub const Cursor = struct {
         self.cdata_brackets = 0;
         self.normal_text_brackets = 0;
         self.effective_version = .xml10;
+        self.mzml_namespace = NAMESPACE;
         self.pending_empty = false;
         self.event_bytes.clearRetainingCapacity();
         self.text_bytes.clearRetainingCapacity();
@@ -599,7 +605,9 @@ pub const Cursor = struct {
                     if (document.version != .xml10) return error.UnsupportedVersion;
                 },
                 .start_element => |start| {
-                    if (!optionalSliceEql(start.name.expanded.namespace_uri, NAMESPACE)) return error.WrongNamespace;
+                    if (self.depth == 1 and optionalSliceEql(start.name.expanded.namespace_uri, NAMESPACE_1_0))
+                        self.mzml_namespace = NAMESPACE_1_0;
+                    if (!optionalSliceEql(start.name.expanded.namespace_uri, self.mzml_namespace)) return error.WrongNamespace;
                     self.current = event;
                     return;
                 },
@@ -1638,7 +1646,7 @@ pub const Writer = struct {
         try self.check(.start_tag);
         if (prefix) |value| {
             if (!std.mem.eql(u8, value, "xsi") or !std.mem.eql(u8, uri, XSI)) return self.fail(error.InvalidNamespace);
-        } else if (!std.mem.eql(u8, uri, NAMESPACE)) {
+        } else if (!std.mem.eql(u8, uri, NAMESPACE) and !std.mem.eql(u8, uri, NAMESPACE_1_0)) {
             return self.fail(error.InvalidNamespace);
         }
         const frame = &self.frames[self.frame_count - 1];
