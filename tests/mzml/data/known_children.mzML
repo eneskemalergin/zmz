@@ -1,0 +1,39 @@
+<mzML xmlns="http://psi.hupo.org/ms/mzml" xmlns:e="urn:extra" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="future">
+  <spectrum id="not-a-record"><binary>not base64</binary></spectrum>
+  <referenceableParamGroupList>
+    <sourceFile><referenceableParamGroup id="unused"><cvParam accession="MS:1000521"/></referenceableParamGroup></sourceFile>
+    <referenceableParamGroup id="encoding"><cvParam accession="MS:1000523"/><cvParam accession="MS:1000576"/></referenceableParamGroup>
+  </referenceableParamGroupList>
+  <run>
+    <software e:type="e:Settings"><cvParam accession="MS:1000511" value="9"/></software>
+    <spectrumList count="1">
+      <chromatogram id="not-a-record"><spectrum/></chromatogram>
+      <spectrum id="s0" index="0" defaultArrayLength="1">
+        <cvParam accession="MS:1000511" value="1"/>
+        <software e:type="e:Local">before<cvParam accession="MS:1000511" value="9"/><binary>not base64</binary>after</software>
+        <scanList><binaryDataArray><binary>not base64</binary></binaryDataArray><scan/></scanList>
+        <binaryDataArrayList>
+          <scan><binaryDataArray/></scan>
+          <binaryDataArray>
+            <scan><cvParam accession="MS:1000521"/><referenceableParamGroupRef ref="absent"/><binary>not base64</binary></scan>
+            <referenceableParamGroupRef ref="encoding"/>
+            <cvParam accession="MS:1000514"/>
+            <binary>AAAAAAAA8D8=</binary>
+            <offset><cvParam accession="MS:1000574"/><binary>not base64</binary></offset>
+          </binaryDataArray>
+          <binaryDataArray><referenceableParamGroupRef ref="encoding"/><cvParam accession="MS:1000515"/><binary>AAAAAAAAAEA=</binary></binaryDataArray>
+        </binaryDataArrayList>
+        <binary>not base64</binary>
+      </spectrum>
+      <software><spectrum/></software>
+    </spectrumList>
+    <scanList><spectrum/></scanList>
+    <chromatogramList count="1">
+      <spectrum id="not-a-record"/>
+      <chromatogram id="c0" index="0" defaultArrayLength="0"><scanList><scan/></scanList></chromatogram>
+      <software/>
+    </chromatogramList>
+    <spectrum/>
+  </run>
+  <binaryDataArrayList><binaryDataArray/></binaryDataArrayList>
+</mzML>

@@ -108,6 +108,44 @@ test "[integration] - [mzML extensions]: selected decoding keeps unfamiliar meta
     try std.testing.checkAllAllocationFailures(std.testing.allocator, readDecodedRecord, .{ support.EXTENSIONS, mzml.arrays.Limits{} });
 }
 
+test "[integration] - [mzML children]: keeps misplaced known names out of metadata and decoding" {
+    var input = std.Io.Reader.fixed(support.KNOWN_CHILDREN);
+    var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+    defer reader.deinit();
+    const header = try reader.readHeader();
+    try std.testing.expectEqual(@as(usize, 1), header.document.children.len);
+    try std.testing.expectEqual(@as(usize, 1), header.groups.len);
+    try std.testing.expectEqualStrings("encoding", header.groups[0].id);
+    try std.testing.expectEqual(@as(usize, 0), header.run.params.len);
+    try std.testing.expectEqual(@as(usize, 0), header.run.children.len);
+    var decoded = mzml.StreamReader.DecodedArrays.init(std.testing.allocator, .{});
+    defer decoded.deinit();
+    const record = (try reader.nextDecodedRecord(&decoded)).?;
+    try std.testing.expectEqualStrings("s0", record.id);
+    try std.testing.expectEqual(@as(?i32, 1), try record.msLevel(header.groups));
+    try std.testing.expectEqual(@as(usize, 2), record.node.children.len);
+    try std.testing.expectEqual(@as(usize, 1), record.scans().len);
+    try std.testing.expectEqual(@as(usize, 2), record.binaryArrays().len);
+    try std.testing.expectEqual(@as(usize, 2), decoded.len());
+    for (0..2) |position| {
+        try std.testing.expectEqual(position, decoded.get(position).?.source_position);
+        try std.testing.expectEqual(@as(usize, 2), record.binaryArrays()[position].params.len);
+        try std.testing.expectEqualSlices(f64, &.{@floatFromInt(position + 1)}, decoded.get(position).?.values.float64);
+    }
+    const next = (try reader.nextDecodedRecord(&decoded)).?;
+    try std.testing.expectEqualStrings("c0", next.id);
+    try std.testing.expectEqual(@as(usize, 0), next.node.children.len);
+    try std.testing.expectEqual(@as(usize, 0), decoded.len());
+    try std.testing.expectEqual(null, try reader.nextDecodedRecord(&decoded));
+    try std.testing.expectEqual(@as(usize, 1), header.spectrum_list.?.observed_count);
+    try std.testing.expectEqual(@as(usize, 1), header.chromatogram_list.?.observed_count);
+    for ([_]usize{ 1, 7, 31 }) |chunk| {
+        try compareDecoded(support.KNOWN_CHILDREN, chunk);
+        try compareDecodedWithSelection(support.KNOWN_CHILDREN, chunk, true);
+    }
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, readDecodedRecord, .{ support.KNOWN_CHILDREN, mzml.arrays.Limits{} });
+}
+
 test "[failure] - [mzML extensions]: bounds retained XML and stops on malformed subtrees" {
     for ([_]mzml.StreamReader.Options{
         .{ .limits = .{ .header_bytes = 128 } },
@@ -119,16 +157,20 @@ test "[failure] - [mzML extensions]: bounds retained XML and stops on malformed 
     const prefix = support.HEADER ++ "<spectrumList count='1'><spectrum id='x' index='0' defaultArrayLength='0'>";
     const minimal = "<mzML xmlns='http://psi.hupo.org/ms/mzml'><run><spectrumList count='1'><spectrum id='x' index='0' defaultArrayLength='0'>";
     const suffix = "</spectrum></spectrumList></run></mzML>";
-    const nodes = minimal ++ "<future><a/><b/></future>" ++ suffix;
-    try support.readAll(std.testing.allocator, nodes, .{ .limits = .{ .nodes = 4 } });
-    try std.testing.expectError(error.LimitExceeded, support.readAll(std.testing.allocator, nodes, .{ .limits = .{ .nodes = 3 } }));
-    try std.testing.expectError(error.LimitExceeded, support.readAll(std.testing.allocator, minimal ++ "<future>" ++ "x" ** 4096 ++ "</future>" ++ suffix, .{ .limits = .{ .record_bytes = 2048 } }));
-    inline for (.{ "<future><nested>", "<future></other>", "<future>&missing;</future>" }) |fragment| {
-        var input = std.Io.Reader.fixed(prefix ++ fragment);
-        var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
-        defer reader.deinit();
-        try std.testing.expectError(error.InvalidXml, reader.nextRecord());
-        try std.testing.expectError(error.FailedState, reader.nextRecord());
+    inline for (.{ "future", "software" }) |name| {
+        const opening = "<" ++ name ++ ">";
+        const closing = "</" ++ name ++ ">";
+        const nodes = minimal ++ opening ++ "<a/><b/>" ++ closing ++ suffix;
+        try support.readAll(std.testing.allocator, nodes, .{ .limits = .{ .nodes = 4 } });
+        try std.testing.expectError(error.LimitExceeded, support.readAll(std.testing.allocator, nodes, .{ .limits = .{ .nodes = 3 } }));
+        try std.testing.expectError(error.LimitExceeded, support.readAll(std.testing.allocator, minimal ++ opening ++ "x" ** 4096 ++ closing ++ suffix, .{ .limits = .{ .record_bytes = 2048 } }));
+        inline for (.{ opening ++ "<nested>", opening ++ "</other>", opening ++ "&missing;" ++ closing }) |fragment| {
+            var input = std.Io.Reader.fixed(prefix ++ fragment);
+            var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+            defer reader.deinit();
+            try std.testing.expectError(error.InvalidXml, reader.nextRecord());
+            try std.testing.expectError(error.FailedState, reader.nextRecord());
+        }
     }
 }
 
@@ -1098,7 +1140,6 @@ test "[integration] - [mzML children]: distinguishes missing payloads from ambig
         "<binaryDataArrayList/><binaryDataArrayList/>",
         "<binaryDataArrayList><binaryDataArray><referenceableParamGroupRef ref='encoding'/><binary>AAAAAAAA8D8=</binary><binary/></binaryDataArray></binaryDataArrayList>",
         "<precursorList><precursor><selectedIonList/><selectedIonList/></precursor></precursorList>",
-        "<scanList><binaryDataArray/></scanList>",
     }) |body| {
         const source = prefix ++ body ++ suffix;
         try std.testing.expectError(error.InvalidStructure, support.readAll(std.testing.allocator, source, .{}));
@@ -1144,7 +1185,7 @@ test "[integration] - [mzML header]: preserves present sections without requirin
         try std.testing.checkAllAllocationFailures(std.testing.allocator, readDecodedRecord, .{ source, mzml.arrays.Limits{} });
     }
     const opening = "<mzML xmlns='http://psi.hupo.org/ms/mzml' version='1.1.0'>";
-    inline for (.{ group ++ group ++ "<run/>", "<spectrum id='x' index='0' defaultArrayLength='0'/><run/>", software }) |body| {
+    inline for (.{ group ++ group ++ "<run/>", software }) |body| {
         try std.testing.expectError(error.InvalidStructure, support.readAll(std.testing.allocator, opening ++ body ++ "</mzML>", .{}));
     }
 }
@@ -1339,7 +1380,7 @@ test "[integration] - [mzML numeric attributes]: requires a length only for requ
     }
 }
 
-test "[failure] - [mzML attributes]: rejects missing identifiers and misplaced groups" {
+test "[failure] - [mzML attributes]: requires identifiers and requested groups" {
     for ([_][]const u8{ "id='encoding'", "id='native=a&amp;b'" }) |attribute| {
         const removed = try std.mem.replaceOwned(u8, std.testing.allocator, support.DOCUMENT, attribute, "");
         defer std.testing.allocator.free(removed);
@@ -1355,7 +1396,8 @@ test "[failure] - [mzML attributes]: rejects missing identifiers and misplaced g
     defer std.testing.allocator.free(unexpected_start);
     const unexpected_group = try std.mem.replaceOwned(u8, std.testing.allocator, unexpected_start, "</referenceableParamGroup>", "</sourceFile>");
     defer std.testing.allocator.free(unexpected_group);
-    try std.testing.expectError(error.InvalidStructure, support.readAll(std.testing.allocator, unexpected_group, .{}));
+    try support.readAll(std.testing.allocator, unexpected_group, .{});
+    try std.testing.expectError(error.MissingGroup, readDecoded(std.testing.allocator, unexpected_group, .{}));
 }
 
 test "[integration] - [mzML numeric attributes]: reads source text and checks numbers when used" {

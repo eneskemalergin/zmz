@@ -339,9 +339,9 @@ pub fn finishEmptySpectrumList(self: *StreamReader) Error!void {
     if (self.active_list != .chromatogram_list) return error.InvalidStructure;
 }
 
-fn skipExtraXml(self: *StreamReader) Error!void {
+fn skipExtraXml(self: *StreamReader, parent: model.Kind) Error!void {
     while (self.cursor.current) |event| {
-        if (event.data != .start_element or self.knownKind() != null) break;
+        if (event.data != .start_element or self.childKind(parent) != null) break;
         self.record_store.reset();
         _ = try self.readXml(&self.record_store, false);
         try self.cursor.advance(false);
@@ -349,10 +349,10 @@ fn skipExtraXml(self: *StreamReader) Error!void {
 }
 
 fn finishSpectrumList(self: *StreamReader) Error!void {
-    try self.skipExtraXml();
+    try self.skipExtraXml(.spectrum_list);
     try self.consumeEnd(.spectrum_list, true);
     self.active_list = null;
-    try self.skipExtraXml();
+    try self.skipExtraXml(.run);
     try self.openList();
 }
 
@@ -400,7 +400,7 @@ fn readHeaderInner(self: *StreamReader) Error!void {
         try self.parseParams(&self.header_store, true, &document_params);
         if (content.items.len != 0 and document_params != before)
             try content.append(self.allocator, .{ .params = document_params - before });
-        const kind_value = self.knownKind() orelse {
+        const kind_value = self.childKind(.mzml) orelse {
             if (content.items.len == 0) try self.startContent(&content, document_params, metadata.items.len);
             const fragment = try self.readXml(&self.header_store, true);
             try content.append(self.allocator, .{ .xml = fragment });
@@ -408,9 +408,6 @@ fn readHeaderInner(self: *StreamReader) Error!void {
             continue;
         };
         if (kind_value == .run) break;
-        for (sections) |section| {
-            if (section.kind == kind_value) break;
-        } else return error.InvalidStructure;
         // Header consumers select one container of each kind.
         if (seen.contains(kind_value)) return error.InvalidStructure;
         seen.insert(kind_value);
@@ -439,7 +436,7 @@ fn readHeaderInner(self: *StreamReader) Error!void {
             try content.append(self.allocator, .{ .params = param_count - before });
         const event = self.cursor.current orelse return error.UnexpectedEnd;
         if (event.data == .end_element) break;
-        if (self.knownKind()) |kind_value| {
+        if (self.childKind(.run)) |kind_value| {
             if (kind_value != .source_file_ref_list) break;
             if (metadata.items.len != 0) return error.InvalidStructure;
             try metadata.append(self.allocator, try self.parseNode(&self.header_store, 1, true, self.options.payload));
@@ -509,10 +506,8 @@ fn nextItemInner(self: *StreamReader, comptime retention: Retention, comptime re
                 self.position = .run;
                 return .list_end;
             }
-            const kind_value = self.knownKind() orelse
+            _ = self.childKind(list_kind) orelse
                 return .{ .xml = try self.readXml(&self.record_store, retain_xml) };
-            const expected: model.Kind = if (list_kind == .spectrum_list) .spectrum else .chromatogram;
-            if (kind_value != expected) return error.InvalidStructure;
             const node = try self.parseNodeFor(&self.record_store, 1, false, self.options.payload, retention);
             const list = if (list_kind == .spectrum_list) &self.header.spectrum_list.? else &self.header.chromatogram_list.?;
             list.observed_count = std.math.add(usize, list.observed_count, 1) catch return error.LimitExceeded;
@@ -530,7 +525,7 @@ fn nextItemInner(self: *StreamReader, comptime retention: Retention, comptime re
                 self.position = .run_end;
                 continue;
             }
-            if (self.knownKind() == null)
+            if (self.childKind(.run) == null)
                 return .{ .xml = try self.readXml(&self.record_store, retain_xml) };
             try self.openList();
         },
@@ -546,7 +541,7 @@ fn nextItemInner(self: *StreamReader, comptime retention: Retention, comptime re
                 try self.consumeEnd(.mzml, false);
                 break;
             }
-            if (self.knownKind() != null) return error.InvalidStructure;
+            if (self.childKind(.mzml) != null) return error.InvalidStructure;
             return .{ .xml = try self.readXml(&self.record_store, retain_xml) };
         },
     };
@@ -590,6 +585,11 @@ fn knownKind(self: *StreamReader) ?model.Kind {
     const value = ELEMENT_KINDS.get(name.local) orelse return null;
     self.current_kind = value;
     return value;
+}
+
+fn childKind(self: *StreamReader, parent: model.Kind) ?model.Kind {
+    const value = self.knownKind() orelse return null;
+    return if (schema.CHILD_KINDS.get(parent).allowed.contains(value)) value else null;
 }
 
 fn startNode(self: *StreamReader, storage: *Storage, kind_value: model.Kind) Error!model.Node {
@@ -663,7 +663,7 @@ fn parseNodeFor(self: *StreamReader, storage: *Storage, depth: usize, advance_af
         try self.parseParams(storage, retention == .tree, &param_count);
         if (kind_value == .binary_data_array) {
             while (self.cursor.current) |event| {
-                if (event.data != .start_element or self.knownKind() != null) break;
+                if (event.data != .start_element or self.childKind(kind_value) != null) break;
                 if (retention == .tree and content.items.len == 0) try self.startContent(&content, param_count, 0);
                 const fragment = try self.readXml(storage, retention == .tree);
                 if (retention == .tree) try content.append(self.allocator, .{ .xml = fragment });
@@ -719,14 +719,13 @@ fn parseNodeFor(self: *StreamReader, storage: *Storage, depth: usize, advance_af
                 }
                 continue;
             }
-            const child_kind = self.knownKind() orelse {
+            const child_kind = self.childKind(kind_value) orelse {
                 if (retention == .tree and content.items.len == 0) try self.startContent(&content, param_count, child_count);
                 const fragment = try self.readXml(storage, retention == .tree);
                 if (retention == .tree) try content.append(self.allocator, .{ .xml = fragment });
                 try self.cursor.advance(false);
                 continue;
             };
-            if (!children.allowed.contains(child_kind)) return error.InvalidStructure;
             // First-child helpers cannot return repeated singular containers.
             if (children.singular.contains(child_kind) and seen.contains(child_kind)) return error.InvalidStructure;
             seen.insert(child_kind);

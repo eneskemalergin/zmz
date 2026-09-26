@@ -6,7 +6,7 @@ const support = @import("support.zig");
 
 test "[integration] - [mzML items]: retains empty-list XML and indexes following chromatograms" {
     const source = "<mzML xmlns='http://psi.hupo.org/ms/mzml' xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance'><run>" ++
-        "<spectrumList count='0'><first/></spectrumList><between/>" ++
+        "<spectrumList count='0'><first/><software/></spectrumList><between/><scan/>" ++
         "<chromatogramList count='1'><before/><chromatogram id='c' index='0' defaultArrayLength='0'/>" ++
         "<after/></chromatogramList><last/></run><tail/></mzML>";
     var sink: std.Io.Writer.Allocating = .init(std.testing.allocator);
@@ -110,6 +110,66 @@ test "[failure] - [mzML items]: rejects misplaced items and propagates failed ou
         const item: mzml.model.Item = .{ .xml = "<note>" ++ "x" ** 2048 ++ "</note>" };
         try std.testing.expectError(if (phase == 2) error.WriteFailed else error.InvalidState, writer.writeItem(item));
         try std.testing.expectError(error.FailedState, writer.finish());
+    }
+}
+
+test "[integration] - [mzML children]: copies misplaced known XML without indexing nested records" {
+    const allocator = std.testing.allocator;
+    for ([_]bool{ false, true }) |indexed| {
+        var input = std.Io.Reader.fixed(support.KNOWN_CHILDREN);
+        var reader = try mzml.StreamReader.init(allocator, &input, .{});
+        defer reader.deinit();
+        var builder = mzml.Builder.init(allocator, .{});
+        defer builder.deinit();
+        const header = try builder.header((try reader.readHeader()).*);
+        var sink: std.Io.Writer.Allocating = .init(allocator);
+        defer sink.deinit();
+        var writer = if (indexed) try mzml.Writer.initIndexed(allocator, &sink.writer, .{}, .{}) else try mzml.Writer.init(allocator, &sink.writer, .{});
+        defer writer.deinit();
+        try writer.writeHeader(header);
+        var item = try reader.nextItem();
+        while (item) |current| {
+            var copy = try mzml.owned.Item.init(allocator, current, .{});
+            defer copy.deinit();
+            item = try reader.nextItem();
+            try writer.writeItem(copy.value);
+        }
+        try writer.finish();
+        var original_input = std.Io.Reader.fixed(support.KNOWN_CHILDREN);
+        var original = try mzml.StreamReader.init(allocator, &original_input, .{});
+        defer original.deinit();
+        var written_input = std.Io.Reader.fixed(sink.written());
+        var written = try mzml.StreamReader.init(allocator, &written_input, .{ .retain_index = indexed });
+        defer written.deinit();
+        const copied_header = try written.readHeader();
+        try support.expectNode(header.document, copied_header.document);
+        try support.expectNode(header.run, copied_header.run);
+        var fragments: usize = 0;
+        while (try original.nextItem()) |expected| {
+            try support.expectItem(expected, (try written.nextItem()).?);
+            if (expected == .xml) fragments += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 7), fragments);
+        try std.testing.expectEqual(null, try written.nextItem());
+        for (std.enums.values(mzml.IndexedReader.Policy)) |policy| {
+            if (!indexed and policy == .open_embedded) continue;
+            var index = try mzml.IndexedReader.build(allocator, .{ .bytes = sink.written() }, .{ .policy = policy });
+            defer index.deinit();
+            try std.testing.expectEqualDeep([_]usize{ 1, 1 }, index.counts);
+            try std.testing.expectEqual(null, try index.byId(allocator, "not-a-record"));
+            var decoded = mzml.StreamReader.DecodedArrays.init(allocator, .{});
+            defer decoded.deinit();
+            for (index.entries.items) |entry| {
+                var retained = (try index.byId(allocator, entry.id)).?;
+                defer retained.deinit();
+                var numeric = (try index.atDecoded(allocator, entry.kind, entry.index, &decoded)).?;
+                defer numeric.deinit();
+                try std.testing.expectEqualDeep(retained.value.node.content, numeric.value.node.content);
+                try std.testing.expectEqual(if (entry.kind == .spectrum) @as(usize, 2) else 0, decoded.len());
+                for (0..decoded.len()) |position|
+                    try std.testing.expectEqualSlices(f64, &.{@floatFromInt(position + 1)}, decoded.get(position).?.values.float64);
+            }
+        }
     }
 }
 
