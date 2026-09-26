@@ -41,7 +41,12 @@ pub const Copier = struct {
 
     pub fn entries(self: *Copier, source: []const cv.Entry) Error![]const cv.Entry {
         const result = try self.alloc(cv.Entry, source.len);
-        for (source, result) |entry, *copy| copy.* = switch (entry) {
+        for (source, result) |value, *copy| copy.* = try self.entry(value);
+        return result;
+    }
+
+    pub fn entry(self: *Copier, source: cv.Entry) Error!cv.Entry {
+        return switch (source) {
             .group_ref => |ref| .{ .group_ref = .{ .ref = try self.optionalText(ref.ref), .xml = try self.xmlAttributes(ref.xml) } },
             .cv => |param| .{ .cv = .{
                 .cv_ref = try self.optionalText(param.cv_ref),
@@ -59,17 +64,20 @@ pub const Copier = struct {
                 .xml = try self.xmlAttributes(param.xml),
             } },
         };
-        return result;
     }
 
     fn attributes(self: *Copier, source: []const model.Attribute) Error![]const model.Attribute {
         const result = try self.alloc(model.Attribute, source.len);
-        for (source, result) |attr, *copy| copy.* = .{
-            .name = try self.text(attr.name),
-            .namespace_uri = try self.optionalText(attr.namespace_uri),
-            .value = try self.text(attr.value),
-        };
+        for (source, result) |attr, *copy| copy.* = try self.attribute(attr);
         return result;
+    }
+
+    pub fn attribute(self: *Copier, source: model.Attribute) Error!model.Attribute {
+        return .{
+            .name = try self.text(source.name),
+            .namespace_uri = try self.optionalText(source.namespace_uri),
+            .value = try self.text(source.value),
+        };
     }
 
     fn xmlAttributes(self: *Copier, source: ?*const cv.ParameterXml) Error!?*const cv.ParameterXml {

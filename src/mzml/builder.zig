@@ -179,46 +179,53 @@ fn prepareArrayFromInner(self: *Builder, comptime T: type, values: []const T, so
     defer self.remaining = copier.remaining;
     const params = try copier.alloc(cv.Entry, counted.count);
     _ = try reencodedParams(params, source.params, groups, target, replacements, params.len);
+    for (params) |*entry| entry.* = try copier.entry(entry.*);
     const is_default = counted.is_default;
     var encoded_length: [32]u8 = undefined;
     var array_length: [32]u8 = undefined;
     const encoded_text = std.fmt.bufPrint(&encoded_length, "{d}", .{try base64.encodedSize(wire.len)}) catch return error.LimitExceeded;
     const length_text = std.fmt.bufPrint(&array_length, "{d}", .{values.len}) catch return error.LimitExceeded;
-    const attributes = try copier.alloc(model.Attribute, std.math.add(usize, source.attributes.len, 2) catch return error.LimitExceeded);
-    @memcpy(attributes[0..source.attributes.len], source.attributes);
-    var has_encoded_length = false;
-    var has_array_length = false;
-    for (attributes[0..source.attributes.len]) |*attribute| {
-        if (attribute.namespace_uri != null) continue;
-        if (std.mem.eql(u8, attribute.name, "encodedLength")) {
-            attribute.value = encoded_text;
-            has_encoded_length = true;
-        } else if (std.mem.eql(u8, attribute.name, "arrayLength")) {
-            attribute.value = length_text;
-            has_array_length = true;
+    const add_encoded_length = source.attribute("encodedLength") == null;
+    const add_array_length = !is_default and source.attribute("arrayLength") == null;
+    const added = @as(usize, @intFromBool(add_encoded_length)) + @intFromBool(add_array_length);
+    const attributes = try copier.alloc(model.Attribute, std.math.add(usize, source.attributes.len, added) catch return error.LimitExceeded);
+    for (source.attributes, attributes[0..source.attributes.len]) |attribute, *destination| {
+        var changed = attribute;
+        if (attribute.namespace_uri == null) {
+            if (std.mem.eql(u8, attribute.name, "encodedLength")) {
+                changed.value = encoded_text;
+            } else if (std.mem.eql(u8, attribute.name, "arrayLength")) {
+                changed.value = length_text;
+            }
         }
+        destination.* = try copier.attribute(changed);
     }
     var attribute_count = source.attributes.len;
-    if (!has_encoded_length) {
-        attributes[attribute_count] = .{ .name = "encodedLength", .value = encoded_text };
+    if (add_encoded_length) {
+        attributes[attribute_count] = try copier.attribute(.{ .name = "encodedLength", .value = encoded_text });
         attribute_count += 1;
     }
-    if (!has_array_length and !is_default) {
-        attributes[attribute_count] = .{ .name = "arrayLength", .value = length_text };
-        attribute_count += 1;
+    if (add_array_length) {
+        attributes[attribute_count] = try copier.attribute(.{ .name = "arrayLength", .value = length_text });
     }
     var binary = source.children[0];
     binary.text = null;
+    const children = try copier.alloc(model.Node, 1);
+    children[0] = try copier.node(binary, self.limits.depth - 1);
     var result = source;
-    result.attributes = attributes[0..attribute_count];
+    result.attributes = attributes;
     result.params = params;
-    result.children = &.{binary};
+    result.children = children;
+    result.text = if (source.text) |text| try copier.text(text) else null;
     if (source.content) |content| {
         const copied = &(try copier.alloc(model.Content, 1))[0];
         const items = try copier.alloc(model.Content.Item, content.items.len);
         var position: usize = 0;
         for (content.items, items) |item, *destination| {
-            destination.* = item;
+            destination.* = switch (item) {
+                .xml => |bytes| .{ .xml = try copier.text(bytes) },
+                else => item,
+            };
             if (item != .params) continue;
             if (item.params > source.params.len - position) return error.InvalidStructure;
             const run = try reencodedParams(null, source.params[position..][0..item.params], groups, target, replacements, params.len);
@@ -230,7 +237,7 @@ fn prepareArrayFromInner(self: *Builder, comptime T: type, values: []const T, so
         result.content = copied;
     }
     return .{ .array = .{
-        .node = try copier.node(result, self.limits.depth),
+        .node = result,
         .length = values.len,
         .is_default = is_default,
         .owner = self,

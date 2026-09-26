@@ -303,6 +303,10 @@ fn replaceArrayAllocated(allocator: std.mem.Allocator) !void {
                 .transport = &wire,
                 .transformed = &scratch,
             }, &compressor);
+            var copied = mzml.Builder.init(allocator, .{});
+            defer copied.deinit();
+            _ = try copied.node(result.array.node);
+            try std.testing.expectEqual(copied.limits.bytes - copied.remaining, builder.limits.bytes - builder.remaining);
             try std.testing.expectEqual(length, result.array.length);
             try std.testing.expect(result.array.is_default);
             try std.testing.expectEqual(null, result.array.node.child(.binary).?.text);
@@ -329,6 +333,49 @@ fn replaceArrayAllocated(allocator: std.mem.Allocator) !void {
 
 test "[integration] - [array replacement]: preserves source metadata while changing values and encoding" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, replaceArrayAllocated, .{});
+}
+
+test "[regression] - [array replacement]: charges only final metadata and outlives the source" {
+    var builder = mzml.Builder.init(std.testing.allocator, .{ .depth = 2 });
+    defer builder.deinit();
+    var copied = mzml.Builder.init(std.testing.allocator, .{});
+    defer copied.deinit();
+    const values = [_]f64{ 5, 6 };
+    const scratch: mzml.arrays.Scratch = .{ .transport = &.{}, .transformed = &.{} };
+    const nodes = blk: {
+        var input = std.Io.Reader.fixed(support.EXTENSIONS);
+        var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+        defer reader.deinit();
+        const header = try reader.readHeader();
+        const source = (try reader.nextRecord()).?.binaryArrays()[0];
+        var binary = source.children[0];
+        binary.text = null;
+        var expected_source = source;
+        expected_source.children = &.{binary};
+        const expected = try copied.node(expected_source);
+        const bytes = copied.limits.bytes - copied.remaining;
+        for ([_]mzml.owned.Limits{ .{ .bytes = bytes - 1 }, .{ .depth = 1 } }) |limits| {
+            var limited = mzml.Builder.init(std.testing.allocator, limits);
+            defer limited.deinit();
+            try std.testing.expectError(error.LimitExceeded, limited.prepareArrayFrom(f64, &values, source, header.groups, .{}, scratch, null));
+        }
+        var exact = mzml.Builder.init(std.testing.allocator, .{ .bytes = bytes, .depth = 2 });
+        defer exact.deinit();
+        const bounded = try exact.prepareArrayFrom(f64, &values, source, header.groups, .{}, scratch, null);
+        try std.testing.expectEqual(@as(usize, 0), exact.remaining);
+        try std.testing.expectEqualDeep(expected, bounded.array.node);
+        try std.testing.expectError(error.LimitExceeded, exact.prepareArrayFrom(f64, &values, source, header.groups, .{}, scratch, null));
+        exact.reset();
+        const retried = try exact.prepareArrayFrom(f64, &values, source, header.groups, .{}, scratch, null);
+        try std.testing.expectEqualDeep(expected, retried.array.node);
+        const result = try builder.prepareArrayFrom(f64, &values, source, header.groups, .{}, scratch, null);
+        break :blk .{ expected, result.array.node };
+    };
+    try std.testing.expectEqualDeep(nodes[0], nodes[1]);
+    try std.testing.expectEqual(copied.remaining, builder.remaining);
+    builder.reset();
+    try std.testing.expectEqual(builder.limits.bytes, builder.remaining);
+    try std.testing.expectEqualStrings("24", nodes[0].attribute("encodedLength").?);
 }
 
 test "[integration] - [array replacement]: returns metadata and allocation errors without dropping children" {
@@ -602,6 +649,7 @@ test "[failure] - [mzML construction]: rejects depth options before copying or e
         var builder = mzml.Builder.init(empty.allocator(), .{ .depth = depth });
         defer builder.deinit();
         try std.testing.expectError(error.LimitExceeded, builder.record(.spectrum, "one", 0, 0, &.{}, &.{}, &.{}));
+        try std.testing.expectError(error.LimitExceeded, builder.prepareArrayFrom(f64, &.{1}, .{ .kind = .binary_data_array }, &.{}, .{}, .{ .transport = &.{}, .transformed = &.{} }, null));
         try std.testing.expectError(error.LimitExceeded, builder.preparedRecord(.spectrum, "one", 0, 0, &.{}, &.{}, &.{}));
         const options: mzml.Builder.ArrayOptions = .{ .cv_ref = "MS", .role = .{ .cv_ref = "MS", .accession = mzml.model.Terms.MZ_ARRAY, .name = "m/z" } };
         const scratch: mzml.arrays.Scratch = .{ .transport = &.{}, .transformed = &.{} };
