@@ -6,6 +6,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const math_options = @import("numpress_math_options");
+const cpu = @import("cpu.zig");
 
 const SlofMathBackend = enum { bundled, glibc_vector };
 const SLOF_MATH_BACKEND = std.meta.stringToEnum(
@@ -22,8 +23,6 @@ comptime {
 }
 const F64x2 = @Vector(2, f64);
 const F64x4 = @Vector(4, f64);
-const CpuidLeaf = struct { eax: u32, ebx: u32, ecx: u32, edx: u32 };
-var avx2_state = std.atomic.Value(u8).init(0);
 
 extern fn _ZGVbN2v_exp(F64x2) callconv(.c) F64x2;
 extern fn _ZGVdN4v_exp(F64x4) callconv(.c) F64x4;
@@ -808,7 +807,7 @@ pub fn encodeSlof(values: []const f64, fixed_point: f64, output: []u8) Error!usi
     writeFixedPoint(output[0..8], fixed_point);
 
     if (comptime SLOF_MATH_BACKEND == .glibc_vector) {
-        if (hasAvx2()) {
+        if (cpu.hasAvx2()) {
             try encodeSlofAvx2(values, fixed_point, output, encoded_len);
             return encoded_len;
         }
@@ -861,51 +860,6 @@ noinline fn encodeSlofAvx2(
         try validateNonnegative(value);
         try writeSlofCode(output, index, @log(value + 1.0) * fixed_point);
     }
-}
-
-fn hasAvx2() bool {
-    // The four-lane glibc ABI uses YMM registers, so both CPU support and saved
-    // XMM/YMM operating-system state must be present before entering its body.
-    const cached = avx2_state.load(.acquire);
-    if (cached != 0) return cached == 2;
-    const supported = detectAvx2();
-    avx2_state.store(if (supported) 2 else 1, .release);
-    return supported;
-}
-
-fn detectAvx2() bool {
-    const maximum = cpuid(0, 0).eax;
-    if (maximum < 7) return false;
-    const basic = cpuid(1, 0);
-    const os_xsave = basic.ecx & (@as(u32, 1) << 27) != 0;
-    const avx = basic.ecx & (@as(u32, 1) << 28) != 0;
-    if (!os_xsave or !avx or xcr0() & 0x6 != 0x6) return false;
-    return cpuid(7, 0).ebx & (@as(u32, 1) << 5) != 0;
-}
-
-fn cpuid(leaf: u32, subleaf: u32) CpuidLeaf {
-    var eax: u32 = undefined;
-    var ebx: u32 = undefined;
-    var ecx: u32 = undefined;
-    var edx: u32 = undefined;
-    asm volatile ("cpuid"
-        : [_] "={eax}" (eax),
-          [_] "={ebx}" (ebx),
-          [_] "={ecx}" (ecx),
-          [_] "={edx}" (edx),
-        : [_] "{eax}" (leaf),
-          [_] "{ecx}" (subleaf),
-    );
-    return .{ .eax = eax, .ebx = ebx, .ecx = ecx, .edx = edx };
-}
-
-fn xcr0() u32 {
-    return asm volatile (
-        \\ xor %%ecx, %%ecx
-        \\ xgetbv
-        : [_] "={eax}" (-> u32),
-        :
-        : .{ .edx = true, .ecx = true });
 }
 
 fn slofAllZero(values: []const f64) bool {
@@ -984,7 +938,7 @@ pub fn decodeSlof(input: []const u8, output: []f64) Error!usize {
 
     var index: usize = 0;
     if (comptime SLOF_MATH_BACKEND == .glibc_vector) {
-        if (hasAvx2()) {
+        if (cpu.hasAvx2()) {
             while (value_count - index >= 4) : (index += 4) {
                 const encoded: @Vector(4, u16) = .{
                     std.mem.readInt(u16, input[8 + index * 2 ..][0..2], .little),

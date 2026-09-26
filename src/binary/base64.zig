@@ -8,6 +8,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const options = @import("base64_options");
+const cpu = @import("cpu.zig");
 // Zig's self-hosted x86 backend cannot assemble vector memory operands yet.
 const USE_AVX2 = builtin.cpu.arch == .x86_64 and options.simd and builtin.zig_backend == .stage2_llvm;
 
@@ -262,7 +263,7 @@ fn encodeInto(output: []u8, source: []const u8) void {
     var position: usize = 0;
     var written: usize = 0;
     if (comptime USE_AVX2) {
-        if (source.len >= 32 and hasAvx2()) {
+        if (source.len >= 32 and cpu.hasAvx2()) {
             position = encodeAvx2(source, output);
             written = position / 3 * 4;
         }
@@ -307,7 +308,7 @@ fn decodePrefix(output: []u8, source: []const u8) usize {
     const length = @min(source.len / 4, output.len / 3) * 4;
     var position: usize = 0;
     if (comptime USE_AVX2) {
-        if (length >= 32 and hasAvx2()) position = decodeAvx2(source[0..length], output);
+        if (length >= 32 and cpu.hasAvx2()) position = decodeAvx2(source[0..length], output);
     }
     if (length - position >= 32) {
         while (position < length) : (position += 4) {
@@ -377,51 +378,7 @@ fn overlaps(output: []u8, source: []const u8) bool {
     return if (a <= b) b - a < output.len else a - b < source.len;
 }
 
-// --- CPU selection and AVX2 ---
-
-const AVX_STATE: u32 = (1 << 26) | (1 << 27) | (1 << 28);
-var avx2_cached = std.atomic.Value(u8).init(0);
-
-fn hasAvx2() bool {
-    if (comptime !USE_AVX2) return false;
-    const saved = avx2_cached.load(.monotonic);
-    if (saved != 0) return saved == 2;
-    const available = detectAvx2();
-    avx2_cached.store(if (available) 2 else 1, .monotonic);
-    return available;
-}
-
-fn detectAvx2() bool {
-    if (cpuid(0, 0).eax < 7) return false;
-    const leaf1 = cpuid(1, 0).ecx;
-    if (leaf1 & AVX_STATE != AVX_STATE) return false;
-    const leaf7 = cpuid(7, 0).ebx;
-    if (leaf7 & (1 << 5) == 0) return false;
-    const xcr0 = asm volatile (
-        \\xgetbv
-        : [_] "={eax}" (-> u32),
-        : [_] "{ecx}" (@as(u32, 0)),
-        : .{ .edx = true });
-    return avx2Usable(leaf1, leaf7, xcr0);
-}
-
-fn avx2Usable(leaf1: u32, leaf7: u32, xcr0: u32) bool {
-    return leaf1 & AVX_STATE == AVX_STATE and leaf7 & (1 << 5) != 0 and xcr0 & 6 == 6;
-}
-
-fn cpuid(leaf: u32, subleaf: u32) struct { eax: u32, ebx: u32, ecx: u32 } {
-    var eax: u32 = undefined;
-    var ebx: u32 = undefined;
-    var ecx: u32 = undefined;
-    asm volatile ("cpuid"
-        : [_] "={eax}" (eax),
-          [_] "={ebx}" (ebx),
-          [_] "={ecx}" (ecx),
-        : [_] "{eax}" (leaf),
-          [_] "{ecx}" (subleaf),
-        : .{ .edx = true });
-    return .{ .eax = eax, .ebx = ebx, .ecx = ecx };
-}
+// --- AVX2 ---
 
 const AVX2_ENCODE: [8][32]u8 align(32) = .{
     [_]u8{ 1, 0, 2, 1, 4, 3, 5, 4, 7, 6, 8, 7, 10, 9, 11, 10 } ** 2,
@@ -604,37 +561,4 @@ noinline fn decodeAvx2(input: []const u8, output: []u8) usize {
           .memory = true,
         });
     return (groups - remaining) * 32;
-}
-
-test "[property] - [base64 dispatch]: requires hardware and OS vector state" {
-    try std.testing.expect(avx2Usable(AVX_STATE, 1 << 5, 6));
-    for ([_]u5{ 26, 27, 28 }) |bit|
-        try std.testing.expect(!avx2Usable(AVX_STATE & ~(@as(u32, 1) << bit), 1 << 5, 6));
-    try std.testing.expect(!avx2Usable(AVX_STATE, 0, 6));
-    for ([_]u32{ 0, 2, 4 }) |state|
-        try std.testing.expect(!avx2Usable(AVX_STATE, 1 << 5, state));
-}
-
-test "[unit] - [base64 dispatch]: agrees with host detection on repeated calls" {
-    const expected = if (comptime USE_AVX2)
-        (try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_model = .native })).cpu.has(.x86, .avx2)
-    else
-        false;
-    try std.testing.expectEqual(expected, hasAvx2());
-    try std.testing.expectEqual(expected, hasAvx2());
-}
-
-test "[property] - [base64 dispatch]: cached scalar fallback preserves both directions" {
-    const saved = avx2_cached.swap(1, .monotonic);
-    defer avx2_cached.store(saved, .monotonic);
-    try std.testing.expect(!hasAvx2());
-    var source: [257]u8 = undefined;
-    for (&source, 0..) |*byte, i| byte.* = @truncate(i);
-    var expected: [344]u8 = undefined;
-    var encoded: [344]u8 = undefined;
-    var decoded: [257]u8 = undefined;
-    const text = try encode(&encoded, &source);
-    try std.testing.expectEqualSlices(u8, std.base64.standard.Encoder.encode(&expected, &source), text);
-    const counts = try decode(&decoded, text, .{});
-    try std.testing.expectEqualSlices(u8, &source, decoded[0..counts.decoded_bytes]);
 }
