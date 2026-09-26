@@ -206,6 +206,18 @@ pub const Node = struct {
         return try cv.parseInteger(usize, value);
     }
 
+    /// Borrows this cv element's fields without resolving them.
+    /// Other node kinds return UnexpectedElement.
+    pub fn cvDeclaration(self: Node) error{UnexpectedElement}!cv.Declaration {
+        if (self.kind != .cv) return error.UnexpectedElement;
+        return .{
+            .id = self.attribute("id"),
+            .full_name = self.attribute("fullName"),
+            .uri = self.attribute("URI"),
+            .version = self.attribute("version"),
+        };
+    }
+
     /// Returns one effective parameter, null when absent, or RepeatedParameter.
     /// Group expansion errors propagate; returned text borrows from this node and groups.
     pub fn parameter(self: Node, groups: []const cv.Group, accession: cv.Accession) LookupError!?cv.Param {

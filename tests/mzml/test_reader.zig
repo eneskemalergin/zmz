@@ -2277,12 +2277,7 @@ test "[integration] - [mzML writer]: matches frozen XML and preserves attribute 
     try std.testing.expectEqual(null, params[1].user.value);
     try std.testing.expectEqualStrings("", params[1].user.unit.name.?);
     const declaration_node = header.document.child(.cv_list).?.children[0];
-    const declarations = [_]mzml.cv.Declaration{.{
-        .id = declaration_node.attribute("id"),
-        .full_name = declaration_node.attribute("fullName"),
-        .uri = declaration_node.attribute("URI"),
-        .version = declaration_node.attribute("version"),
-    }};
+    const declarations = [_]mzml.cv.Declaration{try declaration_node.cvDeclaration()};
     const resolver = mzml.cv.Resolver.init(&declarations);
     const resolved = try resolver.resolve(params[0].cv);
     try std.testing.expectEqualDeep(params[0].cv, resolved.source);

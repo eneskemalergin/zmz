@@ -4,6 +4,41 @@ const std = @import("std");
 const mzml = @import("zmz").mzml;
 const support = @import("support.zig");
 
+test "[integration] - [mzML CV declarations]: borrows header fields across record traversal" {
+    const source = "<mzML xmlns='http://psi.hupo.org/ms/mzml'><cvList>" ++
+        "<cv id=' local ' fullName='A&amp;B' URI='urn:test' version=' future '/>" ++
+        "<cv id='' fullName='' URI='' version=''/>" ++
+        "<cv xmlns:x='urn:extra' x:id='other' x:fullName='other' x:URI='other' x:version='other'/>" ++
+        "</cvList><run><spectrumList><spectrum id='s1'/><spectrum id='s2'/></spectrumList></run></mzML>";
+    const expected = [_]mzml.cv.Declaration{
+        .{ .id = " local ", .full_name = "A&B", .uri = "urn:test", .version = " future " },
+        .{ .id = "", .full_name = "", .uri = "", .version = "" },
+        .{},
+    };
+    var input = std.Io.Reader.fixed(source);
+    var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+    defer reader.deinit();
+    const header = try reader.readHeader();
+    const nodes = header.document.child(.cv_list).?.children;
+    try std.testing.expectEqual(expected.len, nodes.len);
+    var declarations: [expected.len]mzml.cv.Declaration = undefined;
+    for (&declarations, nodes) |*declaration, node| {
+        declaration.* = try node.cvDeclaration();
+        inline for (.{ "id", "full_name", "uri", "version" }, .{ "id", "fullName", "URI", "version" }) |field, attribute| {
+            if (@field(declaration.*, field)) |value|
+                try std.testing.expect(value.ptr == node.attribute(attribute).?.ptr);
+        }
+    }
+    try std.testing.expectError(error.UnexpectedElement, header.run.cvDeclaration());
+
+    var records: usize = 0;
+    while (try reader.nextRecord()) |_| {
+        records += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), records);
+    try std.testing.expectEqualDeep(expected, declarations);
+}
+
 test "[integration] - [mzML 1.0 metadata]: reads historical fields without moving source nodes" {
     var input = std.Io.Reader.fixed(support.HISTORICAL);
     var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
@@ -206,12 +241,7 @@ test "[integration] - [mzML scientific metadata]: keeps all scans ions and windo
     try std.testing.expectEqual(@as(f64, 76), (try scans[1].scanStartTime(groups)).?.value);
     const nodes = header.value.document.child(.cv_list).?.children;
     var declarations: [2]mzml.cv.Declaration = undefined;
-    for (&declarations, nodes) |*declaration, node| declaration.* = .{
-        .id = node.attribute("id"),
-        .full_name = node.attribute("fullName"),
-        .uri = node.attribute("URI"),
-        .version = node.attribute("version"),
-    };
+    for (&declarations, nodes) |*declaration, node| declaration.* = try node.cvDeclaration();
     const resolver = mzml.cv.Resolver.init(&declarations);
     const quantity = try resolver.quantity(f64, time.parameter);
     try std.testing.expectEqual(@as(f64, 1.25), quantity.value);

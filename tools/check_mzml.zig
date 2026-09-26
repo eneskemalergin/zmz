@@ -65,12 +65,7 @@ fn checkFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Totals
     const cv_nodes = if (header.document.child(.cv_list)) |list| list.children else &.{};
     const declarations = try allocator.alloc(mzml.cv.Declaration, cv_nodes.len);
     defer allocator.free(declarations);
-    for (declarations, cv_nodes) |*declaration, node| declaration.* = .{
-        .id = node.attribute("id"),
-        .full_name = node.attribute("fullName"),
-        .uri = node.attribute("URI"),
-        .version = node.attribute("version"),
-    };
+    for (declarations, cv_nodes) |*declaration, node| declaration.* = try node.cvDeclaration();
     const resolver = mzml.cv.Resolver.init(declarations);
     const count = index.entries.items.len;
     var totals: Totals = .{};
