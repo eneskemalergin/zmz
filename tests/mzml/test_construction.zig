@@ -87,8 +87,7 @@ fn reencodeReferenceAllocated(allocator: std.mem.Allocator) !void {
     defer writer.deinit();
     try writer.writeHeader(prepared_header.header);
     try writer.beginListWithAttributes(.spectrum_list, 1, header.spectrum_list.?.attributes);
-    const unchanged = "\x00\x00\x00\x00\x00\x00\x08\x40\x00\x00\x00\x00\x00\x00\x10\x40";
-    try writer.writeRecordWithArrays(record, &.{ first.wire, unchanged });
+    try writer.writeRecordWithSelectedArrays(record, &.{ first.wire, null });
     try writer.endList();
     try writer.finish();
     var index = try mzml.IndexedReader.build(allocator, .{ .bytes = sink.buffered() }, .{});

@@ -729,6 +729,17 @@ test "[integration] - [mzML prepared writing]: preserves primitive bytes across 
                     var actual = std.Io.Writer.fixed(&actual_bytes);
                     try support.writeSingleRecord(std.testing.allocator, &actual, header.*, metadata, indexed, &.{ wire, wire });
                     try std.testing.expectEqualStrings(expected.buffered(), actual.buffered());
+                    for ([_][2]?[]const u8{ .{ wire, null }, .{ null, wire }, .{ null, null } }) |choices| {
+                        var mixed = std.Io.Writer.fixed(&actual_bytes);
+                        var writer = if (indexed) try mzml.Writer.initIndexed(std.testing.allocator, &mixed, .{}, .{}) else try mzml.Writer.init(std.testing.allocator, &mixed, .{});
+                        defer writer.deinit();
+                        try writer.writeHeader(header.*);
+                        try writer.beginList(.spectrum_list, 1, "dp");
+                        try writer.writeRecordWithSelectedArrays(record.node, &choices);
+                        try writer.endList();
+                        try writer.finish();
+                        try std.testing.expectEqualStrings(expected.buffered(), mixed.buffered());
+                    }
                     var source = std.Io.Reader.fixed(expected.buffered());
                     var decoded_reader = try mzml.StreamReader.init(std.testing.allocator, &source, .{});
                     defer decoded_reader.deinit();
@@ -771,6 +782,123 @@ test "[integration] - [mzML prepared writing]: preserves primitive bytes across 
                     try std.testing.expectEqual(null, try decoded_reader.nextDecodedRecord(&decoded_arrays));
                 }
             }
+        }
+    }
+}
+
+test "[integration] - [mzML mixed writing]: retains unknown arrays and replaces by array position" {
+    const source = "<mzML xmlns='http://psi.hupo.org/ms/mzml' xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance'>" ++
+        "<run><spectrumList count='1'>" ++
+        "<spectrum id='s' index='0'><binaryDataArrayList count='5'>" ++
+        "<binaryDataArray><cvParam accession='future:codec'/></binaryDataArray>" ++
+        "<binaryDataArray encodedLength='unknown'><cvParam accession='future:codec'/>" ++
+        "<extra><binary>opaque</binary></extra><binary>A!&amp;&lt;]]&gt;&#xD;</binary></binaryDataArray>" ++
+        "<binaryDataArray encodedLength='4'><binary>first</binary><userParam name='late'/></binaryDataArray>" ++
+        "<binaryDataArray encodedLength='0'><binary>empty</binary></binaryDataArray>" ++
+        "<binaryDataArray encodedLength='8'><binary>last</binary></binaryDataArray>" ++
+        "</binaryDataArrayList><binaryDataArrayList count='1'>" ++
+        "<binaryDataArray><binary>unmodeled</binary></binaryDataArray></binaryDataArrayList>" ++
+        "</spectrum></spectrumList></run></mzML>";
+    const first_text = try std.mem.replaceOwned(u8, std.testing.allocator, source, ">first<", ">AQID<");
+    defer std.testing.allocator.free(first_text);
+    const empty_text = try std.mem.replaceOwned(u8, std.testing.allocator, first_text, ">empty<", "><");
+    defer std.testing.allocator.free(empty_text);
+    const expected_text = try std.mem.replaceOwned(u8, std.testing.allocator, empty_text, ">last<", ">BAUGBw==<");
+    defer std.testing.allocator.free(expected_text);
+    var expected_input = std.Io.Reader.fixed(expected_text);
+    var expected = try mzml.StreamReader.init(std.testing.allocator, &expected_input, .{});
+    defer expected.deinit();
+    const expected_record = (try expected.nextRecord()).?;
+
+    for ([_]bool{ false, true }) |indexed| {
+        var input = std.Io.Reader.fixed(source);
+        var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+        defer reader.deinit();
+        const header = try reader.readHeader();
+        const record = (try reader.nextRecord()).?;
+        var bytes: [8192]u8 = undefined;
+        var sink = std.Io.Writer.fixed(&bytes);
+        var writer = if (indexed) try mzml.Writer.initIndexed(std.testing.allocator, &sink, .{}, .{}) else try mzml.Writer.init(std.testing.allocator, &sink, .{});
+        defer writer.deinit();
+        try writer.writeHeader(header.*);
+        try writer.beginListWithAttributes(.spectrum_list, 1, &.{});
+        var first = [_]u8{ 1, 2, 3 };
+        var last = [_]u8{ 4, 5, 6, 7 };
+        var choices = [_]?[]const u8{ null, null, &first, &.{}, &last };
+        try writer.writeRecordWithSelectedArrays(record.node, &choices);
+        @memset(&first, 0);
+        @memset(&last, 0);
+        @memset(&choices, null);
+        try std.testing.expectEqual(null, try reader.nextRecord());
+        try writer.endList();
+        try writer.finish();
+        var output = std.Io.Reader.fixed(sink.buffered());
+        var result = try mzml.StreamReader.init(std.testing.allocator, &output, .{});
+        defer result.deinit();
+        try support.expectNode(expected_record.node, (try result.nextRecord()).?.node);
+        try std.testing.expectEqual(null, try result.nextRecord());
+        if (indexed) {
+            var index = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = sink.buffered() }, .{ .policy = .open_embedded });
+            defer index.deinit();
+            var found = (try index.byId(std.testing.allocator, "s")).?;
+            defer found.deinit();
+            try support.expectNode(expected_record.node, found.value.node);
+        }
+    }
+}
+
+test "[failure] - [mzML mixed writing]: checks supplied bytes and keeps failures sticky" {
+    var input = std.Io.Reader.fixed(support.DOCUMENT);
+    var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+    defer reader.deinit();
+    const header = try reader.readHeader();
+    const record = (try reader.nextRecord()).?;
+    const wire = [_]u8{0} ** 8;
+    const errors = [_]mzml.Writer.Error{
+        error.CountMismatch,      error.EncodedLengthMismatch, error.OverlappingBuffers,
+        error.LimitExceeded,      error.PayloadNotRetained,    error.InvalidStructure,
+        error.OverlappingBuffers, error.WriteFailed,
+    };
+    for ([_]bool{ false, true }) |indexed| {
+        for (errors, 0..) |expected_error, case| {
+            var output: [8192]u8 align(@alignOf(?[]const u8)) = undefined;
+            var sink = std.Io.Writer.fixed(&output);
+            var writer = if (indexed) try mzml.Writer.initIndexed(std.testing.allocator, &sink, .{}, .{}) else try mzml.Writer.init(std.testing.allocator, &sink, .{});
+            defer writer.deinit();
+            try writer.writeHeader(header.*);
+            try writer.beginList(.spectrum_list, 1, "dp");
+            const before = sink.buffered().len;
+            var choices = [_]?[]const u8{ null, &wire };
+            var supplied: []const ?[]const u8 = &choices;
+            var arrays = [_]mzml.model.Node{ record.binaryArrays()[0], record.binaryArrays()[1] };
+            var list = record.node.child(.binary_data_array_list).?;
+            list.children = &arrays;
+            var node = record.node;
+            node.children = &.{list};
+            switch (case) {
+                0 => supplied = choices[0..1],
+                1 => choices[1] = wire[0..1],
+                2 => choices[1] = output[0..8],
+                3 => writer.limits.text_bytes = 11,
+                4 => arrays[0].children = &.{.{ .kind = .binary }},
+                5 => arrays[1].children = &.{},
+                6 => {
+                    const aliased: *[2]?[]const u8 = @ptrCast(@alignCast(&output[4096]));
+                    aliased.* = choices;
+                    supplied = aliased;
+                },
+                7 => sink.buffer = sink.buffer[0 .. sink.end + 1],
+                else => unreachable,
+            }
+            try std.testing.expectError(expected_error, writer.writeRecordWithSelectedArrays(node, supplied));
+            if (case != 4 and case != 7) try std.testing.expectEqual(before, sink.buffered().len);
+            const report = writer.diagnostic().?;
+            try std.testing.expectEqual(.write_record, report.operation);
+            if (case >= 1 and case <= 5)
+                try std.testing.expectEqual(@as(usize, if (case == 4) 0 else 1), report.array_position.?);
+            try std.testing.expectError(error.FailedState, writer.writeRecordWithSelectedArrays(node, &choices));
+            try std.testing.expectError(error.FailedState, writer.finish());
+            try std.testing.expectEqualDeep(report, writer.diagnostic().?);
         }
     }
 }

@@ -216,7 +216,7 @@ pub fn beginListWithAttributes(self: *Writer, kind: model.Kind, count: ?usize, a
 /// Text is escaped as XML, without checking Base64 or interpreting encodedLength.
 /// Numeric array construction uses the separate arrays encoder before this call.
 pub fn writeRecord(self: *Writer, node: model.Node) Error!void {
-    return self.writeRecordInner(node, false, &.{});
+    return self.writeRecordInner(node, false, @as([]const []const u8, &.{}));
 }
 
 /// Writes one forward item without retaining it. List openings use source counts;
@@ -250,7 +250,15 @@ pub fn writeRecordWithArrays(self: *Writer, node: model.Node, wire_arrays: []con
     return self.writeRecordInner(node, true, wire_arrays);
 }
 
-fn writeRecordInner(self: *Writer, node: model.Node, comptime replace_arrays: bool, wire_arrays: []const []const u8) Error!void {
+/// Takes one choice per modeled array in source order: null retains binary text;
+/// a wire slice replaces it, including an empty slice. Only supplied bytes receive
+/// the prepared-array checks of writeRecordWithArrays; retained codecs are not read.
+/// Metadata, choices, and wire borrow until return. Choices must not alias the sink.
+pub fn writeRecordWithSelectedArrays(self: *Writer, node: model.Node, wire_arrays: []const ?[]const u8) Error!void {
+    return self.writeRecordInner(node, true, wire_arrays);
+}
+
+fn writeRecordInner(self: *Writer, node: model.Node, comptime replace_arrays: bool, wire_arrays: anytype) Error!void {
     if (self.failure != null) return error.FailedState;
     errdefer |err| {
         self.fail(err, .write_record);
@@ -271,7 +279,8 @@ fn writeRecordInner(self: *Writer, node: model.Node, comptime replace_arrays: bo
         if (arrays.len != wire_arrays.len) return try self.sizeError(error.CountMismatch, arrays.len, wire_arrays.len, .arrays);
         const sink = if (self.index_state) |state| state.hashed.out else self.engine.sink;
         if (overlaps(sink.buffer, std.mem.sliceAsBytes(wire_arrays))) return error.OverlappingBuffers;
-        for (arrays, wire_arrays, 0..) |array, wire, position| {
+        for (arrays, wire_arrays, 0..) |array, supplied, position| {
+            const wire = @as(?[]const u8, supplied) orelse continue;
             errdefer |err| {
                 self.capture(err, .array, .none);
                 self.failure.?.element = .binary_data_array;
@@ -415,7 +424,7 @@ fn writeIndex(self: *Writer, state: *IndexState) Error!void {
     try self.engine.endElement();
 }
 
-fn writeNode(self: *Writer, node: model.Node, comptime replace_arrays: bool, remaining: *[]const []const u8, depth: usize, budget: *usize) Error!void {
+fn writeNode(self: *Writer, node: model.Node, comptime replace_arrays: bool, remaining: anytype, depth: usize, budget: *usize) Error!void {
     errdefer |err| {
         self.capture(err, .metadata, .none);
         if (self.failure.?.element == null) self.failure.?.element = node.kind;
@@ -423,25 +432,31 @@ fn writeNode(self: *Writer, node: model.Node, comptime replace_arrays: bool, rem
     if (depth == 0) return try self.limitError(.depth, self.limits.depth, null);
     if (budget.* == 0) return try self.limitError(.nodes, self.limits.nodes, null);
     budget.* -= 1;
+    const wire: ?[]const u8 = if (replace_arrays and node.kind == .binary) blk: {
+        if (remaining.len == 0) return error.CountMismatch;
+        break :blk remaining.*[0];
+    } else null;
     if (node.kind == .binary) {
         if (node.params.len != 0) return error.InvalidStructure;
-        if (!replace_arrays and node.text == null) return error.PayloadNotRetained;
+        if (wire == null and node.text == null) return error.PayloadNotRetained;
     } else if (node.text != null) return error.InvalidStructure;
     try self.startKnown(node.kind.xmlName(), node.attributes, false);
     try self.writeAttributes(node.attributes);
-    if (replace_arrays and node.kind == .binary) {
-        if (remaining.len == 0) return error.CountMismatch;
-        try self.engine.binary(remaining.*[0]);
-        remaining.* = remaining.*[1..];
+    if (wire) |bytes| {
+        try self.engine.binary(bytes);
     } else if (node.text) |text| {
         if (text.len > self.limits.text_bytes) return try self.limitError(.text_bytes, self.limits.text_bytes, text.len);
         try self.engine.text(text);
     }
     try self.writeContent(node, replace_arrays, remaining, depth - 1, budget);
     try self.engine.endElement();
+    if (replace_arrays and node.kind == .binary_data_array) {
+        if (remaining.len == 0) return error.CountMismatch;
+        remaining.* = remaining.*[1..];
+    }
 }
 
-fn writeContent(self: *Writer, node: model.Node, comptime replace_arrays: bool, remaining: *[]const []const u8, depth: usize, budget: *usize) Error!void {
+fn writeContent(self: *Writer, node: model.Node, comptime replace_arrays: bool, remaining: anytype, depth: usize, budget: *usize) Error!void {
     errdefer |err| {
         self.capture(err, .metadata, .none);
         if (self.failure.?.element == null) self.failure.?.element = node.kind;
