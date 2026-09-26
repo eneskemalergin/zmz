@@ -336,23 +336,24 @@ pub const Header = struct {
     chromatogram_list: ?RecordList = null,
 };
 
-/// Preserves the source count without comparing it to traversed records.
+/// Preserves the source count, or null when absent, without comparing it to traversed records.
 /// observed_count increases as records are consumed, independently of declared_count.
 pub const RecordList = struct {
     attributes: []const Attribute,
-    declared_count: usize,
+    declared_count: ?usize,
     observed_count: usize = 0,
 };
 
 /// A spectrum or chromatogram with exact source identity and its complete child hierarchy.
 /// Identity and length fields are parsed snapshots, not setters for node.attributes.
+/// Missing source numbers remain null, distinct from zero or an indexed lookup ordinal.
 /// Writers consume node; arrays() uses default_array_length. Edit caller-owned node views
 /// for writing, and keep cached fields consistent if using the edited Record for reading.
 pub const Record = struct {
     node: Node,
     id: []const u8,
-    index: usize,
-    default_array_length: usize,
+    index: ?usize,
+    default_array_length: ?usize,
 
     /// Parses the spectrum's MS level in xs:int range without imposing an analysis policy.
     /// Null means absent. Chromatograms and other node kinds return UnexpectedElement.
@@ -452,9 +453,10 @@ pub const BinaryArray = struct {
     length: usize,
 
     /// Classifies one binary array and reads its explicit or record-default value count.
+    /// MissingValue means neither arrayLength nor a default length was supplied.
     pub fn init(
         node: Node,
-        default_length: usize,
+        default_length: ?usize,
         groups: []const cv.Group,
     ) (EncodingError || cv.ValueError)!BinaryArray {
         return initWithEncoding(node, default_length, try arrayEncoding(node, groups));
@@ -491,7 +493,7 @@ pub const BinaryArray = struct {
 pub const BinaryArrayIterator = struct {
     nodes: []const Node,
     groups: []const cv.Group,
-    default_length: usize,
+    default_length: ?usize,
     position: usize = 0,
     failed: ?BinaryArrayError = null,
 
@@ -522,7 +524,7 @@ pub fn decodeArray(
     comptime T: type,
     output: []T,
     node: Node,
-    default_length: usize,
+    default_length: ?usize,
     groups: []const cv.Group,
     scratch: arrays.Scratch,
     limits: arrays.Limits,
@@ -535,11 +537,11 @@ pub fn decodeArray(
     try array.decode(T, output, scratch, limits);
 }
 
-fn initWithEncoding(node: Node, default_length: usize, descriptor: Encoding) cv.ValueError!BinaryArray {
+fn initWithEncoding(node: Node, default_length: ?usize, descriptor: Encoding) cv.ValueError!BinaryArray {
     const length = if (node.attribute("arrayLength")) |value|
         try cv.parseInteger(usize, value)
     else
-        default_length;
+        default_length orelse return error.MissingValue;
     return .{ .node = node, .encoding = descriptor, .length = length };
 }
 

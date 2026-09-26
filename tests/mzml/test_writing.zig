@@ -454,7 +454,7 @@ test "[integration] - [mzML references]: preserves unresolved and external links
             while (try original.nextRecord()) |record| {
                 const next = (try rewritten.nextRecord()).?;
                 try support.expectNode(record.node, next.node);
-                var found = (try index.at(std.testing.allocator, record.node.kind, record.index)).?;
+                var found = (try index.byId(std.testing.allocator, record.id)).?;
                 defer found.deinit();
                 try support.expectNode(record.node, found.value.node);
                 for (next.binaryArrays()) |array| {
@@ -845,6 +845,61 @@ test "[integration] - [mzML file writer]: patches counts without changing record
                 try std.testing.expectEqualStrings(&std.fmt.bytesToHex(digest, .lower), bytes[checksum_start .. checksum_start + 40]);
             }
         }
+    }
+}
+
+test "[integration] - [mzML writer]: separates absent source numbers from output requirements" {
+    const source = support.HEADER ++ "<spectrumList><spectrum id='x' index='0'>" ++ support.ARRAYS ++
+        "</spectrum></spectrumList></run></mzML>";
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    for ([_]bool{ false, true }) |indexed| {
+        var input = std.Io.Reader.fixed(source);
+        var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+        defer reader.deinit();
+        const header = try reader.readHeader();
+        const opening = (try reader.nextItem()).?;
+        try std.testing.expectEqual(null, opening.list_start.list.declared_count);
+        const record = (try reader.nextRecord()).?;
+        var sink: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer sink.deinit();
+        var forward = if (indexed) try mzml.Writer.initIndexed(std.testing.allocator, &sink.writer, .{}, .{}) else try mzml.Writer.init(std.testing.allocator, &sink.writer, .{});
+        defer forward.deinit();
+        try forward.writeHeader(header.*);
+        try std.testing.expectError(error.InvalidOptions, forward.writeItem(opening));
+        try std.testing.expectError(error.FailedState, forward.finish());
+
+        const file = try dir.dir.createFile(std.testing.io, "numbers.mzML", .{ .read = true });
+        defer file.close(std.testing.io);
+        var buffer: [4096]u8 = undefined;
+        var file_sink = file.writer(std.testing.io, &buffer);
+        var writer = try mzml.Writer.initFile(std.testing.allocator, &file_sink, .{}, if (indexed) .{} else null);
+        defer writer.deinit();
+        try writer.writeHeader(header.*);
+        try writer.writeItem(opening);
+        try writer.writeRecord(record.node);
+        try writer.endList();
+        try writer.finish();
+        try file_sink.interface.flush();
+        var input_buffer: [4096]u8 = undefined;
+        var written_input = file.reader(std.testing.io, &input_buffer);
+        var written = try mzml.StreamReader.init(std.testing.allocator, &written_input.interface, .{});
+        defer written.deinit();
+        try std.testing.expectEqual(@as(?usize, 1), (try written.readHeader()).spectrum_list.?.declared_count);
+        const copied = (try written.nextRecord()).?;
+        try support.expectNode(record.node, copied.node);
+        try std.testing.expectEqual(null, copied.default_array_length);
+        try std.testing.expectEqual(null, try written.nextRecord());
+
+        var discard: std.Io.Writer.Discarding = .init(&.{});
+        var required = if (indexed) try mzml.Writer.initIndexed(std.testing.allocator, &discard.writer, .{}, .{}) else try mzml.Writer.init(std.testing.allocator, &discard.writer, .{});
+        defer required.deinit();
+        try required.writeHeader(header.*);
+        try required.beginListWithAttributes(.spectrum_list, 1, opening.list_start.list.attributes);
+        var missing = record.node;
+        missing.attributes = &.{.{ .name = "id", .value = "x" }};
+        try std.testing.expectError(error.MissingValue, required.writeRecord(missing));
+        try std.testing.expectError(error.FailedState, required.finish());
     }
 }
 

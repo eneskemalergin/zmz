@@ -1255,10 +1255,92 @@ test "[integration] - [mzML attributes]: preserves extras without requiring unus
     for (0..output.len()) |i| try std.testing.expectEqualSlices(f64, &.{1}, output.get(i).?.values.float64);
 }
 
-test "[failure] - [mzML attributes]: rejects missing returned fields and misplaced groups" {
-    for ([_][]const u8{
-        "id='encoding'", "id='native=a&amp;b'", "index='0'", "defaultArrayLength='1'",
-    }) |attribute| {
+test "[integration] - [mzML numeric attributes]: retains absent source numbers without inventing values" {
+    inline for (.{ "index='0'", "defaultArrayLength='1'", "count='1'" }) |removed| {
+        const source = try std.mem.replaceOwned(u8, std.testing.allocator, support.DOCUMENT, removed, "");
+        defer std.testing.allocator.free(source);
+        for ([_]mzml.StreamReader.Payload{ .retain, .skip }) |payload| {
+            var input = std.Io.Reader.fixed(source);
+            var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{ .payload = payload });
+            defer reader.deinit();
+            const header = try reader.readHeader();
+            var records: usize = 0;
+            while (try reader.nextItem()) |item| switch (item) {
+                .list_start => |start| {
+                    try std.testing.expectEqual(if (std.mem.startsWith(u8, removed, "count")) @as(?usize, null) else 1, start.list.declared_count);
+                    try std.testing.expectEqual(@as(usize, 0), start.list.observed_count);
+                },
+                .record => |record| {
+                    try std.testing.expectEqual(if (std.mem.startsWith(u8, removed, "index")) @as(?usize, null) else 0, record.index);
+                    try std.testing.expectEqual(if (std.mem.startsWith(u8, removed, "default")) @as(?usize, null) else 1, record.default_array_length);
+                    var retained = try mzml.owned.Record.init(std.testing.allocator, record, .{});
+                    defer retained.deinit();
+                    try std.testing.expectEqualDeep(record, retained.value);
+                    records += 1;
+                },
+                else => {},
+            };
+            try std.testing.expectEqual(@as(usize, 2), records);
+            try std.testing.expectEqual(@as(usize, 1), header.spectrum_list.?.observed_count);
+            try std.testing.expectEqual(@as(usize, 1), header.chromatogram_list.?.observed_count);
+            var retained = try mzml.owned.Header.init(std.testing.allocator, header.*, .{});
+            defer retained.deinit();
+            try std.testing.expectEqualDeep(header.*, retained.value);
+        }
+    }
+}
+
+test "[integration] - [mzML numeric attributes]: requires a length only for requested arrays" {
+    const source = try std.mem.replaceOwned(u8, std.testing.allocator, support.DOCUMENT, "defaultArrayLength='1'", "");
+    defer std.testing.allocator.free(source);
+    var input = std.Io.Reader.fixed(source);
+    var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+    defer reader.deinit();
+    const header = try reader.readHeader();
+    while (try reader.nextRecord()) |record| {
+        var descriptors = record.arrays(header.groups);
+        try std.testing.expectError(error.MissingValue, descriptors.next());
+        try std.testing.expectError(error.MissingValue, descriptors.next());
+        var value: [1]f64 = undefined;
+        const nodes = record.binaryArrays();
+        try std.testing.expectError(error.MissingValue, mzml.model.decodeArray(f64, &value, nodes[0], record.default_array_length, header.groups, .{ .transport = &.{}, .transformed = &.{} }, .{}));
+        try mzml.model.decodeArray(f64, &value, nodes[1], record.default_array_length, header.groups, .{ .transport = &.{}, .transformed = &.{} }, .{});
+        try std.testing.expectEqualSlices(f64, &.{1}, &value);
+    }
+    try std.testing.expectError(error.MissingValue, readDecoded(std.testing.allocator, source, .{}));
+    try readSelectedDecoded(std.testing.allocator, source);
+    var selection: Selection = .{ .mode = .none };
+    var skipped_input = std.Io.Reader.fixed(source);
+    var skipped = try mzml.StreamReader.init(std.testing.allocator, &skipped_input, .{
+        .array_selector = .{ .user_data = &selection, .select = Selection.select },
+    });
+    defer skipped.deinit();
+    var decoded = mzml.StreamReader.DecodedArrays.init(std.testing.failing_allocator, .{});
+    defer decoded.deinit();
+    var records: usize = 0;
+    while (try skipped.nextDecodedRecord(&decoded)) |_| {
+        try std.testing.expectEqual(@as(usize, 0), decoded.len());
+        records += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), records);
+    const explicit = try std.mem.replaceOwned(u8, std.testing.allocator, source, "<binaryDataArray encodedLength='12'>", "<binaryDataArray encodedLength='12' arrayLength='1'>");
+    defer std.testing.allocator.free(explicit);
+    try compareDecoded(explicit, 1);
+    inline for (.{ "", " index='0' defaultArrayLength='0'" }) |attributes| {
+        const empty = support.HEADER ++ "<spectrumList><spectrum id='empty'" ++ attributes ++ "/></spectrumList></run></mzML>";
+        var empty_input = std.Io.Reader.fixed(empty);
+        var empty_reader = try mzml.StreamReader.init(std.testing.allocator, &empty_input, .{});
+        defer empty_reader.deinit();
+        const record = (try empty_reader.nextDecodedRecord(&decoded)).?;
+        try std.testing.expectEqual(if (attributes.len == 0) @as(?usize, null) else 0, record.index);
+        try std.testing.expectEqual(if (attributes.len == 0) @as(?usize, null) else 0, record.default_array_length);
+        try std.testing.expectEqual(@as(usize, 0), decoded.len());
+        try std.testing.expectEqual(null, try empty_reader.nextDecodedRecord(&decoded));
+    }
+}
+
+test "[failure] - [mzML attributes]: rejects missing identifiers and misplaced groups" {
+    for ([_][]const u8{ "id='encoding'", "id='native=a&amp;b'" }) |attribute| {
         const removed = try std.mem.replaceOwned(u8, std.testing.allocator, support.DOCUMENT, attribute, "");
         defer std.testing.allocator.free(removed);
         const source = try std.mem.replaceOwned(u8, std.testing.allocator, removed, "<binary>AAAA", "<binary>&missing;AAA");
@@ -1267,8 +1349,8 @@ test "[failure] - [mzML attributes]: rejects missing returned fields and misplac
         try std.testing.expectError(error.MissingAttribute, readDecoded(std.testing.allocator, source, .{}));
         try std.testing.expectError(error.MissingAttribute, mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = source }, .{ .policy = .rebuild }));
     }
-    const missing_count = support.HEADER ++ "<spectrumList><broken";
-    try std.testing.expectError(error.MissingAttribute, support.readAll(std.testing.allocator, missing_count, .{}));
+    const incomplete = support.HEADER ++ "<spectrumList><broken";
+    try std.testing.expectError(error.InvalidXml, support.readAll(std.testing.allocator, incomplete, .{}));
     const unexpected_start = try std.mem.replaceOwned(u8, std.testing.allocator, support.DOCUMENT, "<referenceableParamGroup id='encoding'>", "<sourceFile>");
     defer std.testing.allocator.free(unexpected_start);
     const unexpected_group = try std.mem.replaceOwned(u8, std.testing.allocator, unexpected_start, "</referenceableParamGroup>", "</sourceFile>");
@@ -1524,6 +1606,10 @@ test "[integration] - [mzML reader]: rejects unreadable metadata without decodin
         .{ "<activation/>", "<!--a--b--><activation/>", error.InvalidXml },
         .{ "<activation/>", "<activation></precursor>", error.InvalidXml },
         .{ "index='0'", "index='bad'", error.InvalidValue },
+        .{ "index='0'", "index=''", error.EmptyValue },
+        .{ "defaultArrayLength='1'", "defaultArrayLength=''", error.EmptyValue },
+        .{ "count='1'", "count=''", error.EmptyValue },
+        .{ "count='1'", "count='bad'", error.InvalidValue },
         .{ "defaultArrayLength='1'", "defaultArrayLength='-1'", error.Overflow },
         .{ "index='0'", "index='0' index='1'", error.InvalidXml },
     };

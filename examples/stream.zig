@@ -63,9 +63,9 @@ pub fn main(init: std.process.Init) !void {
             }
         }
         if (header.spectrum_list) |list|
-            try output.interface.print("spectra: declared={d} observed={d}\n", .{ list.declared_count, list.observed_count });
+            try output.interface.print("spectra: declared={?d} observed={d}\n", .{ list.declared_count, list.observed_count });
         if (header.chromatogram_list) |list|
-            try output.interface.print("chromatograms: declared={d} observed={d}\n", .{ list.declared_count, list.observed_count });
+            try output.interface.print("chromatograms: declared={?d} observed={d}\n", .{ list.declared_count, list.observed_count });
     }
     if (retained_record) |record| {
         try output.interface.print("retained: {s}", .{record.value.id});

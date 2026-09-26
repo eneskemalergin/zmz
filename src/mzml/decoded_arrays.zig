@@ -32,7 +32,7 @@ wire: std.ArrayList(u8) = .empty,
 transformed: std.ArrayList(u8) = .empty,
 count: usize = 0,
 ready: bool = false,
-default_length: usize = 0,
+default_length: ?usize = null,
 decoder: base64.Decoder = undefined,
 
 pub fn init(allocator: std.mem.Allocator, limits: arrays.Limits) DecodedArrays {
@@ -73,7 +73,7 @@ pub fn get(self: *const DecodedArrays, position: usize) ?Array {
 }
 
 pub fn startRecord(self: *DecodedArrays, node: model.Node) Error!void {
-    self.default_length = try cv.parseInteger(usize, node.attribute("defaultArrayLength"));
+    self.default_length = if (node.attribute("defaultArrayLength")) |value| try cv.parseInteger(usize, value) else null;
 }
 
 pub fn text(self: *DecodedArrays, bytes: []const u8) Error!void {

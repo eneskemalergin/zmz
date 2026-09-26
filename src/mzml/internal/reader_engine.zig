@@ -269,7 +269,12 @@ pub fn readFragment(self: *StreamReader, allocator: std.mem.Allocator, input: *s
         if (self.cursor.current != null) return error.InvalidStructure;
     }
     try shiftOffsets(&node, physical_start - prefix_length);
-    const record: model.Record = .{ .node = node, .id = node.attribute("id").?, .index = try cv.parseInteger(usize, node.attribute("index")), .default_array_length = try cv.parseInteger(usize, node.attribute("defaultArrayLength")) };
+    const record: model.Record = .{
+        .node = node,
+        .id = node.attribute("id").?,
+        .index = if (node.attribute("index")) |value| try cv.parseInteger(usize, value) else null,
+        .default_array_length = if (node.attribute("defaultArrayLength")) |value| try cv.parseInteger(usize, value) else null,
+    };
     const arena = self.record_store.arena;
     self.record_store.arena = .init(allocator);
     return .{ .arena = arena, .value = record };
@@ -472,7 +477,7 @@ fn openList(self: *StreamReader) Error!void {
     const node = try self.startNode(&self.header_store, kind_value);
     const list: model.RecordList = .{
         .attributes = node.attributes,
-        .declared_count = try cv.parseInteger(usize, node.attribute("count")),
+        .declared_count = try node.declaredCount(),
     };
     switch (kind_value) {
         .spectrum_list => self.header.spectrum_list = list,
@@ -514,8 +519,8 @@ fn nextItemInner(self: *StreamReader, comptime retention: Retention, comptime re
             return .{ .record = .{
                 .node = node,
                 .id = node.attribute("id").?,
-                .index = try cv.parseInteger(usize, node.attribute("index")),
-                .default_array_length = try cv.parseInteger(usize, node.attribute("defaultArrayLength")),
+                .index = if (node.attribute("index")) |value| try cv.parseInteger(usize, value) else null,
+                .default_array_length = if (node.attribute("defaultArrayLength")) |value| try cv.parseInteger(usize, value) else null,
             } };
         },
         .run => {
@@ -599,9 +604,7 @@ fn startNodeFor(self: *StreamReader, storage: *Storage, kind_value: model.Kind, 
         storage,
         event.data.start_element,
         switch (kind_value) {
-            .referenceable_param_group => "id",
-            .spectrum, .chromatogram => "id index defaultArrayLength",
-            .spectrum_list, .chromatogram_list => "count",
+            .referenceable_param_group, .spectrum, .chromatogram => "id",
             else => "",
         },
         retain,
