@@ -13,6 +13,8 @@ const SLOF_MATH_BACKEND = std.meta.stringToEnum(
     SlofMathBackend,
     math_options.slof_math_backend,
 ) orelse @compileError("invalid SLOF math backend");
+// Zig's self-hosted x86 backend cannot assemble vector memory operands yet.
+const USE_AVX2 = SLOF_MATH_BACKEND == .glibc_vector and builtin.zig_backend == .stage2_llvm;
 comptime {
     if (SLOF_MATH_BACKEND == .glibc_vector and
         (builtin.target.os.tag != .linux or builtin.target.cpu.arch != .x86_64 or
@@ -25,8 +27,6 @@ const F64x2 = @Vector(2, f64);
 const F64x4 = @Vector(4, f64);
 
 extern fn _ZGVbN2v_exp(F64x2) callconv(.c) F64x2;
-extern fn _ZGVdN4v_exp(F64x4) callconv(.c) F64x4;
-extern fn _ZGVdN4v_log(F64x4) callconv(.c) F64x4;
 
 /// Errors returned by checked MS-Numpress operations.
 ///
@@ -806,7 +806,7 @@ pub fn encodeSlof(values: []const f64, fixed_point: f64, output: []u8) Error!usi
     if (output.len < encoded_len) return error.OutputTooSmall;
     writeFixedPoint(output[0..8], fixed_point);
 
-    if (comptime SLOF_MATH_BACKEND == .glibc_vector) {
+    if (comptime USE_AVX2) {
         if (cpu.hasAvx2()) {
             try encodeSlofAvx2(values, fixed_point, output, encoded_len);
             return encoded_len;
@@ -842,7 +842,7 @@ noinline fn encodeSlofAvx2(
             }
             continue;
         }
-        const logged = _ZGVdN4v_log(current + @as(F64x4, @splat(1.0)));
+        const logged = glibcAvx2("_ZGVdN4v_log", current + @as(F64x4, @splat(1.0)));
         const scaled = logged * @as(F64x4, @splat(fixed_point));
         if (@reduce(.And, slofCandidatesAreStable(scaled, fixed_point))) {
             const encoded: @Vector(4, u16) = @intFromFloat(scaled + @as(F64x4, @splat(0.5)));
@@ -860,6 +860,28 @@ noinline fn encodeSlofAvx2(
         try validateNonnegative(value);
         try writeSlofCode(output, index, @log(value + 1.0) * fixed_point);
     }
+}
+
+// The baseline C ABI does not pass four doubles in YMM0. A pointer call keeps
+// that ABI outside the wrapper; pushing the pointer aligns the nested call.
+fn glibcAvx2(comptime symbol: []const u8, values: F64x4) F64x4 {
+    const Wrapper = struct {
+        fn invoke() callconv(.naked) void {
+            asm volatile (
+                \\pushq %%rdi
+                \\vmovupd (%%rdi), %%ymm0
+            ++ "\ncallq " ++ symbol ++ "@PLT\n" ++
+                \\popq %%rdi
+                \\vmovupd %%ymm0, (%%rdi)
+                \\vzeroupper
+                \\retq
+            );
+        }
+    };
+    var result = values;
+    const invoke: *const fn (*F64x4) callconv(.c) void = @ptrCast(&Wrapper.invoke);
+    invoke(&result);
+    return result;
 }
 
 fn slofAllZero(values: []const f64) bool {
@@ -938,7 +960,7 @@ pub fn decodeSlof(input: []const u8, output: []f64) Error!usize {
 
     var index: usize = 0;
     if (comptime SLOF_MATH_BACKEND == .glibc_vector) {
-        if (cpu.hasAvx2()) {
+        if (comptime USE_AVX2) if (cpu.hasAvx2()) {
             while (value_count - index >= 4) : (index += 4) {
                 const encoded: @Vector(4, u16) = .{
                     std.mem.readInt(u16, input[8 + index * 2 ..][0..2], .little),
@@ -948,13 +970,13 @@ pub fn decodeSlof(input: []const u8, output: []f64) Error!usize {
                 };
                 const scaled: F64x4 = @as(F64x4, @floatFromInt(encoded)) /
                     @as(F64x4, @splat(fixed_point));
-                const decoded = _ZGVdN4v_exp(scaled) - @as(F64x4, @splat(1.0));
+                const decoded = glibcAvx2("_ZGVdN4v_exp", scaled) - @as(F64x4, @splat(1.0));
                 if (!@reduce(.And, @abs(decoded) <= @as(F64x4, @splat(std.math.floatMax(f64))))) {
                     return error.InvalidData;
                 }
                 inline for (0..4) |lane| output[index + lane] = decoded[lane];
             }
-        }
+        };
         while (value_count - index >= 2) : (index += 2) {
             const encoded_0 = std.mem.readInt(u16, input[8 + index * 2 ..][0..2], .little);
             const encoded_1 = std.mem.readInt(u16, input[10 + index * 2 ..][0..2], .little);
