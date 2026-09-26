@@ -1,4 +1,4 @@
-//! Reads spectra and chromatograms through EOF, with all arrays decoded or metadata only.
+//! Reads spectra and chromatograms through EOF, decoding modeled arrays or returning metadata only.
 //! The first record's metadata and header are copied so they can outlive the reader.
 //! Numeric slices belong to DecodedArrays and are consumed before its next use.
 

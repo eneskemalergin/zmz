@@ -2,7 +2,7 @@
 //! With --ms1, filters spectra in one input pass and fills in the surviving count.
 //! Chromatograms are kept. Record IDs and references stay unchanged; only surviving
 //! spectrum indexes are reassigned. Other list attributes stay unchanged.
-//! With --zlib, decodes all arrays and reencodes their values losslessly with zlib.
+//! With --zlib, decodes modeled arrays and reencodes their values losslessly with zlib.
 //! Source metadata and array references are kept through prepared header groups.
 
 const std = @import("std");

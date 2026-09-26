@@ -146,6 +146,67 @@ test "[integration] - [mzML children]: keeps misplaced known names out of metada
     try std.testing.checkAllAllocationFailures(std.testing.allocator, readDecodedRecord, .{ support.KNOWN_CHILDREN, mzml.arrays.Limits{} });
 }
 
+test "[integration] - [mzML containers]: retains later occurrences without merging their contents" {
+    var input = std.Io.Reader.fixed(support.REPEATED_CONTAINERS);
+    var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+    defer reader.deinit();
+    const header = try reader.readHeader();
+    try std.testing.expectEqual(@as(usize, 2), header.document.children.len);
+    try std.testing.expectEqual(@as(usize, 1), header.groups.len);
+    try std.testing.expectEqualStrings("encoding", header.groups[0].id);
+    try std.testing.expectEqual(@as(usize, 1), header.run.children.len);
+    try std.testing.expectEqual(mzml.model.Content.Item{ .children = 1 }, header.document.content.?.items[1]);
+    try std.testing.expect(std.mem.indexOf(u8, header.document.content.?.items[2].xml, "zmz-reencoded-0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, header.run.content.?.items[2].xml, "second-source") != null);
+    var decoded = mzml.StreamReader.DecodedArrays.init(std.testing.allocator, .{});
+    defer decoded.deinit();
+    const record = (try reader.nextDecodedRecord(&decoded)).?;
+    try std.testing.expectEqual(@as(usize, 1), record.scans().len);
+    try std.testing.expectEqual(@as(f64, 1), (try record.scans()[0].scanStartTime(header.groups)).?.value);
+    try std.testing.expectEqual(@as(usize, 1), record.precursors().len);
+    try std.testing.expectEqualStrings("first", record.precursors()[0].attribute("spectrumRef").?);
+    const ions = try record.precursors()[0].selectedIons();
+    try std.testing.expectEqual(@as(usize, 1), ions.len);
+    try std.testing.expectEqualStrings("first ion", ions[0].params[0].user.name.?);
+    try std.testing.expectEqual(@as(usize, 1), record.products().len);
+    try std.testing.expectEqual(@as(usize, 2), record.binaryArrays().len);
+    try std.testing.expectEqual(@as(usize, 2), decoded.len());
+    for (0..2) |i| try std.testing.expectEqualSlices(f64, &.{@floatFromInt(i + 1)}, decoded.get(i).?.values.float64);
+    try std.testing.expectEqual(record.binaryArrays()[0], (try record.arrayByRole(header.groups, mzml.model.Terms.MZ_ARRAY)).?);
+    try std.testing.expect(std.mem.indexOf(u8, record.node.content.?.items[record.node.content.?.items.len - 1].xml, "AAAAAAAACEA=") != null);
+    const chrom = (try reader.nextDecodedRecord(&decoded)).?;
+    try std.testing.expectEqual(@as(usize, 1), chrom.precursors().len);
+    try std.testing.expectEqual(@as(usize, 1), chrom.products().len);
+    try std.testing.expectEqual(@as(usize, 0), chrom.binaryArrays().len);
+    try std.testing.expectEqual(@as(usize, 0), decoded.len());
+    try std.testing.expectEqual(null, try reader.nextDecodedRecord(&decoded));
+    for ([_]usize{ 1, 7, 31 }) |chunk| {
+        try compareDecoded(support.REPEATED_CONTAINERS, chunk);
+        try compareDecodedWithSelection(support.REPEATED_CONTAINERS, chunk, true);
+    }
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, readDecodedRecord, .{ support.REPEATED_CONTAINERS, mzml.arrays.Limits{} });
+}
+
+test "[failure] - [mzML containers]: bounds extra XML and leaves extra group definitions unexpanded" {
+    const prefix = "<mzML xmlns='http://psi.hupo.org/ms/mzml'><run><spectrumList><spectrum id='s'><scanList/>";
+    const suffix = "</spectrum></spectrumList></run></mzML>";
+    const nodes = prefix ++ "<scanList><scan/><scan/></scanList>" ++ suffix;
+    try support.readAll(std.testing.allocator, nodes, .{ .limits = .{ .nodes = 5 } });
+    try std.testing.expectError(error.LimitExceeded, support.readAll(std.testing.allocator, nodes, .{ .limits = .{ .nodes = 4 } }));
+    try std.testing.expectError(error.LimitExceeded, support.readAll(std.testing.allocator, prefix ++ "<scanList>" ++ "x" ** 2048 ++ "</scanList>" ++ suffix, .{ .limits = .{ .record_bytes = 2048 } }));
+    inline for (.{ "<scanList></other>", "<scanList><scan>", "<scanList>&missing;</scanList>" }) |body| {
+        var input = std.Io.Reader.fixed(prefix ++ body ++ suffix);
+        var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+        defer reader.deinit();
+        try std.testing.expectError(error.InvalidXml, reader.nextRecord());
+        try std.testing.expectError(error.FailedState, reader.nextRecord());
+    }
+    const source = try std.mem.replaceOwned(u8, std.testing.allocator, support.REPEATED_CONTAINERS, "ref=\"encoding\"", "ref=\"zmz-reencoded-0\"");
+    defer std.testing.allocator.free(source);
+    try support.readAll(std.testing.allocator, source, .{});
+    try std.testing.expectError(error.MissingGroup, readDecoded(std.testing.allocator, source, .{}));
+}
+
 test "[failure] - [mzML extensions]: bounds retained XML and stops on malformed subtrees" {
     for ([_]mzml.StreamReader.Options{
         .{ .limits = .{ .header_bytes = 128 } },
@@ -1111,7 +1172,7 @@ test "[integration] - [mzML children]: reads present metadata without schema ord
     try std.testing.checkAllAllocationFailures(std.testing.allocator, readDecodedRecord, .{ source, mzml.arrays.Limits{} });
 }
 
-test "[integration] - [mzML children]: distinguishes missing payloads from ambiguous containers" {
+test "[integration] - [mzML children]: distinguishes missing payloads from repeated payloads" {
     const prefix = support.HEADER ++ "<spectrumList count='1'><spectrum id='s' index='0' defaultArrayLength='1'>";
     const suffix = "</spectrum></spectrumList></run></mzML>";
     inline for (.{ "", "<binary>AAAAAAAA8D8=</binary>" }) |binary| {
@@ -1138,14 +1199,16 @@ test "[integration] - [mzML children]: distinguishes missing payloads from ambig
         "<scanList/><scanList/>",
         "<precursorList/><precursorList/>",
         "<binaryDataArrayList/><binaryDataArrayList/>",
-        "<binaryDataArrayList><binaryDataArray><referenceableParamGroupRef ref='encoding'/><binary>AAAAAAAA8D8=</binary><binary/></binaryDataArray></binaryDataArrayList>",
         "<precursorList><precursor><selectedIonList/><selectedIonList/></precursor></precursorList>",
     }) |body| {
         const source = prefix ++ body ++ suffix;
-        try std.testing.expectError(error.InvalidStructure, support.readAll(std.testing.allocator, source, .{}));
-        try std.testing.expectError(error.InvalidStructure, readDecoded(std.testing.allocator, source, .{}));
-        try std.testing.expectError(error.InvalidStructure, mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = source }, .{ .policy = .rebuild }));
+        try compareDecoded(source, 1);
     }
+    const ambiguous = prefix ++ "<binaryDataArrayList><binaryDataArray><referenceableParamGroupRef ref='encoding'/>" ++
+        "<binary>AAAAAAAA8D8=</binary><binary/></binaryDataArray></binaryDataArrayList>" ++ suffix;
+    try std.testing.expectError(error.InvalidStructure, support.readAll(std.testing.allocator, ambiguous, .{}));
+    try std.testing.expectError(error.InvalidStructure, readDecoded(std.testing.allocator, ambiguous, .{}));
+    try std.testing.expectError(error.InvalidStructure, mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = ambiguous }, .{ .policy = .rebuild }));
 }
 
 test "[integration] - [mzML header]: preserves present sections without requiring schema order" {
@@ -1185,9 +1248,8 @@ test "[integration] - [mzML header]: preserves present sections without requirin
         try std.testing.checkAllAllocationFailures(std.testing.allocator, readDecodedRecord, .{ source, mzml.arrays.Limits{} });
     }
     const opening = "<mzML xmlns='http://psi.hupo.org/ms/mzml' version='1.1.0'>";
-    inline for (.{ group ++ group ++ "<run/>", software }) |body| {
-        try std.testing.expectError(error.InvalidStructure, support.readAll(std.testing.allocator, opening ++ body ++ "</mzML>", .{}));
-    }
+    try support.readAll(std.testing.allocator, opening ++ group ++ group ++ "<run/></mzML>", .{});
+    try std.testing.expectError(error.InvalidStructure, support.readAll(std.testing.allocator, opening ++ software ++ "</mzML>", .{}));
 }
 
 test "[integration] - [mzML lists]: reads absent and empty lists without requiring records" {

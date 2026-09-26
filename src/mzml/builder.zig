@@ -15,6 +15,7 @@ const base64 = @import("../binary/base64.zig");
 const encoding = @import("../binary/encoding.zig");
 const zlib = @import("../binary/zlib.zig");
 const schema = @import("schema.zig");
+const xml = @import("../xml/mzml_adapter.zig");
 
 const Builder = @This();
 
@@ -274,6 +275,11 @@ pub fn reencoding(self: *Builder, source: model.Header, targets: []const model.E
                         break;
                     }
                 }
+                if (!collision) collision = extraGroupIdUsed(self.arena.child_allocator, header_copy, candidate) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.LimitExceeded => return error.LimitExceeded,
+                    else => return error.InvalidStructure,
+                };
                 if (!collision) break try copier.text(candidate);
             };
             var node_copy = group_node;
@@ -321,6 +327,29 @@ pub fn reencoding(self: *Builder, source: model.Header, targets: []const model.E
 
 const GroupEncoding = struct { primitive: ?model.Primitive = null, pipeline: ?arrays.Pipeline = null };
 const GroupReplacement = struct { source_id: []const u8, encoding: GroupEncoding, id: []const u8 };
+
+// Extra group lists are not expanded, but their IDs must not be reused.
+fn extraGroupIdUsed(allocator: std.mem.Allocator, header_value: model.Header, id: []const u8) xml.Error!bool {
+    const content = header_value.document.content orelse return false;
+    for (content.items) |item| {
+        if (item != .xml) continue;
+        var input = std.Io.Reader.fixed(item.xml);
+        var cursor = try xml.Cursor.init(allocator, &input, 64, @max(1, item.xml.len / 4), item.xml.len);
+        defer cursor.deinit();
+        try cursor.advanceFragment(false);
+        const root = cursor.current orelse return error.InvalidXml;
+        if (root.data != .start_element or !root.data.start_element.name.eql(header_value.namespace_uri, "referenceableParamGroupList")) continue;
+        while (true) {
+            try cursor.advanceFragment(true);
+            const event = cursor.current orelse break;
+            if (event.data != .start_element or cursor.depth != 2) continue;
+            const start = event.data.start_element;
+            if (!start.name.eql(header_value.namespace_uri, "referenceableParamGroup")) continue;
+            if (start.attribute(null, "id")) |attribute| if (sameGroupId(attribute.value, id)) return true;
+        }
+    }
+    return false;
+}
 
 fn sameGroupId(left: []const u8, right: []const u8) bool {
     return std.mem.eql(u8, std.mem.trim(u8, left, " \t\r\n"), std.mem.trim(u8, right, " \t\r\n"));

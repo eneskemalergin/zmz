@@ -11,7 +11,7 @@ pub const StreamReader = struct {
     /// Independent bounds for parser state, retained metadata, records, lists, and payload text.
     pub const Limits = impl.Limits;
 
-    /// Retains or skips binary text without decoding it.
+    /// Retains or skips modeled binary text without decoding it; XML fragments stay intact.
     pub const Payload = impl.Payload;
 
     pub const ArraySelector = impl.ArraySelector;
@@ -66,8 +66,8 @@ pub const StreamReader = struct {
     }
 
     /// Reads a complete record and decodes selected arrays into reusable output storage.
-    /// Without array_selector, decodes every array. Skipped arrays keep their metadata.
-    /// Metadata borrows this reader as in nextRecord; binary text is not retained.
+    /// Without array_selector, decodes every modeled array. Skipped arrays keep their metadata.
+    /// Metadata borrows this reader as in nextRecord; modeled binary text is not retained.
     /// Output slices last until output is reused, reset, or deinitialized. EOF and errors
     /// clear its visible results. Payload does not affect this call.
     /// The first failure stops reading and sets the diagnostic;

@@ -227,6 +227,7 @@ test "[cli] - [mzML examples]: rewrites list attributes and records without deco
         support.REFERENCED_DOCUMENT,
         support.STREAM_EXTENSIONS,
         support.KNOWN_CHILDREN,
+        support.REPEATED_CONTAINERS,
         support.HEADER ++ "<spectrumList count='1' sourceNote='A&amp;B' xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance' xsi:schemaLocation='urn:example list.xsd'>" ++
             support.SPECTRUM ++ "</spectrumList><chromatogramList count='0' defaultDataProcessingRef='' sourceNote=''/></run></mzML>",
         support.HEADER ++ "<spectrumList count='0' defaultDataProcessingRef='dp'/><chromatogramList count='0' defaultDataProcessingRef='dp'/></run></mzML>",

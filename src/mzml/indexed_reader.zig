@@ -163,8 +163,8 @@ pub fn at(self: *IndexedReader, allocator: std.mem.Allocator, kind: model.Kind, 
 }
 
 /// Returns independent metadata and decodes selected arrays into caller-owned reusable storage.
-/// Without reader.array_selector, decodes every array. All array metadata remains available.
-/// Binary text is omitted; payload is ignored.
+/// Without reader.array_selector, decodes every modeled array. Extra XML stays uninterpreted.
+/// Modeled binary text is omitted; payload is ignored.
 /// Missing IDs and failures clear output. A failed lookup stops immediately; later lookups may retry.
 /// Numeric slices last until output is reused, reset, or deinitialized, independently of metadata.
 pub fn byIdDecoded(self: *IndexedReader, allocator: std.mem.Allocator, id: []const u8, output: *DecodedArrays) Error!?owned.Record {

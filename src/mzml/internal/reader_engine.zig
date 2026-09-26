@@ -400,7 +400,7 @@ fn readHeaderInner(self: *StreamReader) Error!void {
         try self.parseParams(&self.header_store, true, &document_params);
         if (content.items.len != 0 and document_params != before)
             try content.append(self.allocator, .{ .params = document_params - before });
-        const kind_value = self.childKind(.mzml) orelse {
+        const kind_value = self.firstChildKind(.mzml, seen) orelse {
             if (content.items.len == 0) try self.startContent(&content, document_params, metadata.items.len);
             const fragment = try self.readXml(&self.header_store, true);
             try content.append(self.allocator, .{ .xml = fragment });
@@ -408,8 +408,6 @@ fn readHeaderInner(self: *StreamReader) Error!void {
             continue;
         };
         if (kind_value == .run) break;
-        // Header consumers select one container of each kind.
-        if (seen.contains(kind_value)) return error.InvalidStructure;
         seen.insert(kind_value);
         try metadata.append(self.allocator, try self.parseNode(&self.header_store, 1, true, self.options.payload));
         if (content.items.len != 0) try content.append(self.allocator, .{ .children = 1 });
@@ -436,9 +434,9 @@ fn readHeaderInner(self: *StreamReader) Error!void {
             try content.append(self.allocator, .{ .params = param_count - before });
         const event = self.cursor.current orelse return error.UnexpectedEnd;
         if (event.data == .end_element) break;
-        if (self.childKind(.run)) |kind_value| {
-            if (kind_value != .source_file_ref_list) break;
-            if (metadata.items.len != 0) return error.InvalidStructure;
+        const kind_value = self.childKind(.run);
+        if (kind_value != null and kind_value != .source_file_ref_list) break;
+        if (kind_value == .source_file_ref_list and metadata.items.len == 0) {
             try metadata.append(self.allocator, try self.parseNode(&self.header_store, 1, true, self.options.payload));
             if (content.items.len != 0) try content.append(self.allocator, .{ .children = 1 });
         } else {
@@ -592,6 +590,12 @@ fn childKind(self: *StreamReader, parent: model.Kind) ?model.Kind {
     return if (schema.CHILD_KINDS.get(parent).allowed.contains(value)) value else null;
 }
 
+fn firstChildKind(self: *StreamReader, parent: model.Kind, seen: std.EnumSet(model.Kind)) ?model.Kind {
+    const value = self.childKind(parent) orelse return null;
+    if (value != .binary and seen.contains(value) and schema.CHILD_KINDS.get(parent).singular.contains(value)) return null;
+    return value;
+}
+
 fn startNode(self: *StreamReader, storage: *Storage, kind_value: model.Kind) Error!model.Node {
     return self.startNodeFor(storage, kind_value, true);
 }
@@ -719,15 +723,14 @@ fn parseNodeFor(self: *StreamReader, storage: *Storage, depth: usize, advance_af
                 }
                 continue;
             }
-            const child_kind = self.childKind(kind_value) orelse {
+            const child_kind = self.firstChildKind(kind_value, seen) orelse {
                 if (retention == .tree and content.items.len == 0) try self.startContent(&content, param_count, child_count);
                 const fragment = try self.readXml(storage, retention == .tree);
                 if (retention == .tree) try content.append(self.allocator, .{ .xml = fragment });
                 try self.cursor.advance(false);
                 continue;
             };
-            // First-child helpers cannot return repeated singular containers.
-            if (children.singular.contains(child_kind) and seen.contains(child_kind)) return error.InvalidStructure;
+            if (child_kind == .binary and seen.contains(.binary)) return error.InvalidStructure;
             seen.insert(child_kind);
             if (child_count == self.options.limits.list_entries) return error.LimitExceeded;
             if (child_kind == .binary_data_array_list and storage == &self.record_store and child_payload == .retain) {

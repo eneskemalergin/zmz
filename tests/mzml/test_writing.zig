@@ -113,10 +113,14 @@ test "[failure] - [mzML items]: rejects misplaced items and propagates failed ou
     }
 }
 
-test "[integration] - [mzML children]: copies misplaced known XML without indexing nested records" {
+test "[integration] - [mzML children]: copies retained XML without indexing nested records" {
     const allocator = std.testing.allocator;
-    for ([_]bool{ false, true }) |indexed| {
-        var input = std.Io.Reader.fixed(support.KNOWN_CHILDREN);
+    const Case = struct { source: []const u8, fragments: usize };
+    for ([_]Case{
+        .{ .source = support.KNOWN_CHILDREN, .fragments = 7 },
+        .{ .source = support.REPEATED_CONTAINERS, .fragments = 0 },
+    }) |case| for ([_]bool{ false, true }) |indexed| {
+        var input = std.Io.Reader.fixed(case.source);
         var reader = try mzml.StreamReader.init(allocator, &input, .{});
         defer reader.deinit();
         var builder = mzml.Builder.init(allocator, .{});
@@ -135,7 +139,7 @@ test "[integration] - [mzML children]: copies misplaced known XML without indexi
             try writer.writeItem(copy.value);
         }
         try writer.finish();
-        var original_input = std.Io.Reader.fixed(support.KNOWN_CHILDREN);
+        var original_input = std.Io.Reader.fixed(case.source);
         var original = try mzml.StreamReader.init(allocator, &original_input, .{});
         defer original.deinit();
         var written_input = std.Io.Reader.fixed(sink.written());
@@ -149,7 +153,7 @@ test "[integration] - [mzML children]: copies misplaced known XML without indexi
             try support.expectItem(expected, (try written.nextItem()).?);
             if (expected == .xml) fragments += 1;
         }
-        try std.testing.expectEqual(@as(usize, 7), fragments);
+        try std.testing.expectEqual(case.fragments, fragments);
         try std.testing.expectEqual(null, try written.nextItem());
         for (std.enums.values(mzml.IndexedReader.Policy)) |policy| {
             if (!indexed and policy == .open_embedded) continue;
@@ -170,7 +174,7 @@ test "[integration] - [mzML children]: copies misplaced known XML without indexi
                     try std.testing.expectEqualSlices(f64, &.{@floatFromInt(position + 1)}, decoded.get(position).?.values.float64);
             }
         }
-    }
+    };
 }
 
 test "[integration] - [mzML extensions]: retains attributes and mixed XML through copies and writing" {

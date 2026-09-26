@@ -169,6 +169,7 @@ pub const Content = struct {
 /// A faithful mzML node, bounded to header metadata or one record, never a complete run.
 /// Parameter order and multiplicity are preserved. Extra XML keeps namespace bindings;
 /// known mzML prefixes, comments, and formatting need not match the source.
+/// Later occurrences of singular metadata containers remain in content as XML, not children.
 pub const Node = struct {
     kind: Kind,
     attributes: []const Attribute = &.{},
@@ -236,7 +237,7 @@ pub const Node = struct {
         return self.number(groups, Terms.SCAN_START_TIME);
     }
 
-    /// Returns every selected ion of this precursor in source order, without copying.
+    /// Returns selected ions from the first list in source order, without copying.
     /// Other node kinds return UnexpectedElement; an absent list returns an empty slice.
     pub fn selectedIons(self: Node) error{UnexpectedElement}![]const Node {
         if (self.kind != .precursor) return error.UnexpectedElement;
@@ -328,6 +329,7 @@ pub const Header = struct {
     run: Node,
     /// Source namespace, independent of the document's version attribute.
     namespace_uri: []const u8 = "http://psi.hupo.org/ms/mzml",
+    /// Definitions from the first group list; extra lists remain uninterpreted XML.
     groups: []const cv.Group = &.{},
     /// An indexed wrapper was observed; its index and checksum have not been verified.
     indexed: bool = false,
@@ -349,6 +351,7 @@ pub const RecordList = struct {
 /// Missing source numbers remain null, distinct from zero or an indexed lookup ordinal.
 /// Writers consume node; arrays() uses default_array_length. Edit caller-owned node views
 /// for writing, and keep cached fields consistent if using the edited Record for reading.
+/// Helpers read modeled nodes, not extra containers retained in Node.content.
 pub const Record = struct {
     node: Node,
     id: []const u8,
@@ -380,7 +383,7 @@ pub const Record = struct {
         return if (centroid) .centroid else .profile;
     }
 
-    /// Returns all scans in source order. Chromatograms have no scan list.
+    /// Returns modeled scans in source order. Chromatograms have no scan list.
     /// Like binaryArrays, list access borrows a structurally valid record hierarchy.
     pub fn scans(self: Record) []const Node {
         if (self.node.child(.spectrum_description)) |description| {
@@ -391,18 +394,18 @@ pub const Record = struct {
         return listItems(self.node, .scan_list);
     }
 
-    /// Returns all spectrum precursors or the optional direct chromatogram precursor.
-    /// No first-precursor selection, copying, or parameter interpretation occurs.
+    /// Returns modeled spectrum precursors or the first direct chromatogram precursor.
+    /// Borrows nodes without copying or parameter interpretation.
     pub fn precursors(self: Record) []const Node {
         return recordChildren(self.node.child(.spectrum_description) orelse self.node, .precursor_list, .precursor);
     }
 
-    /// Returns all spectrum products or the optional direct chromatogram product.
+    /// Returns modeled spectrum products or the first direct chromatogram product.
     pub fn products(self: Record) []const Node {
         return recordChildren(self.node, .product_list, .product);
     }
 
-    /// Returns all binary array descriptors, including auxiliary arrays and unknown roles.
+    /// Returns descriptors from the first array list, including auxiliary arrays and unknown roles.
     pub fn binaryArrays(self: Record) []const Node {
         const list = self.node.child(.binary_data_array_list) orelse return &.{};
         return list.children;

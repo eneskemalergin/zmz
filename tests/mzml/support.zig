@@ -7,6 +7,7 @@ pub const HISTORICAL = @embedFile("data/historical.mzML");
 pub const EXTENSIONS = @embedFile("data/extensions.mzML");
 pub const STREAM_EXTENSIONS = @embedFile("data/stream_extensions.mzML");
 pub const KNOWN_CHILDREN = @embedFile("data/known_children.mzML");
+pub const REPEATED_CONTAINERS = @embedFile("data/repeated_containers.mzML");
 
 pub const HEADER =
     "<mzML xmlns='http://psi.hupo.org/ms/mzml' version='1.1.0' id='example'>" ++

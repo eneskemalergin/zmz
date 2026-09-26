@@ -111,6 +111,59 @@ test "[integration] - [group reencoding]: retains annotated references without c
     try std.testing.checkAllAllocationFailures(std.testing.allocator, reencodeReferenceAllocated, .{});
 }
 
+test "[integration] - [mzML containers]: prepared writing preserves extra containers and group IDs" {
+    const Check = struct {
+        fn write(allocator: std.mem.Allocator) !void {
+            var input = std.Io.Reader.fixed(support.REPEATED_CONTAINERS);
+            var reader = try mzml.StreamReader.init(allocator, &input, .{});
+            defer reader.deinit();
+            const header = try reader.readHeader();
+            const record = (try reader.nextRecord()).?;
+            var header_builder = mzml.Builder.init(allocator, .{});
+            defer header_builder.deinit();
+            const prepared_header = try header_builder.reencoding(header.*, &.{.{ .primitive = .float32, .pipeline = .none }});
+            try std.testing.expectEqual(@as(usize, 2), prepared_header.header.groups.len);
+            try std.testing.expectEqualStrings("zmz-reencoded-1", prepared_header.header.groups[1].id);
+            var builder = mzml.Builder.init(allocator, .{});
+            defer builder.deinit();
+            const scratch: mzml.arrays.Scratch = .{ .transport = &.{}, .transformed = &.{} };
+            const first = try prepared_header.prepareArray(&builder, f32, &.{1}, record.binaryArrays()[0], .{}, scratch, null);
+            const second = try prepared_header.prepareArray(&builder, f32, &.{2}, record.binaryArrays()[1], .{}, scratch, null);
+            const children = try allocator.dupe(mzml.model.Node, record.node.children);
+            defer allocator.free(children);
+            for (children) |*child| if (child.kind == .binary_data_array_list) {
+                child.children = &.{ first.array.node, second.array.node };
+            };
+            var node = record.node;
+            node.children = children;
+            var bytes: [16 * 1024]u8 = undefined;
+            var sink: std.Io.Writer = .fixed(&bytes);
+            var writer = try mzml.Writer.initIndexed(allocator, &sink, .{}, .{});
+            defer writer.deinit();
+            try writer.writeHeader(prepared_header.header);
+            try writer.beginListWithAttributes(.spectrum_list, 1, header.spectrum_list.?.attributes);
+            try writer.writeRecordWithArrays(node, &.{ first.wire, second.wire });
+            try writer.endList();
+            try writer.finish();
+            var index = try mzml.IndexedReader.build(allocator, .{ .bytes = sink.buffered() }, .{});
+            defer index.deinit();
+            var decoded = mzml.StreamReader.DecodedArrays.init(allocator, .{});
+            defer decoded.deinit();
+            var actual = (try index.byIdDecoded(allocator, "s0", &decoded)).?;
+            defer actual.deinit();
+            try std.testing.expectEqual(@as(usize, 2), decoded.len());
+            try std.testing.expectEqualSlices(f32, &.{1}, decoded.get(0).?.values.float32);
+            try std.testing.expectEqualSlices(f32, &.{2}, decoded.get(1).?.values.float32);
+            try std.testing.expectEqualDeep(record.node.content, actual.value.node.content);
+            try std.testing.expectEqualStrings("encoding", index.header().groups[0].id);
+            try std.testing.expectEqualStrings("zmz-reencoded-1", actual.value.binaryArrays()[0].params[0].group_ref.ref.?);
+            try std.testing.expectEqualStrings(header.document.content.?.items[2].xml, index.header().document.content.?.items[2].xml);
+            try support.expectNode(header.run, index.header().run);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.write, .{});
+}
+
 test "[integration] - [group reencoding]: handles partial groups, ID collisions, and ordered XML" {
     const xml: mzml.cv.ParameterXml = .{ .attributes = &.{.{ .name = "extra", .value = "keep" }}, .content = &.{.{ .xml = "<e:detail xmlns:e='urn:producer'/>" }} };
     const primitive: mzml.model.Node = .{ .kind = .referenceable_param_group, .attributes = &.{.{ .name = "id", .value = " zmz-reencoded-0 " }}, .params = &.{.{ .cv = .{ .accession = .{ .raw = "MS:1000523" }, .name = "64-bit float", .xml = &xml } }} };

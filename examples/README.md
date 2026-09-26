@@ -18,9 +18,9 @@ zig-out/bin/mzml-select input.mzML MS:1000515 --stream
 zig-out/bin/mzml-select input.mzML MS:1000514 --ms1
 ```
 
-[stream.zig](stream.zig) reads spectra and chromatograms until the reader returns null, regardless of declared list counts. By default it decodes every array and matches the returned numeric union. `--metadata` skips binary text and numeric decoding. MS level is optional and queried only on spectra. Scan times keep their source units; the example does not convert them.
+[stream.zig](stream.zig) reads spectra and chromatograms until the reader returns null, regardless of declared list counts. By default it decodes every modeled array and matches the returned numeric union. `--metadata` skips modeled binary text and numeric decoding. MS level is optional and queried only on spectra. Scan times keep their source units; the example does not convert them.
 
-The example copies the first record and header, then uses that metadata after closing the reader. A record copy does not include header parameter groups or numeric buffers. `DecodedArrays` keeps numbers only until its next use, reset, or destruction, including a read that reaches EOF. Copy numeric slices separately if you need to retain them. Neither metadata-only nor decoded reading retains Base64 text for `writeRecord`.
+The example copies the first record and header, then uses that metadata after closing the reader. A record copy does not include header parameter groups or numeric buffers. `DecodedArrays` keeps numbers only until its next use, reset, or destruction, including a read that reaches EOF. Copy numeric slices separately if you need to retain them. Neither metadata-only nor decoded reading retains modeled Base64 text for `writeRecord`.
 
 The live header pointer lasts until reader destruction; list descriptors and observed counts update during traversal. An owned header is a snapshot. A borrowed record expires on the next read, even if that read fails or reaches EOF.
 
@@ -30,7 +30,7 @@ The live header pointer lasts until reader destruction; list descriptors and obs
 
 By default, this example retains the current record's binary text and allocates typed output and scratch only for the requested array. `--stream` instead uses `array_selector` with `nextDecodedRecord`: it selects from leading array parameters and decodes into reusable buffers without retaining Base64. `--ms1` also uses `select_record` to skip decoding outside MS1 spectra. Record selection sees the kind, attributes, and record-level parameters read before the array list; array selection sees attributes and leading parameters. Neither callback sees later parameters. Use the default retained-text route when selection needs complete metadata.
 
-Selected numeric results are compact and stay in source order. Each `DecodedArrays.Array.source_position` indexes the returned record's `binaryArrays()`, whose metadata includes unselected arrays. An empty selection returns the record with zero decoded arrays, not EOF. Without a selector, numeric reads still decode every array.
+Selected numeric results are compact and stay in source order. Each `DecodedArrays.Array.source_position` indexes the returned record's `binaryArrays()`, whose metadata includes unselected arrays. An empty selection returns the record with zero decoded arrays, not EOF. Without a selector, numeric reads still decode every modeled array.
 
 ## Indexed access
 
@@ -139,5 +139,7 @@ This uses a local package dependency, including the library's build options. It 
 ## Current input limits
 
 The reader handles XML 1.0 in UTF-8, UTF-16, and declared ISO-8859-1. Returned text and written XML use UTF-8; source offsets count original bytes. The mzML version attribute is preserved, including empty or absent values, without rejecting its value. Original mzML 1.0.0 and modern mzML namespaces and structures use the same API. Extra attributes and unknown XML inside header and record nodes survive copying and writing without being interpreted as scans or arrays. `UnsupportedVersion` concerns the XML declaration; an unrecognized document namespace returns `WrongNamespace`. A schema filename alone does not establish that the input is readable.
+
+When a singular metadata container repeats, only the first occurrence is modeled. Later occurrences remain intact in `Node.content` as XML. Scan helpers, array decoding, and group expansion do not read those fragments. Copying preserves them; `--zlib` leaves their payloads unchanged. Even `--metadata` retains their XML bytes, within the reader's retained-byte limits. Multiple binary payloads in one modeled array and unsupported run/list ordering still fail.
 
 The stream example prints the reader's first error, byte offset, and element when available, then returns the error. No example prechecks the whole file or silently skips a failed record. Whole-file gzip is not handled here.

@@ -1,0 +1,33 @@
+<mzML xmlns="http://psi.hupo.org/ms/mzml" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:e="urn:producer" version="1.1.0">
+  <referenceableParamGroupList count="1"><referenceableParamGroup id="encoding"><cvParam cvRef="MS" accession="MS:1000523" name="64-bit float"/><cvParam cvRef="MS" accession="MS:1000576" name="no compression"/></referenceableParamGroup></referenceableParamGroupList>
+  <m:referenceableParamGroupList xmlns:m="http://psi.hupo.org/ms/mzml" count="1" e:part="extra"><m:referenceableParamGroup id=" zmz-reencoded-0 "><userParam name="kept definition"/></m:referenceableParamGroup></m:referenceableParamGroupList>
+  <softwareList count="1"><software id="first" version="1"/></softwareList>
+  <softwareList count="1"><software id="second" version="2"/></softwareList>
+  <run id="r">
+    <sourceFileRefList count="1"><sourceFileRef ref="first-source"/></sourceFileRefList>
+    <sourceFileRefList count="1"><sourceFileRef ref="second-source"/></sourceFileRefList>
+    <spectrumList count="1">
+      <spectrum id="s0" index="0" defaultArrayLength="1">
+        <scanList count="1"><scan><cvParam accession="MS:1000016" name="scan start time" value="1"/></scan></scanList>
+        <userParam name="between lists"/>
+        <scanList count="1" e:part="extra"><scan><cvParam accession="MS:1000016" name="scan start time" value="2"/><e:note>keep</e:note></scan></scanList>
+        <precursorList count="1"><precursor spectrumRef="first"><selectedIonList count="1"><selectedIon><userParam name="first ion"/></selectedIon></selectedIonList><selectedIonList count="1"><selectedIon><userParam name="second ion"/></selectedIon></selectedIonList><activation/><activation><userParam name="second activation"/></activation></precursor></precursorList>
+        <precursorList count="1"><precursor spectrumRef="second"/></precursorList>
+        <productList count="1"><product><isolationWindow><userParam name="first window"/></isolationWindow><isolationWindow><userParam name="second window"/></isolationWindow></product></productList>
+        <productList count="1"><product><userParam name="second product"/></product></productList>
+        <binaryDataArrayList count="2">
+          <binaryDataArray encodedLength="12"><referenceableParamGroupRef ref="encoding"/><cvParam accession="MS:1000514" name="m/z array"/><binary>AAAAAAAA8D8=</binary></binaryDataArray>
+          <binaryDataArray encodedLength="12"><referenceableParamGroupRef ref="encoding"/><cvParam accession="MS:1000515" name="intensity array"/><binary>AAAAAAAAAEA=</binary></binaryDataArray>
+        </binaryDataArrayList>
+        <binaryDataArrayList count="1" e:part="extra"><binaryDataArray encodedLength="12"><referenceableParamGroupRef ref="encoding"/><cvParam accession="MS:1000514" name="m/z array"/><binary>AAAAAAAACEA=</binary></binaryDataArray></binaryDataArrayList>
+      </spectrum>
+    </spectrumList>
+    <chromatogramList count="1">
+      <chromatogram id="c0" index="0" defaultArrayLength="0">
+        <precursor spectrumRef="first"/><precursor spectrumRef="second"/>
+        <product><userParam name="first product"/></product><product><userParam name="second product"/></product>
+        <binaryDataArrayList count="0"/><binaryDataArrayList count="1"><binaryDataArray encodedLength="12" arrayLength="1"><referenceableParamGroupRef ref="encoding"/><binary>AAAAAAAAEEA=</binary></binaryDataArray></binaryDataArrayList>
+      </chromatogram>
+    </chromatogramList>
+  </run>
+</mzML>
