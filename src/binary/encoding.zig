@@ -54,7 +54,8 @@ pub const Error = cv.ExpansionError || error{
 };
 
 /// Classifies only reviewed wire terms. It never selects a default for missing declarations.
-/// This does not resolve arbitrary ontology descendants.
+/// Repeated terms may agree; different primitive or codec identities conflict.
+/// This does not change source parameters or resolve arbitrary ontology descendants.
 pub fn classify(params: []const cv.Entry, groups: []const cv.Group) Error!Descriptor {
     var primitive: ?Primitive = null;
     var pipeline: ?Pipeline = null;
@@ -68,7 +69,7 @@ pub fn classify(params: []const cv.Entry, groups: []const cv.Group) Error!Descri
             if (std.mem.eql(u8, raw, primitiveTerm(candidate).accession)) p = candidate;
         }
         if (p) |selected| {
-            if (primitive != null) return error.ConflictingPrimitive;
+            if (primitive != null and primitive.? != selected) return error.ConflictingPrimitive;
             primitive = selected;
         }
         var c: ?Pipeline = null;
@@ -76,7 +77,7 @@ pub fn classify(params: []const cv.Entry, groups: []const cv.Group) Error!Descri
             if (std.mem.eql(u8, raw, codecTerm(candidate).accession)) c = candidate;
         }
         if (c) |selected| {
-            if (pipeline != null) return error.ConflictingCompression;
+            if (pipeline != null and pipeline.? != selected) return error.ConflictingCompression;
             pipeline = selected;
         }
         if (std.mem.eql(u8, raw, "MS:1000520") or std.mem.eql(u8, raw, "MS:1001479"))

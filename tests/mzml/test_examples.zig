@@ -320,9 +320,13 @@ test "[cli] - [mzML examples]: failed rewrites remove partial output and never o
 test "[cli] - [mzML examples]: reencodes all codecs without changing values or record metadata" {
     var dir = std.testing.tmpDir(.{});
     defer dir.cleanup();
+    const repeated = try std.mem.replaceOwned(u8, std.testing.allocator, support.REFERENCED_DOCUMENT, "<referenceableParamGroupRef ref='encoding'/>", "<referenceableParamGroupRef ref='encoding'/><cvParam accession='MS:1000523' name='source label'/>" ++
+        "<cvParam accession='MS:1000576' name='source codec label'/>");
+    defer std.testing.allocator.free(repeated);
     for ([_][]const u8{
         @embedFile("data/writer_plain.mzML"),
         support.REFERENCED_DOCUMENT,
+        repeated,
         support.HEADER ++ "<spectrumList count='1' sourceNote='keep'>" ++ support.SPECTRUM ++
             "</spectrumList><chromatogramList count='0' defaultDataProcessingRef=''/></run></mzML>",
     }) |source| {

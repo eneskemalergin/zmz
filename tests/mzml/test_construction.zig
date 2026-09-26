@@ -163,7 +163,7 @@ fn replaceArrayAllocated(allocator: std.mem.Allocator) !void {
             .{ .name = "arrayLength", .value = "3" },
             .{ .name = "extra", .value = "keep" },
         },
-        .params = &.{ .{ .group_ref = .{ .ref = "encoding" } }, .{ .user = .{ .name = "local note", .value = "" } } },
+        .params = &.{ .{ .group_ref = .{ .ref = "encoding" } }, .{ .user = .{ .name = "local note", .value = "" } }, params[1], params[2] },
         .children = &.{.{ .kind = .binary, .attributes = &.{.{ .name = "extra", .value = "binary" }}, .text = "A" ** 8192 }},
     };
     var builder = mzml.Builder.init(allocator, .{ .bytes = 4096 });
@@ -193,10 +193,12 @@ fn replaceArrayAllocated(allocator: std.mem.Allocator) !void {
             try std.testing.expectEqual(length, try mzml.cv.parseInteger(usize, result.array.node.attribute("arrayLength")));
             try std.testing.expectEqual(try mzml.base64.encodedSize(result.wire.len), try mzml.cv.parseInteger(usize, result.array.node.attribute("encodedLength")));
             try std.testing.expectEqualDeep(mzml.model.Encoding{ .primitive = .float32, .pipeline = pipeline }, try mzml.model.arrayEncoding(result.array.node, &.{}));
-            try std.testing.expectEqual(@as(usize, 5), result.array.node.params.len);
+            try std.testing.expectEqual(@as(usize, 7), result.array.node.params.len);
             try std.testing.expectEqualDeep(params[0], result.array.node.params[0]);
             try std.testing.expectEqualDeep(params[3], result.array.node.params[3]);
             try std.testing.expectEqualDeep(source.params[1], result.array.node.params[4]);
+            try std.testing.expectEqualDeep(result.array.node.params[1], result.array.node.params[5]);
+            try std.testing.expectEqualDeep(result.array.node.params[2], result.array.node.params[6]);
             try std.testing.expectEqualStrings("MS:1000576", groups[0].entries[2].cv.accession.?.raw);
             var decoded: [2]f32 = undefined;
             try mzml.arrays.decodeWire(f32, decoded[0..length], result.wire, pipeline, &.{}, .{});

@@ -420,10 +420,54 @@ test "[integration] - [mzML parameters]: retains late array declarations without
     var fetched = (try index.at(std.testing.allocator, .spectrum, 0)).?;
     defer fetched.deinit();
     try std.testing.expectEqualDeep(record, fetched.value);
-    const conflicting = try std.mem.replaceOwned(u8, std.testing.allocator, source, "X:role", "MS:1000521");
-    defer std.testing.allocator.free(conflicting);
-    try support.readAll(std.testing.allocator, conflicting, .{});
-    try std.testing.expectError(error.ConflictingPrimitive, readDecoded(std.testing.allocator, conflicting, .{}));
+    inline for (.{
+        .{ "MS:1000521", error.ConflictingPrimitive },
+        .{ "MS:1000574", error.ConflictingCompression },
+    }) |case| {
+        const conflicting = try std.mem.replaceOwned(u8, std.testing.allocator, source, "X:role", case[0]);
+        defer std.testing.allocator.free(conflicting);
+        try support.readAll(std.testing.allocator, conflicting, .{});
+        try std.testing.expectError(case[1], readDecoded(std.testing.allocator, conflicting, .{}));
+    }
+}
+
+test "[integration] - [mzML arrays]: retains repeated encoding terms across numeric reads" {
+    const declarations = "<cvParam accession='MS:1000523' name='source primitive label' extra='keep'/>" ++
+        "<cvParam accession='MS:1000576' name='source codec label'><note xmlns='urn:producer'>keep</note></cvParam>";
+    const reference = "<referenceableParamGroupRef ref='encoding'/>";
+    inline for (.{
+        .{ reference, declarations ++ declarations },
+        .{ reference, reference ++ declarations },
+        .{ reference, declarations ++ reference },
+        .{ reference, reference ++ reference },
+        .{ "</referenceableParamGroup>", declarations ++ "</referenceableParamGroup>" },
+        .{ "</binary>", "</binary>" ++ declarations },
+    }) |case| {
+        const source = try std.mem.replaceOwned(u8, std.testing.allocator, support.DOCUMENT, case[0], case[1]);
+        defer std.testing.allocator.free(source);
+        try compareDecoded(source, 1);
+        try compareDecodedWithSelection(source, 7, true);
+        var input = std.Io.Reader.fixed(source);
+        var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+        defer reader.deinit();
+        const header = try reader.readHeader();
+        var index = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = source }, .{ .policy = .rebuild });
+        defer index.deinit();
+        var decoded = mzml.StreamReader.DecodedArrays.init(std.testing.allocator, .{});
+        defer decoded.deinit();
+        while (try reader.nextRecord()) |record| {
+            for (record.binaryArrays()) |array| {
+                var value: [1]f64 = undefined;
+                try mzml.model.decodeArray(f64, &value, array, 1, header.groups, .{ .transport = &.{}, .transformed = &.{} }, .{});
+                try std.testing.expectEqualSlices(f64, &.{1}, &value);
+            }
+            var fetched = (try index.byIdDecoded(std.testing.allocator, record.id, &decoded)).?;
+            defer fetched.deinit();
+            try expectSelectedNode(record.node, fetched.value.node);
+            try std.testing.expectEqual(@as(usize, 2), decoded.len());
+            for (0..decoded.len()) |i| try std.testing.expectEqualSlices(f64, &.{1}, decoded.get(i).?.values.float64);
+        }
+    }
 }
 
 test "[integration] - [mzML parameters]: defers group and encoding errors until requested" {
@@ -1916,15 +1960,39 @@ test "[integration] - [mzML arrays]: classifies explicit encodings without guess
                 .primitive = primitive[1],
                 .pipeline = pipeline[1],
             }, try mzml.model.arrayEncoding(array, &.{}));
+            const groups = [_]mzml.cv.Group{
+                .{ .id = "encoding", .entries = &.{ entries[0], entries[1], entries[0], entries[1] } },
+                .{ .id = "other", .entries = entries[0..2] },
+            };
+            const reference: mzml.cv.Entry = .{ .group_ref = .{ .ref = "encoding" } };
+            for ([_][]const mzml.cv.Entry{
+                &.{ entries[0], entries[0], entries[1], entries[1], entries[2] },
+                &.{ reference, entries[0], entries[1] },
+                &.{ entries[0], entries[1], reference },
+                &.{ reference, reference, .{ .group_ref = .{ .ref = "other" } } },
+            }) |params| {
+                try std.testing.expectEqualDeep(mzml.model.Encoding{
+                    .primitive = primitive[1],
+                    .pipeline = pipeline[1],
+                }, try mzml.model.arrayEncoding(.{ .kind = .binary_data_array, .params = params }, &groups));
+            }
         }
     }
     const primitive: mzml.cv.Entry = .{ .cv = .{ .accession = .{ .raw = "MS:1000523" } } };
     const compression: mzml.cv.Entry = .{ .cv = .{ .accession = .{ .raw = "MS:1000576" } } };
+    const other_primitive: mzml.cv.Entry = .{ .cv = .{ .accession = .{ .raw = "MS:1000522" } } };
+    const other_compression: mzml.cv.Entry = .{ .cv = .{ .accession = .{ .raw = "MS:1000574" } } };
+    const group: mzml.cv.Entry = .{ .group_ref = .{ .ref = "encoding" } };
+    const conflict_groups = [_]mzml.cv.Group{.{ .id = "encoding", .entries = &.{ primitive, compression } }};
     const cases = .{
         .{ &[_]mzml.cv.Entry{}, error.MissingPrimitive },
         .{ &[_]mzml.cv.Entry{primitive}, error.MissingCompression },
-        .{ &[_]mzml.cv.Entry{ primitive, primitive, compression }, error.ConflictingPrimitive },
-        .{ &[_]mzml.cv.Entry{ primitive, compression, compression }, error.ConflictingCompression },
+        .{ &[_]mzml.cv.Entry{ primitive, primitive, other_primitive, compression }, error.ConflictingPrimitive },
+        .{ &[_]mzml.cv.Entry{ primitive, compression, compression, other_compression }, error.ConflictingCompression },
+        .{ &[_]mzml.cv.Entry{ group, other_primitive }, error.ConflictingPrimitive },
+        .{ &[_]mzml.cv.Entry{ other_primitive, group }, error.ConflictingPrimitive },
+        .{ &[_]mzml.cv.Entry{ group, other_compression }, error.ConflictingCompression },
+        .{ &[_]mzml.cv.Entry{ other_compression, group }, error.ConflictingCompression },
         .{ &[_]mzml.cv.Entry{.{ .group_ref = .{ .ref = "absent" } }}, error.MissingGroup },
         .{ &[_]mzml.cv.Entry{.{ .cv = .{ .accession = .{ .raw = "MS:1003780" } } }}, error.UnsupportedEncoding },
     };
@@ -1932,7 +2000,7 @@ test "[integration] - [mzML arrays]: classifies explicit encodings without guess
         try std.testing.expectError(case[1], mzml.model.arrayEncoding(.{
             .kind = .binary_data_array,
             .params = case[0],
-        }, &.{}));
+        }, &conflict_groups));
     }
     inline for (.{ "MS:1003088", "MS:1003089", "MS:1003090" }) |accession| {
         const unsupported: mzml.cv.Entry = .{ .cv = .{ .accession = .{ .raw = accession } } };
