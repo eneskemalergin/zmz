@@ -66,9 +66,11 @@ Builder reset releases its metadata. The example resets only after the header or
 zig-out/bin/mzml-rewrite input.mzML copy.mzML
 zig-out/bin/mzml-rewrite input.mzML ms1.mzML --ms1
 zig-out/bin/mzml-rewrite input.mzML zlib.mzML --zlib
+zig-out/bin/mzml-rewrite input.mzML edited.mzML --replace-user-param note "reviewed"
+zig-out/bin/mzml-rewrite input.mzML removed.mzML --remove-user-param note
 ```
 
-[rewrite.zig](rewrite.zig) writes a new indexed file. The default and `--ms1` modes retain source record metadata and binary text without decoding arrays, so an unfamiliar codec can be copied. XML spelling and the old index wrapper are not reproduced.
+[rewrite.zig](rewrite.zig) writes a new indexed file. Copying, filtering, and parameter edits retain binary text without decoding arrays, so an unfamiliar codec can be copied. XML spelling and the old index wrapper are not reproduced.
 
 All modes use `nextItem` or `nextDecodedItem` and `writeItem` to keep XML before, between, and after records, inside empty lists, and after the run. `nextRecord` returns records only and skips that surrounding XML, so it is not a complete file-copy iterator. Items borrow until the next traversal call; `owned.Item.init` keeps an independent copy. Filtering leaves surrounding XML in source order, even when adjacent spectra are removed.
 
@@ -80,9 +82,13 @@ Filtering uses `Writer.initFile` and a null spectrum count in `beginListWithAttr
 
 All modes handle empty or absent lists. `beginListWithAttributes(kind, count, list.attributes)` writes the requested count first and retains the other attributes, including extra fields and absent versus empty `defaultDataProcessingRef`. It borrows attributes only until return. Use `beginList(kind, count, processing_ref)` when constructing a list with just those two attributes. Errors remove the new partial output, and an existing destination is never overwritten.
 
-Writing still needs consecutive record indexes. Plain copy and `--zlib` use forward-only writers and need declared list counts; use `Writer.initFile` for unknown output counts, as `--ms1` does. Copying retains an absent `defaultArrayLength`; numeric rewriting needs an array length or record default.
+Writing still needs consecutive record indexes. Every mode except `--ms1` uses a forward-only writer and needs declared list counts; use `Writer.initFile` for unknown output counts, as `--ms1` does. Copying and parameter edits retain an absent `defaultArrayLength`; numeric rewriting needs an array length or record default.
 
-For metadata edits, copy the affected attribute or child slices into caller-owned storage and give the resulting node to the writer, as `--ms1` does for indexes. Changing the cached `Record.id`, `index`, or `default_array_length` fields alone does not change emitted XML. `Builder.record` and `preparedRecord` construct new record attributes; they are not source-record editors.
+`--replace-user-param NAME VALUE` changes the value attribute on every matching direct `userParam` of each spectrum and chromatogram. Names are case-sensitive; absent names never match, and an empty name is distinct from an absent name. An empty value writes `value=""`. Replacement retains the parameter's type, units, extra attributes, and child XML, so supply a value suitable for its retained type and units. `--remove-user-param NAME` removes the whole matching parameter, including its attached XML. Neither mode adds an absent parameter, edits shared groups or nested metadata, nor decodes arrays. Choose one mode per invocation.
+
+For metadata edits, copy the affected slices into caller-owned storage and give the resulting node to the writer. `ParameterEditor` in `rewrite.zig` copies parameter entries and adjusts each `.params` run in `Node.content` after removal. It leaves `.children` runs and `.xml` fragments in place. Null content means parameters precede children and needs no run edits. The reusable slices and content descriptor stay alive through `writeRecord`; strings, parameter XML, and untouched children still borrow from the reader. Write before the next read or editor call. Removing children follows the same rule for `.children` runs and may also require updating the enclosing list's `count` attribute.
+
+`--ms1` separately shows editing the attribute slice. Changing the cached `Record.id`, `index`, or `default_array_length` fields alone does not change emitted XML. `Builder.record` and `preparedRecord` construct new record attributes; they are not source-record editors.
 
 For numeric edits, supply your changed values to `prepareArrayFrom`. It copies the source array's metadata without its old payload, replaces primitive/codec declarations, and updates lengths. Bare group references become local parameters; annotated references remain intact when their group's encoding stays unchanged. Changing an annotated group's encoding returns `GroupRewriteRequired` without a prepared replacement. Use `header_builder.reencoding(header, targets)` before writing the header, then `prepared.prepareArray(&record_builder, ...)` as the example does. Write `prepared.header` and keep its builder alive while preparing arrays; reset only the separate record builder between records. Targets are the primitive/compression combinations you intend to write.
 

@@ -298,14 +298,86 @@ test "[cli] - [mzML examples]: filtering and reencoding retain surrounding XML" 
     }
 }
 
+test "[cli] - [mzML metadata editing]: replaces and removes ordered record parameters without changing other XML" {
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    const source = @embedFile("data/ordered_metadata.mzML");
+    const annotated = "<userParam name=\"note\" value=\"old\" type=\"xsd:string\" unitName=\"source unit\" e:extra=\"keep\">before<e:detail/>after</userParam>";
+    const targets = [_][]const u8{ annotated, "<userParam name=\"note\"/>", "<userParam name=\"note\" value=\"\"/>", "<userParam name=\"\"/>" };
+    const cases = [_]struct { args: []const []const u8, replacements: [4][]const u8 }{
+        .{ .args = &.{ "--replace-user-param", "note", "A&B\"" }, .replacements = .{
+            "<userParam name=\"note\" value=\"A&amp;B&quot;\" type=\"xsd:string\" unitName=\"source unit\" e:extra=\"keep\">before<e:detail/>after</userParam>",
+            "<userParam name=\"note\" value=\"A&amp;B&quot;\"/>",
+            "<userParam name=\"note\" value=\"A&amp;B&quot;\"/>",
+            targets[3],
+        } },
+        .{ .args = &.{ "--remove-user-param", "note" }, .replacements = .{ "", "", "", targets[3] } },
+        .{ .args = &.{ "--replace-user-param", "note", "" }, .replacements = .{
+            "<userParam name=\"note\" value=\"\" type=\"xsd:string\" unitName=\"source unit\" e:extra=\"keep\">before<e:detail/>after</userParam>",
+            targets[2],
+            targets[2],
+            targets[3],
+        } },
+        .{ .args = &.{ "--remove-user-param", "absent" }, .replacements = targets },
+        .{ .args = &.{ "--remove-user-param", "" }, .replacements = .{ targets[0], targets[1], targets[2], "" } },
+    };
+    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "input.mzML", .data = source });
+    for (cases) |case| {
+        var expected = try std.testing.allocator.dupe(u8, source);
+        defer std.testing.allocator.free(expected);
+        for (targets, case.replacements) |old, new| {
+            const changed = try std.mem.replaceOwned(u8, std.testing.allocator, expected, old, new);
+            std.testing.allocator.free(expected);
+            expected = changed;
+        }
+        const args = try std.mem.concat(std.testing.allocator, []const u8, &.{ &.{ "input.mzML", "edited.mzML" }, case.args });
+        defer std.testing.allocator.free(args);
+        const stdout = try run(dir.dir, options.rewrite, args, 0);
+        defer std.testing.allocator.free(stdout);
+        try std.testing.expectEqualStrings("", stdout);
+        const bytes = try dir.dir.readFileAlloc(std.testing.io, "edited.mzML", std.testing.allocator, .limited(16 * 1024));
+        defer std.testing.allocator.free(bytes);
+        var a_input = std.Io.Reader.fixed(expected);
+        var a = try mzml.StreamReader.init(std.testing.allocator, &a_input, .{});
+        defer a.deinit();
+        var b_input = std.Io.Reader.fixed(bytes);
+        var b = try mzml.StreamReader.init(std.testing.allocator, &b_input, .{});
+        defer b.deinit();
+        const header = try a.readHeader();
+        try support.expectNode(header.document, (try b.readHeader()).document);
+        try support.expectNode(header.run, (try b.readHeader()).run);
+        while (try a.nextItem()) |item| try support.expectItem(item, (try b.nextItem()).?);
+        try std.testing.expectEqual(null, try b.nextItem());
+        var index = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = bytes }, .{});
+        defer index.deinit();
+        var decoded = mzml.StreamReader.DecodedArrays.init(std.testing.allocator, .{});
+        defer decoded.deinit();
+        var record = (try index.byIdDecoded(std.testing.allocator, "s0", &decoded)).?;
+        defer record.deinit();
+        try std.testing.expectEqualSlices(f64, &.{1}, decoded.get(0).?.values.float64);
+        try std.testing.expectEqualDeep([_]usize{ 3, 1 }, index.counts);
+        try dir.dir.deleteFile(std.testing.io, "edited.mzML");
+    }
+}
+
 test "[cli] - [mzML examples]: failed rewrites remove partial output and never overwrite input" {
     var dir = std.testing.tmpDir(.{});
     defer dir.cleanup();
     const source = support.HEADER ++ "<spectrumList count='1' defaultDataProcessingRef='dp'/></run></mzML>";
     try dir.dir.writeFile(std.testing.io, .{ .sub_path = "input.mzML", .data = source });
-    const failed = try run(dir.dir, options.rewrite, &.{ "input.mzML", "failed.mzML" }, 1);
-    defer std.testing.allocator.free(failed);
-    try std.testing.expectError(error.FileNotFound, dir.dir.openFile(std.testing.io, "failed.mzML", .{}));
+    for ([_][]const []const u8{
+        &.{ "input.mzML", "failed.mzML" },
+        &.{ "input.mzML", "failed.mzML", "--replace-user-param", "note", "value" },
+        &.{ "input.mzML", "failed.mzML", "--remove-user-param", "note" },
+        &.{ "input.mzML", "failed.mzML", "--replace-user-param", "note" },
+        &.{ "input.mzML", "failed.mzML", "--remove-user-param" },
+        &.{ "input.mzML", "failed.mzML", "--remove-user-param", "note", "extra" },
+    }) |args| {
+        const failed = try run(dir.dir, options.rewrite, args, 1);
+        defer std.testing.allocator.free(failed);
+        try std.testing.expectEqualStrings("", failed);
+        try std.testing.expectError(error.FileNotFound, dir.dir.openFile(std.testing.io, "failed.mzML", .{}));
+    }
     const same_path = try run(dir.dir, options.rewrite, &.{ "input.mzML", "input.mzML" }, 1);
     defer std.testing.allocator.free(same_path);
     var buffer: [4096]u8 = undefined;

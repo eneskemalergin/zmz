@@ -4,6 +4,10 @@
 //! spectrum indexes are reassigned. Other list attributes stay unchanged.
 //! With --zlib, decodes modeled arrays and reencodes their values losslessly with zlib.
 //! Source metadata and array references are kept through prepared header groups.
+//! --replace-user-param NAME VALUE and --remove-user-param NAME edit all matching
+//! direct user parameters on spectra and chromatograms, without expanding groups.
+//! Parameter replacement keeps units, type, and extra XML; removal deletes the whole
+//! parameter. Other parameters, children, and surrounding XML keep their order.
 
 const std = @import("std");
 const mzml = @import("zmz").mzml;
@@ -12,8 +16,10 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     const ms1 = args.len == 4 and std.mem.eql(u8, args[3], "--ms1");
     const reencode = args.len == 4 and std.mem.eql(u8, args[3], "--zlib");
-    if (args.len != 3 and !ms1 and !reencode) {
-        try std.Io.File.stderr().writeStreamingAll(init.io, "usage: mzml-rewrite INPUT.mzML OUTPUT.mzML [--ms1|--zlib]\n");
+    const replace_param = args.len == 6 and std.mem.eql(u8, args[3], "--replace-user-param");
+    const remove_param = args.len == 5 and std.mem.eql(u8, args[3], "--remove-user-param");
+    if (args.len != 3 and !ms1 and !reencode and !replace_param and !remove_param) {
+        try std.Io.File.stderr().writeStreamingAll(init.io, "usage: mzml-rewrite INPUT.mzML OUTPUT.mzML [--ms1|--zlib|--replace-user-param NAME VALUE|--remove-user-param NAME]\n");
         return error.InvalidArguments;
     }
     const dir = std.Io.Dir.cwd();
@@ -36,6 +42,11 @@ pub fn main(init: std.process.Init) !void {
     defer writer.deinit();
     var attributes: std.ArrayList(mzml.model.Attribute) = .empty;
     defer attributes.deinit(init.gpa);
+    var editor: ?ParameterEditor = if (replace_param or remove_param)
+        .{ .name = args[4], .replacement = if (replace_param) args[5] else null }
+    else
+        null;
+    defer if (editor) |*value| value.deinit(init.gpa);
     var decoded = mzml.StreamReader.DecodedArrays.init(init.gpa, .{});
     defer decoded.deinit();
     var header_builder = mzml.Builder.init(init.gpa, .{});
@@ -71,6 +82,7 @@ pub fn main(init: std.process.Init) !void {
                         }
                         emitted.attributes = attributes.items;
                     }
+                    if (editor) |*value| emitted = try value.apply(init.gpa, emitted);
                     if (encoder) |*value|
                         try value.write(&writer, emitted, &decoded)
                     else
@@ -84,6 +96,54 @@ pub fn main(init: std.process.Init) !void {
     try writer.finish();
     try output.interface.flush();
 }
+
+const ParameterEditor = struct {
+    name: []const u8,
+    replacement: ?[]const u8,
+    params: std.ArrayList(mzml.cv.Entry) = .empty,
+    items: std.ArrayList(mzml.model.Content.Item) = .empty,
+    content: mzml.model.Content = .{ .items = &.{} },
+
+    fn deinit(self: *ParameterEditor, allocator: std.mem.Allocator) void {
+        self.params.deinit(allocator);
+        self.items.deinit(allocator);
+    }
+
+    fn apply(self: *ParameterEditor, allocator: std.mem.Allocator, source: mzml.model.Node) !mzml.model.Node {
+        self.params.clearRetainingCapacity();
+        try self.params.ensureTotalCapacity(allocator, source.params.len);
+        var result = source;
+        if (source.content) |content| {
+            try self.items.resize(allocator, content.items.len);
+            var position: usize = 0;
+            for (content.items, self.items.items) |item, *out| {
+                out.* = item;
+                if (item == .params) {
+                    out.* = .{ .params = self.append(source.params[position..][0..item.params]) };
+                    position += item.params;
+                }
+            }
+            self.content.items = self.items.items;
+            result.content = &self.content;
+        } else {
+            _ = self.append(source.params);
+        }
+        result.params = self.params.items;
+        return result;
+    }
+
+    fn append(self: *ParameterEditor, entries: []const mzml.cv.Entry) usize {
+        const start = self.params.items.len;
+        for (entries) |entry| {
+            var changed = entry;
+            if (entry == .user and entry.user.name != null and std.mem.eql(u8, entry.user.name.?, self.name)) {
+                if (self.replacement) |value| changed.user.value = value else continue;
+            }
+            self.params.appendAssumeCapacity(changed);
+        }
+        return self.params.items.len - start;
+    }
+};
 
 const Reencoder = struct {
     allocator: std.mem.Allocator,

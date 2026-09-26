@@ -1,0 +1,22 @@
+<mzML xmlns="http://psi.hupo.org/ms/mzml" xmlns:e="urn:notes" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema" version="1.1.0">
+  <referenceableParamGroupList count="1"><referenceableParamGroup id="notes"><userParam name="note" value="shared"/></referenceableParamGroup></referenceableParamGroupList>
+  <run id="run">
+    <spectrumList count="3">
+      <spectrum id="s0" index="0" defaultArrayLength="1">
+        <userParam name="note" value="old" type="xsd:string" unitName="source unit" e:extra="keep">before<e:detail/>after</userParam>
+        <cvParam accession="MS:1000511" value="1"/>
+        <userParam name="note"/>
+        <e:marker><userParam name="note" value="nested"/></e:marker>
+        <userParam name="note" value=""/>
+        <scanList count="1"><scan><userParam name="note" value="scan"/></scan></scanList>
+        <userParam name="note"/>
+        <binaryDataArrayList count="1"><binaryDataArray encodedLength="12"><cvParam accession="MS:1000523"/><cvParam accession="MS:1000576"/><cvParam accession="MS:1000514"/><binary>AAAAAAAA8D8=</binary></binaryDataArray></binaryDataArrayList>
+        <userParam name="note"/>
+        <e:tail/>
+      </spectrum>
+      <spectrum id="s1" index="1" defaultArrayLength="0"/>
+      <spectrum id="s2" index="2" defaultArrayLength="0"><referenceableParamGroupRef ref="notes"/><userParam value="unnamed"/><userParam name=""/><userParam name="Note" value="case-sensitive"/></spectrum>
+    </spectrumList>
+    <chromatogramList count="1"><chromatogram id="c0" index="0" defaultArrayLength="0"><userParam name="note"/></chromatogram></chromatogramList>
+  </run>
+</mzML>
