@@ -111,6 +111,74 @@ test "[integration] - [group reencoding]: retains annotated references without c
     try std.testing.checkAllAllocationFailures(std.testing.allocator, reencodeReferenceAllocated, .{});
 }
 
+test "[integration] - [parameter namespaces]: reencoding keeps reference and member bindings" {
+    const Check = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            const source = "<mzML xmlns='http://psi.hupo.org/ms/mzml'><referenceableParamGroupList count='1'>" ++
+                "<referenceableParamGroup id='encoding'>" ++
+                "<cvParam xmlns:t='urn:primitive' accession='MS:1000523' value='t:Float'/>" ++
+                "<cvParam accession='MS:1000576'/></referenceableParamGroup></referenceableParamGroupList>" ++
+                "<run><spectrumList count='1'><spectrum id='s' index='0' defaultArrayLength='1'>" ++
+                "<binaryDataArrayList count='1'><binaryDataArray encodedLength='12'>" ++
+                "<referenceableParamGroupRef xmlns:t='urn:reference' ref='encoding'></referenceableParamGroupRef>" ++
+                "<userParam xmlns:t='urn:label' name='note' type='t:Label'/>" ++
+                "<cvParam accession='MS:1000514'/><binary>AAAAAAAA8D8=</binary>" ++
+                "</binaryDataArray></binaryDataArrayList></spectrum></spectrumList></run></mzML>";
+            var header_builder = mzml.Builder.init(allocator, .{});
+            defer header_builder.deinit();
+            var builder = mzml.Builder.init(allocator, .{});
+            defer builder.deinit();
+            const values = [_]f32{3};
+            const prepared = blk: {
+                var input = std.Io.Reader.fixed(source);
+                var reader = try mzml.StreamReader.init(allocator, &input, .{});
+                defer reader.deinit();
+                const header = try reader.readHeader();
+                const record = (try reader.nextRecord()).?;
+                const rewritten = try header_builder.reencoding(header.*, &.{.{ .primitive = .float32, .pipeline = .none }});
+                const array = try rewritten.prepareArray(&builder, f32, &values, record.binaryArrays()[0], .{}, .{ .transport = &.{}, .transformed = &.{} }, null);
+                const copied = try builder.preparedRecord(.spectrum, record.id, 0, 1, &.{}, &.{}, &.{array.array});
+                break :blk .{ .header = rewritten.header, .record = copied, .wire = array.wire };
+            };
+            try std.testing.expectEqual(@as(usize, 2), prepared.header.groups.len);
+            for ([_]bool{ false, true }) |indexed| {
+                var buffer: [8192]u8 = undefined;
+                var sink = std.Io.Writer.fixed(&buffer);
+                try support.writeSingleRecord(allocator, &sink, prepared.header, prepared.record.node, indexed, &.{prepared.wire});
+                var lookup = try mzml.IndexedReader.build(allocator, .{ .bytes = sink.buffered() }, .{ .policy = if (indexed) .open_embedded else .rebuild });
+                defer lookup.deinit();
+                var decoded = mzml.StreamReader.DecodedArrays.init(allocator, .{});
+                defer decoded.deinit();
+                var found = (try lookup.byIdDecoded(allocator, "s", &decoded)).?;
+                defer found.deinit();
+                try std.testing.expectEqualSlices(f32, &values, decoded.get(0).?.values.float32);
+                const params = found.value.binaryArrays()[0].params;
+                try std.testing.expectEqualStrings(lookup.header().groups[1].id, params[0].group_ref.ref.?);
+                try std.testing.expectEqualStrings("t:Label", params[1].user.value_type.?);
+                const groups = lookup.header().groups;
+                try std.testing.expectEqualStrings("MS:1000523", groups[0].entries[0].cv.accession.?.raw);
+                try std.testing.expectEqualStrings("MS:1000521", groups[1].entries[0].cv.accession.?.raw);
+                try std.testing.expectEqualStrings("t:Float", groups[1].entries[0].cv.value.?);
+                const entries = [_]mzml.cv.Entry{ groups[0].entries[0], groups[1].entries[0], params[0], params[1] };
+                for (entries, [_][]const u8{ "urn:primitive", "urn:primitive", "urn:reference", "urn:label" }) |entry, uri| {
+                    const extra = switch (entry) {
+                        inline else => |parameter| parameter.xml,
+                    };
+                    try std.testing.expect(extra != null);
+                    var found_binding = false;
+                    for (extra.?.attributes) |attribute| {
+                        if (!std.mem.eql(u8, attribute.name, "xmlns:t")) continue;
+                        try std.testing.expectEqualStrings(uri, attribute.value);
+                        found_binding = true;
+                    }
+                    try std.testing.expect(found_binding);
+                }
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
 test "[integration] - [mzML containers]: prepared writing preserves extra containers and group IDs" {
     const Check = struct {
         fn write(allocator: std.mem.Allocator) !void {

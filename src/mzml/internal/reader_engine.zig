@@ -845,7 +845,7 @@ fn parseParams(self: *StreamReader, storage: *Storage, comptime retain: bool, co
         const selected = self.paramKind(start) orelse break;
         if (count.* == self.options.limits.list_entries) return try self.limitError(.list_entries, self.options.limits.list_entries, null);
         if (retain and count.* == 0) try entries.ensureUnusedCapacity(self.allocator, @min(8, self.options.limits.list_entries));
-        var has_extra = false;
+        var has_extra = retain and self.cursor.hasAdditionalNamespaces();
         const attrs = try copyParamAttributes(storage, start, selected, retain, &has_extra);
         const has_content = !start.empty_element_syntax;
         const extra = if (retain and (has_extra or has_content)) try self.copyParamExtra(storage, start, selected) else null;

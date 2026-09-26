@@ -311,6 +311,92 @@ test "[integration] - [mzML extensions]: retains a foreign default namespace for
     }
 }
 
+test "[integration] - [parameter namespaces]: retains bindings without extra attributes or content" {
+    const Check = struct {
+        fn params(entries: []const mzml.cv.Entry, name: []const u8, uri: ?[]const u8, value_type: []const u8) !void {
+            try std.testing.expectEqual(@as(usize, 3), entries.len);
+            try std.testing.expectEqualStrings(value_type, entries[0].cv.value.?);
+            try std.testing.expectEqualStrings(value_type, entries[1].user.value_type.?);
+            try std.testing.expectEqualStrings("kept", entries[1].user.value.?);
+            try std.testing.expectEqualStrings("g", entries[2].group_ref.ref.?);
+            for (entries) |entry| {
+                const extra = switch (entry) {
+                    inline else => |parameter| parameter.xml,
+                };
+                if (uri) |expected| {
+                    try std.testing.expect(extra != null);
+                    try std.testing.expectEqual(@as(usize, 0), extra.?.content.len);
+                    var found: usize = 0;
+                    for (extra.?.attributes) |attribute| {
+                        if (!std.mem.eql(u8, attribute.name, name)) continue;
+                        try std.testing.expectEqualStrings("http://www.w3.org/2000/xmlns/", attribute.namespace_uri.?);
+                        try std.testing.expectEqualStrings(expected, attribute.value);
+                        found += 1;
+                    }
+                    try std.testing.expectEqual(@as(usize, 1), found);
+                } else try std.testing.expectEqual(null, extra);
+            }
+        }
+    };
+    inline for (.{
+        .{ "", "", "", "xmlns:t", @as(?[]const u8, null), "string" },
+        .{ "", " xmlns:t='urn:local'", "", "xmlns:t", "urn:local", "t:Value" },
+        .{ " xmlns:t='urn:outer'", " xmlns:t='urn:inner'", "", "xmlns:t", "urn:inner", "t:Value" },
+        .{ " xmlns:t='urn:outer'", "", "", "xmlns:t", "urn:outer", "t:Value" },
+        .{ "", " xmlns:m='http://psi.hupo.org/ms/mzml' xmlns='urn:types'", "m:", "xmlns", "urn:types", "Value" },
+    }) |case| {
+        inline for (.{ false, true }) |empty_tag| {
+            const params = "<" ++ case[2] ++ "cvParam" ++ case[1] ++ " value='" ++ case[5] ++ "'" ++
+                (if (empty_tag) "/>" else "></" ++ case[2] ++ "cvParam>") ++
+                "<" ++ case[2] ++ "userParam" ++ case[1] ++ " name='note' type='" ++ case[5] ++ "' value='kept'" ++
+                (if (empty_tag) "/>" else "></" ++ case[2] ++ "userParam>") ++
+                "<" ++ case[2] ++ "referenceableParamGroupRef" ++ case[1] ++ " ref='g'" ++
+                (if (empty_tag) "/>" else "></" ++ case[2] ++ "referenceableParamGroupRef>");
+            const source = "<mzML xmlns='http://psi.hupo.org/ms/mzml'" ++ case[0] ++ ">" ++
+                "<referenceableParamGroupList count='1'><referenceableParamGroup id='g'/></referenceableParamGroupList>" ++
+                "<run>" ++ params ++ "<spectrumList count='1'><spectrum id='s' index='0' defaultArrayLength='0'>" ++
+                params ++ "</spectrum></spectrumList></run></mzML>";
+            var header: mzml.owned.Header = undefined;
+            var record: mzml.owned.Record = undefined;
+            {
+                var input = std.Io.Reader.fixed(source);
+                var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+                defer reader.deinit();
+                header = try mzml.owned.Header.init(std.testing.allocator, (try reader.readHeader()).*, .{});
+                errdefer header.deinit();
+                record = try mzml.owned.Record.init(std.testing.allocator, (try reader.nextRecord()).?, .{});
+            }
+            defer header.deinit();
+            defer record.deinit();
+            try Check.params(header.value.run.params, case[3], case[4], case[5]);
+            try Check.params(record.value.node.params, case[3], case[4], case[5]);
+            for ([_]bool{ false, true }) |indexed| {
+                var sink: std.Io.Writer.Allocating = .init(std.testing.allocator);
+                defer sink.deinit();
+                var writer = if (indexed) try mzml.Writer.initIndexed(std.testing.allocator, &sink.writer, .{}, .{}) else try mzml.Writer.init(std.testing.allocator, &sink.writer, .{});
+                defer writer.deinit();
+                try writer.writeHeader(header.value);
+                try writer.beginListWithAttributes(.spectrum_list, 1, header.value.spectrum_list.?.attributes);
+                try writer.writeRecord(record.value.node);
+                try writer.endList();
+                try writer.finish();
+                var streamed: std.Io.Writer.Allocating = .init(std.testing.allocator);
+                defer streamed.deinit();
+                try support.rewriteDocument(std.testing.allocator, source, &streamed.writer, indexed);
+                try std.testing.expectEqualStrings(sink.written(), streamed.written());
+                var lookup = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = sink.written() }, .{
+                    .policy = if (indexed) .open_embedded else .rebuild,
+                });
+                defer lookup.deinit();
+                var found = (try lookup.byId(std.testing.allocator, "s")).?;
+                defer found.deinit();
+                try Check.params(lookup.header().run.params, case[3], case[4], case[5]);
+                try Check.params(found.value.node.params, case[3], case[4], case[5]);
+            }
+        }
+    }
+}
+
 test "[integration] - [parameter XML]: preserves absent empty and escaped schema locations" {
     const Check = struct {
         fn location(attributes: []const mzml.model.Attribute) ?[]const u8 {
