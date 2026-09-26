@@ -16,6 +16,7 @@ test "[integration] - [mzML extensions]: array replacement retains XML and late 
     const second = [_]f64{ 3, 4 };
     const scratch: mzml.arrays.Scratch = .{ .transport = &.{}, .transformed = &.{} };
     const first = try builder.prepareArrayFrom(f64, &values, original.binaryArrays()[0], header.groups, .{}, scratch, null);
+    try std.testing.expectEqualDeep(original.binaryArrays()[0].params[0], first.array.node.params[0]);
     const other = try builder.prepareArrayFrom(f64, &second, original.binaryArrays()[1], header.groups, .{}, scratch, null);
     var array_list = original.node.child(.binary_data_array_list).?;
     array_list.children = &.{ first.array.node, other.array.node };
@@ -46,6 +47,105 @@ test "[integration] - [mzML extensions]: array replacement retains XML and late 
     _ = (try result.nextDecodedRecord(&decoded)).?;
     try std.testing.expectEqualSlices(f64, &values, decoded.get(0).?.values.float64);
     try std.testing.expectEqualSlices(f64, &second, decoded.get(1).?.values.float64);
+}
+
+fn reencodeReferenceAllocated(allocator: std.mem.Allocator) !void {
+    var input = std.Io.Reader.fixed(support.EXTENSIONS);
+    var reader = try mzml.StreamReader.init(allocator, &input, .{});
+    defer reader.deinit();
+    const header = try reader.readHeader();
+    const source = (try reader.nextRecord()).?;
+    var header_builder = mzml.Builder.init(allocator, .{});
+    defer header_builder.deinit();
+    const target: mzml.model.Encoding = .{ .primitive = .float32, .pipeline = .zlib };
+    const prepared_header = try header_builder.reencoding(header.*, &.{ target, target });
+    try std.testing.expectEqual(@as(usize, 2), prepared_header.header.groups.len);
+    try std.testing.expectEqualDeep(header.groups, prepared_header.source_groups);
+    try std.testing.expectEqualDeep(header.groups[0].entries[0].cv.xml, prepared_header.header.groups[1].entries[0].cv.xml);
+    var builder = mzml.Builder.init(allocator, .{});
+    defer builder.deinit();
+    var compressor = try mzml.zlib.Compressor.init(allocator, .fastest);
+    defer compressor.deinit();
+    var wire: [128]u8 = undefined;
+    var transformed: [128]u8 = undefined;
+    const scratch: mzml.arrays.Scratch = .{ .transport = &wire, .transformed = &transformed };
+    const values = [_]f32{ 5, 6 };
+    const first_source = source.binaryArrays()[0];
+    try std.testing.expectError(error.GroupRewriteRequired, builder.prepareArrayFrom(f32, &values, first_source, header.groups, .{ .pipeline = .zlib }, scratch, &compressor));
+    const first = try prepared_header.prepareArray(&builder, f32, &values, first_source, .{ .pipeline = .zlib }, scratch, &compressor);
+    try std.testing.expectEqualDeep(first_source.params[0].group_ref.xml, first.array.node.params[0].group_ref.xml);
+    try std.testing.expectEqualStrings(prepared_header.header.groups[1].id, first.array.node.params[0].group_ref.ref.?);
+    try std.testing.expectEqualStrings("encoding", source.binaryArrays()[1].params[0].group_ref.ref.?);
+    try std.testing.expectEqualStrings("MS:1000576", header.groups[0].entries[1].cv.accession.?.raw);
+    var list = source.node.child(.binary_data_array_list).?;
+    list.children = &.{ first.array.node, source.binaryArrays()[1] };
+    var record = source.node;
+    record.children = &.{ source.node.children[0], list };
+    var buffer: [8192]u8 = undefined;
+    var sink = std.Io.Writer.fixed(&buffer);
+    var writer = try mzml.Writer.initIndexed(allocator, &sink, .{}, .{});
+    defer writer.deinit();
+    try writer.writeHeader(prepared_header.header);
+    try writer.beginListWithAttributes(.spectrum_list, 1, header.spectrum_list.?.attributes);
+    const unchanged = "\x00\x00\x00\x00\x00\x00\x08\x40\x00\x00\x00\x00\x00\x00\x10\x40";
+    try writer.writeRecordWithArrays(record, &.{ first.wire, unchanged });
+    try writer.endList();
+    try writer.finish();
+    var index = try mzml.IndexedReader.build(allocator, .{ .bytes = sink.buffered() }, .{});
+    defer index.deinit();
+    var decoded = mzml.StreamReader.DecodedArrays.init(allocator, .{});
+    defer decoded.deinit();
+    var actual = (try index.byIdDecoded(allocator, "scan=1", &decoded)).?;
+    defer actual.deinit();
+    try std.testing.expectEqualSlices(f32, &values, decoded.get(0).?.values.float32);
+    try std.testing.expectEqualSlices(f64, &.{ 3, 4 }, decoded.get(1).?.values.float64);
+    try std.testing.expectEqual(mzml.arrays.Pipeline.zlib, decoded.get(0).?.encoding.pipeline);
+    try std.testing.expectEqual(mzml.arrays.Pipeline.none, decoded.get(1).?.encoding.pipeline);
+    try std.testing.expectEqualStrings(prepared_header.header.groups[1].id, actual.value.binaryArrays()[0].params[0].group_ref.ref.?);
+    try std.testing.expectEqualStrings("encoding", actual.value.binaryArrays()[1].params[0].group_ref.ref.?);
+    try std.testing.expect(std.mem.indexOf(u8, sink.buffered(), "extra=\"reference\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sink.buffered(), "schemaLocation=\"urn:group group.xsd\"") != null);
+}
+
+test "[integration] - [group reencoding]: retains annotated references without changing shared arrays" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, reencodeReferenceAllocated, .{});
+}
+
+test "[integration] - [group reencoding]: handles partial groups, ID collisions, and ordered XML" {
+    const xml: mzml.cv.ParameterXml = .{ .attributes = &.{.{ .name = "extra", .value = "keep" }}, .content = &.{.{ .xml = "<e:detail xmlns:e='urn:producer'/>" }} };
+    const primitive: mzml.model.Node = .{ .kind = .referenceable_param_group, .attributes = &.{.{ .name = "id", .value = " zmz-reencoded-0 " }}, .params = &.{.{ .cv = .{ .accession = .{ .raw = "MS:1000523" }, .name = "64-bit float", .xml = &xml } }} };
+    const codec: mzml.model.Node = .{ .kind = .referenceable_param_group, .attributes = &.{.{ .name = "id", .value = "codec" }}, .params = &.{.{ .cv = .{ .accession = .{ .raw = "MS:1000576" }, .name = "no compression" } }} };
+    const unused: mzml.model.Node = .{ .kind = .referenceable_param_group, .attributes = &.{.{ .name = "id", .value = "unused" }}, .params = &.{.{ .group_ref = .{ .ref = "absent" } }} };
+    const list: mzml.model.Node = .{ .kind = .referenceable_param_group_list, .attributes = &.{ .{ .name = "count", .value = "3" }, .{ .name = "extra", .value = "list" } }, .children = &.{ primitive, codec, unused }, .content = &.{ .items = &.{ .{ .children = 3 }, .{ .xml = "<e:note xmlns:e='urn:producer'/>" } } } };
+    const header: mzml.model.Header = .{ .document = .{ .kind = .mzml, .children = &.{list} }, .run = .{ .kind = .run }, .groups = &.{} };
+    var owner = mzml.Builder.init(std.testing.allocator, .{});
+    defer owner.deinit();
+    const prepared = try owner.reencoding(header, &.{ .{ .primitive = .float32, .pipeline = .zlib }, .{ .primitive = .float64, .pipeline = .zlib }, .{ .primitive = .float32, .pipeline = .zlib } });
+    try std.testing.expectEqual(@as(usize, 5), prepared.header.groups.len);
+    try std.testing.expectEqualStrings("zmz-reencoded-1", prepared.header.groups[3].id);
+    try std.testing.expectEqualStrings("zmz-reencoded-2", prepared.header.groups[4].id);
+    const copied_list = prepared.header.document.children[0];
+    try std.testing.expectEqualStrings("5", copied_list.attribute("count").?);
+    try std.testing.expectEqualStrings("list", copied_list.attribute("extra").?);
+    try std.testing.expectEqualDeep(list.content.?.items, copied_list.content.?.items[0..2]);
+    try std.testing.expectEqual(@as(usize, 2), copied_list.content.?.items[2].children);
+    try std.testing.expectEqualDeep(&xml, prepared.header.groups[3].entries[0].cv.xml.?);
+    var builder = mzml.Builder.init(std.testing.allocator, .{});
+    defer builder.deinit();
+    const array: mzml.model.Node = .{ .kind = .binary_data_array, .params = &.{ .{ .group_ref = .{ .ref = "zmz-reencoded-0", .xml = &xml } }, .{ .group_ref = .{ .ref = " codec ", .xml = &xml } } }, .children = &.{.{ .kind = .binary }} };
+    var compressor = try mzml.zlib.Compressor.init(std.testing.allocator, .fastest);
+    defer compressor.deinit();
+    var wire: [128]u8 = undefined;
+    var transformed: [128]u8 = undefined;
+    const result = try prepared.prepareArray(&builder, f32, &.{ 1, 2 }, array, .{ .pipeline = .zlib }, .{ .transport = &wire, .transformed = &transformed }, &compressor);
+    try std.testing.expectEqualStrings("zmz-reencoded-1", result.array.node.params[0].group_ref.ref.?);
+    try std.testing.expectEqualStrings("zmz-reencoded-2", result.array.node.params[1].group_ref.ref.?);
+    try std.testing.expectEqualDeep(&xml, result.array.node.params[0].group_ref.xml.?);
+    try std.testing.expectEqualDeep(&xml, result.array.node.params[1].group_ref.xml.?);
+    try std.testing.expectError(error.GroupRewriteRequired, prepared.prepareArray(&builder, i32, &.{1}, array, .{ .pipeline = .zlib }, .{ .transport = &wire, .transformed = &transformed }, &compressor));
+    var limited = mzml.Builder.init(std.testing.allocator, .{ .bytes = 1 });
+    defer limited.deinit();
+    try std.testing.expectError(error.LimitExceeded, limited.reencoding(header, &.{.{ .primitive = .float32, .pipeline = .zlib }}));
 }
 
 fn replaceArrayAllocated(allocator: std.mem.Allocator) !void {

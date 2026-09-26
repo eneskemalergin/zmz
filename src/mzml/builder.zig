@@ -23,6 +23,7 @@ pub const Error = owned.Error || schema.Error || arrays.Error || model.EncodingE
     InvalidDeclaration,
     InvalidRecord,
     InvalidArrayLength,
+    GroupRewriteRequired,
 };
 
 /// A caller-selected array role and its source unit. No role or lossy codec is inferred.
@@ -45,6 +46,21 @@ pub const Array = struct {
 
 /// Metadata belongs to the builder; wire borrows values or scratch until writing completes.
 pub const PreparedArray = struct { array: Array, wire: []const u8 };
+
+/// Prepared header and reference replacements, owned by the creating builder.
+/// Write header before records and keep this owner alive through the last preparation.
+/// Use a separate builder for arrays that are reset between records.
+pub const Reencoding = struct {
+    header: model.Header,
+    source_groups: []const cv.Group,
+    replacements: []const GroupReplacement,
+
+    /// Keeps array references and their XML, selecting prepared group definitions as needed.
+    /// Array metadata belongs to builder; wire follows prepareArrayFrom's lifetime rules.
+    pub fn prepareArray(self: Reencoding, builder: *Builder, comptime T: type, values: []const T, source: model.Node, options: arrays.EncodeOptions, scratch: arrays.Scratch, compressor: ?*zlib.Compressor) Error!PreparedArray {
+        return builder.prepareArrayFromInner(T, values, source, self.source_groups, options, scratch, compressor, self.replacements);
+    }
+};
 
 arena: std.heap.ArenaAllocator,
 limits: owned.Limits,
@@ -132,7 +148,9 @@ pub fn prepareArray(self: *Builder, comptime T: type, values: []const T, options
 }
 
 /// Reencodes values using copied source metadata, without copying the old payload.
-/// Group references on this array become local parameters; header groups stay unchanged.
+/// Bare group references become local parameters; annotated references stay intact.
+/// Changing an annotated group's encoding requires reencoding's prepared header;
+/// otherwise returns GroupRewriteRequired rather than discarding its XML.
 /// Replaces primitive/codec terms and lengths, preserving other fields and parameter order.
 /// If a default array omits arrayLength, the caller must update the enclosing record's
 /// defaultArrayLength when changing its length. Wire borrows values or caller scratch.
@@ -146,36 +164,21 @@ pub fn prepareArrayFrom(
     scratch: arrays.Scratch,
     compressor: ?*zlib.Compressor,
 ) Error!PreparedArray {
+    return self.prepareArrayFromInner(T, values, source, groups, options, scratch, compressor, null);
+}
+
+fn prepareArrayFromInner(self: *Builder, comptime T: type, values: []const T, source: model.Node, groups: []const cv.Group, options: arrays.EncodeOptions, scratch: arrays.Scratch, compressor: ?*zlib.Compressor, replacements: ?[]const GroupReplacement) Error!PreparedArray {
     if (self.limits.depth < 2 or self.limits.depth > 64) return error.LimitExceeded;
-    const previous = try model.arrayEncoding(source, groups);
+    _ = try model.arrayEncoding(source, groups);
     if (source.children.len != 1 or source.children[0].kind != .binary) return error.InvalidStructure;
-    const old_primitive = encoding.primitiveTerm(previous.primitive);
-    const old_codec = encoding.codecTerm(previous.pipeline);
-    const primitive = encoding.primitiveTerm(primitiveFor(T));
-    const codec = encoding.codecTerm(options.pipeline);
-    var iterator: cv.EffectiveIterator = .{ .entries = source.params, .groups = groups };
-    var count: usize = 0;
-    while (try iterator.next()) |_| {
-        if (count == self.remaining / @sizeOf(cv.Entry)) return error.LimitExceeded;
-        count += 1;
-    }
+    const target: model.Encoding = .{ .primitive = primitiveFor(T), .pipeline = options.pipeline };
+    const counted = try reencodedParams(null, source.params, groups, target, replacements, self.remaining / @sizeOf(cv.Entry));
     const wire = try arrays.encodeWire(T, values, options, scratch, compressor);
     var copier = self.makeCopier();
     defer self.remaining = copier.remaining;
-    const params = try copier.alloc(cv.Entry, count);
-    var is_default = false;
-    iterator = .{ .entries = source.params, .groups = groups };
-    for (params) |*entry| {
-        entry.* = (try iterator.next()).?;
-        if (entry.* != .cv) continue;
-        const accession = entry.cv.accession orelse continue;
-        is_default = is_default or accession.eql(model.Terms.MZ_ARRAY) or
-            accession.eql(model.Terms.INTENSITY_ARRAY) or accession.eql(model.Terms.TIME_ARRAY);
-        const term = if (std.mem.eql(u8, accession.raw, old_primitive.accession)) primitive else if (std.mem.eql(u8, accession.raw, old_codec.accession)) codec else continue;
-        if (std.mem.eql(u8, accession.raw, term.accession)) continue;
-        entry.cv.accession = .{ .raw = term.accession };
-        entry.cv.name = term.name;
-    }
+    const params = try copier.alloc(cv.Entry, counted.count);
+    _ = try reencodedParams(params, source.params, groups, target, replacements, params.len);
+    const is_default = counted.is_default;
     var encoded_length: [32]u8 = undefined;
     var array_length: [32]u8 = undefined;
     const encoded_text = std.fmt.bufPrint(&encoded_length, "{d}", .{try base64.encodedSize(wire.len)}) catch return error.LimitExceeded;
@@ -217,10 +220,8 @@ pub fn prepareArrayFrom(
             destination.* = item;
             if (item != .params) continue;
             if (item.params > source.params.len - position) return error.InvalidStructure;
-            var expanded: cv.EffectiveIterator = .{ .entries = source.params[position..][0..item.params], .groups = groups };
-            var expanded_count: usize = 0;
-            while (try expanded.next()) |_| expanded_count += 1;
-            destination.* = .{ .params = expanded_count };
+            const run = try reencodedParams(null, source.params[position..][0..item.params], groups, target, replacements, params.len);
+            destination.* = .{ .params = run.count };
             position += item.params;
         }
         if (position != source.params.len) return error.InvalidStructure;
@@ -233,6 +234,189 @@ pub fn prepareArrayFrom(
         .is_default = is_default,
         .owner = self,
     }, .wire = wire };
+}
+
+/// Copies a header and adds changed group definitions for the requested output encodings.
+/// Original definitions remain for unchanged arrays. Repeated equivalent replacements
+/// share a definition; no records are read and unused group references are not resolved.
+pub fn reencoding(self: *Builder, source: model.Header, targets: []const model.Encoding) Error!Reencoding {
+    var header_copy = try self.header(source);
+    const source_groups = header_copy.groups;
+    var count: usize = 0;
+    for (source_groups) |group| for (targets, 0..) |_, i| {
+        if (groupReplacement(group.entries, targets, i) != null)
+            count = std.math.add(usize, count, 1) catch return error.LimitExceeded;
+    };
+    if (count == 0) return .{ .header = header_copy, .source_groups = source_groups, .replacements = &.{} };
+    var copier = self.makeCopier();
+    defer self.remaining = copier.remaining;
+    const replacements = try copier.alloc(GroupReplacement, count);
+    const total = std.math.add(usize, source_groups.len, count) catch return error.LimitExceeded;
+    const groups = try copier.alloc(cv.Group, total);
+    @memcpy(groups[0..source_groups.len], source_groups);
+    for (@constCast(header_copy.document.children)) |*list_node| {
+        if (list_node.kind != .referenceable_param_group_list) continue;
+        const original_nodes = list_node.children;
+        const nodes = try copier.alloc(model.Node, total);
+        @memcpy(nodes[0..original_nodes.len], original_nodes);
+        var next: usize = source_groups.len;
+        var serial: usize = 0;
+        for (original_nodes, source_groups) |group_node, group| for (targets, 0..) |target, i| {
+            const key = groupReplacement(group.entries, targets, i) orelse continue;
+            var id_buffer: [64]u8 = undefined;
+            const id = while (true) {
+                const candidate = std.fmt.bufPrint(&id_buffer, "zmz-reencoded-{d}", .{serial}) catch return error.LimitExceeded;
+                serial = std.math.add(usize, serial, 1) catch return error.LimitExceeded;
+                var collision = false;
+                for (groups[0..next]) |existing| {
+                    if (sameGroupId(candidate, existing.id)) {
+                        collision = true;
+                        break;
+                    }
+                }
+                if (!collision) break try copier.text(candidate);
+            };
+            var node_copy = group_node;
+            const attributes = try copier.alloc(model.Attribute, group_node.attributes.len);
+            @memcpy(attributes, group_node.attributes);
+            for (attributes) |*attribute| {
+                if (attribute.namespace_uri == null and std.mem.eql(u8, attribute.name, "id")) attribute.value = id;
+            }
+            const params = try copier.alloc(cv.Entry, group_node.params.len);
+            for (group_node.params, params) |entry, *destination| destination.* = reencodedParam(entry, target);
+            node_copy.attributes = attributes;
+            node_copy.params = params;
+            nodes[next] = node_copy;
+            groups[next] = .{ .id = id, .entries = params };
+            replacements[next - source_groups.len] = .{ .source_id = group.id, .encoding = key, .id = id };
+            next += 1;
+        };
+        var count_buffer: [32]u8 = undefined;
+        const count_text = try copier.text(std.fmt.bufPrint(&count_buffer, "{d}", .{total}) catch return error.LimitExceeded);
+        const attributes = try copier.alloc(model.Attribute, list_node.attributes.len + 1);
+        @memcpy(attributes[0..list_node.attributes.len], list_node.attributes);
+        var found = false;
+        for (attributes[0..list_node.attributes.len]) |*attribute| {
+            if (attribute.namespace_uri == null and std.mem.eql(u8, attribute.name, "count")) {
+                attribute.value = count_text;
+                found = true;
+            }
+        }
+        attributes[list_node.attributes.len] = .{ .name = "count", .value = count_text };
+        list_node.attributes = attributes[0 .. list_node.attributes.len + @intFromBool(!found)];
+        list_node.children = nodes;
+        if (list_node.content) |content| {
+            const items = try copier.alloc(model.Content.Item, content.items.len + 1);
+            @memcpy(items[0..content.items.len], content.items);
+            items[content.items.len] = .{ .children = count };
+            const copied = &(try copier.alloc(model.Content, 1))[0];
+            copied.* = .{ .items = items };
+            list_node.content = copied;
+        }
+        break;
+    }
+    header_copy.groups = groups;
+    return .{ .header = header_copy, .source_groups = source_groups, .replacements = replacements };
+}
+
+const GroupEncoding = struct { primitive: ?model.Primitive = null, pipeline: ?arrays.Pipeline = null };
+const GroupReplacement = struct { source_id: []const u8, encoding: GroupEncoding, id: []const u8 };
+
+fn sameGroupId(left: []const u8, right: []const u8) bool {
+    return std.mem.eql(u8, std.mem.trim(u8, left, " \t\r\n"), std.mem.trim(u8, right, " \t\r\n"));
+}
+
+fn changedGroupEncoding(entries: []const cv.Entry, target: model.Encoding) ?GroupEncoding {
+    var result: GroupEncoding = .{};
+    var changed = false;
+    for (entries) |entry| {
+        if (entry != .cv) continue;
+        const accession = entry.cv.accession orelse continue;
+        inline for (std.meta.tags(model.Primitive)) |primitive| {
+            if (std.mem.eql(u8, accession.raw, encoding.primitiveTerm(primitive).accession)) {
+                result.primitive = target.primitive;
+                changed = changed or primitive != target.primitive;
+            }
+        }
+        inline for (std.meta.tags(arrays.Pipeline)) |pipeline| {
+            if (std.mem.eql(u8, accession.raw, encoding.codecTerm(pipeline).accession)) {
+                result.pipeline = target.pipeline;
+                changed = changed or pipeline != target.pipeline;
+            }
+        }
+    }
+    return if (changed) result else null;
+}
+
+fn groupReplacement(entries: []const cv.Entry, targets: []const model.Encoding, position: usize) ?GroupEncoding {
+    const key = changedGroupEncoding(entries, targets[position]) orelse return null;
+    for (targets[0..position]) |previous| {
+        if (std.meta.eql(@as(?GroupEncoding, key), changedGroupEncoding(entries, previous))) return null;
+    }
+    return key;
+}
+
+fn reencodedParam(source: cv.Entry, target: model.Encoding) cv.Entry {
+    var entry = source;
+    if (entry != .cv) return entry;
+    const accession = entry.cv.accession orelse return entry;
+    const term = term: {
+        inline for (std.meta.tags(model.Primitive)) |primitive| {
+            if (std.mem.eql(u8, accession.raw, encoding.primitiveTerm(primitive).accession)) break :term encoding.primitiveTerm(target.primitive);
+        }
+        inline for (std.meta.tags(arrays.Pipeline)) |pipeline| {
+            if (std.mem.eql(u8, accession.raw, encoding.codecTerm(pipeline).accession)) break :term encoding.codecTerm(target.pipeline);
+        }
+        return entry;
+    };
+    if (!std.mem.eql(u8, accession.raw, term.accession)) {
+        entry.cv.accession = .{ .raw = term.accession };
+        entry.cv.name = term.name;
+    }
+    return entry;
+}
+
+fn isDefaultParam(entry: cv.Entry) bool {
+    if (entry != .cv) return false;
+    const accession = entry.cv.accession orelse return false;
+    return accession.eql(model.Terms.MZ_ARRAY) or accession.eql(model.Terms.INTENSITY_ARRAY) or accession.eql(model.Terms.TIME_ARRAY);
+}
+
+const ParamCount = struct { count: usize = 0, is_default: bool = false };
+
+fn reencodedParams(output: ?[]cv.Entry, params: []const cv.Entry, groups: []const cv.Group, target: model.Encoding, replacements: ?[]const GroupReplacement, limit: usize) Error!ParamCount {
+    var result: ParamCount = .{};
+    for (params, 0..) |entry, position| {
+        if (entry == .group_ref and (entry.group_ref.xml != null or replacements != null)) {
+            const id = entry.group_ref.ref orelse return error.MissingGroup;
+            const entries = entries: {
+                for (groups) |group| if (sameGroupId(id, group.id)) break :entries group.entries;
+                return error.MissingGroup;
+            };
+            var retained = entry;
+            if (changedGroupEncoding(entries, target)) |key| {
+                retained.group_ref.ref = replacement: {
+                    for (replacements orelse return error.GroupRewriteRequired) |replacement| {
+                        if (sameGroupId(id, replacement.source_id) and std.meta.eql(key, replacement.encoding)) break :replacement replacement.id;
+                    }
+                    return error.GroupRewriteRequired;
+                };
+            }
+            for (entries) |member| result.is_default = result.is_default or isDefaultParam(member);
+            if (result.count == limit) return error.LimitExceeded;
+            if (output) |destination| destination[result.count] = retained;
+            result.count += 1;
+        } else {
+            var iterator: cv.EffectiveIterator = .{ .entries = params[position..][0..1], .groups = groups };
+            while (try iterator.next()) |member| {
+                if (result.count == limit) return error.LimitExceeded;
+                if (output) |destination| destination[result.count] = reencodedParam(member, target);
+                result.count += 1;
+                result.is_default = result.is_default or isDefaultParam(member);
+            }
+        }
+    }
+    return result;
 }
 
 fn buildArray(self: *Builder, comptime T: type, values: []const T, options: ArrayOptions, output: []u8, scratch: arrays.Scratch, compressor: ?*zlib.Compressor, comptime prepared: bool) Error!PreparedArray {

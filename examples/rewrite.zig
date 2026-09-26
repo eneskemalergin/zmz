@@ -3,7 +3,7 @@
 //! Chromatograms are kept. Record IDs and references stay unchanged; only surviving
 //! spectrum indexes are reassigned. Other list attributes stay unchanged.
 //! With --zlib, decodes all arrays and reencodes their values losslessly with zlib.
-//! Source metadata is kept; array group references become local parameters.
+//! Source metadata and array references are kept through prepared header groups.
 
 const std = @import("std");
 const mzml = @import("zmz").mzml;
@@ -38,9 +38,17 @@ pub fn main(init: std.process.Init) !void {
     defer attributes.deinit(init.gpa);
     var decoded = mzml.StreamReader.DecodedArrays.init(init.gpa, .{});
     defer decoded.deinit();
-    var encoder: ?Reencoder = if (reencode) try Reencoder.init(init.gpa) else null;
+    var header_builder = mzml.Builder.init(init.gpa, .{});
+    defer header_builder.deinit();
+    const prepared_header = if (reencode) try header_builder.reencoding(header.*, &.{
+        .{ .primitive = .float32, .pipeline = .zlib },
+        .{ .primitive = .float64, .pipeline = .zlib },
+        .{ .primitive = .int32, .pipeline = .zlib },
+        .{ .primitive = .int64, .pipeline = .zlib },
+    }) else null;
+    var encoder: ?Reencoder = if (prepared_header) |prepared| try Reencoder.init(init.gpa, prepared) else null;
     defer if (encoder) |*value| value.deinit();
-    try writer.writeHeader(header.*);
+    try writer.writeHeader(if (prepared_header) |prepared| prepared.header else header.*);
     var written: usize = 0;
     while (if (reencode) try reader.nextDecodedItem(&decoded) else try reader.nextItem()) |item| {
         switch (item) {
@@ -64,7 +72,7 @@ pub fn main(init: std.process.Init) !void {
                         emitted.attributes = attributes.items;
                     }
                     if (encoder) |*value|
-                        try value.write(&writer, emitted, &decoded, header.groups)
+                        try value.write(&writer, emitted, &decoded)
                     else
                         try writer.writeRecord(emitted);
                     written += 1;
@@ -80,6 +88,7 @@ pub fn main(init: std.process.Init) !void {
 const Reencoder = struct {
     allocator: std.mem.Allocator,
     builder: mzml.Builder,
+    reencoding: mzml.Builder.Reencoding,
     compressor: mzml.zlib.Compressor,
     storage: std.ArrayList(std.ArrayList(u8)) = .empty,
     transformed: std.ArrayList(u8) = .empty,
@@ -87,8 +96,8 @@ const Reencoder = struct {
     children: std.ArrayList(mzml.model.Node) = .empty,
     wires: std.ArrayList([]const u8) = .empty,
 
-    fn init(allocator: std.mem.Allocator) !Reencoder {
-        return .{ .allocator = allocator, .builder = .init(allocator, .{}), .compressor = try .init(allocator, .fastest) };
+    fn init(allocator: std.mem.Allocator, reencoding: mzml.Builder.Reencoding) !Reencoder {
+        return .{ .allocator = allocator, .builder = .init(allocator, .{}), .reencoding = reencoding, .compressor = try .init(allocator, .fastest) };
     }
 
     fn deinit(self: *Reencoder) void {
@@ -102,7 +111,7 @@ const Reencoder = struct {
         self.builder.deinit();
     }
 
-    fn write(self: *Reencoder, writer: *mzml.Writer, source: mzml.model.Node, decoded: *const mzml.StreamReader.DecodedArrays, groups: []const mzml.cv.Group) !void {
+    fn write(self: *Reencoder, writer: *mzml.Writer, source: mzml.model.Node, decoded: *const mzml.StreamReader.DecodedArrays) !void {
         self.builder.reset();
         const source_arrays = if (source.child(.binary_data_array_list)) |list| list.children else &.{};
         try self.storage.ensureTotalCapacity(self.allocator, source_arrays.len);
@@ -111,7 +120,7 @@ const Reencoder = struct {
         try self.wires.resize(self.allocator, source_arrays.len);
         for (source_arrays, self.arrays.items, self.wires.items, 0..) |array, *node, *wire, i| {
             const prepared = switch (decoded.get(i).?.values) {
-                inline else => |values| try self.prepare(@typeInfo(@TypeOf(values)).pointer.child, values, array, groups, &self.storage.items[i]),
+                inline else => |values| try self.prepare(@typeInfo(@TypeOf(values)).pointer.child, values, array, &self.storage.items[i]),
             };
             node.* = prepared.array.node;
             wire.* = prepared.wire;
@@ -126,14 +135,14 @@ const Reencoder = struct {
         try writer.writeRecordWithArrays(record, self.wires.items);
     }
 
-    fn prepare(self: *Reencoder, comptime T: type, values: []const T, source: mzml.model.Node, groups: []const mzml.cv.Group, storage: *std.ArrayList(u8)) !mzml.Builder.PreparedArray {
+    fn prepare(self: *Reencoder, comptime T: type, values: []const T, source: mzml.model.Node, storage: *std.ArrayList(u8)) !mzml.Builder.PreparedArray {
         const byte_limit = (mzml.arrays.Limits{}).array_bytes;
         const bound = try mzml.arrays.wireBound(T, values.len, .zlib);
         if (bound > byte_limit) return error.LimitExceeded;
         if (@import("builtin").cpu.arch.endian() == .big) try self.transformed.resize(self.allocator, bound);
         if (storage.items.len < @max(bound, 1)) try storage.resize(self.allocator, @max(bound, 1));
         while (true) {
-            return self.builder.prepareArrayFrom(T, values, source, groups, .{ .pipeline = .zlib }, .{
+            return self.reencoding.prepareArray(&self.builder, T, values, source, .{ .pipeline = .zlib }, .{
                 .transport = storage.items,
                 .transformed = self.transformed.items,
             }, &self.compressor) catch |err| switch (err) {

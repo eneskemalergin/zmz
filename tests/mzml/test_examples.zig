@@ -5,6 +5,41 @@ const mzml = @import("zmz").mzml;
 const options = @import("example_test_options");
 const support = @import("support.zig");
 
+test "[cli] - [mzML reencoding]: preserves XML on array group references" {
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "input.mzML", .data = support.EXTENSIONS });
+    const rewritten = try run(dir.dir, options.rewrite, &.{ "input.mzML", "zlib.mzML", "--zlib" }, 0);
+    defer std.testing.allocator.free(rewritten);
+    const file = try dir.dir.openFile(std.testing.io, "zlib.mzML", .{});
+    defer file.close(std.testing.io);
+    var index = try mzml.IndexedReader.build(std.testing.allocator, .{ .file = .{ .handle = file, .io = std.testing.io } }, .{});
+    defer index.deinit();
+    var decoded = mzml.StreamReader.DecodedArrays.init(std.testing.allocator, .{});
+    defer decoded.deinit();
+    var record = (try index.byIdDecoded(std.testing.allocator, "scan=1", &decoded)).?;
+    defer record.deinit();
+    const reference = record.value.binaryArrays()[0].params[0].group_ref;
+    const xml = reference.xml.?;
+    var extra = false;
+    var schema_location = false;
+    for (xml.attributes) |attribute| {
+        if (std.mem.eql(u8, attribute.name, "extra")) {
+            try std.testing.expectEqualStrings("reference", attribute.value);
+            extra = true;
+        }
+        if (std.mem.endsWith(u8, attribute.name, ":schemaLocation")) {
+            try std.testing.expectEqualStrings("urn:group group.xsd", attribute.value);
+            schema_location = true;
+        }
+    }
+    try std.testing.expect(extra and schema_location);
+    try std.testing.expectEqual(@as(usize, 1), xml.content.len);
+    try std.testing.expect(std.mem.indexOf(u8, xml.content[0].xml, "e:detail") != null);
+    try std.testing.expectEqualSlices(f64, &.{ 1, 2 }, decoded.get(0).?.values.float64);
+    try std.testing.expectEqualSlices(f64, &.{ 3, 4 }, decoded.get(1).?.values.float64);
+}
+
 test "[integration] - [mzML 1.0 examples]: selects and reencodes through the ordinary API" {
     var dir = std.testing.tmpDir(.{});
     defer dir.cleanup();
@@ -303,7 +338,43 @@ test "[cli] - [mzML examples]: reencodes all codecs without changing values or r
         var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
         defer reader.deinit();
         const header = try reader.readHeader();
-        try support.expectNode(header.document, index.header().document);
+        const document = index.header().document;
+        try std.testing.expectEqualDeep(header.document.attributes, document.attributes);
+        try std.testing.expectEqualDeep(header.document.params, document.params);
+        try std.testing.expectEqual(header.document.children.len, document.children.len);
+        for (header.document.children, document.children) |expected, actual| {
+            if (expected.kind != .referenceable_param_group_list) {
+                try support.expectNode(expected, actual);
+                continue;
+            }
+            try std.testing.expectEqual(expected.children.len + 4, actual.children.len);
+            try std.testing.expectEqual(actual.children.len, try mzml.cv.parseInteger(usize, actual.attribute("count")));
+            try std.testing.expectEqual(expected.attributes.len, actual.attributes.len);
+            for (expected.attributes, actual.attributes) |left, right| {
+                try std.testing.expectEqualStrings(left.name, right.name);
+                if (!std.mem.eql(u8, left.name, "count")) try std.testing.expectEqualDeep(left, right);
+            }
+            var original = actual;
+            original.attributes = expected.attributes;
+            original.children = actual.children[0..expected.children.len];
+            try support.expectNode(expected, original);
+            inline for (.{
+                .{ "MS:1000521", "32-bit float", "zmz-reencoded-0" },
+                .{ "MS:1000523", "64-bit float", "zmz-reencoded-1" },
+                .{ "MS:1000519", "32-bit integer", "zmz-reencoded-2" },
+                .{ "MS:1000522", "64-bit integer", "zmz-reencoded-3" },
+            }, 0..) |fields, i| {
+                var replacement = expected.children[0];
+                var params = [_]mzml.cv.Entry{ replacement.params[0], replacement.params[1] };
+                params[0].cv.accession = .{ .raw = fields[0] };
+                params[0].cv.name = fields[1];
+                params[1].cv.accession = .{ .raw = "MS:1000574" };
+                params[1].cv.name = "zlib compression";
+                replacement.params = &params;
+                replacement.attributes = &.{.{ .name = "id", .value = fields[2] }};
+                try support.expectNode(replacement, actual.children[expected.children.len + i]);
+            }
+        }
         try support.expectNode(header.run, index.header().run);
         var before = mzml.StreamReader.DecodedArrays.init(std.testing.allocator, .{});
         defer before.deinit();
@@ -334,14 +405,14 @@ test "[cli] - [mzML examples]: reencodes all codecs without changing values or r
                     inline else => |values, tag| try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(values), std.mem.sliceAsBytes(@field(right.values, @tagName(tag)))),
                 }
                 var entries: mzml.cv.EffectiveIterator = .{ .entries = record.binaryArrays()[i].params, .groups = header.groups };
-                var position: usize = 0;
-                while (try entries.next()) |entry| : (position += 1) {
-                    const changed = actual.binaryArrays()[i].params[position];
+                var changed_entries: mzml.cv.EffectiveIterator = .{ .entries = actual.binaryArrays()[i].params, .groups = index.header().groups };
+                while (try entries.next()) |entry| {
+                    const changed = (try changed_entries.next()).?;
                     if (changed == .cv and changed.cv.accession != null and changed.cv.accession.?.eql(.{ .raw = "MS:1000574" })) {
                         try std.testing.expectEqualStrings("zlib compression", changed.cv.name.?);
                     } else try std.testing.expectEqualDeep(entry, changed);
                 }
-                try std.testing.expectEqual(position, actual.binaryArrays()[i].params.len);
+                try std.testing.expectEqual(null, try changed_entries.next());
             }
         }
         try std.testing.expectEqualDeep(ordinals, index.counts);
