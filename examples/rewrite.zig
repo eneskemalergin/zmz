@@ -29,6 +29,7 @@ pub fn main(init: std.process.Init) !void {
     var input = source.reader(init.io, &input_buffer);
     var reader = try mzml.StreamReader.init(init.gpa, &input.interface, .{});
     defer reader.deinit();
+    errdefer if (reader.diagnostic()) |report| std.debug.print("{s}: {f}\n", .{ args[1], report });
     const header = try reader.readHeader();
     const destination = try dir.createFile(init.io, args[2], .{ .exclusive = true, .read = ms1 });
     errdefer dir.deleteFile(init.io, args[2]) catch {};
@@ -40,6 +41,7 @@ pub fn main(init: std.process.Init) !void {
     else
         try mzml.Writer.initIndexed(init.gpa, &output.interface, .{}, .{});
     defer writer.deinit();
+    errdefer if (writer.diagnostic()) |report| std.debug.print("{s}: {f}\n", .{ args[2], report });
     var attributes: std.ArrayList(mzml.model.Attribute) = .empty;
     defer attributes.deinit(init.gpa);
     var editor: ?ParameterEditor = if (replace_param or remove_param)

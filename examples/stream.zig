@@ -28,10 +28,7 @@ pub fn main(init: std.process.Init) !void {
         var reader = try mzml.StreamReader.init(init.gpa, &input.interface, .{ .payload = .skip });
         defer reader.deinit();
         errdefer if (reader.diagnostic()) |diagnostic| {
-            std.debug.print("{s}: {s} at byte {d}, element {?s}\n", .{
-                args[1],                                                       @errorName(diagnostic.code), diagnostic.byte_offset,
-                if (diagnostic.element) |element| @tagName(element) else null,
-            });
+            std.debug.print("{s}: {f}\n", .{ args[1], diagnostic });
         };
         const header = try reader.readHeader();
         var decoded = mzml.StreamReader.DecodedArrays.init(init.gpa, .{});

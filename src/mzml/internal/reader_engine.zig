@@ -82,9 +82,7 @@ pub const Error = xml.Error || cv.ValueError || DecodedArrays.Error || std.mem.A
     InvalidIndex,
 };
 
-/// Physical offset of the parser event at failure, not the failing decoded character.
-/// Element identity is present when known.
-pub const Diagnostic = struct { code: Error, byte_offset: u64, element: ?model.Kind };
+pub const Diagnostic = @import("../diagnostic.zig");
 
 allocator: std.mem.Allocator,
 cursor: xml.Cursor,
@@ -143,7 +141,10 @@ pub fn deinit(self: *StreamReader) void {
 /// Metadata slices last until deinit; streaming list observations update as records are consumed.
 pub fn readHeader(self: *StreamReader) Error!*const model.Header {
     if (self.failure != null) return error.FailedState;
-    if (!self.header_ready) self.readHeaderInner() catch |err| return self.fail(err);
+    if (!self.header_ready) self.readHeaderInner() catch |err| {
+        self.fail(err, .read_header);
+        return err;
+    };
     return &self.header;
 }
 
@@ -173,10 +174,11 @@ pub fn nextItem(self: *StreamReader) Error!?model.Item {
 
 fn nextItemFor(self: *StreamReader, comptime retention: Retention, comptime retain_xml: bool) Error!?model.Item {
     if (self.failure != null) return error.FailedState;
+    errdefer |err| self.fail(err, if (retain_xml) .read_item else .read_record);
     _ = try self.readHeader();
     self.record_store.reset();
     if (self.done) return null;
-    return self.nextItemInner(retention, retain_xml) catch |err| return self.fail(err);
+    return self.nextItemInner(retention, retain_xml);
 }
 
 pub fn nextDecodedItem(self: *StreamReader, output: *DecodedArrays) Error!?model.Item {
@@ -229,6 +231,7 @@ pub fn parseFragment(
 /// Internal reusable fragment reader. Returned records use the requested allocator;
 /// parser and list scratch remain owned by this reader. No source bytes remain borrowed.
 pub fn readFragment(self: *StreamReader, allocator: std.mem.Allocator, input: *std.Io.Reader, ancestors: usize, physical_start: u64, prefix_length: usize, complete: bool, reuse_ancestors: bool, expected: ?FragmentTarget) Error!owned.Record {
+    self.failure = null;
     if (self.header_ready or ancestors > 4 or physical_start < prefix_length) return error.InvalidOptions;
     errdefer self.fragment_ancestors = null;
     if (reuse_ancestors) {
@@ -244,6 +247,7 @@ pub fn readFragment(self: *StreamReader, allocator: std.mem.Allocator, input: *s
         self.record_store.arena.deinit();
         self.record_store = Storage.init(self.allocator, self.options.limits.record_bytes);
     }
+    errdefer |err| self.fail(err, .lookup_record);
     try self.cursor.advance(false);
     for (0..if (reuse_ancestors) 0 else ancestors) |i| {
         if ((self.cursor.current orelse return error.UnexpectedEnd).data != .start_element)
@@ -253,9 +257,10 @@ pub fn readFragment(self: *StreamReader, allocator: std.mem.Allocator, input: *s
     }
     const kind_value = try self.kind();
     if (expected) |target| {
+        errdefer |err| self.capture(err, .index, .none);
         if (kind_value != target.kind) return error.InvalidIndex;
         const start = self.cursor.current.?.data.start_element;
-        const id = start.attributeRaw("id") orelse return error.MissingAttribute;
+        const id = start.attributeRaw("id") orelse return try self.attributeError(error.MissingAttribute, .id);
         if (!std.mem.eql(u8, id.value, target.id)) return error.InvalidIndex;
     }
     if (kind_value != .spectrum and kind_value != .chromatogram) return error.InvalidStructure;
@@ -272,8 +277,8 @@ pub fn readFragment(self: *StreamReader, allocator: std.mem.Allocator, input: *s
     const record: model.Record = .{
         .node = node,
         .id = node.attribute("id").?,
-        .index = if (node.attribute("index")) |value| try cv.parseInteger(usize, value) else null,
-        .default_array_length = if (node.attribute("defaultArrayLength")) |value| try cv.parseInteger(usize, value) else null,
+        .index = try self.number(node, .index),
+        .default_array_length = try self.number(node, .default_array_length),
     };
     const arena = self.record_store.arena;
     self.record_store.arena = .init(allocator);
@@ -288,11 +293,17 @@ pub const ParsedFooter = struct {
 
 /// Internal footer parser. Bytes start with the original indexed-wrapper opening,
 /// followed by the index offset, checksum, wrapper closing tag, and EOF.
-pub fn parseFooter(allocator: std.mem.Allocator, bytes: []const u8, options: Options, physical_start: u64, prefix_length: usize) Error!ParsedFooter {
+pub fn parseFooter(allocator: std.mem.Allocator, bytes: []const u8, options: Options, physical_start: u64, prefix_length: usize, failure: *?Diagnostic) Error!ParsedFooter {
+    failure.* = null;
     if (physical_start < prefix_length) return error.InvalidOptions;
     var input = std.Io.Reader.fixed(bytes);
     var reader = try init(allocator, &input, options);
     defer reader.deinit();
+    errdefer |err| {
+        reader.fail(err, .open_index);
+        failure.* = reader.failure;
+        failure.*.?.translate(physical_start, bytes.len - prefix_length, prefix_length);
+    }
     try reader.cursor.advance(false);
     if (try reader.kind() != .indexed_mzml) return error.InvalidStructure;
     try reader.cursor.advance(false);
@@ -317,6 +328,7 @@ pub fn resumeFollowingList(self: *StreamReader, input: *std.Io.Reader, ancestors
     const replacement = try xml.Cursor.init(self.allocator, input, self.options.limits.depth, self.options.limits.attributes, self.options.limits.attribute_bytes);
     self.cursor.deinit();
     self.cursor = replacement;
+    errdefer |err| self.fail(err, .open_index);
     try self.cursor.advance(false);
     for (0..ancestors) |_| {
         if ((self.cursor.current orelse return error.UnexpectedEnd).data != .start_element) return error.InvalidStructure;
@@ -333,6 +345,7 @@ pub fn resumeFollowingList(self: *StreamReader, input: *std.Io.Reader, ancestors
 
 /// Internal indexed-open operation for an empty spectrum list preceding chromatograms.
 pub fn finishEmptySpectrumList(self: *StreamReader) Error!void {
+    errdefer |err| self.fail(err, .open_index);
     if (self.active_list != .spectrum_list) return error.InvalidOptions;
     try self.cursor.advance(false);
     try self.finishSpectrumList();
@@ -363,9 +376,44 @@ fn shiftOffsets(node: *model.Node, delta: u64) Error!void {
     for (@constCast(node.children)) |*child| try shiftOffsets(child, delta);
 }
 
-fn fail(self: *StreamReader, err: Error) Error {
-    self.failure = .{ .code = err, .byte_offset = self.cursor.offset, .element = self.current_kind };
+fn fail(self: *StreamReader, err: Error, operation: Diagnostic.Operation) void {
+    self.capture(err, .metadata, .none);
+    self.failure.?.operation = operation;
+}
+
+fn capture(self: *StreamReader, err: Error, stage: Diagnostic.Stage, detail: Diagnostic.Detail) void {
+    if (self.failure != null) return;
+    var report = Diagnostic.init(err, .read_record, stage, detail);
+    if (self.cursor.failure != null) {
+        report = Diagnostic.init(err, .read_record, .xml, Diagnostic.xmlDetail(&self.cursor));
+    } else if (self.decoded_arrays != null and self.decoded_arrays.?.failure != null) {
+        const decoded = self.decoded_arrays.?.failure.?;
+        report = Diagnostic.init(err, .read_record, decoded.stage, decoded.detail);
+    } else if (self.record_store.exceeded or self.header_store.exceeded) {
+        const record = self.record_store.exceeded;
+        report = Diagnostic.init(err, .read_record, .metadata, .{ .limit = .{
+            .name = if (record) .record_bytes else .header_bytes,
+            .maximum = if (record) self.record_store.limit else self.header_store.limit,
+        } });
+    }
+    report.location = .{ .input_event = self.cursor.offset };
+    report.element = self.current_kind;
+    self.failure = report;
+}
+
+fn limitError(self: *StreamReader, name: Diagnostic.Limit, maximum: usize, needed: ?usize) Error!noreturn {
+    self.capture(error.LimitExceeded, .metadata, .{ .limit = .{ .name = name, .maximum = maximum, .needed = needed } });
+    return error.LimitExceeded;
+}
+
+fn attributeError(self: *StreamReader, err: Error, attribute: Diagnostic.Attribute) Error!noreturn {
+    self.capture(err, .metadata, .{ .attribute = attribute });
     return err;
+}
+
+fn number(self: *StreamReader, node: model.Node, attribute: Diagnostic.Attribute) Error!?usize {
+    const value = node.attribute(attribute.xmlName()) orelse return null;
+    return cv.parseInteger(usize, value) catch |err| return try self.attributeError(err, attribute);
 }
 
 fn readHeaderInner(self: *StreamReader) Error!void {
@@ -472,7 +520,7 @@ fn openList(self: *StreamReader) Error!void {
     const node = try self.startNode(&self.header_store, kind_value);
     const list: model.RecordList = .{
         .attributes = node.attributes,
-        .declared_count = try node.declaredCount(),
+        .declared_count = try self.number(node, .count),
     };
     switch (kind_value) {
         .spectrum_list => self.header.spectrum_list = list,
@@ -506,14 +554,19 @@ fn nextItemInner(self: *StreamReader, comptime retention: Retention, comptime re
             }
             _ = self.childKind(list_kind) orelse
                 return .{ .xml = try self.readXml(&self.record_store, retain_xml) };
-            const node = try self.parseNodeFor(&self.record_store, 1, false, self.options.payload, retention);
             const list = if (list_kind == .spectrum_list) &self.header.spectrum_list.? else &self.header.chromatogram_list.?;
+            const ordinal = list.observed_count;
+            errdefer |err| {
+                self.capture(err, .metadata, .none);
+                self.failure.?.record = .{ .kind = if (list_kind == .spectrum_list) .spectrum else .chromatogram, .ordinal = ordinal };
+            }
+            const node = try self.parseNodeFor(&self.record_store, 1, false, self.options.payload, retention);
             list.observed_count = std.math.add(usize, list.observed_count, 1) catch return error.LimitExceeded;
             return .{ .record = .{
                 .node = node,
                 .id = node.attribute("id").?,
-                .index = if (node.attribute("index")) |value| try cv.parseInteger(usize, value) else null,
-                .default_array_length = if (node.attribute("defaultArrayLength")) |value| try cv.parseInteger(usize, value) else null,
+                .index = try self.number(node, .index),
+                .default_array_length = try self.number(node, .default_array_length),
             } };
         },
         .run => {
@@ -601,7 +654,7 @@ fn startNode(self: *StreamReader, storage: *Storage, kind_value: model.Kind) Err
 }
 
 fn startNodeFor(self: *StreamReader, storage: *Storage, kind_value: model.Kind, comptime retain: bool) Error!model.Node {
-    if (storage.nodes == self.options.limits.nodes) return error.LimitExceeded;
+    if (storage.nodes == self.options.limits.nodes) return try self.limitError(.nodes, self.options.limits.nodes, null);
     storage.nodes += 1;
     const event = self.cursor.current orelse return error.UnexpectedEnd;
     const attributes = try self.copyAttributes(
@@ -626,13 +679,20 @@ fn parseNode(self: *StreamReader, storage: *Storage, depth: usize, advance_after
 }
 
 fn parseNodeFor(self: *StreamReader, storage: *Storage, depth: usize, advance_after: bool, payload: Payload, comptime retention: Retention) Error!model.Node {
-    if (depth > self.options.limits.depth) return error.LimitExceeded;
+    if (depth > self.options.limits.depth) return try self.limitError(.depth, self.options.limits.depth, depth);
     const kind_value = try self.kind();
-    var node = try self.startNodeFor(storage, kind_value, retention != .none);
+    const array_position = storage.arrays;
+    var node: model.Node = .{ .kind = kind_value };
+    errdefer |err| if (kind_value == .binary_data_array and storage == &self.record_store) {
+        self.capture(err, .metadata, .none);
+        if (node.end_offset == 0 or self.cursor.offset < node.end_offset)
+            self.failure.?.array_position = array_position;
+    };
+    node = try self.startNodeFor(storage, kind_value, retention != .none);
     var child_payload = payload;
     if (storage == &self.record_store and depth == 1) {
         if (self.decoded_arrays) |output| {
-            try output.startRecord(node);
+            output.startRecord(node) catch |err| return try self.attributeError(err, .default_array_length);
             child_payload = .retain;
         }
     }
@@ -645,10 +705,10 @@ fn parseNodeFor(self: *StreamReader, storage: *Storage, depth: usize, advance_af
             if (event.data != .text) break;
             const bytes = event.data.text.bytes;
             text_size = std.math.add(usize, text_size, bytes.len) catch return error.LimitExceeded;
-            if (text_size > self.options.limits.binary_text_bytes) return error.LimitExceeded;
+            if (text_size > self.options.limits.binary_text_bytes) return try self.limitError(.binary_text_bytes, self.options.limits.binary_text_bytes, text_size);
             if (kind_value == .binary and self.decode_binary) try self.decoded_arrays.?.text(bytes);
             if (payload == .retain or kind_value != .binary) {
-                if (text_size > storage.limit -| storage.used) return error.LimitExceeded;
+                if (text_size > storage.limit -| storage.used) return try storage.limitError();
                 try text.appendSlice(storage.arena.allocator(), bytes);
             }
             try self.cursor.advance(true);
@@ -688,7 +748,11 @@ fn parseNodeFor(self: *StreamReader, storage: *Storage, depth: usize, advance_af
             }
             if (self.decoded_arrays) |output| {
                 decode_array = child_payload == .retain;
-                if (decode_array) try output.beginArray(node, self.header.groups, position);
+                if (decode_array) output.beginArray(node, self.header.groups, position) catch |err| {
+                    self.capture(err, .array, .none);
+                    self.failure.?.element = .binary_data_array;
+                    return @as(Error!model.Node, err);
+                };
                 child_payload = .skip;
             }
             self.decode_binary = decode_array;
@@ -719,7 +783,10 @@ fn parseNodeFor(self: *StreamReader, storage: *Storage, depth: usize, advance_af
                 if (decode_array) {
                     node.params = self.param_scratch.items[params_start..];
                     // Late declarations must agree with the bytes already decoded.
-                    _ = try model.arrayEncoding(node, self.header.groups);
+                    _ = model.arrayEncoding(node, self.header.groups) catch |err| {
+                        self.capture(err, .array, .none);
+                        return @as(Error!model.Node, err);
+                    };
                 }
                 continue;
             }
@@ -732,7 +799,7 @@ fn parseNodeFor(self: *StreamReader, storage: *Storage, depth: usize, advance_af
             };
             if (child_kind == .binary and seen.contains(.binary)) return error.InvalidStructure;
             seen.insert(child_kind);
-            if (child_count == self.options.limits.list_entries) return error.LimitExceeded;
+            if (child_count == self.options.limits.list_entries) return try self.limitError(.list_entries, self.options.limits.list_entries, null);
             if (child_kind == .binary_data_array_list and storage == &self.record_store and child_payload == .retain) {
                 if (self.options.array_selector) |selector| {
                     if (selector.select_record) |select|
@@ -744,8 +811,10 @@ fn parseNodeFor(self: *StreamReader, storage: *Storage, depth: usize, advance_af
             if (retention == .tree and content.items.len != 0) try content.append(self.allocator, .{ .children = 1 });
             child_count += 1;
         }
-        if (decode_array and !seen.contains(.binary))
+        if (decode_array and !seen.contains(.binary)) {
+            self.capture(error.PayloadNotRetained, .array, .none);
             return error.PayloadNotRetained;
+        }
         self.current_kind = kind_value;
         if (retention == .tree) {
             node.params = try storage.copy(cv.Entry, self.param_scratch.items[params_start..]);
@@ -774,7 +843,7 @@ fn parseParams(self: *StreamReader, storage: *Storage, comptime retain: bool, co
         if (event.data != .start_element) break;
         const start = event.data.start_element;
         const selected = self.paramKind(start) orelse break;
-        if (count.* == self.options.limits.list_entries) return error.LimitExceeded;
+        if (count.* == self.options.limits.list_entries) return try self.limitError(.list_entries, self.options.limits.list_entries, null);
         if (retain and count.* == 0) try entries.ensureUnusedCapacity(self.allocator, @min(8, self.options.limits.list_entries));
         var has_extra = false;
         const attrs = try copyParamAttributes(storage, start, selected, retain, &has_extra);
@@ -820,7 +889,7 @@ fn parseParams(self: *StreamReader, storage: *Storage, comptime retain: bool, co
                             if (text.data != .text) break;
                             if (retain) {
                                 if (text.data.text.bytes.len > storage.limit -| storage.used -| bytes.items.len)
-                                    return error.LimitExceeded;
+                                    return try storage.limitError();
                                 try bytes.appendSlice(storage.arena.allocator(), text.data.text.bytes);
                             }
                             try self.cursor.advance(true);
@@ -831,7 +900,7 @@ fn parseParams(self: *StreamReader, storage: *Storage, comptime retain: bool, co
                     else => return error.InvalidStructure,
                 };
                 if (retain) {
-                    if (content.items.len == self.options.limits.list_entries) return error.LimitExceeded;
+                    if (content.items.len == self.options.limits.list_entries) return try self.limitError(.list_entries, self.options.limits.list_entries, null);
                     try content.append(self.allocator, part);
                 }
                 if (part != .text) try self.cursor.advance(true);
@@ -887,7 +956,7 @@ fn copyAttributes(
     var names = std.mem.tokenizeScalar(u8, required, ' ');
     while (names.next()) |name| {
         const attribute = start.attribute(null, name);
-        if (attribute == null) return error.MissingAttribute;
+        if (attribute == null) return try self.attributeError(error.MissingAttribute, .id);
     }
     if (retain and self.cursor.hasAdditionalNamespaces()) return self.copyForeignAttributes(storage, start, null);
     var byte_count: usize = 0;
@@ -965,9 +1034,10 @@ fn readXml(self: *StreamReader, storage: *Storage, comptime retain: bool) Error!
     defer writer.deinit();
     var remaining = self.options.limits.nodes - storage.nodes;
     self.cursor.writeElement(&writer, &remaining) catch |err| return switch (err) {
-        error.WriteFailed => output.failure orelse error.InvalidXml,
+        error.WriteFailed => if ((output.failure orelse error.InvalidXml) == error.LimitExceeded) try storage.limitError() else output.failure orelse error.InvalidXml,
         error.InvalidName, error.InvalidCharacter, error.InvalidNamespace, error.DuplicateAttribute => error.InvalidXml,
-        error.WriterLimit => error.LimitExceeded,
+        error.WriterLimit => try self.limitError(.depth, 64, null),
+        error.LimitExceeded => if (self.cursor.limit_failure == .nodes) try self.limitError(.nodes, self.options.limits.nodes, null) else error.LimitExceeded,
         else => |other| other,
     };
     storage.nodes = self.options.limits.nodes - remaining;
@@ -1050,6 +1120,7 @@ const Storage = struct {
     used: usize = 0,
     nodes: usize = 0,
     arrays: usize = 0,
+    exceeded: bool = false,
 
     fn init(allocator: std.mem.Allocator, limit: usize) Storage {
         return .{ .arena = .init(allocator), .limit = limit };
@@ -1060,12 +1131,18 @@ const Storage = struct {
         self.used = 0;
         self.nodes = 0;
         self.arrays = 0;
+        self.exceeded = false;
     }
 
     fn charge(self: *Storage, comptime T: type, count: usize) Error!void {
         const bytes = std.math.mul(usize, count, @sizeOf(T)) catch return error.LimitExceeded;
-        if (bytes > self.limit -| self.used) return error.LimitExceeded;
+        if (bytes > self.limit -| self.used) return try self.limitError();
         self.used += bytes;
+    }
+
+    fn limitError(self: *Storage) Error!noreturn {
+        self.exceeded = true;
+        return error.LimitExceeded;
     }
 
     fn alloc(self: *Storage, comptime T: type, count: usize) Error![]T {

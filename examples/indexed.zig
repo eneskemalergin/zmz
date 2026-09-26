@@ -14,10 +14,15 @@ pub fn main(init: std.process.Init) !void {
     }
     const file = try std.Io.Dir.cwd().openFile(init.io, args[1], .{});
     defer file.close(init.io);
-    var index = try mzml.IndexedReader.build(init.gpa, .{ .file = .{ .handle = file, .io = init.io } }, .{
+    var failure: ?mzml.Diagnostic = null;
+    var index = mzml.IndexedReader.buildWithDiagnostic(init.gpa, .{ .file = .{ .handle = file, .io = init.io } }, .{
         .policy = if (rebuild) .rebuild else .open_embedded,
-    });
+    }, &failure) catch |err| {
+        if (failure) |report| std.debug.print("{s}: {f}\n", .{ args[1], report });
+        return err;
+    };
     defer index.deinit();
+    errdefer if (index.diagnostic()) |report| std.debug.print("{s}: {f}\n", .{ args[1], report });
     var decoded = mzml.StreamReader.DecodedArrays.init(init.gpa, .{});
     defer decoded.deinit();
     var output_buffer: [4096]u8 = undefined;

@@ -46,8 +46,9 @@ pub fn parseFooter(
     options: Reader.Options,
     physical_start: u64,
     prefix_length: usize,
+    failure: *?Reader.Diagnostic,
 ) Reader.Error!ParsedFooter {
-    return Reader.parseFooter(allocator, bytes, options, physical_start, prefix_length);
+    return Reader.parseFooter(allocator, bytes, options, physical_start, prefix_length, failure);
 }
 
 pub fn resumeFollowingList(

@@ -14,6 +14,7 @@ const PublicStreamReader = @import("stream_reader.zig").StreamReader;
 const DecodedArrays = PublicStreamReader.DecodedArrays;
 const StreamReader = reader_bridge.Reader;
 const xml = @import("../xml/mzml_adapter.zig");
+const Diagnostic = @import("diagnostic.zig");
 
 const IndexedReader = @This();
 
@@ -67,10 +68,27 @@ contexts: [2]?FragmentAncestors = .{ null, null },
 counts: [2]usize = .{ 0, 0 },
 lookup_reader: ?StreamReader = null,
 lookup_kind: ?model.Kind = null,
+failure: ?Diagnostic = null,
 
 /// Builds an index under the selected policy, retaining metadata but not payloads.
 /// No automatic fallback occurs. Release with deinit; do not copy the returned owner.
 pub fn build(allocator: std.mem.Allocator, source: Source, options: Options) Error!IndexedReader {
+    var failure: ?Diagnostic = null;
+    return buildWithDiagnostic(allocator, source, options, &failure);
+}
+
+/// Clears failure on entry and fills it before cleanup if opening fails. The report
+/// contains no borrowed data; its pointer is not kept by the returned reader.
+pub fn buildWithDiagnostic(allocator: std.mem.Allocator, source: Source, options: Options, failure: *?Diagnostic) Error!IndexedReader {
+    failure.* = null;
+    errdefer |err| {
+        if (failure.* == null) failure.* = Diagnostic.init(err, .open_index, .index, .none);
+        failure.*.?.operation = if (options.policy == .rebuild) .rebuild_index else .open_index;
+    }
+    return buildInner(allocator, source, options, failure);
+}
+
+fn buildInner(allocator: std.mem.Allocator, source: Source, options: Options, failure: *?Diagnostic) Error!IndexedReader {
     if (options.policy == .open_embedded and options.tail_bytes == 0)
         return error.InvalidOptions;
     const stamp = switch (source) {
@@ -88,6 +106,7 @@ pub fn build(allocator: std.mem.Allocator, source: Source, options: Options) Err
         .remaining = options.index_bytes,
     };
     errdefer self.deinit();
+    errdefer failure.* = self.failure;
     var buffer: [64 * 1024]u8 = undefined;
     var fixed = std.Io.Reader.fixed(if (source == .bytes) source.bytes else &.{});
     var file_reader: std.Io.File.Reader = undefined;
@@ -104,16 +123,25 @@ pub fn build(allocator: std.mem.Allocator, source: Source, options: Options) Err
     reader_options.retain_index = false;
     var reader = try StreamReader.init(allocator, input, reader_options);
     defer reader.deinit();
+    errdefer if (self.failure == null) {
+        self.failure = reader.diagnostic();
+    };
     const source_header = try reader.readHeader();
     if (options.policy != .rebuild and !source_header.indexed) return error.MissingIndex;
     if (options.policy == .open_embedded) {
         try self.openEmbedded(&reader);
-        self.metadata = try owned.Header.init(allocator, source_header.*, .{ .bytes = options.reader.limits.header_bytes });
+        self.metadata = owned.Header.init(allocator, source_header.*, .{ .bytes = options.reader.limits.header_bytes }) catch |err| return try self.headerCopyError(err);
         try self.checkSource();
         return self;
     }
     while (try reader_bridge.nextIndexRecord(&reader)) |record| {
-        if (self.entries.items.len == options.max_records) return error.LimitExceeded;
+        errdefer |err| {
+            self.capture(err, .index, .none);
+            self.failure.?.record = .{ .kind = if (record.node.kind == .spectrum) .spectrum else .chromatogram, .ordinal = self.counts[kindIndex(record.node.kind)] };
+            self.failure.?.location = .{ .input_event = record.node.start_offset };
+            self.failure.?.element = record.node.kind;
+        }
+        if (self.entries.items.len == options.max_records) return try self.limitError(.records, options.max_records, null);
         const k = kindIndex(record.node.kind);
         if (record.node.start_offset >= record.node.end_offset or record.node.end_offset > self.size)
             return error.InvalidIndex;
@@ -127,7 +155,7 @@ pub fn build(allocator: std.mem.Allocator, source: Source, options: Options) Err
         self.entries.appendAssumeCapacity(.{ .kind = record.node.kind, .id = id, .index = self.counts[k], .start = record.node.start_offset, .end = record.node.end_offset });
         self.counts[k] += 1;
     }
-    self.metadata = try owned.Header.init(allocator, source_header.*, .{ .bytes = options.reader.limits.header_bytes });
+    self.metadata = owned.Header.init(allocator, source_header.*, .{ .bytes = options.reader.limits.header_bytes }) catch |err| return try self.headerCopyError(err);
     try self.checkSource();
     return self;
 }
@@ -148,16 +176,26 @@ pub fn header(self: *const IndexedReader) *const model.Header {
     return &self.metadata.?.value;
 }
 
+/// Returns the last lookup failure. Each new lookup clears it, including an absent
+/// target. A failure does not prevent later lookups; header access leaves it intact.
+pub fn diagnostic(self: *const IndexedReader) ?Diagnostic {
+    return self.failure;
+}
+
 /// Finds an exact ID and returns an independent record owner, or null when absent.
 /// Returns AmbiguousId when both a spectrum and a chromatogram use this ID.
 /// Lookups reuse parser storage and must not run concurrently on this reader.
 pub fn byId(self: *IndexedReader, allocator: std.mem.Allocator, id: []const u8) Error!?owned.Record {
+    self.failure = null;
+    errdefer |err| self.capture(err, .index, .none);
     const position = try self.idPosition(id) orelse return null;
     return try self.readEntry(allocator, self.entries.items[position], null);
 }
 
 /// Looks up a zero-based ordinal within spectra or chromatograms; other kinds fail.
 pub fn at(self: *IndexedReader, allocator: std.mem.Allocator, kind: model.Kind, ordinal: usize) Error!?owned.Record {
+    self.failure = null;
+    errdefer |err| self.capture(err, .index, .none);
     const position = try self.ordinalPosition(kind, ordinal) orelse return null;
     return try self.readEntry(allocator, self.entries.items[position], null);
 }
@@ -168,6 +206,8 @@ pub fn at(self: *IndexedReader, allocator: std.mem.Allocator, kind: model.Kind, 
 /// Missing IDs and failures clear output. A failed lookup stops immediately; later lookups may retry.
 /// Numeric slices last until output is reused, reset, or deinitialized, independently of metadata.
 pub fn byIdDecoded(self: *IndexedReader, allocator: std.mem.Allocator, id: []const u8, output: *DecodedArrays) Error!?owned.Record {
+    self.failure = null;
+    errdefer |err| self.capture(err, .index, .none);
     output.reset();
     errdefer output.reset();
     const position = try self.idPosition(id) orelse return null;
@@ -176,6 +216,8 @@ pub fn byIdDecoded(self: *IndexedReader, allocator: std.mem.Allocator, id: []con
 
 /// Uses byIdDecoded's storage and failure rules for a zero-based spectrum or chromatogram ordinal.
 pub fn atDecoded(self: *IndexedReader, allocator: std.mem.Allocator, kind: model.Kind, ordinal: usize, output: *DecodedArrays) Error!?owned.Record {
+    self.failure = null;
+    errdefer |err| self.capture(err, .index, .none);
     output.reset();
     errdefer output.reset();
     const position = try self.ordinalPosition(kind, ordinal) orelse return null;
@@ -205,10 +247,14 @@ fn readDecodedEntry(self: *IndexedReader, allocator: std.mem.Allocator, entry: E
 }
 
 fn readEntry(self: *IndexedReader, allocator: std.mem.Allocator, entry: Entry, output: ?*DecodedArrays) Error!owned.Record {
+    errdefer |err| {
+        self.capture(err, .index, .none);
+        self.failure.?.record = .{ .kind = if (entry.kind == .spectrum) .spectrum else .chromatogram, .ordinal = entry.index };
+    }
     try self.checkSource();
     const context = self.contexts[kindIndex(entry.kind)].?;
     const length = std.math.cast(usize, entry.end - entry.start) orelse return error.LimitExceeded;
-    if (length > self.options.record_span_bytes) return error.LimitExceeded;
+    if (length > self.options.record_span_bytes) return try self.limitError(.record_span_bytes, self.options.record_span_bytes, length);
     const prefix_end = std.math.add(usize, context.prefix.len, length) catch return error.LimitExceeded;
     const total = std.math.add(usize, prefix_end, context.suffix.len) catch return error.LimitExceeded;
     var buffer: [64 * 1024]u8 = undefined;
@@ -220,7 +266,11 @@ fn readEntry(self: *IndexedReader, allocator: std.mem.Allocator, entry: Entry, o
         self.lookup_reader = try StreamReader.init(self.allocator, &empty_input, self.options.reader);
         reader_bridge.resetFragmentParser(&self.lookup_reader.?);
     }
-    var record = reader_bridge.readFragment(&self.lookup_reader.?, allocator, &input.interface, context.ancestors, entry.start, context.prefix.len, self.options.policy != .open_embedded, self.header().groups, output, reuse_ancestors, .{ .kind = entry.kind, .id = entry.id }) catch |err| return input.originalError(err);
+    var record = reader_bridge.readFragment(&self.lookup_reader.?, allocator, &input.interface, context.ancestors, entry.start, context.prefix.len, self.options.policy != .open_embedded, self.header().groups, output, reuse_ancestors, .{ .kind = entry.kind, .id = entry.id }) catch |err| {
+        self.failure = self.lookup_reader.?.diagnostic();
+        if (self.failure) |*report| report.translate(entry.start, length, context.prefix.len);
+        return try self.inputError(&input, err);
+    };
     errdefer record.deinit();
     if (record.value.node.end_offset > entry.end or
         (self.options.policy == .rebuild and
@@ -228,6 +278,33 @@ fn readEntry(self: *IndexedReader, allocator: std.mem.Allocator, entry: Entry, o
     try self.checkSource();
     self.lookup_kind = entry.kind;
     return record;
+}
+
+fn capture(self: *IndexedReader, err: Error, stage: Diagnostic.Stage, detail: Diagnostic.Detail) void {
+    if (self.failure == null) self.failure = Diagnostic.init(err, .lookup_record, stage, detail);
+}
+
+fn limitError(self: *IndexedReader, name: Diagnostic.Limit, maximum: usize, needed: ?usize) Error!noreturn {
+    self.capture(error.LimitExceeded, .index, .{ .limit = .{ .name = name, .maximum = maximum, .needed = needed } });
+    return error.LimitExceeded;
+}
+
+fn attributeError(self: *IndexedReader, attribute: Diagnostic.Attribute) Error!noreturn {
+    self.capture(error.MissingAttribute, .index, .{ .attribute = attribute });
+    return error.MissingAttribute;
+}
+
+fn headerCopyError(self: *IndexedReader, err: owned.Error) Error!noreturn {
+    self.capture(err, .metadata, if (err == error.LimitExceeded) .{ .limit = .{ .name = .header_bytes, .maximum = self.options.reader.limits.header_bytes } } else .none);
+    return err;
+}
+
+fn inputError(self: *IndexedReader, input: *const FragmentInput, err: Error) Error!noreturn {
+    const original = input.originalError(err);
+    if (input.failure != null and err == error.ReadFailed) {
+        self.failure = Diagnostic.init(original, .lookup_record, .index, .none);
+    }
+    return original;
 }
 
 fn checkSource(self: *const IndexedReader) Error!void {
@@ -304,7 +381,7 @@ fn trailerLimits(self: *const IndexedReader) PublicStreamReader.Limits {
 fn openEmbedded(self: *IndexedReader, reader: *StreamReader) Error!void {
     const scopes = reader_bridge.scopes(reader);
     const prefix_len = std.math.cast(usize, scopes[0].end) orelse return error.LimitExceeded;
-    if (prefix_len > self.options.reader.limits.header_bytes) return error.LimitExceeded;
+    if (prefix_len > self.options.reader.limits.header_bytes) return try self.limitError(.header_bytes, self.options.reader.limits.header_bytes, prefix_len);
     const prefix = try self.allocator.alloc(u8, prefix_len);
     defer self.allocator.free(prefix);
     try self.readAt(prefix, 0);
@@ -327,8 +404,15 @@ fn openEmbedded(self: *IndexedReader, reader: *StreamReader) Error!void {
         defer self.allocator.free(bytes);
         @memcpy(bytes[0..prefix_len], prefix);
         @memcpy(bytes[prefix_len..], tail[start..]);
-        var parsed = reader_bridge.parseFooter(self.allocator, bytes, trailer_options, physical_start, prefix_len) catch |err| switch (err) {
-            error.OutOfMemory, error.LimitExceeded => return err,
+        var footer_failure: ?Diagnostic = null;
+        var parsed = reader_bridge.parseFooter(self.allocator, bytes, trailer_options, physical_start, prefix_len, &footer_failure) catch |err| switch (err) {
+            error.OutOfMemory, error.LimitExceeded => {
+                self.failure = footer_failure;
+                if (self.failure) |*report| if (report.detail == .limit and report.detail.limit.name == .header_bytes) {
+                    report.detail.limit.name = .index_bytes;
+                };
+                return err;
+            },
             else => continue,
         };
         defer parsed.arena.deinit();
@@ -340,11 +424,11 @@ fn openEmbedded(self: *IndexedReader, reader: *StreamReader) Error!void {
     if (start < final_scope.end or start >= self.size or start > std.math.maxInt(i64) or
         (endian != null and start % 2 != 0)) return error.InvalidIndex;
     const trailer_len = std.math.cast(usize, self.size - start) orelse return error.LimitExceeded;
-    if (trailer_len > self.options.index_bytes) return error.LimitExceeded;
+    if (trailer_len > self.options.index_bytes) return try self.limitError(.index_bytes, self.options.index_bytes, trailer_len);
     const bytes_len = std.math.add(usize, prefix_len, trailer_len) catch return error.LimitExceeded;
     var buffer: [64 * 1024]u8 = undefined;
     var input = FragmentInput.init(self, prefix, start, trailer_len, &.{}, buffer[0..@max(4, @min(buffer.len, bytes_len))]);
-    self.readEmbeddedEntries(&input.interface, start, final_scope.end, endian) catch |err| return input.originalError(err);
+    self.readEmbeddedEntries(&input.interface, start, prefix_len, final_scope.end, endian) catch |err| return try self.inputError(&input, err);
     for (self.entries.items, 0..) |*entry, i| {
         if (i + 1 < self.entries.items.len) entry.end = self.entries.items[i + 1].start;
         if (entry.start >= entry.end) return error.InvalidIndex;
@@ -358,10 +442,14 @@ fn openEmbedded(self: *IndexedReader, reader: *StreamReader) Error!void {
             const last = self.entries.items[self.counts[0] - 1];
             const context = self.contexts[0] orelse return error.InvalidIndex;
             const span = std.math.cast(usize, last.end - last.start) orelse return error.LimitExceeded;
-            if (span > self.options.record_span_bytes) return error.LimitExceeded;
+            if (span > self.options.record_span_bytes) return try self.limitError(.record_span_bytes, self.options.record_span_bytes, span);
             const fragment_len = std.math.add(usize, context.prefix.len, span) catch return error.LimitExceeded;
             var fragment = FragmentInput.init(self, context.prefix, last.start, span, &.{}, buffer[0..@max(4, @min(buffer.len, fragment_len))]);
-            reader_bridge.resumeFollowingList(reader, &fragment.interface, context.ancestors, last.start, context.prefix.len) catch |err| return fragment.originalError(err);
+            reader_bridge.resumeFollowingList(reader, &fragment.interface, context.ancestors, last.start, context.prefix.len) catch |err| {
+                self.failure = reader.diagnostic();
+                if (self.failure) |*report| report.translate(last.start, span, context.prefix.len);
+                return try self.inputError(&fragment, err);
+            };
         }
         self.contexts[1] = try self.captureAncestors(reader, 1);
     }
@@ -376,10 +464,15 @@ fn openEmbedded(self: *IndexedReader, reader: *StreamReader) Error!void {
     }
 }
 
-fn readEmbeddedEntries(self: *IndexedReader, input: *std.Io.Reader, index_start: u64, minimum: u64, endian: ?std.builtin.Endian) Error!void {
+fn readEmbeddedEntries(self: *IndexedReader, input: *std.Io.Reader, index_start: u64, prefix_length: usize, minimum: u64, endian: ?std.builtin.Endian) Error!void {
     const limits = self.options.reader.limits;
     var cursor = try xml.Cursor.init(self.allocator, input, limits.depth, limits.attributes, limits.attribute_bytes);
     defer cursor.deinit();
+    errdefer |err| {
+        self.capture(err, if (cursor.failure != null) .xml else .index, Diagnostic.xmlDetail(&cursor));
+        self.failure.?.location = .{ .input_event = cursor.offset };
+        self.failure.?.translate(index_start, self.size - index_start, prefix_length);
+    }
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(self.allocator);
     try cursor.advance(false);
@@ -390,7 +483,7 @@ fn readEmbeddedEntries(self: *IndexedReader, input: *std.Io.Reader, index_start:
     try cursor.advance(false);
     while ((cursor.current orelse return error.UnexpectedEnd).data == .start_element) {
         const index = try indexStart(&cursor, .index);
-        const name = (index.attribute(null, "name") orelse return error.MissingAttribute).value;
+        const name = (index.attribute(null, "name") orelse return try self.attributeError(.name)).value;
         const kind: model.Kind = if (std.mem.eql(u8, name, "spectrum")) .spectrum else if (std.mem.eql(u8, name, "chromatogram")) .chromatogram else return error.InvalidIndex;
         const k = kindIndex(kind);
         if (seen[k]) return error.InvalidIndex;
@@ -399,8 +492,13 @@ fn readEmbeddedEntries(self: *IndexedReader, input: *std.Io.Reader, index_start:
         try cursor.advance(false);
         while ((cursor.current orelse return error.UnexpectedEnd).data == .start_element) {
             const offset = try indexStart(&cursor, .offset);
-            const id_ref = (offset.attribute(null, "idRef") orelse return error.MissingAttribute).value;
-            if (self.entries.items.len == self.options.max_records) return error.LimitExceeded;
+            errdefer |err| {
+                self.capture(err, if (cursor.failure != null) .xml else .index, Diagnostic.xmlDetail(&cursor));
+                self.failure.?.element = .offset;
+                self.failure.?.record = .{ .kind = if (kind == .spectrum) .spectrum else .chromatogram, .ordinal = self.counts[k] };
+            }
+            const id_ref = (offset.attribute(null, "idRef") orelse return try self.attributeError(.id_ref)).value;
+            if (self.entries.items.len == self.options.max_records) return try self.limitError(.records, self.options.max_records, null);
             try self.charge(@sizeOf(Entry) + @sizeOf(usize) * 4);
             const id = try self.copy(id_ref);
             const target = try cv.parseInteger(u64, try self.indexText(&cursor, &text, .offset));
@@ -445,13 +543,13 @@ fn indexEnd(cursor: *xml.Cursor, kind: model.Kind) Error!void {
     try cursor.advance(false);
 }
 
-fn indexText(self: *const IndexedReader, cursor: *xml.Cursor, text: *std.ArrayList(u8), kind: model.Kind) Error![]const u8 {
+fn indexText(self: *IndexedReader, cursor: *xml.Cursor, text: *std.ArrayList(u8), kind: model.Kind) Error![]const u8 {
     text.clearRetainingCapacity();
     try cursor.advance(true);
     while (cursor.current) |event| {
         if (event.data != .text) break;
         const fragment = event.data.text.bytes;
-        if (fragment.len > self.options.reader.limits.binary_text_bytes -| text.items.len) return error.LimitExceeded;
+        if (fragment.len > self.options.reader.limits.binary_text_bytes -| text.items.len) return try self.limitError(.binary_text_bytes, self.options.reader.limits.binary_text_bytes, null);
         try text.appendSlice(self.allocator, fragment);
         try cursor.advance(true);
     }
@@ -562,7 +660,7 @@ fn readAt(self: *const IndexedReader, output: []u8, offset: u64) Error!void {
 }
 
 fn charge(self: *IndexedReader, bytes: usize) Error!void {
-    if (bytes > self.remaining) return error.LimitExceeded;
+    if (bytes > self.remaining) return try self.limitError(.index_bytes, self.options.index_bytes, null);
     self.remaining -= bytes;
 }
 

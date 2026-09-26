@@ -11,3 +11,4 @@ pub const Builder = @import("builder.zig");
 pub const IndexedReader = @import("indexed_reader.zig");
 pub const StreamReader = @import("stream_reader.zig").StreamReader;
 pub const Writer = @import("writer.zig");
+pub const Diagnostic = @import("diagnostic.zig");

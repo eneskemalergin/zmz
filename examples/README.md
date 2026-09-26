@@ -8,6 +8,8 @@ zig build examples -Doptimize=ReleaseFast
 
 The executables go in `zig-out/bin/`. `zig build test-examples` compiles and runs them on small fixtures; `zig build test` includes those checks. No external datasets are needed.
 
+The stream, indexed, and rewrite programs print saved `mzml.Diagnostic` reports on failure. These include the native error, operation, and available location or size details. Indexed opening uses `buildWithDiagnostic` so its report survives cleanup; lookup, forward-reader, and writer reports come from `diagnostic()`.
+
 ## Read, select, and retain
 
 ```sh

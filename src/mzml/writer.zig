@@ -8,6 +8,7 @@ const model = @import("model.zig");
 const schema = @import("schema.zig");
 const xml = @import("../xml/mzml_adapter.zig");
 const base64 = @import("../binary/base64.zig");
+const Diagnostic = @import("diagnostic.zig");
 
 const Writer = @This();
 const COUNT_PLACEHOLDER = "0" ** std.fmt.comptimePrint("{d}", .{std.math.maxInt(usize)}).len;
@@ -36,7 +37,7 @@ engine: xml.Writer,
 allocator: std.mem.Allocator,
 limits: Limits,
 phase: enum { initial, run, list, document, done } = .initial,
-failed: bool = false,
+failure: ?Diagnostic = null,
 list_kind: ?model.Kind = null,
 expected_count: usize = 0,
 written_count: usize = 0,
@@ -94,11 +95,64 @@ pub fn deinit(self: *Writer) void {
     self.* = undefined;
 }
 
+/// Returns the first failure, unchanged by later FailedState returns. Reports do
+/// not make partial output usable. A final caller-owned flush is not reported here.
+pub fn diagnostic(self: *const Writer) ?Diagnostic {
+    return self.failure;
+}
+
+fn capture(self: *Writer, err: Error, stage: Diagnostic.Stage, detail: Diagnostic.Detail) void {
+    if (self.failure != null) return;
+    var report = Diagnostic.init(err, .write_record, stage, detail);
+    if (self.engine.failure != null) {
+        report.stage = .output;
+        if (err == error.WriterLimit and self.engine.frame_count == 64)
+            report = Diagnostic.init(err, .write_record, .output, .{ .limit = .{ .name = .depth, .maximum = 64 } });
+    }
+    if (self.engine.byteOffset()) |offset| report.location = .{ .output_byte = offset };
+    self.failure = report;
+}
+
+fn fail(self: *Writer, err: Error, operation: Diagnostic.Operation) void {
+    self.capture(err, .metadata, .none);
+    self.failure.?.operation = operation;
+}
+
+fn limitError(self: *Writer, name: Diagnostic.Limit, maximum: usize, needed: ?usize) Error!noreturn {
+    self.capture(error.LimitExceeded, .metadata, .{ .limit = .{ .name = name, .maximum = maximum, .needed = needed } });
+    return error.LimitExceeded;
+}
+
+fn sizeError(self: *Writer, err: Error, expected: usize, actual: usize, unit: Diagnostic.SizeUnit) Error!noreturn {
+    self.capture(err, .metadata, .{ .size = .{ .expected = expected, .actual = actual, .unit = unit } });
+    return err;
+}
+
+fn number(self: *Writer, node: model.Node, attribute: Diagnostic.Attribute) Error!usize {
+    return cv.parseInteger(usize, node.attribute(attribute.xmlName())) catch |err| {
+        self.capture(err, .metadata, .{ .attribute = attribute });
+        return @as(Error!usize, err);
+    };
+}
+
+fn ioFailure(self: *Writer, err: Error) Error!noreturn {
+    self.capture(err, .output, .none);
+    self.failure.?.location = null;
+    return err;
+}
+
+fn copyId(self: *Writer, state: *IndexState, id: []const u8) Error![]const u8 {
+    return state.copyId(id) catch |err| {
+        self.capture(err, .index, if (err == error.LimitExceeded) .{ .limit = .{ .name = .id_bytes, .maximum = state.limits.id_bytes } } else .none);
+        return @as(Error![]const u8, err);
+    };
+}
+
 /// Emits source metadata and opens the run. Initialization selects plain or indexed output.
 /// Nodes and parameters are borrowed only for the duration of this call.
 pub fn writeHeader(self: *Writer, header: model.Header) Error!void {
-    if (self.failed) return error.FailedState;
-    errdefer self.failed = true;
+    if (self.failure != null) return error.FailedState;
+    errdefer |err| self.fail(err, .write_header);
     if (self.phase != .initial) return error.InvalidState;
     try schema.checkHeader(header);
     self.namespace_uri = if (std.mem.eql(u8, header.namespace_uri, xml.NAMESPACE)) xml.NAMESPACE else if (std.mem.eql(u8, header.namespace_uri, xml.NAMESPACE_1_0)) xml.NAMESPACE_1_0 else return error.InvalidNamespace;
@@ -131,8 +185,11 @@ pub fn beginList(self: *Writer, kind: model.Kind, count: ?usize, processing_ref:
 /// first, ignoring source count attributes; other attributes keep their order and values.
 /// An absent processing reference stays absent. Null count and list order follow beginList.
 pub fn beginListWithAttributes(self: *Writer, kind: model.Kind, count: ?usize, attributes: []const model.Attribute) Error!void {
-    if (self.failed) return error.FailedState;
-    errdefer self.failed = true;
+    if (self.failure != null) return error.FailedState;
+    errdefer |err| {
+        self.fail(err, .open_list);
+        self.failure.?.element = kind;
+    }
     if (self.phase != .run) return error.InvalidState;
     if (kind != .spectrum_list and kind != .chromatogram_list) return error.InvalidStructure;
     if (self.list_kind == kind or self.list_kind == .chromatogram_list) return error.InvalidStructure;
@@ -166,8 +223,8 @@ pub fn writeRecord(self: *Writer, node: model.Node) Error!void {
 /// use beginListWithAttributes instead when filtering or choosing unknown counts.
 /// Decoded records still need writeRecordWithArrays for their omitted binary text.
 pub fn writeItem(self: *Writer, item: model.Item) Error!void {
-    if (self.failed) return error.FailedState;
-    errdefer self.failed = true;
+    if (self.failure != null) return error.FailedState;
+    errdefer |err| self.fail(err, .write_item);
     switch (item) {
         .list_start => |start| try self.beginListWithAttributes(start.kind, start.list.declared_count, start.list.attributes),
         .record => |record| try self.writeRecord(record.node),
@@ -194,37 +251,54 @@ pub fn writeRecordWithArrays(self: *Writer, node: model.Node, wire_arrays: []con
 }
 
 fn writeRecordInner(self: *Writer, node: model.Node, comptime replace_arrays: bool, wire_arrays: []const []const u8) Error!void {
-    if (self.failed) return error.FailedState;
-    errdefer self.failed = true;
+    if (self.failure != null) return error.FailedState;
+    errdefer |err| {
+        self.fail(err, .write_record);
+        if (self.failure.?.element == null) self.failure.?.element = node.kind;
+        if (self.phase == .list and (node.kind == .spectrum or node.kind == .chromatogram))
+            self.failure.?.record = .{ .kind = if (node.kind == .spectrum) .spectrum else .chromatogram, .ordinal = self.written_count };
+    }
     if (self.phase != .list) return error.InvalidState;
     const expected: model.Kind = if (self.list_kind == .spectrum_list) .spectrum else .chromatogram;
     if (node.kind != expected) return error.InvalidStructure;
-    if (self.written_count == self.expected_count) return error.CountMismatch;
+    if (self.written_count == self.expected_count) {
+        if (self.written_count < std.math.maxInt(usize)) return try self.sizeError(error.CountMismatch, self.expected_count, self.written_count + 1, .records);
+        return error.CountMismatch;
+    }
     if (replace_arrays) {
         const list = node.child(.binary_data_array_list);
         const arrays = if (list) |value| value.children else &.{};
-        if (arrays.len != wire_arrays.len) return error.CountMismatch;
+        if (arrays.len != wire_arrays.len) return try self.sizeError(error.CountMismatch, arrays.len, wire_arrays.len, .arrays);
         const sink = if (self.index_state) |state| state.hashed.out else self.engine.sink;
         if (overlaps(sink.buffer, std.mem.sliceAsBytes(wire_arrays))) return error.OverlappingBuffers;
-        for (arrays, wire_arrays) |array, wire| {
+        for (arrays, wire_arrays, 0..) |array, wire, position| {
+            errdefer |err| {
+                self.capture(err, .array, .none);
+                self.failure.?.element = .binary_data_array;
+                self.failure.?.array_position = position;
+            }
             if (array.kind != .binary_data_array or array.children.len != 1 or
                 array.children[0].kind != .binary) return error.InvalidStructure;
             if (overlaps(sink.buffer, wire)) return error.OverlappingBuffers;
             const length = try base64.encodedSize(wire.len);
-            if (length > self.limits.text_bytes) return error.LimitExceeded;
-            if (try cv.parseInteger(usize, array.attribute("encodedLength")) != length)
-                return error.EncodedLengthMismatch;
+            if (length > self.limits.text_bytes) return try self.limitError(.text_bytes, self.limits.text_bytes, length);
+            const declared = try self.number(array, .encoded_length);
+            if (declared != length) return try self.sizeError(error.EncodedLengthMismatch, length, declared, .bytes);
         }
     }
-    if (try cv.parseInteger(usize, node.attribute("index")) != self.written_count)
-        return error.InvalidIndex;
+    const index = try self.number(node, .index);
+    if (index != self.written_count) return try self.sizeError(error.InvalidIndex, self.written_count, index, .index);
     if (self.index_state) |state| {
         try self.engine.text("");
         const offset = self.engine.byteOffset() orelse return error.LimitExceeded;
         if (offset > std.math.maxInt(i64)) return error.LimitExceeded;
-        const id = node.attribute("id") orelse return error.MissingAttribute;
-        if (state.entries.items.len == state.limits.records) return error.LimitExceeded;
-        const copied = try state.copyId(id);
+        errdefer |err| self.capture(err, .index, .none);
+        const id = node.attribute("id") orelse {
+            self.capture(error.MissingAttribute, .index, .{ .attribute = .id });
+            return error.MissingAttribute;
+        };
+        if (state.entries.items.len == state.limits.records) return try self.limitError(.records, state.limits.records, null);
+        const copied = try self.copyId(state, id);
         const found = try state.ids[if (node.kind == .spectrum) @as(usize, 0) else 1].getOrPutContextAdapted(
             state.allocator,
             copied,
@@ -234,8 +308,8 @@ fn writeRecordInner(self: *Writer, node: model.Node, comptime replace_arrays: bo
         if (found.found_existing) return error.DuplicateId;
         found.key_ptr.* = state.entries.items.len;
         if (state.historical) {
-            const native_id = if (node.attribute("nativeID")) |value| try state.copyId(value) else null;
-            const spot_id = if (node.attribute("spotID")) |value| try state.copyId(value) else null;
+            const native_id = if (node.attribute("nativeID")) |value| try self.copyId(state, value) else null;
+            const spot_id = if (node.attribute("spotID")) |value| try self.copyId(state, value) else null;
             try state.historical_ids.append(state.allocator, .{ .native_id = native_id, .spot_id = spot_id });
         }
         try state.entries.ensureUnusedCapacity(state.allocator, 1);
@@ -245,26 +319,30 @@ fn writeRecordInner(self: *Writer, node: model.Node, comptime replace_arrays: bo
     var remaining = wire_arrays;
     var budget = self.limits.nodes;
     try self.writeNode(node, replace_arrays, &remaining, self.limits.depth, &budget);
-    if (remaining.len != 0) return error.CountMismatch;
+    if (remaining.len != 0) return try self.sizeError(error.CountMismatch, wire_arrays.len - remaining.len, wire_arrays.len, .arrays);
     self.written_count += 1;
 }
 
 /// Closes the active list, checking a supplied count or patching an unknown count.
 /// Patching flushes pending file bytes but does not change the output position.
 pub fn endList(self: *Writer) Error!void {
-    if (self.failed) return error.FailedState;
-    errdefer self.failed = true;
+    if (self.failure != null) return error.FailedState;
+    errdefer |err| {
+        self.fail(err, .close_list);
+        if (self.failure.?.element == null) self.failure.?.element = self.list_kind;
+    }
     if (self.phase != .list) return error.InvalidState;
-    if (self.count_offset == null and self.written_count != self.expected_count) return error.CountMismatch;
+    if (self.count_offset == null and self.written_count != self.expected_count)
+        return try self.sizeError(error.CountMismatch, self.expected_count, self.written_count, .records);
     try self.engine.endElement();
     if (self.count_offset) |offset| {
         const sink = self.file_sink.?;
-        try sink.interface.flush();
+        sink.interface.flush() catch |err| return try self.ioFailure(err);
         var buffer: [32]u8 = undefined;
         const text = std.fmt.bufPrint(&buffer, "{d}", .{self.written_count}) catch return error.LimitExceeded;
         var count = COUNT_PLACEHOLDER.*;
         @memcpy(count[count.len - text.len ..], text);
-        try sink.file.writePositionalAll(sink.io, &count, offset);
+        sink.file.writePositionalAll(sink.io, &count, offset) catch |err| return try self.ioFailure(err);
     }
     self.phase = .run;
 }
@@ -272,8 +350,8 @@ pub fn endList(self: *Writer) Error!void {
 /// Closes the run and document. Indexed file output flushes and reads the checksum
 /// prefix, but the caller must flush the final bytes. Can succeed only once.
 pub fn finish(self: *Writer) Error!void {
-    if (self.failed) return error.FailedState;
-    errdefer self.failed = true;
+    if (self.failure != null) return error.FailedState;
+    errdefer |err| self.fail(err, .finish);
     if (self.phase != .run and self.phase != .document) return error.InvalidState;
     if (self.phase == .run) try self.engine.endElement();
     try self.engine.endElement();
@@ -283,6 +361,7 @@ pub fn finish(self: *Writer) Error!void {
 }
 
 fn writeIndex(self: *Writer, state: *IndexState) Error!void {
+    errdefer |err| self.capture(err, .index, .none);
     const offset = self.engine.byteOffset() orelse return error.LimitExceeded;
     if (offset > std.math.maxInt(i64)) return error.LimitExceeded;
     const spectrum = state.spectra != 0 or state.entries.items.len == 0;
@@ -316,15 +395,15 @@ fn writeIndex(self: *Writer, state: *IndexState) Error!void {
     try self.engine.startElement("fileChecksum");
     try self.engine.text("");
     const digest = if (self.file_sink) |sink| digest: {
-        try sink.interface.flush();
+        sink.interface.flush() catch |err| return try self.ioFailure(err);
         const end = self.engine.byteOffset() orelse return error.LimitExceeded;
         var hasher = std.crypto.hash.Sha1.init(.{});
         var buffer: [64 * 1024]u8 = undefined;
         var position: u64 = 0;
         while (position < end) {
             const capacity: usize = @intCast(@min(buffer.len, end - position));
-            const length = try sink.file.readPositional(sink.io, &.{buffer[0..capacity]}, position);
-            if (length == 0) return error.UnexpectedEndOfFile;
+            const length = sink.file.readPositional(sink.io, &.{buffer[0..capacity]}, position) catch |err| return try self.ioFailure(err);
+            if (length == 0) return try self.ioFailure(error.UnexpectedEndOfFile);
             hasher.update(buffer[0..length]);
             position += length;
         }
@@ -337,7 +416,12 @@ fn writeIndex(self: *Writer, state: *IndexState) Error!void {
 }
 
 fn writeNode(self: *Writer, node: model.Node, comptime replace_arrays: bool, remaining: *[]const []const u8, depth: usize, budget: *usize) Error!void {
-    if (depth == 0 or budget.* == 0) return error.LimitExceeded;
+    errdefer |err| {
+        self.capture(err, .metadata, .none);
+        if (self.failure.?.element == null) self.failure.?.element = node.kind;
+    }
+    if (depth == 0) return try self.limitError(.depth, self.limits.depth, null);
+    if (budget.* == 0) return try self.limitError(.nodes, self.limits.nodes, null);
     budget.* -= 1;
     if (node.kind == .binary) {
         if (node.params.len != 0) return error.InvalidStructure;
@@ -350,7 +434,7 @@ fn writeNode(self: *Writer, node: model.Node, comptime replace_arrays: bool, rem
         try self.engine.binary(remaining.*[0]);
         remaining.* = remaining.*[1..];
     } else if (node.text) |text| {
-        if (text.len > self.limits.text_bytes) return error.LimitExceeded;
+        if (text.len > self.limits.text_bytes) return try self.limitError(.text_bytes, self.limits.text_bytes, text.len);
         try self.engine.text(text);
     }
     try self.writeContent(node, replace_arrays, remaining, depth - 1, budget);
@@ -358,11 +442,19 @@ fn writeNode(self: *Writer, node: model.Node, comptime replace_arrays: bool, rem
 }
 
 fn writeContent(self: *Writer, node: model.Node, comptime replace_arrays: bool, remaining: *[]const []const u8, depth: usize, budget: *usize) Error!void {
+    errdefer |err| {
+        self.capture(err, .metadata, .none);
+        if (self.failure.?.element == null) self.failure.?.element = node.kind;
+    }
     const rules = schema.CHILD_KINDS.get(node.kind);
     var seen = std.EnumSet(model.Kind).initEmpty();
     if (node.content == null) {
         try self.writeParams(node.params, depth, budget);
-        for (node.children) |child| {
+        for (node.children, 0..) |child, position| {
+            errdefer |err| if (node.kind == .binary_data_array_list) {
+                self.capture(err, .metadata, .none);
+                self.failure.?.array_position = position;
+            };
             if (!rules.allowed.contains(child.kind) or (node.kind == .mzml and child.kind == .run)) return error.InvalidStructure;
             if (rules.singular.contains(child.kind) and seen.contains(child.kind)) return error.InvalidStructure;
             seen.insert(child.kind);
@@ -380,7 +472,11 @@ fn writeContent(self: *Writer, node: model.Node, comptime replace_arrays: bool, 
         },
         .children => |count| {
             if (count > node.children.len - children) return error.InvalidStructure;
-            for (node.children[children..][0..count]) |child| {
+            for (node.children[children..][0..count], children..) |child, position| {
+                errdefer |err| if (node.kind == .binary_data_array_list) {
+                    self.capture(err, .metadata, .none);
+                    self.failure.?.array_position = position;
+                };
                 if (!rules.allowed.contains(child.kind) or (node.kind == .mzml and child.kind == .run))
                     return error.InvalidStructure;
                 if (rules.singular.contains(child.kind) and seen.contains(child.kind)) return error.InvalidStructure;
@@ -396,10 +492,21 @@ fn writeContent(self: *Writer, node: model.Node, comptime replace_arrays: bool, 
 
 // Keep fragment parser storage off ordinary recursive write frames.
 noinline fn writeXml(self: *Writer, bytes: []const u8, depth: usize, budget: *usize) Error!void {
-    if (depth == 0 or bytes.len > self.limits.text_bytes) return error.LimitExceeded;
+    if (depth == 0) return try self.limitError(.depth, self.limits.depth, null);
+    if (bytes.len > self.limits.text_bytes) return try self.limitError(.text_bytes, self.limits.text_bytes, bytes.len);
     var input = std.Io.Reader.fixed(bytes);
     var cursor = try xml.Cursor.init(self.allocator, &input, @min(depth, 64), @max(1, bytes.len / 4), self.limits.text_bytes);
     defer cursor.deinit();
+    errdefer |err| {
+        var detail = Diagnostic.xmlDetail(&cursor);
+        if (detail == .limit) switch (detail.limit.name) {
+            .nodes => detail.limit.maximum = self.limits.nodes,
+            .depth => detail.limit.maximum = self.limits.depth,
+            else => {},
+        };
+        self.capture(err, .xml, detail);
+        if (self.engine.failure == null) self.failure.?.location = null;
+    }
     try cursor.advanceFragment(true);
     if (cursor.current == null or cursor.current.?.data != .start_element) return error.InvalidStructure;
     try cursor.writeElement(&self.engine, budget);
@@ -506,7 +613,7 @@ fn writeParams(self: *Writer, params: []const cv.Entry, depth: usize, budget: *u
         if (extra) |value| for (value.content) |part| switch (part) {
             .xml => |bytes| try self.writeXml(bytes, depth -| 1, budget),
             .text => |bytes| {
-                if (bytes.len > self.limits.text_bytes) return error.LimitExceeded;
+                if (bytes.len > self.limits.text_bytes) return try self.limitError(.text_bytes, self.limits.text_bytes, bytes.len);
                 try self.engine.text(bytes);
             },
         };

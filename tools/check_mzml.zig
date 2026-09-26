@@ -47,11 +47,13 @@ const Totals = struct {
 fn checkFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Totals {
     const file = try std.Io.Dir.cwd().openFile(io, path, .{});
     defer file.close(io);
-    var index = mzml.IndexedReader.build(allocator, .{ .file = .{ .handle = file, .io = io } }, .{ .policy = .rebuild }) catch |err| {
-        std.debug.print("index diagnostic: {s}\n", .{@errorName(err)});
+    var failure: ?mzml.Diagnostic = null;
+    var index = mzml.IndexedReader.buildWithDiagnostic(allocator, .{ .file = .{ .handle = file, .io = io } }, .{ .policy = .rebuild }, &failure) catch |err| {
+        if (failure) |report| std.debug.print("index diagnostic: {f}\n", .{report});
         return err;
     };
     defer index.deinit();
+    errdefer if (index.diagnostic()) |report| std.debug.print("index diagnostic: {f}\n", .{report});
     var buffer: [64 * 1024]u8 = undefined;
     var input = file.reader(io, &buffer);
     var reader = try mzml.StreamReader.init(allocator, &input.interface, .{});
@@ -111,15 +113,7 @@ fn checkFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Totals
 
 fn reportReaderFailure(reader: *mzml.StreamReader, err: anyerror) void {
     if (reader.diagnostic()) |diagnostic| {
-        if (diagnostic.element) |element| {
-            std.debug.print("diagnostic: {s} at byte {d}, element {s}\n", .{
-                @errorName(diagnostic.code), diagnostic.byte_offset, @tagName(element),
-            });
-        } else {
-            std.debug.print("diagnostic: {s} at byte {d}, element none\n", .{
-                @errorName(diagnostic.code), diagnostic.byte_offset,
-            });
-        }
+        std.debug.print("diagnostic: {f}\n", .{diagnostic});
     } else {
         std.debug.print("diagnostic: {s} without reader location\n", .{@errorName(err)});
     }

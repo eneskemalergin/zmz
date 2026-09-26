@@ -471,6 +471,8 @@ pub const Cursor = struct {
     namespace_bytes: std.ArrayList(u8) = .empty,
     namespace_bindings: std.ArrayList(NamespaceBinding) = .empty,
     additional_namespaces: ?bool = null,
+    failure: ?Error = null,
+    limit_failure: ?enum { depth, attributes, attribute_bytes, nodes, declaration_bytes, text_bytes } = null,
 
     /// Initializes a cursor without consuming the input.
     pub fn init(
@@ -557,6 +559,8 @@ pub const Cursor = struct {
     }
 
     fn resetState(self: *Cursor, keep_ancestors: bool) void {
+        self.failure = null;
+        self.limit_failure = null;
         self.current = null;
         self.offset = 0;
         self.document_started = false;
@@ -595,6 +599,7 @@ pub const Cursor = struct {
     }
 
     fn advanceInner(self: *Cursor, text: bool, comptime mzml_root: bool) Error!void {
+        errdefer |err| self.failure = err;
         self.current = null;
         while (true) {
             const maybe_event = self.nextEvent(!text) catch |err| {
@@ -677,7 +682,7 @@ pub const Cursor = struct {
         while (self.current) |event| {
             switch (event.data) {
                 .start_element => |start| {
-                    if (remaining_nodes.* == 0) return error.LimitExceeded;
+                    if (remaining_nodes.* == 0) return self.limitError(.nodes);
                     remaining_nodes.* -= 1;
                     nesting += 1;
                     try output.startElement(start.name.raw);
@@ -707,6 +712,7 @@ pub const Cursor = struct {
 
     /// Checks and skips the current start-element subtree.
     pub fn skip(self: *Cursor) Error!void {
+        errdefer |err| self.failure = err;
         const start = self.current orelse return error.InvalidState;
         switch (start.data) {
             .start_element => {},
@@ -865,13 +871,13 @@ pub const Cursor = struct {
     }
 
     fn appendEventByte(self: *Cursor, value: u8) Error!void {
-        if (self.event_bytes.items.len >= self.max_attribute_bytes) return error.LimitExceeded;
+        if (self.event_bytes.items.len >= self.max_attribute_bytes) return self.limitError(.attribute_bytes);
         try self.event_bytes.append(self.allocator, value);
     }
 
     fn appendEventSlice(self: *Cursor, value: []const u8) Error!void {
         const next_length = std.math.add(usize, self.event_bytes.items.len, value.len) catch return error.LimitExceeded;
-        if (next_length > self.max_attribute_bytes) return error.LimitExceeded;
+        if (next_length > self.max_attribute_bytes) return self.limitError(.attribute_bytes);
         try self.event_bytes.appendSlice(self.allocator, value);
     }
 
@@ -888,7 +894,7 @@ pub const Cursor = struct {
         var encoded: [4]u8 = undefined;
         const len = std.unicode.utf8Encode(actual, &encoded) catch return error.InvalidXml;
         const next_length = std.math.add(usize, self.text_bytes.items.len, len) catch return error.LimitExceeded;
-        if (next_length > TEXT_CHUNK_BYTES) return error.LimitExceeded;
+        if (next_length > TEXT_CHUNK_BYTES) return self.limitError(.text_bytes);
         try self.text_bytes.appendSlice(self.allocator, encoded[0..len]);
     }
 
@@ -1154,7 +1160,7 @@ pub const Cursor = struct {
             }
             try self.source.unread(marker);
 
-            if (self.attribute_ranges.items.len == self.max_attributes) return error.LimitExceeded;
+            if (self.attribute_ranges.items.len == self.max_attributes) return self.limitError(.attributes);
             const attribute_name = try self.parseQName();
             const quote: u21 = opening: {
                 if (try self.source.peekSingleByte()) |bytes| {
@@ -1200,7 +1206,7 @@ pub const Cursor = struct {
             if (self.root_closed) return error.InvalidXml;
             self.root_seen = true;
         }
-        if (self.depth == self.max_depth) return error.LimitExceeded;
+        if (self.depth == self.max_depth) return self.limitError(.depth);
 
         const binding_start = self.namespace_bindings.items.len;
         const namespace_bytes_start = self.namespace_bytes.items.len;
@@ -1532,8 +1538,13 @@ pub const Cursor = struct {
     }
 
     fn appendDeclarationByte(self: *Cursor, value: u8) Error!void {
-        if (self.declaration_bytes.items.len == 4096) return error.LimitExceeded;
+        if (self.declaration_bytes.items.len == 4096) return self.limitError(.declaration_bytes);
         try self.declaration_bytes.append(self.allocator, value);
+    }
+
+    fn limitError(self: *Cursor, limit: @TypeOf(self.limit_failure.?)) Error {
+        self.limit_failure = limit;
+        return error.LimitExceeded;
     }
 
     fn parseXmlDeclaration(self: *Cursor) Error!void {

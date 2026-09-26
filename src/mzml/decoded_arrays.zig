@@ -13,6 +13,7 @@ const cv = @import("../cv/source.zig");
 const arrays = @import("../binary/arrays.zig");
 const base64 = @import("../binary/base64.zig");
 const encoding = @import("../binary/encoding.zig");
+const Diagnostic = @import("diagnostic.zig");
 
 const DecodedArrays = @This();
 
@@ -34,6 +35,7 @@ count: usize = 0,
 ready: bool = false,
 default_length: ?usize = null,
 decoder: base64.Decoder = undefined,
+failure: ?struct { stage: Diagnostic.Stage, detail: Diagnostic.Detail = .none } = null,
 
 pub fn init(allocator: std.mem.Allocator, limits: arrays.Limits) DecodedArrays {
     return .{ .allocator = allocator, .limits = limits };
@@ -51,6 +53,7 @@ pub fn deinit(self: *DecodedArrays) void {
 pub fn reset(self: *DecodedArrays) void {
     self.count = 0;
     self.ready = false;
+    self.failure = null;
 }
 
 pub fn len(self: *const DecodedArrays) usize {
@@ -77,20 +80,29 @@ pub fn startRecord(self: *DecodedArrays, node: model.Node) Error!void {
 }
 
 pub fn text(self: *DecodedArrays, bytes: []const u8) Error!void {
+    errdefer if (self.failure == null) {
+        self.failure = .{ .stage = .base64 };
+    };
     const compressed = self.outputs.items[self.count - 1].encoding.pipeline != .none;
     if (compressed) {
         const total = std.math.add(usize, self.decoder.counts.text_bytes, bytes.len) catch return error.LengthOverflow;
-        if (total > self.limits.base64_text.text_bytes) return error.LimitExceeded;
+        if (total > self.limits.base64_text.text_bytes) return try self.limitError(.base64_text_bytes, self.limits.base64_text.text_bytes, total);
         const incoming = @min(bytes.len, self.limits.base64_text.significant_bytes -| self.decoder.counts.significant_bytes);
         const pending = std.math.add(usize, incoming, self.decoder.quartet_len) catch return error.LengthOverflow;
         const needed = std.math.add(usize, self.decoder.counts.decoded_bytes, pending / 4 * 3) catch return error.LengthOverflow;
         try self.wire.resize(self.allocator, @min(needed, self.limits.base64_text.decoded_bytes));
         self.decoder.output = self.wire.items;
     }
-    self.decoder.update(bytes) catch |err| return if (err == error.OutputTooSmall and !compressed)
-        error.DecodedSizeMismatch
-    else
-        err;
+    self.decoder.update(bytes) catch |err| {
+        if (err == error.LimitExceeded) {
+            if (self.decoder.quartet_len == 4)
+                return try self.limitError(.base64_decoded_bytes, self.limits.base64_text.decoded_bytes, null);
+            if (self.decoder.error_offset != null)
+                return try self.limitError(.base64_significant_bytes, self.limits.base64_text.significant_bytes, null);
+            return try self.limitError(.base64_text_bytes, self.limits.base64_text.text_bytes, null);
+        }
+        return if (err == error.OutputTooSmall and !compressed) error.DecodedSizeMismatch else err;
+    };
 }
 
 pub fn complete(self: *DecodedArrays) void {
@@ -98,6 +110,12 @@ pub fn complete(self: *DecodedArrays) void {
 }
 
 pub fn beginArray(self: *DecodedArrays, node: model.Node, groups: []const cv.Group, source_position: usize) Error!void {
+    errdefer |err| if (self.failure == null) {
+        self.failure = .{ .stage = .array, .detail = switch (@as(anyerror, err)) {
+            error.MissingValue, error.EmptyValue, error.InvalidValue, error.Overflow => .{ .attribute = .array_length },
+            else => .none,
+        } };
+    };
     const array = try model.BinaryArray.init(node, self.default_length, groups);
     if (self.count == self.outputs.items.len) try self.outputs.append(self.allocator, .{});
     const output = &self.outputs.items[self.count];
@@ -110,7 +128,7 @@ pub fn beginArray(self: *DecodedArrays, node: model.Node, groups: []const cv.Gro
         .float64, .int64 => 8,
     };
     const bytes = std.math.mul(usize, array.length, width) catch return error.LengthOverflow;
-    if (bytes > self.limits.array_bytes) return error.LimitExceeded;
+    if (bytes > self.limits.array_bytes) return try self.limitError(.array_bytes, self.limits.array_bytes, bytes);
     try output.words.resize(self.allocator, bytes / 8 + @intFromBool(bytes % 8 != 0));
     self.wire.clearRetainingCapacity();
     try self.transformed.resize(self.allocator, switch (array.encoding.pipeline) {
@@ -122,19 +140,35 @@ pub fn beginArray(self: *DecodedArrays, node: model.Node, groups: []const cv.Gro
 }
 
 pub fn finishArray(self: *DecodedArrays) Error!void {
-    const counts = try self.decoder.finish();
+    const counts = self.decoder.finish() catch |err| {
+        self.failure = .{ .stage = .base64 };
+        return err;
+    };
     const output = &self.outputs.items[self.count - 1];
     const wire = self.decoder.output[0..counts.decoded_bytes];
     const pipeline = if (output.length == 0 and output.encoding.pipeline == .zlib and counts.significant_bytes == 0)
         arrays.Pipeline.none
     else
         output.encoding.pipeline;
+    errdefer |err| {
+        self.failure = .{ .stage = .array };
+        if (err == error.DecodedSizeMismatch and pipeline == .none)
+            self.failure.?.detail = .{ .size = .{ .expected = switch (output.primitive()) {
+                .float32, .int32 => output.length * 4,
+                .float64, .int64 => output.length * 8,
+            }, .actual = counts.decoded_bytes, .unit = .bytes } };
+    }
     switch (output.primitive()) {
         .float32 => try arrays.decodeWire(f32, output.values(f32), wire, pipeline, self.transformed.items, self.limits),
         .float64 => try arrays.decodeWire(f64, output.values(f64), wire, pipeline, self.transformed.items, self.limits),
         .int32 => try arrays.decodeWire(i32, output.values(i32), wire, pipeline, self.transformed.items, self.limits),
         .int64 => try arrays.decodeWire(i64, output.values(i64), wire, pipeline, self.transformed.items, self.limits),
     }
+}
+
+fn limitError(self: *DecodedArrays, name: Diagnostic.Limit, maximum: usize, needed: ?usize) Error!noreturn {
+    self.failure = .{ .stage = if (name == .array_bytes) .array else .base64, .detail = .{ .limit = .{ .name = name, .maximum = maximum, .needed = needed } } };
+    return error.LimitExceeded;
 }
 
 const Output = struct {

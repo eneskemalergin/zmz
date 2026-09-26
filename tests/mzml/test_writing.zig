@@ -4,6 +4,68 @@ const std = @import("std");
 const mzml = @import("zmz").mzml;
 const support = @import("support.zig");
 
+test "[failure] - [mzML diagnostics]: reports writer counts indexes and allocation failures" {
+    const header: mzml.model.Header = .{ .document = .{ .kind = .mzml }, .run = .{ .kind = .run } };
+    for (0..4) |case| {
+        var bytes: [4096]u8 = undefined;
+        var sink = std.Io.Writer.fixed(&bytes);
+        var writer = try mzml.Writer.init(std.testing.allocator, &sink, .{});
+        defer writer.deinit();
+        try writer.writeHeader(header);
+        try writer.beginListWithAttributes(.spectrum_list, 1, &.{});
+        const node: mzml.model.Node = .{ .kind = .spectrum, .attributes = if (case == 3) &.{} else &.{.{ .name = "index", .value = if (case == 0) "4" else "0" }} };
+        switch (case) {
+            0 => try std.testing.expectError(error.InvalidIndex, writer.writeRecord(node)),
+            1 => try std.testing.expectError(error.CountMismatch, writer.endList()),
+            2 => {
+                try writer.writeRecord(node);
+                try std.testing.expectError(error.CountMismatch, writer.writeItem(.{ .record = .{ .node = node, .id = "", .index = null, .default_array_length = null } }));
+            },
+            3 => try std.testing.expectError(error.MissingValue, writer.writeRecord(node)),
+            else => unreachable,
+        }
+        const report = writer.diagnostic().?;
+        if (case == 3) {
+            try std.testing.expectEqual(.index, report.detail.attribute);
+        } else {
+            try std.testing.expectEqual(@as(u64, if (case == 0) 0 else 1), report.detail.size.expected);
+            try std.testing.expectEqual(@as(u64, if (case == 0) 4 else if (case == 1) 0 else 2), report.detail.size.actual);
+        }
+        const operation: mzml.Diagnostic.Operation = if (case == 2) .write_item else if (case == 1) .close_list else .write_record;
+        try std.testing.expectEqual(operation, report.operation);
+        try std.testing.expect(report.location.?.output_byte > 0);
+        try std.testing.expectError(error.FailedState, writer.finish());
+        try std.testing.expectEqualDeep(report, writer.diagnostic().?);
+    }
+    const Check = struct {
+        fn emit(writer: *mzml.Writer) mzml.Writer.Error!void {
+            try writer.writeHeader(header);
+            try writer.beginListWithAttributes(.spectrum_list, 1, &.{});
+            try writer.writeRecord(.{ .kind = .spectrum, .attributes = &.{ .{ .name = "index", .value = "0" }, .{ .name = "id", .value = "first" } } });
+            try writer.endList();
+            try writer.finish();
+        }
+        fn run(allocator: std.mem.Allocator) !void {
+            var bytes: [4096]u8 = undefined;
+            var sink = std.Io.Writer.fixed(&bytes);
+            var writer = try mzml.Writer.initIndexed(allocator, &sink, .{}, .{});
+            defer writer.deinit();
+            emit(&writer) catch |err| {
+                const report = writer.diagnostic().?;
+                try std.testing.expectEqual(error.OutOfMemory, err);
+                try std.testing.expectEqual(err, report.code);
+                try std.testing.expectEqual(.out_of_memory, report.id);
+                var text: [512]u8 = undefined;
+                var output = std.Io.Writer.fixed(&text);
+                try report.format(&output);
+                return err;
+            };
+            try std.testing.expectEqual(null, writer.diagnostic());
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
 test "[integration] - [mzML items]: retains empty-list XML and indexes following chromatograms" {
     const source = "<mzML xmlns='http://psi.hupo.org/ms/mzml' xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance'><run>" ++
         "<spectrumList count='0'><first/><software/></spectrumList><between/><scan/>" ++
@@ -677,8 +739,32 @@ test "[integration] - [mzML prepared writing]: rejects mismatches and keeps sink
                 else => unreachable,
             }
             if (failure != 4 and failure != 8) try std.testing.expectEqual(before, sink.buffered().len);
+            const report = writer.diagnostic().?;
+            try std.testing.expectEqual(.write_record, report.operation);
+            try std.testing.expectEqual(@as(usize, 0), report.record.?.ordinal);
+            switch (failure) {
+                0 => {
+                    try std.testing.expectEqual(.count_mismatch, report.id);
+                    try std.testing.expectEqual(@as(u64, 2), report.detail.size.expected);
+                    try std.testing.expectEqual(@as(u64, 0), report.detail.size.actual);
+                    try std.testing.expectEqual(.arrays, report.detail.size.unit);
+                },
+                1 => {
+                    try std.testing.expectEqual(.encoded_length_mismatch, report.id);
+                    try std.testing.expectEqual(@as(usize, 1), report.array_position.?);
+                    try std.testing.expectEqual(@as(u64, 4), report.detail.size.expected);
+                    try std.testing.expectEqual(@as(u64, 12), report.detail.size.actual);
+                },
+                3 => {
+                    try std.testing.expectEqual(.text_bytes, report.detail.limit.name);
+                    try std.testing.expectEqual(@as(u64, 11), report.detail.limit.maximum);
+                },
+                4 => try std.testing.expectEqual(null, report.location),
+                else => {},
+            }
             try std.testing.expectError(error.FailedState, writer.finish());
             try std.testing.expectError(error.FailedState, writer.writeRecordWithArrays(record.node, &.{ &bytes, &bytes }));
+            try std.testing.expectEqualDeep(report, writer.diagnostic().?);
         }
     }
 }
@@ -789,6 +875,9 @@ test "[failure] - [mzML writer]: checks node bounds and missing payloads during 
     var missing = node;
     missing.children = &.{list};
     try std.testing.expectError(error.PayloadNotRetained, writer.writeRecord(missing));
+    try std.testing.expectEqual(.missing_payload, writer.diagnostic().?.id);
+    try std.testing.expectEqual(.binary, writer.diagnostic().?.element.?);
+    try std.testing.expectEqual(@as(usize, 0), writer.diagnostic().?.array_position.?);
     try std.testing.expectError(error.FailedState, writer.finish());
 }
 
@@ -1065,8 +1154,20 @@ test "[failure] - [mzML file writer]: flush, count patch, and checksum read fail
                 try std.testing.expectError(if (failure == .read) error.InputOutput else error.UnexpectedEndOfFile, writer.finish());
             },
         }
+        const report = writer.diagnostic().?;
+        try std.testing.expectEqual(switch (failure) {
+            .flush => error.WriteFailed,
+            .patch => error.NoSpaceLeft,
+            .unseekable => error.Unseekable,
+            .read => error.InputOutput,
+            .eof => error.UnexpectedEndOfFile,
+        }, report.code);
+        try std.testing.expectEqual(.output, report.stage);
+        try std.testing.expectEqual(null, report.location);
+        try std.testing.expectEqual(if (failure == .read or failure == .eof) mzml.Diagnostic.Operation.finish else .close_list, report.operation);
         try std.testing.expectError(error.FailedState, writer.endList());
         try std.testing.expectError(error.FailedState, writer.finish());
+        try std.testing.expectEqualDeep(report, writer.diagnostic().?);
     }
 }
 
