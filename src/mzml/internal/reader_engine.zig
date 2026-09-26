@@ -1027,12 +1027,19 @@ fn saveContent(storage: *Storage, items: []const model.Content.Item) Error!?*con
 }
 
 fn readXml(self: *StreamReader, storage: *Storage, comptime retain: bool) Error![]const u8 {
+    var remaining = self.options.limits.nodes - storage.nodes;
+    if (!retain) {
+        self.cursor.skipElement(&remaining) catch |err| return switch (err) {
+            error.LimitExceeded => if (self.cursor.limit_failure == .nodes) try self.limitError(.nodes, self.options.limits.nodes, null) else err,
+            else => err,
+        };
+        storage.nodes = self.options.limits.nodes - remaining;
+        return &.{};
+    }
     var output: FragmentBuffer = .{ .allocator = self.allocator, .limit = storage.limit -| storage.used };
     defer output.bytes.deinit(self.allocator);
-    var discarding: std.Io.Writer.Discarding = .init(&.{});
-    var writer = try xml.Writer.init(self.allocator, if (retain) &output.writer else &discarding.writer, .{ .fragment = true });
+    var writer = try xml.Writer.init(self.allocator, &output.writer, .{ .fragment = true });
     defer writer.deinit();
-    var remaining = self.options.limits.nodes - storage.nodes;
     self.cursor.writeElement(&writer, &remaining) catch |err| return switch (err) {
         error.WriteFailed => if ((output.failure orelse error.InvalidXml) == error.LimitExceeded) try storage.limitError() else output.failure orelse error.InvalidXml,
         error.InvalidName, error.InvalidCharacter, error.InvalidNamespace, error.DuplicateAttribute => error.InvalidXml,
@@ -1041,7 +1048,7 @@ fn readXml(self: *StreamReader, storage: *Storage, comptime retain: bool) Error!
         else => |other| other,
     };
     storage.nodes = self.options.limits.nodes - remaining;
-    return if (retain) try storage.copy(u8, output.bytes.items) else &.{};
+    return try storage.copy(u8, output.bytes.items);
 }
 
 const FragmentBuffer = struct {

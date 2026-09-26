@@ -710,6 +710,29 @@ pub const Cursor = struct {
         return error.UnexpectedEnd;
     }
 
+    /// Discards the current subtree within the node budget, leaving its end event.
+    pub fn skipElement(self: *Cursor, remaining_nodes: *usize) Error!void {
+        var nesting: usize = 0;
+        while (self.current) |event| {
+            switch (event.data) {
+                .start_element => {
+                    if (remaining_nodes.* == 0) return self.limitError(.nodes);
+                    remaining_nodes.* -= 1;
+                    nesting += 1;
+                },
+                .end_element => {
+                    if (nesting == 0) return error.InvalidXml;
+                    nesting -= 1;
+                    if (nesting == 0) return;
+                },
+                .text => {},
+                else => return error.InvalidXml,
+            }
+            try self.advanceFragment(true);
+        }
+        return error.UnexpectedEnd;
+    }
+
     /// Checks and skips the current start-element subtree.
     pub fn skip(self: *Cursor) Error!void {
         errdefer |err| self.failure = err;

@@ -1310,6 +1310,31 @@ test "[integration] - [mzML index]: discarded metadata does not consume retained
     }
 }
 
+test "[integration] - [mzML index]: skips extra XML while preserving record spans and retained lookups" {
+    const allocator = std.testing.allocator;
+    for ([_][]const u8{ support.EXTENSIONS, support.STREAM_EXTENSIONS, support.KNOWN_CHILDREN, support.REPEATED_CONTAINERS }) |source| {
+        var index = try mzml.IndexedReader.build(allocator, .{ .bytes = source }, .{ .policy = .rebuild });
+        defer index.deinit();
+        var input = std.Io.Reader.fixed(source);
+        var reader = try mzml.StreamReader.init(allocator, &input, .{});
+        defer reader.deinit();
+        var count: usize = 0;
+        while (try reader.nextItem()) |item| {
+            if (item != .record) continue;
+            const record = item.record;
+            const entry = index.entries.items[count];
+            count += 1;
+            try std.testing.expectEqual(record.node.start_offset, entry.start);
+            try std.testing.expectEqual(record.node.end_offset, entry.end);
+            var found = (try index.byId(allocator, record.id)).?;
+            defer found.deinit();
+            try std.testing.expectEqualDeep(record, found.value);
+        }
+        try std.testing.expectEqual(index.entries.items.len, count);
+        try std.testing.expectEqualDeep((try reader.readHeader()).*, index.header().*);
+    }
+}
+
 test "[property] - [mzML index]: preserves parser checks and limits during rebuilding" {
     const Parse = struct {
         fn failure(bytes: []const u8, limits: mzml.StreamReader.Limits) ?anyerror {
@@ -1332,6 +1357,20 @@ test "[property] - [mzML index]: preserves parser checks and limits during rebui
         for ([_]mzml.StreamReader.Limits{
             .{ .nodes = limit }, .{ .list_entries = limit },
         }) |limits| try Parse.compare(support.DOCUMENT, limits);
+    }
+    for ([_]usize{ 3, 4, 5 }) |limit| {
+        const bytes = "<mzML xmlns='http://psi.hupo.org/ms/mzml'><run><spectrumList>" ++
+            "<spectrum id='s'><scanList/><scanList><scan/><scan/></scanList></spectrum>" ++
+            "<spectrum id='t'/></spectrumList></run></mzML>";
+        try Parse.compare(bytes, .{ .nodes = limit });
+    }
+    for ([_][]const u8{ "<scanList><scan>", "<scanList></wrong>", "<scanList>&missing;</scanList>" }) |fragment| {
+        const bytes = try std.mem.concat(std.testing.allocator, u8, &.{
+            "<mzML xmlns='http://psi.hupo.org/ms/mzml'><run><spectrumList><spectrum id='s'><scanList/>", fragment,
+        });
+        defer std.testing.allocator.free(bytes);
+        try std.testing.expectEqual(error.InvalidXml, Parse.failure(bytes, .{}).?);
+        try Parse.compare(bytes, .{});
     }
     for ([_][2][]const u8{
         .{ "<userParam name='note' value=''/>", "<userParam value='' extra='x'/>" },

@@ -231,6 +231,80 @@ test "[integration] - [mzML items]: streams selected arrays and XML across short
     }
 }
 
+test "[edge] - [mzML reader]: reuses cursor storage for discarded XML" {
+    const fragment = "<e:note xmlns:e='urn:note' e:label='A&amp;B'>before<e:part/>after<![CDATA[<&>]]></e:note>";
+    const source = "<mzML xmlns='http://psi.hupo.org/ms/mzml'><run><spectrumList>" ++
+        fragment ++ "<spectrum id='s'/>" ++ fragment ++ "</spectrumList></run></mzML>";
+    var allocations = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var input = std.Io.Reader.fixed(source);
+    var reader = try mzml.StreamReader.init(allocations.allocator(), &input, .{});
+    defer reader.deinit();
+    try std.testing.expectEqualStrings("s", (try reader.nextRecord()).?.id);
+    allocations.fail_index = allocations.alloc_index;
+    allocations.resize_fail_index = allocations.resize_index;
+    try std.testing.expectEqual(null, try reader.nextRecord());
+    try std.testing.expectEqual(null, reader.diagnostic());
+    try std.testing.expect(!allocations.has_induced_failure);
+}
+
+test "[property] - [mzML items]: discarding XML preserves parser errors and diagnostic locations" {
+    const prefix = "<mzML xmlns='http://psi.hupo.org/ms/mzml'><run><spectrumList>";
+    const Case = struct {
+        fragment: []const u8,
+        limits: mzml.StreamReader.Limits = .{},
+        failure: anyerror = error.InvalidXml,
+    };
+    for ([_]Case{
+        .{ .fragment = "<future><part>" },
+        .{ .fragment = "<future></other>" },
+        .{ .fragment = "<future>&missing;</future>" },
+        .{ .fragment = "<future><![CDATA[unfinished" },
+        .{ .fragment = "<future><!--unfinished" },
+        .{ .fragment = "<future><part label='unfinished" },
+        .{ .fragment = "<future><e:part/></future>" },
+        .{ .fragment = "<future xmlns:a='urn:a' xmlns:b='urn:a'><part a:x='1' b:x='2'/></future>" },
+        .{ .fragment = "<future>\x01</future>" },
+        .{ .fragment = "<future><a/><b/><c/></future>", .limits = .{ .nodes = 3 }, .failure = error.LimitExceeded },
+        .{ .fragment = "<future><part/></future>", .limits = .{ .depth = 4 }, .failure = error.LimitExceeded },
+        .{ .fragment = "<future a='1' b='2'/>", .limits = .{ .attributes = 1 }, .failure = error.LimitExceeded },
+        .{ .fragment = "<future a='" ++ "x" ** 129 ++ "'/>", .limits = .{ .attribute_bytes = 128 }, .failure = error.LimitExceeded },
+    }) |case| {
+        const source = try std.mem.concat(std.testing.allocator, u8, &.{ prefix, case.fragment });
+        defer std.testing.allocator.free(source);
+        const utf16 = try std.testing.allocator.alloc(u8, source.len * 2 + 2);
+        defer std.testing.allocator.free(utf16);
+        for ([_]?std.builtin.Endian{ null, .little, .big }) |endian| {
+            const bytes = if (endian) |order| encoded: {
+                std.mem.writeInt(u16, utf16[0..2], 0xfeff, order);
+                for (source, 0..) |byte, i| std.mem.writeInt(u16, utf16[2 + i * 2 ..][0..2], byte, order);
+                break :encoded utf16;
+            } else source;
+            var expected: ?mzml.Diagnostic = null;
+            for ([_]usize{ 1, 7, 31 }) |chunk| {
+                for ([_]bool{ true, false }) |retain| {
+                    var buffer: [31]u8 = undefined;
+                    var input: std.testing.Reader = .init(buffer[0..chunk], &.{.{ .buffer = bytes }});
+                    input.artificial_limit = .limited(chunk);
+                    var reader = try mzml.StreamReader.init(std.testing.allocator, &input.interface, .{ .limits = case.limits });
+                    defer reader.deinit();
+                    try std.testing.expectEqual(.list_start, std.meta.activeTag((try reader.nextItem()).?));
+                    if (retain) {
+                        try std.testing.expectError(case.failure, reader.nextItem());
+                    } else try std.testing.expectError(case.failure, reader.nextRecord());
+                    const saved = reader.diagnostic().?;
+                    try std.testing.expectError(error.FailedState, reader.nextRecord());
+                    try std.testing.expectEqualDeep(saved, reader.diagnostic().?);
+                    var report = saved;
+                    report.operation = .read_item;
+                    if (expected) |value| {
+                        try std.testing.expectEqualDeep(value, report);
+                    } else expected = report;
+                }
+            }
+        }
+    }
+}
+
 test "[failure] - [mzML items]: bounds each XML item and stops at truncated input" {
     const prefix = "<mzML xmlns='http://psi.hupo.org/ms/mzml'><run><spectrumList count='0'>";
     const suffix = "</spectrumList></run></mzML>";
@@ -2298,15 +2372,21 @@ test "[integration] - [mzML reader]: reads indexed trailers only when requested"
 test "[integration] - [mzML reader]: distinguishes read failures from truncated XML" {
     var unbuffered = std.Io.Reader.failing;
     try std.testing.expectError(error.InvalidOptions, mzml.StreamReader.init(std.testing.allocator, &unbuffered, .{}));
+    const Case = struct { source: []const u8, cut: usize };
+    const cases = [_]Case{
+        .{ .source = support.DOCUMENT, .cut = support.HEADER.len },
+        .{ .source = support.STREAM_EXTENSIONS, .cut = std.mem.indexOf(u8, support.STREAM_EXTENSIONS, "before").? + "before".len },
+    };
     for ([_]mzml.StreamReader.Options{
         .{},
         .{ .array_selector = .{ .select = selectSecond } },
-    }) |options| {
-        var bytes: [support.DOCUMENT.len]u8 = undefined;
-        for ([_]usize{ 0, support.HEADER.len, support.DOCUMENT.len / 2, support.DOCUMENT.len }) |length| {
-            @memcpy(&bytes, support.DOCUMENT);
+    }) |options| for (cases) |case| {
+        const source = std.mem.trimEnd(u8, case.source, "\r\n");
+        var bytes: [@max(support.DOCUMENT.len, support.STREAM_EXTENSIONS.len)]u8 = undefined;
+        for ([_]usize{ 0, case.cut, source.len / 2, source.len }) |length| {
+            @memcpy(bytes[0..source.len], source);
             var input = std.Io.Reader.failing;
-            input.buffer = &bytes;
+            input.buffer = bytes[0..source.len];
             input.end = length;
             var reader = try mzml.StreamReader.init(std.testing.allocator, &input, options);
             defer reader.deinit();
@@ -2317,10 +2397,10 @@ test "[integration] - [mzML reader]: distinguishes read failures from truncated 
             }
             return error.TestUnexpectedResult;
         }
-        for ([_]usize{ 0, 1, support.HEADER.len, support.DOCUMENT.len / 2, support.DOCUMENT.len - 1 }) |length| {
-            try std.testing.expectError(error.InvalidXml, support.readAll(std.testing.allocator, support.DOCUMENT[0..length], options));
+        for ([_]usize{ 0, 1, case.cut, source.len / 2, source.len - 1 }) |length| {
+            try std.testing.expectError(error.InvalidXml, support.readAll(std.testing.allocator, source[0..length], options));
         }
-    }
+    };
 }
 
 test "[integration] - [mzML arrays]: classifies explicit encodings without guessing" {
