@@ -451,13 +451,8 @@ pub const Record = struct {
 
 // --- Binary arrays ---
 
-/// Reviewed primitive identities, separate from an array's scientific role.
 pub const Primitive = encoding.Primitive;
-
-/// Established primitive and codec declaration pair.
 pub const Encoding = encoding.Descriptor;
-
-/// Failures in declaration classification, before payload decoding.
 pub const EncodingError = encoding.Error;
 
 /// A source-preserving binary array with its reviewed wire descriptor and value count.

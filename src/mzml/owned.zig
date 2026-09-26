@@ -2,6 +2,7 @@
 //!
 //! Owners must not be copied. Their views remain valid until deinit; cloning does not
 //! restore skipped payloads. Keep an owned header for group resolution.
+//! Failed copies release their allocated storage.
 
 const std = @import("std");
 const cv = @import("../cv/source.zig");
@@ -15,7 +16,6 @@ pub const Limits = struct {
     depth: usize = 64,
 };
 
-/// Copying failures leave no owned allocations behind.
 pub const Error = copy.Error;
 
 /// Independently owned forward item, including XML or list attributes.

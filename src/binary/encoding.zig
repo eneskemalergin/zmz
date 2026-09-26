@@ -4,6 +4,8 @@ const std = @import("std");
 const cv = @import("../cv/source.zig");
 
 pub const Primitive = enum { float32, float64, int32, int64 };
+
+/// Names follow encoding order before Base64.
 pub const Pipeline = enum { none, zlib, linear, pic, slof, linear_zlib, pic_zlib, slof_zlib };
 
 /// Returns whether a pipeline changes numeric values into the Numpress wire format.

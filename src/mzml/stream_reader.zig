@@ -8,23 +8,12 @@ const impl = @import("internal/reader_engine.zig");
 pub const StreamReader = struct {
     const Reader = @This();
 
-    /// Independent bounds for parser state, retained metadata, records, lists, and payload text.
     pub const Limits = impl.Limits;
-
-    /// Retains or skips modeled binary text without decoding it; XML fragments stay intact.
     pub const Payload = impl.Payload;
-
     pub const ArraySelector = impl.ArraySelector;
-
-    /// Reader limits, payload policy, and index retention.
     pub const Options = impl.Options;
-
-    /// Includes decoding errors when numeric arrays are requested.
     pub const Error = impl.Error;
-
-    /// The first reader failure and its physical source location.
     pub const Diagnostic = impl.Diagnostic;
-
     pub const DecodedArrays = @import("decoded_arrays.zig");
 
     inner: impl,

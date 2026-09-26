@@ -48,6 +48,7 @@ pub const Limits = struct {
 };
 
 /// Ordinary reads retain or skip text; decoded reads decode or skip array bytes.
+/// Payload selection does not discard retained XML fragments.
 pub const Payload = enum { retain, skip };
 
 /// Chooses arrays after their leading parameters and before their binary text.

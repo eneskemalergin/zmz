@@ -13,7 +13,6 @@ const Diagnostic = @import("diagnostic.zig");
 const Writer = @This();
 const COUNT_PLACEHOLDER = "0" ** std.fmt.comptimePrint("{d}", .{std.math.maxInt(usize)}).len;
 
-/// Explicit bounds for caller-supplied node hierarchies.
 pub const Limits = schema.Limits;
 
 /// Writer failures are sticky. No error permits treating partially written output as complete.

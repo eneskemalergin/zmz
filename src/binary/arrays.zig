@@ -8,7 +8,6 @@ const zlib = @import("zlib.zig");
 const numpress = @import("numpress.zig");
 const encoding = @import("encoding.zig");
 
-/// Established array pipelines, named in encoding order before the Base64 envelope.
 pub const Pipeline = encoding.Pipeline;
 
 /// Caller-owned disjoint scratch buffers. Neither buffer aliases input or output.

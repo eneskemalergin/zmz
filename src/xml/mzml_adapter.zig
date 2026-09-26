@@ -84,7 +84,6 @@ pub const Name = struct {
     }
 };
 
-/// Alias used by indexed-reader helpers for a start-element event.
 pub const Start = StartElement;
 
 pub fn localName(name: Name) []const u8 {
