@@ -368,17 +368,13 @@ fn changedGroupEncoding(entries: []const cv.Entry, target: model.Encoding) ?Grou
     for (entries) |entry| {
         if (entry != .cv) continue;
         const accession = entry.cv.accession orelse continue;
-        inline for (std.meta.tags(model.Primitive)) |primitive| {
-            if (std.mem.eql(u8, accession.raw, encoding.primitiveTerm(primitive).accession)) {
-                result.primitive = target.primitive;
-                changed = changed or primitive != target.primitive;
-            }
+        if (encoding.primitiveFromAccession(accession.raw)) |primitive| {
+            result.primitive = target.primitive;
+            changed = changed or primitive != target.primitive;
         }
-        inline for (std.meta.tags(arrays.Pipeline)) |pipeline| {
-            if (std.mem.eql(u8, accession.raw, encoding.codecTerm(pipeline).accession)) {
-                result.pipeline = target.pipeline;
-                changed = changed or pipeline != target.pipeline;
-            }
+        if (encoding.codecFromAccession(accession.raw)) |pipeline| {
+            result.pipeline = target.pipeline;
+            changed = changed or pipeline != target.pipeline;
         }
     }
     return if (changed) result else null;
@@ -396,15 +392,12 @@ fn reencodedParam(source: cv.Entry, target: model.Encoding) cv.Entry {
     var entry = source;
     if (entry != .cv) return entry;
     const accession = entry.cv.accession orelse return entry;
-    const term = term: {
-        inline for (std.meta.tags(model.Primitive)) |primitive| {
-            if (std.mem.eql(u8, accession.raw, encoding.primitiveTerm(primitive).accession)) break :term encoding.primitiveTerm(target.primitive);
-        }
-        inline for (std.meta.tags(arrays.Pipeline)) |pipeline| {
-            if (std.mem.eql(u8, accession.raw, encoding.codecTerm(pipeline).accession)) break :term encoding.codecTerm(target.pipeline);
-        }
+    const term = if (encoding.primitiveFromAccession(accession.raw) != null)
+        encoding.primitiveTerm(target.primitive)
+    else if (encoding.codecFromAccession(accession.raw) != null)
+        encoding.codecTerm(target.pipeline)
+    else
         return entry;
-    };
     if (!std.mem.eql(u8, accession.raw, term.accession)) {
         entry.cv.accession = .{ .raw = term.accession };
         entry.cv.name = term.name;

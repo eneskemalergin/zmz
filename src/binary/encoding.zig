@@ -25,6 +25,13 @@ pub fn primitiveTerm(primitive: Primitive) Term {
     };
 }
 
+pub fn primitiveFromAccession(accession: []const u8) ?Primitive {
+    inline for (std.meta.tags(Primitive)) |primitive| {
+        if (std.mem.eql(u8, accession, primitiveTerm(primitive).accession)) return primitive;
+    }
+    return null;
+}
+
 pub fn codecTerm(pipeline: Pipeline) Term {
     return switch (pipeline) {
         .none => .{ .accession = "MS:1000576", .name = "no compression" },
@@ -36,6 +43,13 @@ pub fn codecTerm(pipeline: Pipeline) Term {
         .pic_zlib => .{ .accession = "MS:1002747", .name = "MS-Numpress positive integer compression followed by zlib compression" },
         .slof_zlib => .{ .accession = "MS:1002748", .name = "MS-Numpress short logged float compression followed by zlib compression" },
     };
+}
+
+pub fn codecFromAccession(accession: []const u8) ?Pipeline {
+    inline for (std.meta.tags(Pipeline)) |pipeline| {
+        if (std.mem.eql(u8, accession, codecTerm(pipeline).accession)) return pipeline;
+    }
+    return null;
 }
 
 /// A recognized established encoding. Unknown metadata remains in the source node.
@@ -64,19 +78,11 @@ pub fn classify(params: []const cv.Entry, groups: []const cv.Group) Error!Descri
         if (entry != .cv) continue;
         const accession = entry.cv.accession orelse continue;
         const raw = accession.raw;
-        var p: ?Primitive = null;
-        inline for (std.meta.tags(Primitive)) |candidate| {
-            if (std.mem.eql(u8, raw, primitiveTerm(candidate).accession)) p = candidate;
-        }
-        if (p) |selected| {
+        if (primitiveFromAccession(raw)) |selected| {
             if (primitive != null and primitive.? != selected) return error.ConflictingPrimitive;
             primitive = selected;
         }
-        var c: ?Pipeline = null;
-        inline for (std.meta.tags(Pipeline)) |candidate| {
-            if (std.mem.eql(u8, raw, codecTerm(candidate).accession)) c = candidate;
-        }
-        if (c) |selected| {
+        if (codecFromAccession(raw)) |selected| {
             if (pipeline != null and pipeline.? != selected) return error.ConflictingCompression;
             pipeline = selected;
         }
