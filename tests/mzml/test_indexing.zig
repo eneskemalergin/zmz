@@ -591,20 +591,27 @@ test "[failure] - [mzML indexed decoding]: clears results and recovers after dec
     try std.testing.expectEqual(@as(usize, 0), index.diagnostic().?.array_position.?);
 }
 
-test "[failure] - [mzML indexed decoding]: checks the source before publishing arrays" {
+test "[failure] - [mzML indexed lookup]: checks the source once before reading and once before returning" {
     const Source = struct {
         calls: usize = 0,
+        reads: usize = 0,
         fail_at: ?usize = null,
+        stat_error: bool = false,
 
         fn stat(data: ?*anyopaque, file: std.Io.File) std.Io.File.StatError!std.Io.File.Stat {
             const self: *@This() = @ptrCast(@alignCast(data.?));
             self.calls += 1;
             var result = try file.stat(std.testing.io);
-            if (self.fail_at == self.calls) result.size += 1;
+            if (self.fail_at == self.calls) {
+                if (self.stat_error) return error.AccessDenied;
+                result.size += 1;
+            }
             return result;
         }
 
-        fn read(_: ?*anyopaque, file: std.Io.File, slices: []const []u8, offset: u64) std.Io.File.ReadPositionalError!usize {
+        fn read(data: ?*anyopaque, file: std.Io.File, slices: []const []u8, offset: u64) std.Io.File.ReadPositionalError!usize {
+            const self: *@This() = @ptrCast(@alignCast(data.?));
+            self.reads += 1;
             return std.testing.io.vtable.fileReadPositional(std.testing.io.userdata, file, slices, offset);
         }
     };
@@ -623,21 +630,44 @@ test "[failure] - [mzML indexed decoding]: checks the source before publishing a
     defer index.deinit();
     var output = mzml.StreamReader.DecodedArrays.init(allocator, .{});
     defer output.deinit();
-    for (1..4) |fail_at| {
+    for ([_]bool{ false, true }) |by_id| {
         source = .{};
-        var good = (try index.atDecoded(allocator, .spectrum, 0, &output)).?;
-        defer good.deinit();
-        try std.testing.expectEqual(@as(usize, 3), source.calls);
-        source = .{ .fail_at = fail_at };
-        try std.testing.expectError(error.StaleSource, index.byIdDecoded(allocator, "scan=zlib", &output));
-        try std.testing.expectEqual(.source_changed, index.diagnostic().?.id);
-        try std.testing.expectEqual(null, index.diagnostic().?.location);
-        try std.testing.expectEqual(@as(usize, 0), output.len());
-        try std.testing.expectEqual(fail_at, source.calls);
+        var retained = (if (by_id) try index.byId(allocator, "scan=none") else try index.at(allocator, .spectrum, 0)).?;
+        defer retained.deinit();
+        try std.testing.expectEqual(@as(usize, 2), source.calls);
+        try std.testing.expect(source.reads > 0);
+        for ([_]bool{ false, true }) |stat_error| {
+            for (1..3) |fail_at| {
+                source = .{};
+                var good = (if (by_id) try index.byIdDecoded(allocator, "scan=none", &output) else try index.atDecoded(allocator, .spectrum, 0, &output)).?;
+                defer good.deinit();
+                try std.testing.expectEqual(@as(usize, 2), source.calls);
+                try std.testing.expectEqual(@as(usize, 2), output.len());
+                try std.testing.expectEqual(null, index.diagnostic());
+                source = .{ .fail_at = fail_at, .stat_error = stat_error };
+                const result = if (by_id) index.byIdDecoded(allocator, "scan=zlib", &output) else index.atDecoded(allocator, .spectrum, 1, &output);
+                try std.testing.expectError(if (stat_error) error.AccessDenied else error.StaleSource, result);
+                const report = index.diagnostic().?;
+                try std.testing.expectEqual(if (stat_error) error.AccessDenied else error.StaleSource, report.code);
+                try std.testing.expectEqual(if (stat_error) mzml.Diagnostic.Id.io_failed else .source_changed, report.id);
+                try std.testing.expectEqual(null, report.location);
+                try std.testing.expectEqual(@as(usize, 0), output.len());
+                try std.testing.expectEqual(fail_at, source.calls);
+                if (fail_at == 1) {
+                    try std.testing.expectEqual(@as(usize, 0), source.reads);
+                    try std.testing.expectEqual(null, report.record);
+                } else {
+                    try std.testing.expect(source.reads > 0);
+                    try std.testing.expectEqual(@as(usize, 1), report.record.?.ordinal);
+                }
+            }
+        }
     }
     source = .{};
     var recovered = (try index.atDecoded(allocator, .spectrum, 1, &output)).?;
     defer recovered.deinit();
+    try std.testing.expectEqual(@as(usize, 2), source.calls);
+    try std.testing.expectEqual(null, index.diagnostic());
     try std.testing.expectEqual(@as(usize, 2), output.len());
 }
 
@@ -1426,7 +1456,14 @@ test "[integration] - [mzML index]: builds plain files explicitly and rejects ch
     try file.setLength(std.testing.io, support.DOCUMENT.len - 1);
     try std.testing.expectError(error.StaleSource, index.byId(std.testing.allocator, "native=a&b"));
     try std.testing.expectError(error.StaleSource, index.byId(std.testing.allocator, "absent"));
+    try std.testing.expectError(error.StaleSource, index.at(std.testing.allocator, .spectrum, 0));
     try std.testing.expectError(error.StaleSource, index.at(std.testing.allocator, .spectrum, 100));
+    var decoded = mzml.StreamReader.DecodedArrays.init(std.testing.allocator, .{});
+    defer decoded.deinit();
+    try std.testing.expectError(error.StaleSource, index.byIdDecoded(std.testing.allocator, "absent", &decoded));
+    try std.testing.expectError(error.StaleSource, index.atDecoded(std.testing.allocator, .spectrum, 100, &decoded));
+    try std.testing.expectEqual(@as(usize, 0), decoded.len());
+    try std.testing.expectError(error.InvalidIndex, index.at(std.testing.allocator, .run, 0));
     try std.testing.expectError(error.LimitExceeded, mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = support.DOCUMENT }, .{ .policy = .rebuild, .max_records = 1 }));
     try std.testing.expectError(error.LimitExceeded, mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = support.DOCUMENT }, .{ .policy = .rebuild, .index_bytes = 1 }));
     const duplicate = support.HEADER ++ "<spectrumList count='2' defaultDataProcessingRef='dp'>" ++

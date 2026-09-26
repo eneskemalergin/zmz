@@ -251,7 +251,6 @@ fn readEntry(self: *IndexedReader, allocator: std.mem.Allocator, entry: Entry, o
         self.capture(err, .index, .none);
         self.failure.?.record = .{ .kind = if (entry.kind == .spectrum) .spectrum else .chromatogram, .ordinal = entry.index };
     }
-    try self.checkSource();
     const context = self.contexts[kindIndex(entry.kind)].?;
     const length = std.math.cast(usize, entry.end - entry.start) orelse return error.LimitExceeded;
     if (length > self.options.record_span_bytes) return try self.limitError(.record_span_bytes, self.options.record_span_bytes, length);
