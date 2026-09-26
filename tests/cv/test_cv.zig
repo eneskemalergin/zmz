@@ -291,9 +291,9 @@ test "[unit] - [CV lookup]: expands at the reference position without overriding
     const groups = [_]cv.Group{.{ .id = "g", .entries = &group_entries }};
     const entries = [_]cv.Entry{
         .{ .user = .{ .name = "before", .value = "" } },
-        .{ .group_ref = "g" },
+        .{ .group_ref = .{ .ref = "g" } },
         .{ .cv = .{ .accession = accession, .value = "local" } },
-        .{ .group_ref = "g" },
+        .{ .group_ref = .{ .ref = "g" } },
     };
     var iterator: cv.EffectiveIterator = .{ .entries = &entries, .groups = &groups };
     try std.testing.expectEqualStrings("before", (try iterator.next()).?.user.name.?);
@@ -309,15 +309,15 @@ test "[unit] - [CV lookup]: expands at the reference position without overriding
     );
     const unique = try cv.findOne(&group_entries, &.{}, accession);
     try std.testing.expectEqualStrings("group", unique.one.value.?);
-    const collapsed = try cv.findOne(&.{.{ .group_ref = "\t g \n" }}, &groups, accession);
+    const collapsed = try cv.findOne(&.{.{ .group_ref = .{ .ref = "\t g \n" } }}, &groups, accession);
     try std.testing.expectEqualStrings("group", collapsed.one.value.?);
-    try std.testing.expectError(error.DuplicateGroup, cv.findOne(&.{.{ .group_ref = "g" }}, &.{
+    try std.testing.expectError(error.DuplicateGroup, cv.findOne(&.{.{ .group_ref = .{ .ref = "g" } }}, &.{
         groups[0], .{ .id = " g ", .entries = &group_entries },
     }, accession));
 }
 
 test "[failure] - [CV expansion]: bounds missing duplicate and nested references" {
-    const entries = [_]cv.Entry{.{ .group_ref = "g" }};
+    const entries = [_]cv.Entry{.{ .group_ref = .{ .ref = "g" } }};
     const group: cv.Group = .{ .id = "g", .entries = &.{} };
     try std.testing.expectError(error.MissingGroup, cv.findOne(&entries, &.{}, .{ .raw = "MS:1" }));
     try std.testing.expectError(

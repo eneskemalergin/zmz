@@ -20,6 +20,9 @@ pub const Unit = source.Unit;
 pub const Param = source.Param;
 /// A user parameter with its declared type and lexical value.
 pub const UserParam = source.UserParam;
+pub const GroupRef = source.GroupRef;
+pub const Attribute = source.Attribute;
+pub const ParameterXml = source.ParameterXml;
 /// One source entry, preserving parameter and group-reference order.
 pub const Entry = source.Entry;
 /// A borrowed referenceable parameter group.

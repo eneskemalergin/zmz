@@ -4,6 +4,268 @@ const std = @import("std");
 const mzml = @import("zmz").mzml;
 const support = @import("support.zig");
 
+test "[integration] - [mzML items]: retains empty-list XML and indexes following chromatograms" {
+    const source = "<mzML xmlns='http://psi.hupo.org/ms/mzml' xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance'><run>" ++
+        "<spectrumList count='0'><first/></spectrumList><between/>" ++
+        "<chromatogramList count='1'><before/><chromatogram id='c' index='0' defaultArrayLength='0'/>" ++
+        "<after/></chromatogramList><last/></run><tail/></mzML>";
+    var sink: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer sink.deinit();
+    try support.rewriteDocument(std.testing.allocator, source, &sink.writer, true);
+    var index = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = sink.written() }, .{});
+    defer index.deinit();
+    var record = (try index.at(std.testing.allocator, .chromatogram, 0)).?;
+    defer record.deinit();
+    try std.testing.expectEqualStrings("c", record.value.id);
+    try std.testing.expectEqual(@as(usize, 0), index.header().spectrum_list.?.declared_count);
+    var source_input = std.Io.Reader.fixed(source);
+    var original = try mzml.StreamReader.init(std.testing.allocator, &source_input, .{});
+    defer original.deinit();
+    var output_input = std.Io.Reader.fixed(sink.written());
+    var written = try mzml.StreamReader.init(std.testing.allocator, &output_input, .{});
+    defer written.deinit();
+    while (try original.nextItem()) |item| try support.expectItem(item, (try written.nextItem()).?);
+    try std.testing.expectEqual(null, try written.nextItem());
+}
+
+test "[integration] - [mzML items]: preserves XML positions through owned plain and indexed copies" {
+    const source = support.STREAM_EXTENSIONS;
+    var items: std.ArrayList(mzml.owned.Item) = .empty;
+    defer {
+        for (items.items) |*item| item.deinit();
+        items.deinit(std.testing.allocator);
+    }
+    var header = blk: {
+        var input = std.Io.Reader.fixed(source);
+        var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+        defer reader.deinit();
+        const retained = try mzml.owned.Header.init(std.testing.allocator, (try reader.readHeader()).*, .{});
+        errdefer {
+            var failed = retained;
+            failed.deinit();
+        }
+        while (try reader.nextItem()) |item| {
+            var retained_item = try mzml.owned.Item.init(std.testing.allocator, item, .{});
+            errdefer retained_item.deinit();
+            try items.append(std.testing.allocator, retained_item);
+        }
+        break :blk retained;
+    };
+    defer header.deinit();
+    const tags = [_]std.meta.Tag(mzml.model.Item){
+        .list_start, .xml, .record, .xml, .record,   .xml, .list_end, .xml,
+        .list_start, .xml, .record, .xml, .list_end, .xml, .run_end,  .xml,
+    };
+    try std.testing.expectEqual(tags.len, items.items.len);
+    for (items.items, tags) |item, tag| try std.testing.expectEqual(tag, std.meta.activeTag(item.value));
+    const Check = struct {
+        fn copy(allocator: std.mem.Allocator, source_item: mzml.model.Item) !void {
+            var result = try mzml.owned.Item.init(allocator, source_item, .{});
+            defer result.deinit();
+            try support.expectItem(source_item, result.value);
+        }
+    };
+    for (items.items) |item|
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.copy, .{item.value});
+
+    for ([_]bool{ false, true }) |indexed| {
+        var sink: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer sink.deinit();
+        var writer = if (indexed) try mzml.Writer.initIndexed(std.testing.allocator, &sink.writer, .{}, .{}) else try mzml.Writer.init(std.testing.allocator, &sink.writer, .{});
+        defer writer.deinit();
+        try writer.writeHeader(header.value);
+        for (items.items) |item| try writer.writeItem(item.value);
+        try writer.finish();
+        var input = std.Io.Reader.fixed(sink.written());
+        var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{ .retain_index = indexed });
+        defer reader.deinit();
+        for (items.items) |expected| {
+            const actual = (try reader.nextItem()).?;
+            try support.expectItem(expected.value, actual);
+        }
+        try std.testing.expectEqual(null, try reader.nextItem());
+        try std.testing.expectEqual(null, try reader.nextItem());
+        if (indexed) try std.testing.expect(reader.indexTrailer() != null);
+        for ([_]mzml.IndexedReader.Policy{ .rebuild, .open_embedded }) |policy| {
+            if (!indexed and policy == .open_embedded) continue;
+            var index = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = sink.written() }, .{ .policy = policy });
+            defer index.deinit();
+            for ([_][]const u8{ "s0", "s1", "c0" }) |id| {
+                var found = (try index.byId(std.testing.allocator, id)).?;
+                defer found.deinit();
+                try std.testing.expectEqualStrings(id, found.value.id);
+            }
+        }
+    }
+}
+
+test "[failure] - [mzML items]: rejects misplaced items and propagates failed output" {
+    for (0..3) |phase| {
+        var bytes: [1024]u8 = undefined;
+        var sink: std.Io.Writer = .fixed(&bytes);
+        var writer = try mzml.Writer.init(std.testing.allocator, &sink, .{});
+        defer writer.deinit();
+        if (phase != 0) try writer.writeHeader(.{ .document = .{ .kind = .mzml }, .run = .{ .kind = .run } });
+        if (phase == 1) try writer.finish();
+        const item: mzml.model.Item = .{ .xml = "<note>" ++ "x" ** 2048 ++ "</note>" };
+        try std.testing.expectError(if (phase == 2) error.WriteFailed else error.InvalidState, writer.writeItem(item));
+        try std.testing.expectError(error.FailedState, writer.finish());
+    }
+}
+
+test "[integration] - [mzML extensions]: retains attributes and mixed XML through copies and writing" {
+    var input = std.Io.Reader.fixed(support.EXTENSIONS);
+    var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+    defer reader.deinit();
+    var header = try mzml.owned.Header.init(std.testing.allocator, (try reader.readHeader()).*, .{});
+    defer header.deinit();
+    var retained = try mzml.owned.Record.init(std.testing.allocator, (try reader.nextRecord()).?, .{});
+    defer retained.deinit();
+    try std.testing.expectEqual(null, try reader.nextRecord());
+    for ([_]bool{ false, true }) |indexed| {
+        var sink: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer sink.deinit();
+        var writer = if (indexed) try mzml.Writer.initIndexed(std.testing.allocator, &sink.writer, .{}, .{}) else try mzml.Writer.init(std.testing.allocator, &sink.writer, .{});
+        defer writer.deinit();
+        try writer.writeHeader(header.value);
+        try writer.beginListWithAttributes(.spectrum_list, 1, header.value.spectrum_list.?.attributes);
+        try writer.writeRecord(retained.value.node);
+        try writer.endList();
+        try writer.finish();
+        const bytes = sink.written();
+        try std.testing.expect(std.mem.indexOf(u8, bytes, "e:note=\"A&amp;B\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, bytes, "e:type=\"e:Primitive\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, bytes, "extra=\"keep\"") != null);
+        const before = std.mem.indexOf(u8, bytes, "name=\"before\"").?;
+        const annotation = std.mem.indexOfPos(u8, bytes, before, "<e:annotation").?;
+        const arrays = std.mem.indexOf(u8, bytes, "<binaryDataArrayList").?;
+        const after = std.mem.indexOf(u8, bytes, "name=\"after\"").?;
+        try std.testing.expect(before < annotation and annotation < arrays and arrays < after);
+        var output = std.Io.Reader.fixed(bytes);
+        var copied = try mzml.StreamReader.init(std.testing.allocator, &output, .{});
+        defer copied.deinit();
+        const record = (try copied.nextRecord()).?;
+        try std.testing.expectEqual(@as(usize, 2), record.binaryArrays().len);
+        try std.testing.expectEqualStrings("before", record.node.params[0].user.name.?);
+        try std.testing.expectEqualStrings("after", record.node.params[1].user.name.?);
+        if (indexed) {
+            var lookup = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = bytes }, .{});
+            defer lookup.deinit();
+            var found = (try lookup.byId(std.testing.allocator, "scan=1")).?;
+            defer found.deinit();
+            try support.expectNode(record.node, found.value.node);
+        }
+    }
+}
+
+test "[integration] - [mzML extensions]: retains a foreign default namespace for attribute values" {
+    const source = "<m:mzML xmlns:m='http://psi.hupo.org/ms/mzml' xmlns='urn:values' xmlns:e='urn:types'>" ++
+        "<m:run><m:spectrumList count='1' e:type='Label'><m:spectrum id='x' index='0' defaultArrayLength='0' e:type='Label'>" ++
+        "<m:userParam name='note' e:type='Label'/><e:note>text</e:note></m:spectrum></m:spectrumList></m:run></m:mzML>";
+    var sink: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer sink.deinit();
+    try support.rewriteDocument(std.testing.allocator, source, &sink.writer, false);
+    var input = std.Io.Reader.fixed(sink.written());
+    var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+    defer reader.deinit();
+    const record = (try reader.nextRecord()).?;
+    for ([_][]const mzml.model.Attribute{ record.node.attributes, record.node.params[0].user.xml.?.attributes }) |attributes| {
+        var found: usize = 0;
+        for (attributes) |attribute| {
+            if (std.mem.eql(u8, attribute.name, "xmlns")) {
+                try std.testing.expectEqualStrings("urn:values", attribute.value);
+                found += 1;
+            } else if (std.mem.eql(u8, attribute.name, "e:type")) {
+                try std.testing.expectEqualStrings("urn:types", attribute.namespace_uri.?);
+                try std.testing.expectEqualStrings("Label", attribute.value);
+                found += 1;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 2), found);
+    }
+}
+
+test "[integration] - [parameter XML]: preserves absent empty and escaped schema locations" {
+    const Check = struct {
+        fn location(attributes: []const mzml.model.Attribute) ?[]const u8 {
+            for (attributes) |attribute| {
+                const start = if (std.mem.indexOfScalar(u8, attribute.name, ':')) |colon| colon + 1 else 0;
+                if (std.mem.eql(u8, attribute.namespace_uri orelse "", "http://www.w3.org/2001/XMLSchema-instance") and
+                    std.mem.eql(u8, attribute.name[start..], "schemaLocation")) return attribute.value;
+            }
+            return null;
+        }
+    };
+    inline for (.{
+        .{ "", @as(?[]const u8, null) },
+        .{ " q:schemaLocation=''", @as(?[]const u8, "") },
+        .{ " q:schemaLocation='a&amp;b&#9;&quot;'", @as(?[]const u8, "a&b\t\"") },
+    }) |case| {
+        const source = "<mzML xmlns='http://psi.hupo.org/ms/mzml' xmlns:q='http://www.w3.org/2001/XMLSchema-instance' xmlns:xsi='urn:other' xsi:note='keep'>" ++
+            "<run><spectrumList count='1'><spectrum id='x' index='0' defaultArrayLength='0'" ++ case[0] ++ ">" ++
+            "<cvParam" ++ case[0] ++ "/><userParam" ++ case[0] ++ "/><referenceableParamGroupRef" ++ case[0] ++
+            "/></spectrum></spectrumList></run></mzML>";
+        for ([_]bool{ false, true }) |indexed| {
+            var sink: std.Io.Writer.Allocating = .init(std.testing.allocator);
+            defer sink.deinit();
+            try support.rewriteDocument(std.testing.allocator, source, &sink.writer, indexed);
+            var input = std.Io.Reader.fixed(sink.written());
+            var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+            defer reader.deinit();
+            const record = (try reader.nextRecord()).?;
+            try std.testing.expectEqualDeep(case[1], Check.location(record.node.attributes));
+            for (record.node.params) |entry| {
+                const extra = switch (entry) {
+                    inline else => |parameter| parameter.xml,
+                };
+                try std.testing.expectEqualDeep(case[1], if (extra) |value| Check.location(value.attributes) else null);
+            }
+        }
+    }
+}
+
+test "[integration] - [mzML writer]: does not borrow the header namespace after writing" {
+    var namespace = "http://psi.hupo.org/schema_revision/mzML_1.0.0".*;
+    var bytes: [1024]u8 = undefined;
+    var sink = std.Io.Writer.fixed(&bytes);
+    var writer = try mzml.Writer.init(std.testing.allocator, &sink, .{});
+    defer writer.deinit();
+    try writer.writeHeader(.{ .document = .{ .kind = .mzml }, .run = .{ .kind = .run }, .namespace_uri = &namespace });
+    @memset(&namespace, 'x');
+    try writer.beginListWithAttributes(.spectrum_list, 0, &.{});
+    try writer.endList();
+    try writer.finish();
+    var input = std.Io.Reader.fixed(sink.buffered());
+    var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+    defer reader.deinit();
+    try std.testing.expectEqualStrings("http://psi.hupo.org/schema_revision/mzML_1.0.0", (try reader.readHeader()).namespace_uri);
+    try std.testing.expectEqual(null, try reader.nextRecord());
+}
+
+test "[failure] - [mzML extensions]: rejects incomplete content and bounds fragment emission" {
+    const cases = [_]struct { items: []const mzml.model.Content.Item, limits: mzml.Writer.Limits = .{}, err: mzml.Writer.Error }{
+        .{ .items = &.{.{ .params = 1 }}, .err = error.InvalidStructure },
+        .{ .items = &.{.{ .children = 1 }}, .err = error.InvalidStructure },
+        .{ .items = &.{.{ .xml = "<extra>" }}, .err = error.InvalidXml },
+        .{ .items = &.{.{ .xml = "<extra/>" }}, .limits = .{ .depth = 1 }, .err = error.LimitExceeded },
+        .{ .items = &.{.{ .xml = "<extra/>" }}, .limits = .{ .nodes = 1 }, .err = error.LimitExceeded },
+        .{ .items = &.{.{ .xml = "<extra/>" }}, .limits = .{ .text_bytes = 7 }, .err = error.LimitExceeded },
+    };
+    for (cases) |case| {
+        var bytes: [1024]u8 = undefined;
+        var sink = std.Io.Writer.fixed(&bytes);
+        var writer = try mzml.Writer.init(std.testing.allocator, &sink, case.limits);
+        defer writer.deinit();
+        try writer.writeHeader(.{ .document = .{ .kind = .mzml }, .run = .{ .kind = .run } });
+        try writer.beginListWithAttributes(.spectrum_list, 1, &.{});
+        const node: mzml.model.Node = .{ .kind = .spectrum, .attributes = &.{
+            .{ .name = "id", .value = "x" }, .{ .name = "index", .value = "0" }, .{ .name = "defaultArrayLength", .value = "0" },
+        }, .content = &.{ .items = case.items } };
+        try std.testing.expectError(case.err, writer.writeRecord(node));
+        try std.testing.expectError(error.FailedState, writer.finish());
+    }
+}
+
 test "[integration] - [mzML 1.0 writing]: retains the namespace hierarchy and payloads" {
     for ([_]bool{ false, true }) |indexed| {
         var sink: std.Io.Writer.Allocating = .init(std.testing.allocator);

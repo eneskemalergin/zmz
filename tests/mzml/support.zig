@@ -4,6 +4,8 @@ const std = @import("std");
 const mzml = @import("zmz").mzml;
 
 pub const HISTORICAL = @embedFile("data/historical.mzML");
+pub const EXTENSIONS = @embedFile("data/extensions.mzML");
+pub const STREAM_EXTENSIONS = @embedFile("data/stream_extensions.mzML");
 
 pub const HEADER =
     "<mzML xmlns='http://psi.hupo.org/ms/mzml' version='1.1.0' id='example'>" ++
@@ -48,6 +50,16 @@ pub const REFERENCED_DOCUMENT = HEADER ++ "<spectrumList count='2' defaultDataPr
 
 // --- Shared helpers ---
 
+pub fn expectItem(expected: mzml.model.Item, actual: mzml.model.Item) !void {
+    try std.testing.expectEqual(std.meta.activeTag(expected), std.meta.activeTag(actual));
+    switch (expected) {
+        .record => |record| try expectNode(record.node, actual.record.node),
+        .xml => |bytes| try std.testing.expectEqualStrings(bytes, actual.xml),
+        .list_start => |start| try std.testing.expectEqualDeep(start, actual.list_start),
+        else => {},
+    }
+}
+
 pub fn readAll(allocator: std.mem.Allocator, bytes: []const u8, options: mzml.StreamReader.Options) !void {
     var input = std.Io.Reader.fixed(bytes);
     var reader = try mzml.StreamReader.init(allocator, &input, options);
@@ -79,6 +91,7 @@ pub fn expectNode(expected: mzml.model.Node, actual: mzml.model.Node) !void {
     try std.testing.expectEqualDeep(expected.attributes, actual.attributes);
     try std.testing.expectEqualDeep(expected.params, actual.params);
     try std.testing.expectEqualDeep(expected.text, actual.text);
+    try std.testing.expectEqualDeep(expected.content, actual.content);
     try std.testing.expectEqual(expected.children.len, actual.children.len);
     for (expected.children, actual.children) |a, b| try expectNode(a, b);
 }
@@ -97,20 +110,7 @@ pub fn rewriteDocument(allocator: std.mem.Allocator, source: []const u8, sink: *
     var writer = if (indexed) try mzml.Writer.initIndexed(allocator, sink, .{}, .{}) else try mzml.Writer.init(allocator, sink, .{});
     defer writer.deinit();
     try writer.writeHeader(header.*);
-    var current = try reader.nextRecord();
-    inline for (.{ mzml.model.Kind.spectrum_list, mzml.model.Kind.chromatogram_list }) |kind| {
-        const list = if (kind == .spectrum_list) header.spectrum_list else header.chromatogram_list;
-        if (list) |descriptor| {
-            try writer.beginListWithAttributes(kind, descriptor.declared_count, descriptor.attributes);
-            while (current) |record| {
-                if (record.node.kind != (if (kind == .spectrum_list) mzml.model.Kind.spectrum else .chromatogram)) break;
-                try writer.writeRecord(record.node);
-                current = try reader.nextRecord();
-            }
-            try writer.endList();
-        }
-    }
-    try std.testing.expectEqual(null, current);
+    while (try reader.nextItem()) |item| try writer.writeItem(item);
     try writer.finish();
 }
 
@@ -176,7 +176,7 @@ pub fn constructFixture(allocator: std.mem.Allocator, sink: *std.Io.Writer, inde
             }
             var id: [64]u8 = undefined;
             const build_record: *const @TypeOf(mzml.Builder.record) = if (prepared) mzml.Builder.preparedRecord else mzml.Builder.record;
-            const record = try build_record(&builder, if (list_kind == .spectrum_list) .spectrum else .chromatogram, try std.fmt.bufPrint(&id, "{s}={s}", .{ if (list_kind == .spectrum_list) "scan" else "chromatogram", @tagName(pipeline) }), index, 3, if (list_kind == .spectrum_list) &.{.{ .group_ref = "record-type" }} else &.{}, &.{}, &nodes);
+            const record = try build_record(&builder, if (list_kind == .spectrum_list) .spectrum else .chromatogram, try std.fmt.bufPrint(&id, "{s}={s}", .{ if (list_kind == .spectrum_list) "scan" else "chromatogram", @tagName(pipeline) }), index, 3, if (list_kind == .spectrum_list) &.{.{ .group_ref = .{ .ref = "record-type" } }} else &.{}, &.{}, &nodes);
             if (prepared) {
                 try writer.writeRecordWithArrays(record.node, &wires);
             } else try writer.writeRecord(record.node);

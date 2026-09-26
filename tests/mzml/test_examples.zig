@@ -190,6 +190,7 @@ test "[cli] - [mzML examples]: rewrites list attributes and records without deco
     defer dir.cleanup();
     inline for (.{
         support.REFERENCED_DOCUMENT,
+        support.STREAM_EXTENSIONS,
         support.HEADER ++ "<spectrumList count='1' sourceNote='A&amp;B' xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance' xsi:schemaLocation='urn:example list.xsd'>" ++
             support.SPECTRUM ++ "</spectrumList><chromatogramList count='0' defaultDataProcessingRef='' sourceNote=''/></run></mzML>",
         support.HEADER ++ "<spectrumList count='0' defaultDataProcessingRef='dp'/><chromatogramList count='0' defaultDataProcessingRef='dp'/></run></mzML>",
@@ -213,15 +214,50 @@ test "[cli] - [mzML examples]: rewrites list attributes and records without deco
         const after_header = try after.readHeader();
         try support.expectNode(before_header.document, after_header.document);
         try support.expectNode(before_header.run, after_header.run);
-        while (try before.nextRecord()) |record|
-            try support.expectNode(record.node, (try after.nextRecord()).?.node);
-        try std.testing.expectEqual(null, try after.nextRecord());
+        while (try before.nextItem()) |item|
+            try support.expectItem(item, (try after.nextItem()).?);
+        try std.testing.expectEqual(null, try after.nextItem());
         inline for (.{ "spectrum_list", "chromatogram_list" }) |field| {
             const expected = @field(before_header, field);
             const actual = @field(after_header, field);
             try std.testing.expectEqual(expected == null, actual == null);
             if (expected) |list| try std.testing.expectEqualDeep(list, actual.?);
         }
+    }
+}
+
+test "[cli] - [mzML examples]: filtering and reencoding retain surrounding XML" {
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "input.mzML", .data = support.STREAM_EXTENSIONS });
+    inline for (.{ "--ms1", "--zlib" }, 0..) |mode, i| {
+        const path = std.fmt.comptimePrint("mode{d}.mzML", .{i});
+        const result = try run(dir.dir, options.rewrite, &.{ "input.mzML", path, mode }, 0);
+        defer std.testing.allocator.free(result);
+        const bytes = try dir.dir.readFileAlloc(std.testing.io, path, std.testing.allocator, .limited(16 * 1024));
+        defer std.testing.allocator.free(bytes);
+        var a_input = std.Io.Reader.fixed(support.STREAM_EXTENSIONS);
+        var a = try mzml.StreamReader.init(std.testing.allocator, &a_input, .{});
+        defer a.deinit();
+        var b_input = std.Io.Reader.fixed(bytes);
+        var b = try mzml.StreamReader.init(std.testing.allocator, &b_input, .{});
+        defer b.deinit();
+        var records: usize = 0;
+        var fragments: usize = 0;
+        while (try a.nextItem()) |expected| {
+            if (expected != .xml) continue;
+            while (try b.nextItem()) |actual| {
+                if (actual == .record) records += 1;
+                if (actual == .xml) {
+                    try support.expectItem(expected, actual);
+                    fragments += 1;
+                    break;
+                }
+            } else return error.MissingXml;
+        }
+        try std.testing.expectEqual(@as(usize, if (i == 0) 1 else 3), records);
+        try std.testing.expectEqual(@as(usize, 8), fragments);
+        try std.testing.expectEqual(null, try b.nextItem());
     }
 }
 

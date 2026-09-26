@@ -69,14 +69,14 @@ test "[property] - [mzML scientific metadata]: distinguishes absent repeated and
         const first: mzml.cv.Entry = .{ .cv = .{ .accession = .{ .raw = pair[0] }, .value = "" } };
         const second: mzml.cv.Entry = .{ .cv = .{ .accession = .{ .raw = pair[1] } } };
         const groups = [_]mzml.cv.Group{.{ .id = "g", .entries = &.{first} }};
-        record.node.params = &.{.{ .group_ref = "g" }};
+        record.node.params = &.{.{ .group_ref = .{ .ref = "g" } }};
         try std.testing.expectEqual(pair[3], (try pair[2](record, &groups)).?);
         try std.testing.expectError(error.MissingGroup, pair[2](record, &.{}));
         record.node.params = &.{second};
         try std.testing.expectEqual(pair[4], (try pair[2](record, &.{})).?);
-        record.node.params = &.{ .{ .group_ref = "g" }, first };
+        record.node.params = &.{ .{ .group_ref = .{ .ref = "g" } }, first };
         try std.testing.expectError(error.RepeatedParameter, pair[2](record, &groups));
-        record.node.params = &.{ .{ .group_ref = "g" }, second };
+        record.node.params = &.{ .{ .group_ref = .{ .ref = "g" } }, second };
         try std.testing.expectError(error.ConflictingParameter, pair[2](record, &groups));
         record.node.params = &.{.{ .cv = .{ .accession = .{ .raw = "X:future" }, .name = "positive scan" } }};
         try std.testing.expectEqual(null, try pair[2](record, &.{}));
@@ -126,7 +126,7 @@ test "[property] - [mzML scientific metadata]: preserves independent fields and 
     try std.testing.expectError(error.Overflow, ion.selectedIonValues(&.{}));
     window.params = &.{ .{ .cv = .{ .accession = model.Terms.ISOLATION_TARGET_MZ, .value = "1" } }, .{ .cv = .{ .accession = model.Terms.ISOLATION_TARGET_MZ, .value = "2" } } };
     try std.testing.expectError(error.RepeatedParameter, window.isolationWindowValues(&.{}));
-    scan.params = &.{.{ .group_ref = "missing" }};
+    scan.params = &.{.{ .group_ref = .{ .ref = "missing" } }};
     try std.testing.expectError(error.MissingGroup, scan.scanStartTime(&.{}));
 }
 
@@ -141,14 +141,14 @@ test "[integration] - [mzML field access]: preserves source units and rejects am
         } } },
     };
     const groups = [_]mzml.cv.Group{.{ .id = "fields", .entries = &entries }};
-    var node: model.Node = .{ .kind = .scan, .params = &.{.{ .group_ref = "fields" }} };
+    var node: model.Node = .{ .kind = .scan, .params = &.{.{ .group_ref = .{ .ref = "fields" } }} };
     try std.testing.expectEqual(@as(?u32, 2), try node.integer(u32, &groups, model.Terms.MS_LEVEL));
     const time = (try node.number(&groups, model.Terms.SCAN_START_TIME)).?;
     try std.testing.expectEqual(@as(f64, 1.25), time.value);
     try std.testing.expectEqualDeep(entries[1].cv, time.parameter);
     try std.testing.expectEqual(null, try node.number(&groups, model.Terms.SELECTED_ION_MZ));
     try std.testing.expectError(error.MissingGroup, node.parameter(&.{}, model.Terms.MS_LEVEL));
-    node.params = &.{ .{ .group_ref = "fields" }, entries[0] };
+    node.params = &.{ .{ .group_ref = .{ .ref = "fields" } }, entries[0] };
     try std.testing.expectError(error.RepeatedParameter, node.integer(u32, &groups, model.Terms.MS_LEVEL));
     node.params = &.{.{ .cv = .{ .accession = model.Terms.SCAN_START_TIME, .unit = .{ .name = "" } } }};
     try std.testing.expectError(error.MissingValue, node.number(&.{}, model.Terms.SCAN_START_TIME));

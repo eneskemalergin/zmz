@@ -16,7 +16,7 @@ const COUNT_PLACEHOLDER = "0" ** std.fmt.comptimePrint("{d}", .{std.math.maxInt(
 pub const Limits = schema.Limits;
 
 /// Writer failures are sticky. No error permits treating partially written output as complete.
-pub const Error = xml.WriterError || cv.ValueError || base64.Error || schema.Error || std.Io.File.WritePositionalError || std.Io.File.ReadPositionalError || error{
+pub const Error = xml.WriterError || xml.Error || cv.ValueError || base64.Error || schema.Error || std.Io.File.WritePositionalError || std.Io.File.ReadPositionalError || error{
     InvalidStructure,
     MissingAttribute,
     UnknownAttribute,
@@ -35,7 +35,7 @@ pub const Error = xml.WriterError || cv.ValueError || base64.Error || schema.Err
 engine: xml.Writer,
 allocator: std.mem.Allocator,
 limits: Limits,
-phase: enum { initial, run, list, done } = .initial,
+phase: enum { initial, run, list, document, done } = .initial,
 failed: bool = false,
 list_kind: ?model.Kind = null,
 expected_count: usize = 0,
@@ -43,6 +43,7 @@ written_count: usize = 0,
 index_state: ?*IndexState = null,
 file_sink: ?*std.Io.File.Writer = null,
 count_offset: ?u64 = null,
+namespace_uri: []const u8 = xml.NAMESPACE,
 
 /// Bounds retained index entries and ID bytes, including historical native/spot IDs.
 pub const IndexLimits = struct { records: usize = 1_000_000, id_bytes: usize = 64 * 1024 * 1024 };
@@ -100,24 +101,22 @@ pub fn writeHeader(self: *Writer, header: model.Header) Error!void {
     errdefer self.failed = true;
     if (self.phase != .initial) return error.InvalidState;
     try schema.checkHeader(header);
+    self.namespace_uri = if (std.mem.eql(u8, header.namespace_uri, xml.NAMESPACE)) xml.NAMESPACE else if (std.mem.eql(u8, header.namespace_uri, xml.NAMESPACE_1_0)) xml.NAMESPACE_1_0 else return error.InvalidNamespace;
     try self.engine.startDocument();
     if (self.index_state) |state| {
         state.historical = std.mem.eql(u8, header.namespace_uri, xml.NAMESPACE_1_0);
         try self.engine.startElement("indexedmzML");
         try self.engine.namespace(null, header.namespace_uri);
     }
-    try self.engine.startElement("mzML");
-    try self.engine.namespace(null, header.namespace_uri);
-    try self.engine.namespace("xsi", xml.XSI);
+    try self.startKnown("mzML", header.document.attributes, true);
+    if (self.engine.namespaceUri("xsi") == null) try self.engine.namespace("xsi", xml.XSI);
     try self.writeAttributes(header.document.attributes);
-    try self.writeParams(header.document.params);
     var no_arrays: []const []const u8 = &.{};
     var budget = self.limits.nodes;
-    try self.writeChildren(header.document, false, &no_arrays, self.limits.depth, &budget);
-    try self.engine.startElement("run");
+    try self.writeContent(header.document, false, &no_arrays, self.limits.depth, &budget);
+    try self.startKnown("run", header.run.attributes, false);
     try self.writeAttributes(header.run.attributes);
-    try self.writeParams(header.run.params);
-    try self.writeChildren(header.run, false, &no_arrays, self.limits.depth, &budget);
+    try self.writeContent(header.run, false, &no_arrays, self.limits.depth, &budget);
     self.phase = .run;
 }
 
@@ -140,7 +139,7 @@ pub fn beginListWithAttributes(self: *Writer, kind: model.Kind, count: ?usize, a
     if (count == null and self.file_sink == null) return error.InvalidOptions;
     var buffer: [32]u8 = undefined;
     const text = if (count) |value| std.fmt.bufPrint(&buffer, "{d}", .{value}) catch return error.LimitExceeded else COUNT_PLACEHOLDER;
-    try self.engine.startElement(kind.xmlName());
+    try self.startKnown(kind.xmlName(), attributes, false);
     try self.engine.attribute("count", text);
     self.count_offset = if (count == null)
         (self.engine.byteOffset() orelse return error.LimitExceeded) - 1 - COUNT_PLACEHOLDER.len
@@ -161,6 +160,29 @@ pub fn beginListWithAttributes(self: *Writer, kind: model.Kind, count: ?usize, a
 /// Numeric array construction uses the separate arrays encoder before this call.
 pub fn writeRecord(self: *Writer, node: model.Node) Error!void {
     return self.writeRecordInner(node, false, &.{});
+}
+
+/// Writes one forward item without retaining it. List openings use source counts;
+/// use beginListWithAttributes instead when filtering or choosing unknown counts.
+/// Decoded records still need writeRecordWithArrays for their omitted binary text.
+pub fn writeItem(self: *Writer, item: model.Item) Error!void {
+    if (self.failed) return error.FailedState;
+    errdefer self.failed = true;
+    switch (item) {
+        .list_start => |start| try self.beginListWithAttributes(start.kind, start.list.declared_count, start.list.attributes),
+        .record => |record| try self.writeRecord(record.node),
+        .list_end => try self.endList(),
+        .run_end => {
+            if (self.phase != .run) return error.InvalidState;
+            try self.engine.endElement();
+            self.phase = .document;
+        },
+        .xml => |bytes| {
+            if (self.phase != .run and self.phase != .list and self.phase != .document) return error.InvalidState;
+            var budget = self.limits.nodes;
+            try self.writeXml(bytes, self.limits.depth, &budget);
+        },
+    }
 }
 
 /// Writes prepared primitive, Numpress, or compressed bytes as canonical Base64 in array order.
@@ -252,8 +274,8 @@ pub fn endList(self: *Writer) Error!void {
 pub fn finish(self: *Writer) Error!void {
     if (self.failed) return error.FailedState;
     errdefer self.failed = true;
-    if (self.phase != .run) return error.InvalidState;
-    try self.engine.endElement();
+    if (self.phase != .run and self.phase != .document) return error.InvalidState;
+    if (self.phase == .run) try self.engine.endElement();
     try self.engine.endElement();
     if (self.index_state) |state| try self.writeIndex(state);
     try self.engine.endDocument();
@@ -321,9 +343,8 @@ fn writeNode(self: *Writer, node: model.Node, comptime replace_arrays: bool, rem
         if (node.params.len != 0) return error.InvalidStructure;
         if (!replace_arrays and node.text == null) return error.PayloadNotRetained;
     } else if (node.text != null) return error.InvalidStructure;
-    try self.engine.startElement(node.kind.xmlName());
+    try self.startKnown(node.kind.xmlName(), node.attributes, false);
     try self.writeAttributes(node.attributes);
-    try self.writeParams(node.params);
     if (replace_arrays and node.kind == .binary) {
         if (remaining.len == 0) return error.CountMismatch;
         try self.engine.binary(remaining.*[0]);
@@ -332,20 +353,58 @@ fn writeNode(self: *Writer, node: model.Node, comptime replace_arrays: bool, rem
         if (text.len > self.limits.text_bytes) return error.LimitExceeded;
         try self.engine.text(text);
     }
-    try self.writeChildren(node, replace_arrays, remaining, depth - 1, budget);
+    try self.writeContent(node, replace_arrays, remaining, depth - 1, budget);
     try self.engine.endElement();
 }
 
-fn writeChildren(self: *Writer, node: model.Node, comptime replace_arrays: bool, remaining: *[]const []const u8, depth: usize, budget: *usize) Error!void {
+fn writeContent(self: *Writer, node: model.Node, comptime replace_arrays: bool, remaining: *[]const []const u8, depth: usize, budget: *usize) Error!void {
     const rules = schema.CHILD_KINDS.get(node.kind);
     var seen = std.EnumSet(model.Kind).initEmpty();
-    for (node.children) |child| {
-        if (!rules.allowed.contains(child.kind) or (node.kind == .mzml and child.kind == .run))
-            return error.InvalidStructure;
-        if (rules.singular.contains(child.kind) and seen.contains(child.kind)) return error.InvalidStructure;
-        seen.insert(child.kind);
-        try self.writeNode(child, replace_arrays, remaining, depth, budget);
+    if (node.content == null) {
+        try self.writeParams(node.params, depth, budget);
+        for (node.children) |child| {
+            if (!rules.allowed.contains(child.kind) or (node.kind == .mzml and child.kind == .run)) return error.InvalidStructure;
+            if (rules.singular.contains(child.kind) and seen.contains(child.kind)) return error.InvalidStructure;
+            seen.insert(child.kind);
+            try self.writeNode(child, replace_arrays, remaining, depth, budget);
+        }
+        return;
     }
+    var params: usize = 0;
+    var children: usize = 0;
+    for (node.content.?.items) |item| switch (item) {
+        .params => |count| {
+            if (count > node.params.len - params) return error.InvalidStructure;
+            try self.writeParams(node.params[params..][0..count], depth, budget);
+            params += count;
+        },
+        .children => |count| {
+            if (count > node.children.len - children) return error.InvalidStructure;
+            for (node.children[children..][0..count]) |child| {
+                if (!rules.allowed.contains(child.kind) or (node.kind == .mzml and child.kind == .run))
+                    return error.InvalidStructure;
+                if (rules.singular.contains(child.kind) and seen.contains(child.kind)) return error.InvalidStructure;
+                seen.insert(child.kind);
+                try self.writeNode(child, replace_arrays, remaining, depth, budget);
+            }
+            children += count;
+        },
+        .xml => |bytes| try self.writeXml(bytes, depth, budget),
+    };
+    if (params != node.params.len or children != node.children.len) return error.InvalidStructure;
+}
+
+// Keep fragment parser storage off ordinary recursive write frames.
+noinline fn writeXml(self: *Writer, bytes: []const u8, depth: usize, budget: *usize) Error!void {
+    if (depth == 0 or bytes.len > self.limits.text_bytes) return error.LimitExceeded;
+    var input = std.Io.Reader.fixed(bytes);
+    var cursor = try xml.Cursor.init(self.allocator, &input, @min(depth, 64), @max(1, bytes.len / 4), self.limits.text_bytes);
+    defer cursor.deinit();
+    try cursor.advanceFragment(true);
+    if (cursor.current == null or cursor.current.?.data != .start_element) return error.InvalidStructure;
+    try cursor.writeElement(&self.engine, budget);
+    try cursor.advanceFragment(false);
+    if (cursor.current != null) return error.InvalidStructure;
 }
 
 fn overlaps(a: []const u8, b: []const u8) bool {
@@ -357,23 +416,78 @@ fn overlaps(a: []const u8, b: []const u8) bool {
 
 fn writeAttributes(self: *Writer, attrs: []const model.Attribute) Error!void {
     for (attrs) |attr| {
+        if (namespacePrefix(attr) != null) continue;
         if (attr.namespace_uri) |uri| {
-            if (!std.mem.eql(u8, uri, xml.XSI) or !std.mem.eql(u8, attr.name, "schemaLocation"))
-                return error.UnknownAttribute;
+            if (std.mem.indexOfScalar(u8, attr.name, ':')) |colon| {
+                const actual = self.engine.namespaceUri(attr.name[0..colon]) orelse return error.InvalidNamespace;
+                if (!std.mem.eql(u8, actual, uri)) return error.InvalidNamespace;
+                try self.engine.attribute(attr.name, attr.value);
+            } else if (std.mem.eql(u8, uri, xml.XSI) and std.mem.eql(u8, attr.name, "schemaLocation")) {
+                if (!std.mem.eql(u8, self.engine.namespaceUri("xsi") orelse "", xml.XSI)) try self.engine.namespace("xsi", xml.XSI);
+                try self.engine.attribute("xsi:schemaLocation", attr.value);
+            } else return error.UnknownAttribute;
+        } else {
+            if (std.mem.indexOfScalar(u8, attr.name, ':') != null) return error.InvalidNamespace;
+            try self.engine.attribute(attr.name, attr.value);
         }
-        try self.engine.attribute(if (attr.namespace_uri != null) "xsi:schemaLocation" else attr.name, attr.value);
     }
 }
 
-fn writeParams(self: *Writer, params: []const cv.Entry) Error!void {
+fn namespacePrefix(attr: model.Attribute) ?[]const u8 {
+    if (!std.mem.eql(u8, attr.namespace_uri orelse "", xml.XMLNS_NAMESPACE)) return null;
+    if (std.mem.eql(u8, attr.name, "xmlns")) return "";
+    if (std.mem.startsWith(u8, attr.name, "xmlns:")) return attr.name[6..];
+    return null;
+}
+
+fn startKnown(self: *Writer, name: []const u8, attrs: []const model.Attribute, root: bool) Error!void {
+    var source_default: ?[]const u8 = null;
+    var has_namespaces = false;
+    for (attrs) |attr| if (namespacePrefix(attr)) |prefix| {
+        has_namespaces = true;
+        if (prefix.len == 0) source_default = attr.value;
+    };
+    if (source_default) |uri| {
+        if (!std.mem.eql(u8, uri, self.namespace_uri)) {
+            var prefix: ?[]const u8 = null;
+            for (attrs) |attr| if (namespacePrefix(attr)) |candidate| {
+                if (candidate.len != 0 and std.mem.eql(u8, attr.value, self.namespace_uri)) prefix = candidate;
+            };
+            const selected = prefix orelse return error.InvalidNamespace;
+            const qualified = try self.allocator.alloc(u8, selected.len + 1 + name.len);
+            defer self.allocator.free(qualified);
+            @memcpy(qualified[0..selected.len], selected);
+            qualified[selected.len] = ':';
+            @memcpy(qualified[selected.len + 1 ..], name);
+            try self.engine.startElement(qualified);
+        } else try self.engine.startElement(name);
+    } else {
+        const declare = root or !std.mem.eql(u8, self.engine.namespaceUri("") orelse "", self.namespace_uri);
+        try self.engine.startElement(name);
+        if (declare) try self.engine.namespace(null, self.namespace_uri);
+        if (!has_namespaces) return;
+    }
+    for (attrs) |attr| if (namespacePrefix(attr)) |prefix| {
+        if (!std.mem.eql(u8, self.engine.namespaceUri(prefix) orelse "", attr.value))
+            try self.engine.namespace(if (prefix.len == 0) null else prefix, attr.value);
+    };
+}
+
+fn writeParams(self: *Writer, params: []const cv.Entry, depth: usize, budget: *usize) Error!void {
     for (params) |entry| {
+        const extra = switch (entry) {
+            .group_ref => |ref| ref.xml,
+            .cv => |param| param.xml,
+            .user => |param| param.xml,
+        };
+        const attrs = if (extra) |value| value.attributes else &.{};
         switch (entry) {
             .group_ref => |ref| {
-                try self.engine.startElement("referenceableParamGroupRef");
-                try self.optionalAttribute("ref", ref);
+                try self.startKnown("referenceableParamGroupRef", attrs, false);
+                try self.optionalAttribute("ref", ref.ref);
             },
             .cv => |param| {
-                try self.engine.startElement("cvParam");
+                try self.startKnown("cvParam", attrs, false);
                 try self.optionalAttribute("cvRef", param.cv_ref);
                 try self.optionalAttribute("accession", if (param.accession) |accession| accession.raw else null);
                 try self.optionalAttribute("name", param.name);
@@ -381,13 +495,21 @@ fn writeParams(self: *Writer, params: []const cv.Entry) Error!void {
                 try self.writeUnit(param.unit);
             },
             .user => |param| {
-                try self.engine.startElement("userParam");
+                try self.startKnown("userParam", attrs, false);
                 try self.optionalAttribute("name", param.name);
                 try self.optionalAttribute("value", param.value);
                 try self.optionalAttribute("type", param.value_type);
                 try self.writeUnit(param.unit);
             },
         }
+        try self.writeAttributes(attrs);
+        if (extra) |value| for (value.content) |part| switch (part) {
+            .xml => |bytes| try self.writeXml(bytes, depth -| 1, budget),
+            .text => |bytes| {
+                if (bytes.len > self.limits.text_bytes) return error.LimitExceeded;
+                try self.engine.text(bytes);
+            },
+        };
         try self.engine.endElement();
     }
 }

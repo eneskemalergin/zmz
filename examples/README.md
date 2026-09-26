@@ -68,6 +68,8 @@ zig-out/bin/mzml-rewrite input.mzML zlib.mzML --zlib
 
 [rewrite.zig](rewrite.zig) writes a new indexed file. The default and `--ms1` modes retain source record metadata and binary text without decoding arrays, so an unfamiliar codec can be copied. XML spelling and the old index wrapper are not reproduced.
 
+All modes use `nextItem` or `nextDecodedItem` and `writeItem` to keep XML before, between, and after records, inside empty lists, and after the run. `nextRecord` returns records only and skips that surrounding XML, so it is not a complete file-copy iterator. Items borrow until the next traversal call; `owned.Item.init` keeps an independent copy. Filtering leaves surrounding XML in source order, even when adjacent spectra are removed.
+
 The default copy requires accurate declared list counts and consecutive zero-based record indexes. `--ms1` keeps spectra whose MS level is 1, skips spectra without an MS level, and keeps all chromatograms. It reads the input once and assigns consecutive output spectrum indexes while preserving all other record attributes, IDs, references, and binary text. References to removed spectra remain unchanged; choosing how to handle them is the caller's decision.
 
 Filtering uses `Writer.initFile` and a null spectrum count in `beginListWithAttributes`. `endList` patches a fixed-width, zero-padded decimal count without moving any records. Plain file output needs write access; indexed file output also needs read access because `finish` reads the written prefix once to compute its checksum. This adds an output read, not another input scan or a retained copy of the file. `init` and `initIndexed` still need exact counts and work with forward-only sinks. Pass null index limits to `initFile` for plain output or `.{}` for indexed output.
@@ -130,6 +132,6 @@ This uses a local package dependency, including the library's build options. It 
 
 ## Current input limits
 
-The reader handles XML 1.0 in UTF-8, UTF-16, and declared ISO-8859-1. Returned text and written XML use UTF-8; source offsets count original bytes. The mzML version attribute is preserved, including empty or absent values, without rejecting its value. The stable namespace and modeled elements still determine what can be read. Genuine mzML 1.0.0 namespaces and structures remain unsupported. `UnsupportedVersion` concerns the XML declaration; a legacy namespace returns `WrongNamespace`. A schema filename alone does not establish that the input is readable.
+The reader handles XML 1.0 in UTF-8, UTF-16, and declared ISO-8859-1. Returned text and written XML use UTF-8; source offsets count original bytes. The mzML version attribute is preserved, including empty or absent values, without rejecting its value. Original mzML 1.0.0 and modern mzML namespaces and structures use the same API. Extra attributes and unknown XML inside header and record nodes survive copying and writing without being interpreted as scans or arrays. `UnsupportedVersion` concerns the XML declaration; an unrecognized document namespace returns `WrongNamespace`. A schema filename alone does not establish that the input is readable.
 
 The stream example prints the reader's first error, byte offset, and element when available, then returns the error. No example prechecks the whole file or silently skips a failed record. Whole-file gzip is not handled here.

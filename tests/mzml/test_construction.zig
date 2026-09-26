@@ -4,6 +4,50 @@ const std = @import("std");
 const mzml = @import("zmz").mzml;
 const support = @import("support.zig");
 
+test "[integration] - [mzML extensions]: array replacement retains XML and late parameter order" {
+    var input = std.Io.Reader.fixed(support.EXTENSIONS);
+    var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+    defer reader.deinit();
+    const header = try reader.readHeader();
+    const original = (try reader.nextRecord()).?;
+    var builder = mzml.Builder.init(std.testing.allocator, .{});
+    defer builder.deinit();
+    const values = [_]f64{ 5, 6 };
+    const second = [_]f64{ 3, 4 };
+    const scratch: mzml.arrays.Scratch = .{ .transport = &.{}, .transformed = &.{} };
+    const first = try builder.prepareArrayFrom(f64, &values, original.binaryArrays()[0], header.groups, .{}, scratch, null);
+    const other = try builder.prepareArrayFrom(f64, &second, original.binaryArrays()[1], header.groups, .{}, scratch, null);
+    var array_list = original.node.child(.binary_data_array_list).?;
+    array_list.children = &.{ first.array.node, other.array.node };
+    var record = original.node;
+    record.children = &.{ original.node.children[0], array_list };
+    var sink: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer sink.deinit();
+    var writer = try mzml.Writer.init(std.testing.allocator, &sink.writer, .{});
+    defer writer.deinit();
+    try writer.writeHeader(header.*);
+    try writer.beginListWithAttributes(.spectrum_list, 1, header.spectrum_list.?.attributes);
+    try writer.writeRecordWithArrays(record, &.{ first.wire, other.wire });
+    try writer.endList();
+    try writer.finish();
+    const bytes = sink.written();
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "e:array=\"keep\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "e:payload=\"keep\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "e:type=\"e:Primitive\"") != null);
+    const units = std.mem.indexOf(u8, bytes, "<e:units").?;
+    const binary = std.mem.indexOfPos(u8, bytes, units, "<binary").?;
+    const late = std.mem.indexOf(u8, bytes, "name=\"late array note\"").?;
+    try std.testing.expect(units < binary and binary < late);
+    var copied = std.Io.Reader.fixed(bytes);
+    var result = try mzml.StreamReader.init(std.testing.allocator, &copied, .{});
+    defer result.deinit();
+    var decoded = mzml.StreamReader.DecodedArrays.init(std.testing.allocator, .{});
+    defer decoded.deinit();
+    _ = (try result.nextDecodedRecord(&decoded)).?;
+    try std.testing.expectEqualSlices(f64, &values, decoded.get(0).?.values.float64);
+    try std.testing.expectEqualSlices(f64, &second, decoded.get(1).?.values.float64);
+}
+
 fn replaceArrayAllocated(allocator: std.mem.Allocator) !void {
     const params = [_]mzml.cv.Entry{
         .{ .cv = .{ .cv_ref = "MS", .accession = mzml.model.Terms.INTENSITY_ARRAY, .name = "intensity", .unit = .{ .name = "source unit" } } },
@@ -19,7 +63,7 @@ fn replaceArrayAllocated(allocator: std.mem.Allocator) !void {
             .{ .name = "arrayLength", .value = "3" },
             .{ .name = "extra", .value = "keep" },
         },
-        .params = &.{ .{ .group_ref = "encoding" }, .{ .user = .{ .name = "local note", .value = "" } } },
+        .params = &.{ .{ .group_ref = .{ .ref = "encoding" } }, .{ .user = .{ .name = "local note", .value = "" } } },
         .children = &.{.{ .kind = .binary, .attributes = &.{.{ .name = "extra", .value = "binary" }}, .text = "A" ** 8192 }},
     };
     var builder = mzml.Builder.init(allocator, .{ .bytes = 4096 });
@@ -349,7 +393,7 @@ test "[integration] - [mzML construction]: preserves partial fields and supplied
     defer builder.deinit();
     const source: mzml.model.Header = .{
         .document = .{ .kind = .mzml, .attributes = &.{.{ .name = "version", .value = "1.1.0" }} },
-        .run = .{ .kind = .run, .params = &.{ .{ .user = .{ .unit = .{ .name = "partial" } } }, .{ .cv = .{} }, .{ .group_ref = null } } },
+        .run = .{ .kind = .run, .params = &.{ .{ .user = .{ .unit = .{ .name = "partial" } } }, .{ .cv = .{} }, .{ .group_ref = .{ .ref = null } } } },
     };
     const header = try builder.header(source);
     try support.expectNode(source.document, header.document);

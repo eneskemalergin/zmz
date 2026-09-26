@@ -102,6 +102,7 @@ fn expectDecodedNode(expected: mzml.model.Node, actual: mzml.model.Node) !void {
     try std.testing.expectEqual(expected.kind, actual.kind);
     try std.testing.expectEqualDeep(expected.attributes, actual.attributes);
     try std.testing.expectEqualDeep(expected.params, actual.params);
+    try std.testing.expectEqualDeep(expected.content, actual.content);
     try std.testing.expectEqual(expected.start_offset, actual.start_offset);
     try std.testing.expectEqual(expected.content_offset, actual.content_offset);
     try std.testing.expectEqual(expected.end_offset, actual.end_offset);
@@ -1151,7 +1152,7 @@ test "[property] - [mzML index]: preserves parser checks and limits during rebui
     }) |replacement| {
         const bytes = try std.mem.replaceOwned(u8, std.testing.allocator, support.DOCUMENT, replacement[0], replacement[1]);
         defer std.testing.allocator.free(bytes);
-        try std.testing.expect(Parse.failure(bytes, .{}) != null);
+        try std.testing.expectEqual(null, Parse.failure(bytes, .{}));
         try Parse.compare(bytes, .{});
     }
     for ([_][2][]const u8{
@@ -1200,7 +1201,7 @@ test "[integration] - [mzML index]: separates trailer budgets from header and re
     const allocator = std.testing.allocator;
     const source = @embedFile("data/writer_indexed.mzML");
     for ([_]mzml.StreamReader.Limits{
-        .{ .nodes = 32 }, .{ .list_entries = 4 }, .{ .header_bytes = 4096 },
+        .{ .nodes = 32 }, .{ .list_entries = 4 }, .{ .header_bytes = 4352 },
     }) |limits| {
         try std.testing.expectError(error.LimitExceeded, support.readAll(allocator, source, .{ .retain_index = true, .limits = limits }));
         var index = try mzml.IndexedReader.build(allocator, .{ .bytes = source }, .{

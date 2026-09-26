@@ -77,7 +77,6 @@ pub const Options = struct {
 pub const Error = xml.Error || cv.ValueError || DecodedArrays.Error || std.mem.Allocator.Error || error{
     InvalidStructure,
     MissingAttribute,
-    UnknownAttribute,
     FailedState,
     InvalidOptions,
     InvalidIndex,
@@ -97,6 +96,7 @@ header_ready: bool = false,
 done: bool = false,
 failure: ?Diagnostic = null,
 active_list: ?model.Kind = null,
+position: enum { list_start, list, run, run_end, document } = .run_end,
 current_kind: ?model.Kind = null,
 index_trailer: [3]model.Node = undefined,
 scopes: [3]Scope = undefined,
@@ -161,11 +161,32 @@ pub fn nextIndexRecord(self: *StreamReader) Error!?model.Record {
 const Retention = enum { tree, entry, none };
 
 fn nextRecordFor(self: *StreamReader, comptime retention: Retention) Error!?model.Record {
+    while (try self.nextItemFor(retention, false)) |item| {
+        if (item == .record) return item.record;
+    }
+    return null;
+}
+
+pub fn nextItem(self: *StreamReader) Error!?model.Item {
+    return self.nextItemFor(.tree, true);
+}
+
+fn nextItemFor(self: *StreamReader, comptime retention: Retention, comptime retain_xml: bool) Error!?model.Item {
     if (self.failure != null) return error.FailedState;
     _ = try self.readHeader();
     self.record_store.reset();
     if (self.done) return null;
-    return self.nextRecordInner(retention) catch |err| return self.fail(err);
+    return self.nextItemInner(retention, retain_xml) catch |err| return self.fail(err);
+}
+
+pub fn nextDecodedItem(self: *StreamReader, output: *DecodedArrays) Error!?model.Item {
+    output.reset();
+    errdefer output.reset();
+    self.decoded_arrays = output;
+    defer self.decoded_arrays = null;
+    const item = try self.nextItem() orelse return null;
+    if (item == .record) output.complete();
+    return item;
 }
 
 pub fn nextDecodedRecord(self: *StreamReader, output: *DecodedArrays) Error!?model.Record {
@@ -298,9 +319,7 @@ pub fn resumeFollowingList(self: *StreamReader, input: *std.Io.Reader, ancestors
     }
     if (try self.kind() != .spectrum) return error.InvalidStructure;
     try self.cursor.skip();
-    try self.consumeEnd(.spectrum_list, true);
-    self.active_list = null;
-    try self.openList();
+    try self.finishSpectrumList();
     if (self.active_list != .chromatogram_list) return error.InvalidStructure;
     const scope = &self.list_scopes[1].?;
     scope.start = std.math.add(u64, scope.start, physical_start - prefix_length) catch return error.LimitExceeded;
@@ -311,10 +330,25 @@ pub fn resumeFollowingList(self: *StreamReader, input: *std.Io.Reader, ancestors
 pub fn finishEmptySpectrumList(self: *StreamReader) Error!void {
     if (self.active_list != .spectrum_list) return error.InvalidOptions;
     try self.cursor.advance(false);
+    try self.finishSpectrumList();
+    if (self.active_list != .chromatogram_list) return error.InvalidStructure;
+}
+
+fn skipExtraXml(self: *StreamReader) Error!void {
+    while (self.cursor.current) |event| {
+        if (event.data != .start_element or self.knownKind() != null) break;
+        self.record_store.reset();
+        _ = try self.readXml(&self.record_store, false);
+        try self.cursor.advance(false);
+    }
+}
+
+fn finishSpectrumList(self: *StreamReader) Error!void {
+    try self.skipExtraXml();
     try self.consumeEnd(.spectrum_list, true);
     self.active_list = null;
+    try self.skipExtraXml();
     try self.openList();
-    if (self.active_list != .chromatogram_list) return error.InvalidStructure;
 }
 
 fn shiftOffsets(node: *model.Node, delta: u64) Error!void {
@@ -349,9 +383,25 @@ fn readHeaderInner(self: *StreamReader) Error!void {
     defer metadata.deinit(self.allocator);
     try metadata.ensureTotalCapacity(self.allocator, sections.len - 1);
     var document_params: usize = 0;
+    var content: std.ArrayList(model.Content.Item) = .empty;
+    defer content.deinit(self.allocator);
     while (true) {
+        const before = document_params;
+        const current = self.cursor.current orelse return error.UnexpectedEnd;
+        if (current.data != .start_element) return error.InvalidStructure;
+        if (self.paramKind(current.data.start_element) != null and
+            metadata.items.len != 0 and content.items.len == 0)
+            try self.startContent(&content, document_params, metadata.items.len);
         try self.parseParams(&self.header_store, true, &document_params);
-        const kind_value = try self.kind();
+        if (content.items.len != 0 and document_params != before)
+            try content.append(self.allocator, .{ .params = document_params - before });
+        const kind_value = self.knownKind() orelse {
+            if (content.items.len == 0) try self.startContent(&content, document_params, metadata.items.len);
+            const fragment = try self.readXml(&self.header_store, true);
+            try content.append(self.allocator, .{ .xml = fragment });
+            try self.cursor.advance(false);
+            continue;
+        };
         if (kind_value == .run) break;
         for (sections) |section| {
             if (section.kind == kind_value) break;
@@ -360,23 +410,45 @@ fn readHeaderInner(self: *StreamReader) Error!void {
         if (seen.contains(kind_value)) return error.InvalidStructure;
         seen.insert(kind_value);
         try metadata.append(self.allocator, try self.parseNode(&self.header_store, 1, true, self.options.payload));
+        if (content.items.len != 0) try content.append(self.allocator, .{ .children = 1 });
     }
     document.params = try self.header_store.copy(cv.Entry, self.param_scratch.items);
     self.param_scratch.clearRetainingCapacity();
     document.children = try self.header_store.copy(model.Node, metadata.items);
+    document.content = try saveContent(&self.header_store, content.items);
+    content.clearRetainingCapacity();
+    metadata.clearRetainingCapacity();
     var run = try self.startNode(&self.header_store, .run);
     self.scopes[self.scope_count] = try self.captureScope();
     self.scope_count += 1;
     try self.cursor.advance(false);
     var param_count: usize = 0;
-    try self.parseParams(&self.header_store, true, &param_count);
+    while (true) {
+        const before = param_count;
+        const current = self.cursor.current orelse return error.UnexpectedEnd;
+        if (current.data == .start_element and self.paramKind(current.data.start_element) != null and
+            metadata.items.len != 0 and content.items.len == 0)
+            try self.startContent(&content, param_count, metadata.items.len);
+        try self.parseParams(&self.header_store, true, &param_count);
+        if (content.items.len != 0 and param_count != before)
+            try content.append(self.allocator, .{ .params = param_count - before });
+        const event = self.cursor.current orelse return error.UnexpectedEnd;
+        if (event.data == .end_element) break;
+        if (self.knownKind()) |kind_value| {
+            if (kind_value != .source_file_ref_list) break;
+            if (metadata.items.len != 0) return error.InvalidStructure;
+            try metadata.append(self.allocator, try self.parseNode(&self.header_store, 1, true, self.options.payload));
+            if (content.items.len != 0) try content.append(self.allocator, .{ .children = 1 });
+        } else {
+            if (content.items.len == 0) try self.startContent(&content, param_count, metadata.items.len);
+            try content.append(self.allocator, .{ .xml = try self.readXml(&self.header_store, true) });
+            try self.cursor.advance(false);
+        }
+    }
     run.params = try self.header_store.copy(cv.Entry, self.param_scratch.items);
     self.param_scratch.clearRetainingCapacity();
-    const event = self.cursor.current orelse return error.UnexpectedEnd;
-    if (event.data == .start_element and try self.kind() == .source_file_ref_list) {
-        const refs = try self.parseNode(&self.header_store, 1, true, self.options.payload);
-        run.children = try self.header_store.copy(model.Node, &.{refs});
-    }
+    run.children = try self.header_store.copy(model.Node, metadata.items);
+    run.content = try saveContent(&self.header_store, content.items);
     const group_list = document.child(.referenceable_param_group_list);
     const group_nodes = if (group_list) |list| list.children else &.{};
     const groups = try self.header_store.alloc(cv.Group, group_nodes.len);
@@ -408,35 +480,71 @@ fn openList(self: *StreamReader) Error!void {
         else => return error.InvalidStructure,
     }
     self.active_list = kind_value;
+    self.position = .list_start;
     self.list_scopes[if (kind_value == .spectrum_list) @as(usize, 0) else 1] = try self.captureScope();
 }
 
-fn nextRecordInner(self: *StreamReader, comptime retention: Retention) Error!?model.Record {
-    while (self.active_list) |list_kind| {
-        try self.cursor.advance(false);
-        const event = self.cursor.current orelse return error.UnexpectedEnd;
-        const list = if (list_kind == .spectrum_list) &self.header.spectrum_list.? else &self.header.chromatogram_list.?;
-        if (event.data == .end_element) {
-            self.current_kind = list_kind;
-            self.active_list = null;
+fn nextItemInner(self: *StreamReader, comptime retention: Retention, comptime retain_xml: bool) Error!?model.Item {
+    while (true) switch (self.position) {
+        .list_start => {
+            self.position = .list;
+            const kind_value = self.active_list.?;
+            return .{ .list_start = .{
+                .kind = kind_value,
+                .list = if (kind_value == .spectrum_list) self.header.spectrum_list.? else self.header.chromatogram_list.?,
+            } };
+        },
+        .list => {
+            const list_kind = self.active_list.?;
             try self.cursor.advance(false);
+            const event = self.cursor.current orelse return error.UnexpectedEnd;
+            if (event.data == .end_element) {
+                try self.consumeEnd(list_kind, false);
+                self.active_list = null;
+                self.position = .run;
+                return .list_end;
+            }
+            const kind_value = self.knownKind() orelse
+                return .{ .xml = try self.readXml(&self.record_store, retain_xml) };
+            const expected: model.Kind = if (list_kind == .spectrum_list) .spectrum else .chromatogram;
+            if (kind_value != expected) return error.InvalidStructure;
+            const node = try self.parseNodeFor(&self.record_store, 1, false, self.options.payload, retention);
+            const list = if (list_kind == .spectrum_list) &self.header.spectrum_list.? else &self.header.chromatogram_list.?;
+            list.observed_count = std.math.add(usize, list.observed_count, 1) catch return error.LimitExceeded;
+            return .{ .record = .{
+                .node = node,
+                .id = node.attribute("id").?,
+                .index = try cv.parseInteger(usize, node.attribute("index")),
+                .default_array_length = try cv.parseInteger(usize, node.attribute("defaultArrayLength")),
+            } };
+        },
+        .run => {
+            try self.cursor.advance(false);
+            const event = self.cursor.current orelse return error.UnexpectedEnd;
+            if (event.data == .end_element) {
+                self.position = .run_end;
+                continue;
+            }
+            if (self.knownKind() == null)
+                return .{ .xml = try self.readXml(&self.record_store, retain_xml) };
             try self.openList();
-            continue;
-        }
-        const expected: model.Kind = if (list_kind == .spectrum_list) .spectrum else .chromatogram;
-        if (try self.kind() != expected) return error.InvalidStructure;
-        const node = try self.parseNodeFor(&self.record_store, 1, false, self.options.payload, retention);
-        list.observed_count = std.math.add(usize, list.observed_count, 1) catch
-            return error.LimitExceeded;
-        return .{
-            .node = node,
-            .id = node.attribute("id").?,
-            .index = try cv.parseInteger(usize, node.attribute("index")),
-            .default_array_length = try cv.parseInteger(usize, node.attribute("defaultArrayLength")),
-        };
-    }
-    try self.consumeEnd(.run, true);
-    try self.consumeEnd(.mzml, false);
+        },
+        .run_end => {
+            try self.consumeEnd(.run, false);
+            self.position = .document;
+            return .run_end;
+        },
+        .document => {
+            try self.cursor.advance(false);
+            const event = self.cursor.current orelse return error.UnexpectedEnd;
+            if (event.data == .end_element) {
+                try self.consumeEnd(.mzml, false);
+                break;
+            }
+            if (self.knownKind() != null) return error.InvalidStructure;
+            return .{ .xml = try self.readXml(&self.record_store, retain_xml) };
+        },
+    };
     if (self.header.indexed and !self.options.retain_index) {
         self.done = true;
         return null;
@@ -465,11 +573,16 @@ fn consumeEnd(self: *StreamReader, kind_value: model.Kind, advance: bool) Error!
 }
 
 fn kind(self: *StreamReader) Error!model.Kind {
-    const event = self.cursor.current orelse return error.UnexpectedEnd;
-    if (event.data != .start_element) return error.InvalidStructure;
+    return self.knownKind() orelse error.InvalidStructure;
+}
+
+fn knownKind(self: *StreamReader) ?model.Kind {
+    const event = self.cursor.current orelse return null;
+    if (event.data != .start_element) return null;
+    const name = event.data.start_element.name.expanded;
+    if (!std.mem.eql(u8, name.namespace_uri orelse "", self.cursor.mzml_namespace)) return null;
     // The cursor resolves namespaces and matches closing tags.
-    const name = xml.localName(event.data.start_element.name);
-    const value = ELEMENT_KINDS.get(name) orelse return error.InvalidStructure;
+    const value = ELEMENT_KINDS.get(name.local) orelse return null;
     self.current_kind = value;
     return value;
 }
@@ -482,7 +595,7 @@ fn startNodeFor(self: *StreamReader, storage: *Storage, kind_value: model.Kind, 
     if (storage.nodes == self.options.limits.nodes) return error.LimitExceeded;
     storage.nodes += 1;
     const event = self.cursor.current orelse return error.UnexpectedEnd;
-    const attributes = try copyAttributes(
+    const attributes = try self.copyAttributes(
         storage,
         event.data.start_element,
         switch (kind_value) {
@@ -542,7 +655,21 @@ fn parseNodeFor(self: *StreamReader, storage: *Storage, depth: usize, advance_af
         const params_start = self.param_scratch.items.len;
         defer self.param_scratch.shrinkRetainingCapacity(params_start);
         var param_count: usize = 0;
+        var content: std.ArrayList(model.Content.Item) = .empty;
+        defer content.deinit(self.allocator);
         try self.parseParams(storage, retention == .tree, &param_count);
+        if (kind_value == .binary_data_array) {
+            while (self.cursor.current) |event| {
+                if (event.data != .start_element or self.knownKind() != null) break;
+                if (retention == .tree and content.items.len == 0) try self.startContent(&content, param_count, 0);
+                const fragment = try self.readXml(storage, retention == .tree);
+                if (retention == .tree) try content.append(self.allocator, .{ .xml = fragment });
+                try self.cursor.advance(false);
+                const before = param_count;
+                try self.parseParams(storage, retention == .tree, &param_count);
+                if (retention == .tree and param_count != before) try content.append(self.allocator, .{ .params = param_count - before });
+            }
+        }
         node.params = self.param_scratch.items[params_start..];
         var decode_array = false;
         if (kind_value == .binary_data_array and storage == &self.record_store) {
@@ -575,8 +702,13 @@ fn parseNodeFor(self: *StreamReader, storage: *Storage, depth: usize, advance_af
         var child_count: usize = 0;
         while (self.cursor.current) |event| {
             if (event.data == .end_element) break;
-            if (event.data == .start_element and paramKind(event.data.start_element) != null) {
+            if (event.data == .start_element and self.paramKind(event.data.start_element) != null) {
+                if (retention == .tree and child_count != 0 and content.items.len == 0)
+                    try self.startContent(&content, param_count, child_count);
+                const before = param_count;
                 try self.parseParams(storage, retention == .tree, &param_count);
+                if (retention == .tree and content.items.len != 0)
+                    try content.append(self.allocator, .{ .params = param_count - before });
                 if (decode_array) {
                     node.params = self.param_scratch.items[params_start..];
                     // Late declarations must agree with the bytes already decoded.
@@ -584,7 +716,13 @@ fn parseNodeFor(self: *StreamReader, storage: *Storage, depth: usize, advance_af
                 }
                 continue;
             }
-            const child_kind = try self.kind();
+            const child_kind = self.knownKind() orelse {
+                if (retention == .tree and content.items.len == 0) try self.startContent(&content, param_count, child_count);
+                const fragment = try self.readXml(storage, retention == .tree);
+                if (retention == .tree) try content.append(self.allocator, .{ .xml = fragment });
+                try self.cursor.advance(false);
+                continue;
+            };
             if (!children.allowed.contains(child_kind)) return error.InvalidStructure;
             // First-child helpers cannot return repeated singular containers.
             if (children.singular.contains(child_kind) and seen.contains(child_kind)) return error.InvalidStructure;
@@ -598,6 +736,7 @@ fn parseNodeFor(self: *StreamReader, storage: *Storage, depth: usize, advance_af
             }
             const child = try self.parseNodeFor(storage, depth + 1, true, child_payload, if (retention == .tree) .tree else .none);
             if (retention == .tree) try self.child_scratch.append(self.allocator, child);
+            if (retention == .tree and content.items.len != 0) try content.append(self.allocator, .{ .children = 1 });
             child_count += 1;
         }
         if (decode_array and !seen.contains(.binary))
@@ -606,6 +745,7 @@ fn parseNodeFor(self: *StreamReader, storage: *Storage, depth: usize, advance_af
         if (retention == .tree) {
             node.params = try storage.copy(cv.Entry, self.param_scratch.items[params_start..]);
             node.children = try storage.copy(model.Node, self.child_scratch.items[children_start..]);
+            node.content = try saveContent(storage, content.items);
         }
     }
     const end = self.cursor.current orelse return error.UnexpectedEnd;
@@ -614,7 +754,8 @@ fn parseNodeFor(self: *StreamReader, storage: *Storage, depth: usize, advance_af
     return node;
 }
 
-fn paramKind(start: xml.Start) ?u2 {
+fn paramKind(self: *const StreamReader, start: xml.Start) ?u2 {
+    if (!std.mem.eql(u8, start.name.expanded.namespace_uri orelse "", self.cursor.mzml_namespace)) return null;
     const local = xml.localName(start.name);
     if (std.mem.eql(u8, local, "referenceableParamGroupRef")) return 0;
     if (std.mem.eql(u8, local, "cvParam")) return 1;
@@ -627,63 +768,92 @@ fn parseParams(self: *StreamReader, storage: *Storage, comptime retain: bool, co
     while (self.cursor.current) |event| {
         if (event.data != .start_element) break;
         const start = event.data.start_element;
-        const selected = paramKind(start) orelse break;
+        const selected = self.paramKind(start) orelse break;
         if (count.* == self.options.limits.list_entries) return error.LimitExceeded;
         if (retain and count.* == 0) try entries.ensureUnusedCapacity(self.allocator, @min(8, self.options.limits.list_entries));
-        const attrs = try copyParamAttributes(storage, start, selected, retain);
+        var has_extra = false;
+        const attrs = try copyParamAttributes(storage, start, selected, retain, &has_extra);
+        const has_content = !start.empty_element_syntax;
+        const extra = if (retain and (has_extra or has_content)) try self.copyParamExtra(storage, start, selected) else null;
         const unit: cv.Unit = .{
             .cv_ref = attrs.unit_cv_ref,
             .name = attrs.unit_name,
             .accession = if (attrs.unit_accession) |value| .{ .raw = value } else null,
         };
         const entry: cv.Entry = switch (selected) {
-            0 => .{ .group_ref = attrs.ref },
+            0 => .{ .group_ref = .{ .ref = attrs.ref, .xml = extra } },
             1 => .{ .cv = .{
                 .cv_ref = attrs.cv_ref,
                 .name = attrs.name,
                 .accession = if (attrs.accession) |value| .{ .raw = value } else null,
                 .value = attrs.value,
                 .unit = unit,
+                .xml = extra,
             } },
             2 => .{ .user = .{
                 .name = attrs.name,
                 .value = attrs.value,
                 .value_type = attrs.value_type,
                 .unit = unit,
+                .xml = extra,
             } },
             else => unreachable,
         };
         if (retain) try entries.append(self.allocator, entry);
         count.* += 1;
-        try self.cursor.advance(false);
+        try self.cursor.advance(has_content);
+        if (has_content) {
+            var content: std.ArrayList(cv.ParameterXml.Part) = .empty;
+            defer content.deinit(self.allocator);
+            while (self.cursor.current) |current| {
+                const part: cv.ParameterXml.Part = switch (current.data) {
+                    .end_element => break,
+                    .start_element => .{ .xml = try self.readXml(storage, retain) },
+                    .text => blk: {
+                        var bytes: std.ArrayList(u8) = .empty;
+                        while (self.cursor.current) |text| {
+                            if (text.data != .text) break;
+                            if (retain) {
+                                if (text.data.text.bytes.len > storage.limit -| storage.used -| bytes.items.len)
+                                    return error.LimitExceeded;
+                                try bytes.appendSlice(storage.arena.allocator(), text.data.text.bytes);
+                            }
+                            try self.cursor.advance(true);
+                        }
+                        storage.used += bytes.items.len;
+                        break :blk .{ .text = bytes.items };
+                    },
+                    else => return error.InvalidStructure,
+                };
+                if (retain) {
+                    if (content.items.len == self.options.limits.list_entries) return error.LimitExceeded;
+                    try content.append(self.allocator, part);
+                }
+                if (part != .text) try self.cursor.advance(true);
+            }
+            if (retain) extra.?.content = try storage.copy(cv.ParameterXml.Part, content.items);
+            if (retain and !has_extra and content.items.len == 0) switch (entries.items[entries.items.len - 1]) {
+                inline else => |*param| param.xml = null,
+            };
+        }
         const end = self.cursor.current orelse return error.UnexpectedEnd;
         if (end.data != .end_element) return error.InvalidStructure;
         try self.cursor.advance(false);
     }
 }
 
-fn copyParamAttributes(storage: *Storage, start: xml.Start, selected: u2, comptime retain: bool) Error!ParamAttributes {
+fn copyParamAttributes(storage: *Storage, start: xml.Start, selected: u2, comptime retain: bool, has_extra: *bool) Error!ParamAttributes {
     var result: ParamAttributes = .{};
-    var unknown = false;
     for (start.attributes) |attribute| {
         const name = attribute.name.expanded;
-        if (name.namespace_uri) |uri| {
-            if (!std.mem.eql(u8, uri, xml.XSI) or !std.mem.eql(u8, name.local, "schemaLocation")) unknown = true;
-            continue;
-        }
-        const field = PARAM_ATTRIBUTES.get(name.local) orelse {
-            unknown = true;
+        const field = parameterAttribute(name, selected) orelse {
+            has_extra.* = true;
             continue;
         };
         switch (field) {
             inline else => |tag| @field(result, @tagName(tag)) = attribute.value,
         }
     }
-    if (unknown or (selected != 0 and result.ref != null) or
-        (selected != 1 and (result.cv_ref != null or result.accession != null)) or
-        (selected != 2 and result.value_type != null)) return error.UnknownAttribute;
-    if (selected == 0 and (result.name != null or result.value != null or result.unit_cv_ref != null or
-        result.unit_accession != null or result.unit_name != null)) return error.UnknownAttribute;
     if (!retain) return result;
     var length: usize = 0;
     inline for (std.meta.fields(ParamAttributes)) |field| {
@@ -703,6 +873,7 @@ fn copyParamAttributes(storage: *Storage, start: xml.Start, selected: u2, compti
 }
 
 fn copyAttributes(
+    self: *StreamReader,
     storage: *Storage,
     start: xml.Start,
     required: []const u8,
@@ -713,13 +884,14 @@ fn copyAttributes(
         const attribute = start.attribute(null, name);
         if (attribute == null) return error.MissingAttribute;
     }
+    if (retain and self.cursor.hasAdditionalNamespaces()) return self.copyForeignAttributes(storage, start, null);
     var byte_count: usize = 0;
     var attribute_count: usize = 0;
     for (start.attributes) |attribute| {
         const name = attribute.name.expanded;
         if (name.namespace_uri) |uri| {
             if (!std.mem.eql(u8, uri, xml.XSI) or !std.mem.eql(u8, name.local, "schemaLocation"))
-                return error.UnknownAttribute;
+                return if (retain) self.copyForeignAttributes(storage, start, null) else &.{};
         }
         if (retain) {
             attribute_count += 1;
@@ -746,6 +918,123 @@ fn copyAttributes(
             .value = value,
         };
         position += 1;
+    }
+    return result;
+}
+
+fn parameterAttribute(name: xml.ExpandedName, selected: u2) ?std.meta.FieldEnum(ParamAttributes) {
+    if (name.namespace_uri != null) return null;
+    const field = PARAM_ATTRIBUTES.get(name.local) orelse return null;
+    if (selected == 0) return if (field == .ref) field else null;
+    return switch (field) {
+        .ref => null,
+        .cv_ref, .accession => if (selected == 1) field else null,
+        .value_type => if (selected == 2) field else null,
+        else => field,
+    };
+}
+
+fn copyParamExtra(self: *StreamReader, storage: *Storage, start: xml.Start, selected: u2) Error!*cv.ParameterXml {
+    const result = &(try storage.alloc(cv.ParameterXml, 1))[0];
+    result.* = .{ .attributes = try self.copyForeignAttributes(storage, start, selected) };
+    return result;
+}
+
+fn startContent(self: *StreamReader, content: *std.ArrayList(model.Content.Item), params: usize, children: usize) Error!void {
+    try content.append(self.allocator, .{ .params = params });
+    try content.append(self.allocator, .{ .children = children });
+}
+
+fn saveContent(storage: *Storage, items: []const model.Content.Item) Error!?*const model.Content {
+    if (items.len == 0) return null;
+    const result = &(try storage.alloc(model.Content, 1))[0];
+    result.* = .{ .items = try storage.copy(model.Content.Item, items) };
+    return result;
+}
+
+fn readXml(self: *StreamReader, storage: *Storage, comptime retain: bool) Error![]const u8 {
+    var output: FragmentBuffer = .{ .allocator = self.allocator, .limit = storage.limit -| storage.used };
+    defer output.bytes.deinit(self.allocator);
+    var discarding: std.Io.Writer.Discarding = .init(&.{});
+    var writer = try xml.Writer.init(self.allocator, if (retain) &output.writer else &discarding.writer, .{ .fragment = true });
+    defer writer.deinit();
+    var remaining = self.options.limits.nodes - storage.nodes;
+    self.cursor.writeElement(&writer, &remaining) catch |err| return switch (err) {
+        error.WriteFailed => output.failure orelse error.InvalidXml,
+        error.InvalidName, error.InvalidCharacter, error.InvalidNamespace, error.DuplicateAttribute => error.InvalidXml,
+        error.WriterLimit => error.LimitExceeded,
+        else => |other| other,
+    };
+    storage.nodes = self.options.limits.nodes - remaining;
+    return if (retain) try storage.copy(u8, output.bytes.items) else &.{};
+}
+
+const FragmentBuffer = struct {
+    allocator: std.mem.Allocator,
+    limit: usize,
+    bytes: std.ArrayList(u8) = .empty,
+    failure: ?Error = null,
+    writer: std.Io.Writer = .{ .vtable = &.{ .drain = drain }, .buffer = &.{} },
+
+    fn drain(writer: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *FragmentBuffer = @alignCast(@fieldParentPtr("writer", writer));
+        std.debug.assert(writer.end == 0 and data.len == 1 and splat == 1);
+        const bytes = data[0];
+        if (bytes.len > self.limit - self.bytes.items.len) {
+            self.failure = error.LimitExceeded;
+            return error.WriteFailed;
+        }
+        const needed = self.bytes.items.len + bytes.len;
+        if (needed > self.bytes.capacity) {
+            const capacity = @min(self.limit, @max(needed, self.bytes.capacity +| self.bytes.capacity / 2 +| 256));
+            self.bytes.ensureTotalCapacityPrecise(self.allocator, capacity) catch {
+                self.failure = error.OutOfMemory;
+                return error.WriteFailed;
+            };
+        }
+        self.bytes.appendSliceAssumeCapacity(bytes);
+        return bytes.len;
+    }
+};
+
+fn copyForeignAttributes(self: *StreamReader, storage: *Storage, start: xml.Start, parameter: ?u2) Error![]const model.Attribute {
+    var count: usize = 0;
+    var position: usize = 0;
+    var has_default = false;
+    while (self.cursor.namespaceAt(&position)) |binding| {
+        count += 1;
+        has_default = has_default or binding.prefix.len == 0;
+    }
+    if (!has_default) count += 1;
+    for (start.attributes) |attribute| {
+        if (parameter) |selected| if (parameterAttribute(attribute.name.expanded, selected) != null) continue;
+        count += 1;
+    }
+    const result = try storage.alloc(model.Attribute, count);
+    position = 0;
+    var i: usize = 0;
+    while (self.cursor.namespaceAt(&position)) |binding| {
+        const name = try storage.alloc(u8, if (binding.prefix.len == 0) 5 else 6 + binding.prefix.len);
+        @memcpy(name[0..5], "xmlns");
+        if (binding.prefix.len != 0) {
+            name[5] = ':';
+            @memcpy(name[6..], binding.prefix);
+        }
+        result[i] = .{ .name = name, .namespace_uri = xml.XMLNS_NAMESPACE, .value = try storage.copy(u8, binding.uri) };
+        i += 1;
+    }
+    if (!has_default) {
+        result[i] = .{ .name = "xmlns", .namespace_uri = xml.XMLNS_NAMESPACE, .value = "" };
+        i += 1;
+    }
+    for (start.attributes) |attribute| {
+        if (parameter) |selected| if (parameterAttribute(attribute.name.expanded, selected) != null) continue;
+        result[i] = .{
+            .name = try storage.copy(u8, attribute.name.raw),
+            .namespace_uri = if (attribute.name.expanded.namespace_uri) |uri| try storage.copy(u8, uri) else null,
+            .value = try storage.copy(u8, attribute.value),
+        };
+        i += 1;
     }
     return result;
 }

@@ -197,6 +197,18 @@ fn sameNode(a: mzml.model.Node, b: mzml.model.Node) bool {
         a.content_offset != b.content_offset or a.end_offset != b.end_offset or
         a.attributes.len != b.attributes.len or a.params.len != b.params.len or
         a.children.len != b.children.len or !sameText(a.text, b.text)) return false;
+    if (a.content) |content| {
+        const other = b.content orelse return false;
+        if (content.items.len != other.items.len) return false;
+        for (content.items, other.items) |left, right| {
+            if (std.meta.activeTag(left) != std.meta.activeTag(right)) return false;
+            switch (left) {
+                .xml => |bytes| if (!std.mem.eql(u8, bytes, right.xml)) return false,
+                .params => |count| if (count != right.params) return false,
+                .children => |count| if (count != right.children) return false,
+            }
+        }
+    } else if (b.content != null) return false;
     for (a.attributes, b.attributes) |left, right| {
         if (!sameText(left.name, right.name) or !sameText(left.value, right.value) or
             !sameText(left.namespace_uri, right.namespace_uri)) return false;
@@ -204,21 +216,40 @@ fn sameNode(a: mzml.model.Node, b: mzml.model.Node) bool {
     for (a.params, b.params) |left, right| {
         if (std.meta.activeTag(left) != std.meta.activeTag(right)) return false;
         switch (left) {
-            .group_ref => |ref| if (!sameText(ref, right.group_ref)) return false,
+            .group_ref => |ref| if (!sameText(ref.ref, right.group_ref.ref) or !sameXmlAttributes(ref.xml, right.group_ref.xml)) return false,
             .cv => |param| {
                 const other = right.cv;
                 if (!sameText(param.cv_ref, other.cv_ref) or !sameText(param.name, other.name) or
                     !sameText(param.value, other.value) or !sameAccession(param.accession, other.accession) or
-                    !sameUnit(param.unit, other.unit)) return false;
+                    !sameUnit(param.unit, other.unit) or !sameXmlAttributes(param.xml, other.xml)) return false;
             },
             .user => |param| {
                 const other = right.user;
                 if (!sameText(param.name, other.name) or !sameText(param.value, other.value) or
-                    !sameText(param.value_type, other.value_type) or !sameUnit(param.unit, other.unit)) return false;
+                    !sameText(param.value_type, other.value_type) or !sameUnit(param.unit, other.unit) or
+                    !sameXmlAttributes(param.xml, other.xml)) return false;
             },
         }
     }
     for (a.children, b.children) |left, right| if (!sameNode(left, right)) return false;
+    return true;
+}
+
+fn sameXmlAttributes(a: ?*const mzml.cv.ParameterXml, b: ?*const mzml.cv.ParameterXml) bool {
+    const left = a orelse return b == null;
+    const right = b orelse return false;
+    if (left.attributes.len != right.attributes.len) return false;
+    for (left.attributes, right.attributes) |x, y| {
+        if (!sameText(x.name, y.name) or !sameText(x.value, y.value) or !sameText(x.namespace_uri, y.namespace_uri)) return false;
+    }
+    if (left.content.len != right.content.len) return false;
+    for (left.content, right.content) |x, y| {
+        if (std.meta.activeTag(x) != std.meta.activeTag(y)) return false;
+        switch (x) {
+            .text => |bytes| if (!sameText(bytes, y.text)) return false,
+            .xml => |bytes| if (!sameText(bytes, y.xml)) return false,
+        }
+    }
     return true;
 }
 

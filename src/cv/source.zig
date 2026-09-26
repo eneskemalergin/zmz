@@ -2,6 +2,23 @@
 
 const std = @import("std");
 
+/// Attribute text after XML normalization. Names may include a source prefix;
+/// namespace_uri identifies its namespace. Declarations use the XMLNS URI.
+pub const Attribute = struct {
+    name: []const u8,
+    namespace_uri: ?[]const u8 = null,
+    value: []const u8,
+};
+
+/// Extra attributes, namespace declarations, and ordered parameter content.
+/// Text is normalized UTF-8; XML parts include their namespace bindings.
+/// All slices borrow from the parameter owner.
+pub const ParameterXml = struct {
+    attributes: []const Attribute,
+    content: []const Part = &.{},
+    pub const Part = union(enum) { text: []const u8, xml: []const u8 };
+};
+
 /// An exact accession spelling borrowed from caller-owned text.
 pub const Accession = struct {
     raw: []const u8,
@@ -66,6 +83,7 @@ pub const Param = struct {
     name: ?[]const u8 = null,
     value: ?[]const u8 = null,
     unit: Unit = .{},
+    xml: ?*const ParameterXml = null,
 };
 
 /// A user parameter whose declared type and lexical value remain unchanged.
@@ -74,11 +92,17 @@ pub const UserParam = struct {
     value: ?[]const u8 = null,
     value_type: ?[]const u8 = null,
     unit: Unit = .{},
+    xml: ?*const ParameterXml = null,
+};
+
+pub const GroupRef = struct {
+    ref: ?[]const u8 = null,
+    xml: ?*const ParameterXml = null,
 };
 
 /// A source entry; sequences preserve ordering, repetition, and group references.
 pub const Entry = union(enum) {
-    group_ref: ?[]const u8,
+    group_ref: GroupRef,
     cv: Param,
     user: UserParam,
 };
@@ -138,7 +162,7 @@ pub const EffectiveIterator = struct {
             const entry = self.entries[self.position];
             self.position += 1;
             if (entry != .group_ref) return entry;
-            const id = std.mem.trim(u8, entry.group_ref orelse return error.MissingGroup, " \t\r\n");
+            const id = std.mem.trim(u8, entry.group_ref.ref orelse return error.MissingGroup, " \t\r\n");
             var found: ?[]const Entry = null;
             for (self.groups) |group| {
                 try self.charge();

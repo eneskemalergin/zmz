@@ -1,6 +1,6 @@
 //! Preserves the mzML element hierarchy and source parameters without XML parser types.
 //!
-//! Slices borrow from their owner. Reader records expire on the next record request;
+//! Slices borrow from their owner. Reader records and XML items expire on the next traversal call;
 //! reader headers remain valid until reader deinitialization. Explicit owned copies
 //! remain valid until their owner's deinit.
 
@@ -145,20 +145,36 @@ pub const Kind = enum {
     }
 };
 
-/// Source attribute text after XML entity and whitespace normalization.
-pub const Attribute = struct {
-    name: []const u8,
-    namespace_uri: ?[]const u8 = null,
-    value: []const u8,
+pub const Attribute = cv.Attribute;
+
+/// Forward items after the header, in source order. Reader-owned records and XML
+/// expire on the next traversal call. List attributes live with the header.
+/// XML is self-contained UTF-8; copy its bytes to keep it beyond that call.
+pub const Item = union(enum) {
+    list_start: struct { kind: Kind, list: RecordList },
+    record: Record,
+    xml: []const u8,
+    list_end,
+    run_end,
+};
+
+/// Runs of parameters/children and self-contained UTF-8 XML, in source order.
+/// Null Node.content means parameters precede children. Counts consume those slices
+/// consecutively; callers changing their lengths must update the runs too.
+pub const Content = struct {
+    items: []const Content.Item,
+    pub const Item = union(enum) { params: usize, children: usize, xml: []const u8 };
 };
 
 /// A faithful mzML node, bounded to header metadata or one record, never a complete run.
-/// Parameter order and multiplicity are preserved. Prefixes, comments, and formatting are not.
+/// Parameter order and multiplicity are preserved. Extra XML keeps namespace bindings;
+/// known mzML prefixes, comments, and formatting need not match the source.
 pub const Node = struct {
     kind: Kind,
     attributes: []const Attribute = &.{},
     params: []const cv.Entry = &.{},
     children: []const Node = &.{},
+    content: ?*const Content = null,
     /// Null when text was deliberately skipped; retained empty text is an empty slice.
     text: ?[]const u8 = null,
     /// Physical source byte offsets covering the element, including its tags.

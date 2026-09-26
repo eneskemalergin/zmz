@@ -4,6 +4,51 @@ const std = @import("std");
 const mzml = @import("zmz").mzml;
 const support = @import("support.zig");
 
+test "[integration] - [mzML extensions]: owns XML after reader closure and cleans failed copies" {
+    const Check = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var builder = mzml.Builder.init(allocator, .{});
+            defer builder.deinit();
+            var header: mzml.owned.Header = undefined;
+            var record: mzml.owned.Record = undefined;
+            const built = blk: {
+                var input = std.Io.Reader.fixed(support.EXTENSIONS);
+                var reader = try mzml.StreamReader.init(allocator, &input, .{});
+                defer reader.deinit();
+                header = try mzml.owned.Header.init(allocator, (try reader.readHeader()).*, .{});
+                errdefer header.deinit();
+                record = try mzml.owned.Record.init(allocator, (try reader.nextRecord()).?, .{});
+                errdefer record.deinit();
+                const copy = try builder.node(record.value.node);
+                break :blk copy;
+            };
+            defer header.deinit();
+            defer record.deinit();
+            try support.expectNode(record.value.node, built);
+            try std.testing.expectEqualStrings("keep", record.value.node.params[0].user.xml.?.attributes[4].value);
+            var bytes: [32768]u8 = undefined;
+            var sink = std.Io.Writer.fixed(&bytes);
+            var writer = try mzml.Writer.initIndexed(allocator, &sink, .{}, .{});
+            defer writer.deinit();
+            try writer.writeHeader(header.value);
+            try writer.beginListWithAttributes(.spectrum_list, 1, header.value.spectrum_list.?.attributes);
+            try writer.writeRecord(built);
+            try writer.endList();
+            try writer.finish();
+            var index = try mzml.IndexedReader.build(allocator, .{ .bytes = sink.buffered() }, .{});
+            defer index.deinit();
+            var output = mzml.StreamReader.DecodedArrays.init(allocator, .{});
+            defer output.deinit();
+            var found = (try index.byIdDecoded(allocator, "scan=1", &output)).?;
+            defer found.deinit();
+            try std.testing.expectEqualSlices(f64, &.{ 1, 2 }, output.get(0).?.values.float64);
+            try std.testing.expectEqualSlices(f64, &.{ 3, 4 }, output.get(1).?.values.float64);
+            try std.testing.expect(found.value.node.content != null);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
 test "[integration] - [mzML 1.0 copies]: keeps header and record metadata after reader reuse" {
     const Check = struct {
         fn run(allocator: std.mem.Allocator) !void {
@@ -51,7 +96,7 @@ test "[integration] - [mzML ownership]: copies optional text and bounds storage 
         .node = .{ .kind = .spectrum, .attributes = &.{.{ .name = &text, .namespace_uri = &text, .value = &text }}, .params = &.{
             .{ .user = .{ .name = &text, .value = "", .value_type = &text, .unit = .{ .cv_ref = &text, .name = &text, .accession = .{ .raw = &text } } } },
             .{ .cv = .{ .cv_ref = &text, .accession = .{ .raw = &text }, .name = &text, .value = &text, .unit = .{ .name = "" } } },
-            .{ .group_ref = &text },
+            .{ .group_ref = .{ .ref = &text } },
         }, .children = &.{.{ .kind = .binary, .text = null }} },
     };
     var copy = try mzml.owned.Record.init(std.testing.allocator, source, .{ .depth = 2 });
@@ -62,7 +107,7 @@ test "[integration] - [mzML ownership]: copies optional text and bounds storage 
     try std.testing.expectEqualStrings("x", copy.value.node.params[0].user.unit.accession.?.raw);
     try std.testing.expectEqualStrings("", copy.value.node.params[0].user.value.?);
     try std.testing.expectEqualStrings("x", copy.value.node.params[1].cv.value.?);
-    try std.testing.expectEqualStrings("x", copy.value.node.params[2].group_ref.?);
+    try std.testing.expectEqualStrings("x", copy.value.node.params[2].group_ref.ref.?);
     try std.testing.expectEqual(null, copy.value.node.children[0].text);
     try std.testing.expectError(error.LimitExceeded, mzml.owned.Record.init(std.testing.allocator, source, .{ .depth = 1 }));
     try std.testing.expectError(error.LimitExceeded, mzml.owned.Record.init(std.testing.allocator, source, .{ .bytes = 0 }));

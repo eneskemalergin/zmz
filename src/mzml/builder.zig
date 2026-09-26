@@ -209,6 +209,24 @@ pub fn prepareArrayFrom(
     result.attributes = attributes[0..attribute_count];
     result.params = params;
     result.children = &.{binary};
+    if (source.content) |content| {
+        const copied = &(try copier.alloc(model.Content, 1))[0];
+        const items = try copier.alloc(model.Content.Item, content.items.len);
+        var position: usize = 0;
+        for (content.items, items) |item, *destination| {
+            destination.* = item;
+            if (item != .params) continue;
+            if (item.params > source.params.len - position) return error.InvalidStructure;
+            var expanded: cv.EffectiveIterator = .{ .entries = source.params[position..][0..item.params], .groups = groups };
+            var expanded_count: usize = 0;
+            while (try expanded.next()) |_| expanded_count += 1;
+            destination.* = .{ .params = expanded_count };
+            position += item.params;
+        }
+        if (position != source.params.len) return error.InvalidStructure;
+        copied.* = .{ .items = items };
+        result.content = copied;
+    }
     return .{ .array = .{
         .node = try copier.node(result, self.limits.depth),
         .length = values.len,

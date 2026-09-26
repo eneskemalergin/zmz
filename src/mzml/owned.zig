@@ -1,4 +1,4 @@
-//! Copies mzML records and header metadata into independently owned arenas.
+//! Copies mzML headers, records, and forward items into independently owned arenas.
 //!
 //! Owners must not be copied. Their views remain valid until deinit; cloning does not
 //! restore skipped payloads. Keep an owned header for group resolution.
@@ -17,6 +17,37 @@ pub const Limits = struct {
 
 /// Copying failures leave no owned allocations behind.
 pub const Error = copy.Error;
+
+/// Independently owned forward item, including XML or list attributes.
+pub const Item = struct {
+    arena: std.heap.ArenaAllocator,
+    value: model.Item,
+
+    /// Copies every borrowed slice; release the result with deinit.
+    pub fn init(allocator: std.mem.Allocator, source: model.Item, limits: Limits) Error!Item {
+        if (limits.depth == 0 or limits.depth > 64) return error.LimitExceeded;
+        var arena: std.heap.ArenaAllocator = .init(allocator);
+        errdefer arena.deinit();
+        var copier: copy.Copier = .{ .allocator = arena.allocator(), .remaining = limits.bytes };
+        const value: model.Item = switch (source) {
+            .xml => |bytes| .{ .xml = try copier.text(bytes) },
+            .list_start => |start| .{ .list_start = .{ .kind = start.kind, .list = (try copier.list(start.list)).? } },
+            .record => |record| blk: {
+                var result = record;
+                result.node = try copier.node(record.node, limits.depth);
+                result.id = try copier.text(record.id);
+                break :blk .{ .record = result };
+            },
+            .list_end, .run_end => source,
+        };
+        return .{ .arena = arena, .value = value };
+    }
+
+    pub fn deinit(self: *Item) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
 
 /// Independently owned record. Group references remain references to header metadata.
 pub const Record = struct {

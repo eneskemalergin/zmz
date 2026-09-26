@@ -45,10 +45,24 @@ pub const StreamReader = struct {
         return self.inner.readHeader();
     }
 
-    /// Returns a borrowed record or null after the mzML content.
+    /// Returns records only, skipping XML outside them and list transitions.
+    /// Use nextItem for a rewrite that retains those fields and their positions.
     /// Indexed trailers are read only with retain_index; input buffering may fetch ahead.
     pub fn nextRecord(self: *Reader) Error!?model.Record {
         return self.inner.nextRecord();
+    }
+
+    /// Returns list transitions, records, and XML after the header in source order.
+    /// Each call invalidates the previous record or XML item. Null marks mzML end;
+    /// retain_index controls trailer reading as for nextRecord.
+    pub fn nextItem(self: *Reader) Error!?model.Item {
+        return self.inner.nextItem();
+    }
+
+    /// Like nextItem, with selected record arrays decoded into output. Non-record
+    /// items, EOF, and errors clear visible arrays. Lifetimes follow nextDecodedRecord.
+    pub fn nextDecodedItem(self: *Reader, output: *DecodedArrays) Error!?model.Item {
+        return self.inner.nextDecodedItem(output);
     }
 
     /// Reads a complete record and decodes selected arrays into reusable output storage.

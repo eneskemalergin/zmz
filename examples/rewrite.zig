@@ -41,15 +41,16 @@ pub fn main(init: std.process.Init) !void {
     var encoder: ?Reencoder = if (reencode) try Reencoder.init(init.gpa) else null;
     defer if (encoder) |*value| value.deinit();
     try writer.writeHeader(header.*);
-    var current = if (reencode) try reader.nextDecodedRecord(&decoded) else try reader.nextRecord();
-    inline for (.{ mzml.model.Kind.spectrum_list, mzml.model.Kind.chromatogram_list }) |kind| {
-        const descriptor = if (kind == .spectrum_list) header.spectrum_list else header.chromatogram_list;
-        if (descriptor) |list| {
-            const filter = ms1 and kind == .spectrum_list;
-            try writer.beginListWithAttributes(kind, if (filter) null else list.declared_count, list.attributes);
-            var written: usize = 0;
-            while (current) |record| {
-                if (record.node.kind != (if (kind == .spectrum_list) mzml.model.Kind.spectrum else .chromatogram)) break;
+    var written: usize = 0;
+    while (if (reencode) try reader.nextDecodedItem(&decoded) else try reader.nextItem()) |item| {
+        switch (item) {
+            .list_start => |start| {
+                const filter = ms1 and start.kind == .spectrum_list;
+                try writer.beginListWithAttributes(start.kind, if (filter) null else start.list.declared_count, start.list.attributes);
+                written = 0;
+            },
+            .record => |record| {
+                const filter = ms1 and record.node.kind == .spectrum;
                 if (!filter or try record.msLevel(header.groups) == 1) {
                     var emitted = record.node;
                     var index_text: [32]u8 = undefined;
@@ -68,12 +69,10 @@ pub fn main(init: std.process.Init) !void {
                         try writer.writeRecord(emitted);
                     written += 1;
                 }
-                current = if (reencode) try reader.nextDecodedRecord(&decoded) else try reader.nextRecord();
-            }
-            try writer.endList();
+            },
+            else => try writer.writeItem(item),
         }
     }
-    if (current != null) return error.UnwrittenRecord;
     try writer.finish();
     try output.interface.flush();
 }

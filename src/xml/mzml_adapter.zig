@@ -6,10 +6,9 @@ const base64 = @import("../binary/base64.zig");
 /// Stable mzML namespace used by reader and writer paths.
 pub const NAMESPACE = "http://psi.hupo.org/ms/mzml";
 pub const NAMESPACE_1_0 = "http://psi.hupo.org/schema_revision/mzML_1.0.0";
-/// XML Schema instance namespace used only for `schemaLocation`.
 pub const XSI = "http://www.w3.org/2001/XMLSchema-instance";
 const XML_NAMESPACE = "http://www.w3.org/XML/1998/namespace";
-const XMLNS_NAMESPACE = "http://www.w3.org/2000/xmlns/";
+pub const XMLNS_NAMESPACE = "http://www.w3.org/2000/xmlns/";
 const TEXT_CHUNK_BYTES = 64 * 1024;
 const MAX_XML_DEPTH = 64;
 
@@ -471,6 +470,7 @@ pub const Cursor = struct {
     open_names: std.ArrayList(u8) = .empty,
     namespace_bytes: std.ArrayList(u8) = .empty,
     namespace_bindings: std.ArrayList(NamespaceBinding) = .empty,
+    additional_namespaces: ?bool = null,
 
     /// Initializes a cursor without consuming the input.
     pub fn init(
@@ -569,6 +569,7 @@ pub const Cursor = struct {
         self.normal_text_brackets = 0;
         self.effective_version = .xml10;
         self.mzml_namespace = NAMESPACE;
+        self.additional_namespaces = null;
         self.pending_empty = false;
         self.event_bytes.clearRetainingCapacity();
         self.text_bytes.clearRetainingCapacity();
@@ -586,6 +587,14 @@ pub const Cursor = struct {
 
     /// Advances to the next significant event, optionally returning text.
     pub fn advance(self: *Cursor, text: bool) Error!void {
+        return self.advanceInner(text, true);
+    }
+
+    pub fn advanceFragment(self: *Cursor, text: bool) Error!void {
+        return self.advanceInner(text, false);
+    }
+
+    fn advanceInner(self: *Cursor, text: bool, comptime mzml_root: bool) Error!void {
         self.current = null;
         while (true) {
             const maybe_event = self.nextEvent(!text) catch |err| {
@@ -607,7 +616,7 @@ pub const Cursor = struct {
                 .start_element => |start| {
                     if (self.depth == 1 and optionalSliceEql(start.name.expanded.namespace_uri, NAMESPACE_1_0))
                         self.mzml_namespace = NAMESPACE_1_0;
-                    if (!optionalSliceEql(start.name.expanded.namespace_uri, self.mzml_namespace)) return error.WrongNamespace;
+                    if (mzml_root and self.depth == 1 and !optionalSliceEql(start.name.expanded.namespace_uri, self.mzml_namespace)) return error.WrongNamespace;
                     self.current = event;
                     return;
                 },
@@ -628,6 +637,72 @@ pub const Cursor = struct {
                 },
             }
         }
+    }
+
+    pub const Namespace = struct { prefix: []const u8, uri: []const u8 };
+
+    pub fn hasAdditionalNamespaces(self: *Cursor) bool {
+        if (self.additional_namespaces) |value| return value;
+        for (self.namespace_bindings.items) |binding| {
+            const prefix = self.namespace_bytes.items[binding.prefix_start..][0..binding.prefix_len];
+            const uri = self.namespace_bytes.items[binding.uri_start..][0..binding.uri_len];
+            if (prefix.len == 0 and std.mem.eql(u8, uri, self.mzml_namespace)) continue;
+            if (std.mem.eql(u8, prefix, "xsi") and std.mem.eql(u8, uri, XSI)) continue;
+            if (std.mem.eql(u8, prefix, "xml") and std.mem.eql(u8, uri, XML_NAMESPACE)) continue;
+            self.additional_namespaces = true;
+            return true;
+        }
+        self.additional_namespaces = false;
+        return false;
+    }
+
+    /// Iterates active bindings, excluding shadowed declarations. Views expire on advance.
+    pub fn namespaceAt(self: *const Cursor, position: *usize) ?Namespace {
+        while (position.* < self.namespace_bindings.items.len) {
+            const binding = self.namespace_bindings.items[position.*];
+            position.* += 1;
+            const prefix = self.namespace_bytes.items[binding.prefix_start..][0..binding.prefix_len];
+            const uri = self.namespace_bytes.items[binding.uri_start..][0..binding.uri_len];
+            const active = self.resolveNamespace(if (prefix.len == 0) null else prefix) orelse continue;
+            if (active.ptr != uri.ptr) continue;
+            return .{ .prefix = prefix, .uri = uri };
+        }
+        return null;
+    }
+
+    /// Copies the current subtree without interpreting its contents, leaving its end event.
+    /// Namespace bindings make the emitted fragment independent of its former ancestors.
+    pub fn writeElement(self: *Cursor, output: *Writer, remaining_nodes: *usize) (Error || WriterError)!void {
+        var nesting: usize = 0;
+        while (self.current) |event| {
+            switch (event.data) {
+                .start_element => |start| {
+                    if (remaining_nodes.* == 0) return error.LimitExceeded;
+                    remaining_nodes.* -= 1;
+                    nesting += 1;
+                    try output.startElement(start.name.raw);
+                    var position: usize = 0;
+                    var default_seen = false;
+                    while (self.namespaceAt(&position)) |binding| {
+                        default_seen = default_seen or binding.prefix.len == 0;
+                        if (!optionalSliceEql(output.namespaceUri(binding.prefix), binding.uri))
+                            try output.namespace(if (binding.prefix.len == 0) null else binding.prefix, binding.uri);
+                    }
+                    if (!default_seen and !optionalSliceEql(output.namespaceUri(""), "")) try output.namespace(null, "");
+                    for (start.attributes) |attribute| try output.attribute(attribute.name.raw, attribute.value);
+                },
+                .end_element => {
+                    if (nesting == 0) return error.InvalidXml;
+                    try output.endElement();
+                    nesting -= 1;
+                    if (nesting == 0) return;
+                },
+                .text => |value| try output.text(value.bytes),
+                else => return error.InvalidXml,
+            }
+            try self.advanceFragment(true);
+        }
+        return error.UnexpectedEnd;
     }
 
     /// Checks and skips the current start-element subtree.
@@ -1169,6 +1244,7 @@ pub const Cursor = struct {
     }
 
     fn installNamespaces(self: *Cursor, binding_start: usize) Error!void {
+        if (self.namespace_declarations.items.len != 0) self.additional_namespaces = null;
         for (self.namespace_declarations.items) |declaration| {
             const prefix = self.event_bytes.items[declaration.prefix.start..][0..declaration.prefix.len];
             const uri = self.event_bytes.items[declaration.uri.start..][0..declaration.uri.len];
@@ -1251,6 +1327,7 @@ pub const Cursor = struct {
         const name = try self.makeName(self.event_bytes.items, name_range);
         self.depth -= 1;
         self.open_names.items.len = frame.name_start;
+        if (self.namespace_bindings.items.len != frame.binding_start) self.additional_namespaces = null;
         self.namespace_bindings.items.len = frame.binding_start;
         self.namespace_bytes.items.len = frame.namespace_bytes_start;
         if (self.depth == 0) self.root_closed = true;
@@ -1269,6 +1346,7 @@ pub const Cursor = struct {
         self.pending_empty = false;
         self.depth -= 1;
         self.open_names.items.len = frame.name_start;
+        if (self.namespace_bindings.items.len != frame.binding_start) self.additional_namespaces = null;
         self.namespace_bindings.items.len = frame.binding_start;
         self.namespace_bytes.items.len = frame.namespace_bytes_start;
         if (self.depth == 0) self.root_closed = true;
@@ -1573,9 +1651,11 @@ const WriterFrame = struct {
     name_len: usize,
     attribute_start: usize,
     namespace_start: usize,
+    default_uri_start: usize,
+    default_uri_len: usize,
 };
 
-/// Direct buffered XML writer for the mzML namespace and XML Schema location.
+/// Buffered XML emission for mzML and retained metadata fragments.
 pub const Writer = struct {
     allocator: std.mem.Allocator,
     sink: *std.Io.Writer,
@@ -1589,12 +1669,13 @@ pub const Writer = struct {
     open_names: std.ArrayList(u8) = .empty,
     attribute_names: std.ArrayList(u8) = .empty,
     namespace_names: std.ArrayList(u8) = .empty,
+    default_uri_start: usize = 0,
+    default_uri_len: usize = 0,
     text_brackets: u2 = 0,
 
     /// Initializes a writer over a caller-owned sink.
-    pub fn init(allocator: std.mem.Allocator, sink: *std.Io.Writer, options: struct {}) WriterInitError!Writer {
-        _ = options;
-        return .{ .allocator = allocator, .sink = sink };
+    pub fn init(allocator: std.mem.Allocator, sink: *std.Io.Writer, options: struct { fragment: bool = false }) WriterInitError!Writer {
+        return .{ .allocator = allocator, .sink = sink, .state = if (options.fragment) .epilog else .initial };
     }
 
     /// Releases retained name and namespace scratch.
@@ -1617,15 +1698,17 @@ pub const Writer = struct {
         self.state = .epilog;
     }
 
-    /// Opens an unprefixed mzML element.
+    /// Opens an element; any prefix must have a declaration before its content is written.
     pub fn startElement(self: *Writer, name: []const u8) WriterError!void {
         try self.checkAny();
         if (self.state == .epilog and self.root_written) return self.fail(error.InvalidState);
         if (self.state != .epilog and self.state != .content and self.state != .start_tag) return self.fail(error.InvalidState);
         validateQName(name) catch |err| return self.fail(err);
-        if (std.mem.indexOfScalar(u8, name, ':') != null) return self.fail(error.InvalidNamespace);
         if (self.frame_count == MAX_XML_DEPTH) return self.fail(error.WriterLimit);
-        if (self.state == .start_tag) try self.writeByte('>');
+        if (self.state == .start_tag) {
+            try self.checkOpeningName();
+            try self.writeByte('>');
+        }
         const name_start = self.open_names.items.len;
         self.open_names.appendSlice(self.allocator, name) catch return self.fail(error.OutOfMemory);
         self.frames[self.frame_count] = .{
@@ -1633,6 +1716,8 @@ pub const Writer = struct {
             .name_len = name.len,
             .attribute_start = self.attribute_names.items.len,
             .namespace_start = self.namespace_names.items.len,
+            .default_uri_start = self.default_uri_start,
+            .default_uri_len = self.default_uri_len,
         };
         self.frame_count += 1;
         if (self.frame_count == 1) self.root_written = true;
@@ -1641,23 +1726,31 @@ pub const Writer = struct {
         try self.writeBytes(name);
     }
 
-    /// Writes one supported default or `xsi` namespace declaration.
+    /// Writes a namespace declaration on the current opening tag.
     pub fn namespace(self: *Writer, prefix: ?[]const u8, uri: []const u8) WriterError!void {
         try self.check(.start_tag);
         if (prefix) |value| {
-            if (!std.mem.eql(u8, value, "xsi") or !std.mem.eql(u8, uri, XSI)) return self.fail(error.InvalidNamespace);
-        } else if (!std.mem.eql(u8, uri, NAMESPACE) and !std.mem.eql(u8, uri, NAMESPACE_1_0)) {
-            return self.fail(error.InvalidNamespace);
+            validateQName(value) catch |err| return self.fail(err);
+            if (std.mem.indexOfScalar(u8, value, ':') != null or std.mem.eql(u8, value, "xmlns") or uri.len == 0)
+                return self.fail(error.InvalidNamespace);
+            if (std.mem.eql(u8, value, "xml") != std.mem.eql(u8, uri, XML_NAMESPACE)) return self.fail(error.InvalidNamespace);
         }
+        if (std.mem.eql(u8, uri, XMLNS_NAMESPACE) or (prefix == null and std.mem.eql(u8, uri, XML_NAMESPACE))) return self.fail(error.InvalidNamespace);
         const frame = &self.frames[self.frame_count - 1];
         const actual_prefix = prefix orelse "";
         var position = frame.namespace_start;
         while (position < self.namespace_names.items.len) {
             const end = std.mem.indexOfScalarPos(u8, self.namespace_names.items, position, 0) orelse self.namespace_names.items.len;
             if (std.mem.eql(u8, self.namespace_names.items[position..end], actual_prefix)) return self.fail(error.DuplicateAttribute);
-            position = if (end == self.namespace_names.items.len) end else end + 1;
+            position = std.mem.indexOfScalarPos(u8, self.namespace_names.items, end + 1, 0).? + 1;
         }
         self.namespace_names.appendSlice(self.allocator, actual_prefix) catch return self.fail(error.OutOfMemory);
+        self.namespace_names.append(self.allocator, 0) catch return self.fail(error.OutOfMemory);
+        if (prefix == null) {
+            self.default_uri_start = self.namespace_names.items.len;
+            self.default_uri_len = uri.len;
+        }
+        self.namespace_names.appendSlice(self.allocator, uri) catch return self.fail(error.OutOfMemory);
         self.namespace_names.append(self.allocator, 0) catch return self.fail(error.OutOfMemory);
         try self.writeByte(' ');
         try self.writeBytes(if (prefix == null) "xmlns=\"" else "xmlns:");
@@ -1669,23 +1762,25 @@ pub const Writer = struct {
         try self.writeByte('"');
     }
 
-    /// Writes one ordinary or declared `xsi:schemaLocation` attribute.
+    /// Writes an attribute with any prefix resolved in the current namespace bindings.
     pub fn attribute(self: *Writer, name: []const u8, value: []const u8) WriterError!void {
         try self.check(.start_tag);
         validateQName(name) catch |err| return self.fail(err);
         if (std.mem.eql(u8, name, "xmlns") or std.mem.startsWith(u8, name, "xmlns:"))
             return self.fail(error.InvalidNamespace);
-        if (std.mem.eql(u8, name, "xsi:schemaLocation") and !self.hasNamespace("xsi"))
-            return self.fail(error.InvalidNamespace);
-        if (std.mem.indexOfScalar(u8, name, ':') != null and !std.mem.eql(u8, name, "xsi:schemaLocation"))
-            return self.fail(error.InvalidNamespace);
+        const prefix_end = std.mem.indexOfScalar(u8, name, ':');
+        if (prefix_end) |colon| {
+            if (self.namespaceUri(name[0..colon]) == null) return self.fail(error.InvalidNamespace);
+        }
         const frame = &self.frames[self.frame_count - 1];
         var position = frame.attribute_start;
         while (position < self.attribute_names.items.len) {
             const length = std.mem.bytesToValue(usize, self.attribute_names.items[position..][0..@sizeOf(usize)]);
             position += @sizeOf(usize);
             const end = position + length;
-            if (std.mem.eql(u8, self.attribute_names.items[position..end], name)) return self.fail(error.DuplicateAttribute);
+            const previous = self.attribute_names.items[position..end];
+            if (std.mem.eql(u8, previous, name) or (prefix_end != null and self.sameAttribute(previous, name, prefix_end.?)))
+                return self.fail(error.DuplicateAttribute);
             position = end;
         }
         self.attribute_names.appendSlice(self.allocator, std.mem.asBytes(&name.len)) catch return self.fail(error.OutOfMemory);
@@ -1702,6 +1797,7 @@ pub const Writer = struct {
         try self.checkAny();
         if (self.state != .start_tag and self.state != .content) return self.fail(error.InvalidState);
         if (self.state == .start_tag) {
+            try self.checkOpeningName();
             try self.writeByte('>');
             self.state = .content;
         }
@@ -1712,6 +1808,7 @@ pub const Writer = struct {
         try self.checkAny();
         if (self.state != .start_tag and self.state != .content) return self.fail(error.InvalidState);
         if (self.state == .start_tag) {
+            try self.checkOpeningName();
             try self.writeByte('>');
             self.state = .content;
         }
@@ -1746,6 +1843,7 @@ pub const Writer = struct {
         const frame = self.frames[self.frame_count - 1];
         const name = self.open_names.items[frame.name_start..][0..frame.name_len];
         if (self.state == .start_tag) {
+            try self.checkOpeningName();
             try self.writeBytes("/>");
         } else {
             try self.writeBytes("</");
@@ -1756,6 +1854,8 @@ pub const Writer = struct {
         self.open_names.items.len = frame.name_start;
         self.attribute_names.items.len = frame.attribute_start;
         self.namespace_names.items.len = frame.namespace_start;
+        self.default_uri_start = frame.default_uri_start;
+        self.default_uri_len = frame.default_uri_len;
         self.text_brackets = 0;
         self.state = if (self.frame_count == 0) .epilog else .content;
     }
@@ -1777,14 +1877,32 @@ pub const Writer = struct {
         if (self.state == .failed) return error.WriteFailed;
     }
 
-    fn hasNamespace(self: *const Writer, prefix: []const u8) bool {
+    pub fn namespaceUri(self: *const Writer, prefix: []const u8) ?[]const u8 {
+        if (prefix.len == 0) return if (self.default_uri_len == 0) "" else self.namespace_names.items[self.default_uri_start..][0..self.default_uri_len];
+        if (std.mem.eql(u8, prefix, "xml")) return XML_NAMESPACE;
+        var result: ?[]const u8 = null;
         var position: usize = 0;
         while (position < self.namespace_names.items.len) {
-            const end = std.mem.indexOfScalarPos(u8, self.namespace_names.items, position, 0) orelse self.namespace_names.items.len;
-            if (std.mem.eql(u8, self.namespace_names.items[position..end], prefix)) return true;
-            position = if (end == self.namespace_names.items.len) end else end + 1;
+            const end = std.mem.indexOfScalarPos(u8, self.namespace_names.items, position, 0).?;
+            const uri_end = std.mem.indexOfScalarPos(u8, self.namespace_names.items, end + 1, 0).?;
+            if (std.mem.eql(u8, self.namespace_names.items[position..end], prefix)) result = self.namespace_names.items[end + 1 .. uri_end];
+            position = uri_end + 1;
         }
-        return false;
+        return result;
+    }
+
+    fn checkOpeningName(self: *Writer) WriterError!void {
+        const frame = self.frames[self.frame_count - 1];
+        const name = self.open_names.items[frame.name_start..][0..frame.name_len];
+        if (std.mem.indexOfScalar(u8, name, ':')) |colon| {
+            if (self.namespaceUri(name[0..colon]) == null) return self.fail(error.InvalidNamespace);
+        }
+    }
+
+    fn sameAttribute(self: *const Writer, a: []const u8, b: []const u8, b_colon: usize) bool {
+        const a_colon = std.mem.indexOfScalar(u8, a, ':') orelse return false;
+        return std.mem.eql(u8, a[a_colon + 1 ..], b[b_colon + 1 ..]) and
+            optionalSliceEql(self.namespaceUri(a[0..a_colon]), self.namespaceUri(b[0..b_colon]));
     }
 
     fn fail(self: *Writer, failure: WriterError) WriterError {
@@ -2574,7 +2692,7 @@ test "[property] - [mzML XML writer]: copies attribute names and permits reuse o
     }
 }
 
-test "[unit] - [mzML XML writer]: rejects generic and undeclared namespace names" {
+test "[unit] - [mzML XML writer]: rejects undeclared namespace names" {
     {
         var output: [256]u8 = undefined;
         var sink = std.Io.Writer.fixed(&output);
@@ -2595,6 +2713,7 @@ test "[unit] - [mzML XML writer]: rejects generic and undeclared namespace names
         try writer.startDocument();
         try writer.startElement("mzML");
         try writer.namespace(null, NAMESPACE);
-        try std.testing.expectError(error.InvalidNamespace, writer.startElement("p:child"));
+        try writer.startElement("p:child");
+        try std.testing.expectError(error.InvalidNamespace, writer.endElement());
     }
 }

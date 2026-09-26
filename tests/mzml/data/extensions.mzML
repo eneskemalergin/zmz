@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mzML xmlns="http://psi.hupo.org/ms/mzml" xmlns:e="urn:producer" xmlns:i="http://www.w3.org/2001/XMLSchema-instance" version="future" e:source="e:Dataset">
+  <fileDescription><fileContent><userParam name="format" extra="A&amp;B"/></fileContent><e:annotation>header<e:part/>tail</e:annotation></fileDescription>
+  <referenceableParamGroupList count="1"><referenceableParamGroup id="encoding">
+    <cvParam accession="MS:1000523" name="64-bit float" i:schemaLocation="" e:type="e:Primitive"><e:detail type="e:Type"/></cvParam>
+    <cvParam accession="MS:1000576" name="no compression"/>
+  </referenceableParamGroup></referenceableParamGroupList>
+  <futureHeader code="new"/>
+  <run id="run"><e:settings e:value="keep"/><userParam name="run note"/>
+    <spectrumList count="1" e:list="keep">
+      <spectrum id="scan=1" index="0" defaultArrayLength="2" xml:lang="en" e:note="A&amp;B">
+        <userParam name="before" i:schemaLocation="urn:producer producer.xsd" extra="keep">before<e:detail>nested</e:detail>after</userParam>
+        <e:annotation>before &amp; <e:value xmlns:e="urn:inner" e:type="e:Text">caf&#xE9;</e:value> after</e:annotation>
+        <scanList count="1"><scan xmlns:e="urn:scan" sourceNote="e:Scan"><future value="metadata"/><e:scan value="not an mzML scan"/></scan></scanList>
+        <binaryDataArrayList count="2">
+          <binaryDataArray encodedLength="24" e:array="keep">
+            <e:arrayNote>before parameters</e:arrayNote>
+            <referenceableParamGroupRef ref="encoding" i:schemaLocation="urn:group group.xsd" extra="reference"><e:detail/></referenceableParamGroupRef>
+            <cvParam accession="MS:1000514" name="m/z array"/>
+            <e:units e:type="e:Unit"/>
+            <binary e:payload="keep">AAAAAAAA8D8AAAAAAAAAQA==</binary>
+            <userParam name="late array note" e:value="keep"/>
+          </binaryDataArray>
+          <binaryDataArray encodedLength="24"><referenceableParamGroupRef ref="encoding"/><cvParam accession="MS:1000515" name="intensity array"/><binary>AAAAAAAACEAAAAAAAAAQQA==</binary></binaryDataArray>
+        </binaryDataArrayList>
+        <userParam name="after">plain text</userParam>
+      </spectrum>
+    </spectrumList>
+  </run>
+</mzML>

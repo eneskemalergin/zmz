@@ -6,6 +6,132 @@ const mzml = zmz.mzml;
 const gates = @import("gates_test_support");
 const support = @import("support.zig");
 
+test "[integration] - [mzML items]: streams selected arrays and XML across short reads" {
+    const source = support.HEADER ++ "<spectrumList count='1'><future/>" ++ support.SPECTRUM ++
+        "<tail/></spectrumList><between/><chromatogramList count='0'><empty/></chromatogramList>" ++
+        "<runTail/></run><documentTail/></mzML>";
+    for ([_]usize{ 1, 7, 31 }) |chunk| {
+        var buffer: [31]u8 = undefined;
+        var input: std.testing.Reader = .init(buffer[0..chunk], &.{.{ .buffer = source }});
+        input.artificial_limit = .limited(chunk);
+        var reader = try mzml.StreamReader.init(std.testing.allocator, &input.interface, .{
+            .array_selector = .{ .select = selectSecond },
+        });
+        defer reader.deinit();
+        var fixed = std.Io.Reader.fixed(source);
+        var expected = try mzml.StreamReader.init(std.testing.allocator, &fixed, .{ .payload = .skip });
+        defer expected.deinit();
+        var decoded = mzml.StreamReader.DecodedArrays.init(std.testing.allocator, .{});
+        defer decoded.deinit();
+        var records: usize = 0;
+        var fragments: usize = 0;
+        while (try expected.nextItem()) |item| {
+            const actual = (try reader.nextDecodedItem(&decoded)).?;
+            try support.expectItem(item, actual);
+            if (actual == .record) {
+                records += 1;
+                try std.testing.expectEqual(@as(usize, 1), decoded.len());
+                try std.testing.expectEqual(@as(usize, 1), decoded.get(0).?.source_position);
+                try std.testing.expectEqualSlices(f64, &.{1}, decoded.get(0).?.values.float64);
+            } else {
+                try std.testing.expectEqual(@as(usize, 0), decoded.len());
+                if (actual == .xml) fragments += 1;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 1), records);
+        try std.testing.expectEqual(@as(usize, 6), fragments);
+        try std.testing.expectEqual(null, try reader.nextDecodedItem(&decoded));
+        try std.testing.expectEqual(@as(usize, 0), decoded.len());
+    }
+}
+
+test "[failure] - [mzML items]: bounds each XML item and stops at truncated input" {
+    const prefix = "<mzML xmlns='http://psi.hupo.org/ms/mzml'><run><spectrumList count='0'>";
+    const suffix = "</spectrumList></run></mzML>";
+    const Check = struct {
+        fn read(allocator: std.mem.Allocator, source: []const u8, options: mzml.StreamReader.Options) !void {
+            var input = std.Io.Reader.fixed(source);
+            var reader = try mzml.StreamReader.init(allocator, &input, options);
+            defer reader.deinit();
+            while (try reader.nextItem()) |_| {}
+        }
+        fn copyFirst(allocator: std.mem.Allocator) !void {
+            var input = std.Io.Reader.fixed(prefix ++ "<future><part/></future>" ++ suffix);
+            var reader = try mzml.StreamReader.init(allocator, &input, .{});
+            defer reader.deinit();
+            _ = try reader.nextItem();
+            var copy = try mzml.owned.Item.init(allocator, (try reader.nextItem()).?, .{});
+            defer copy.deinit();
+            var output: [4096]u8 = undefined;
+            var sink: std.Io.Writer = .fixed(&output);
+            var writer = try mzml.Writer.init(allocator, &sink, .{});
+            defer writer.deinit();
+            try writer.writeHeader((try reader.readHeader()).*);
+            try writer.beginListWithAttributes(.spectrum_list, 0, &.{});
+            try writer.writeItem(copy.value);
+            try writer.endList();
+            try writer.finish();
+        }
+    };
+    try Check.read(std.testing.allocator, prefix ++ "<future/>" ** 100 ++ suffix, .{ .limits = .{ .record_bytes = 128, .nodes = 3 } });
+    try std.testing.expectError(error.LimitExceeded, Check.read(std.testing.allocator, prefix ++ "<future>" ++ "x" ** 129 ++ "</future>" ++ suffix, .{ .limits = .{ .record_bytes = 128 } }));
+    try std.testing.expectError(error.LimitExceeded, Check.read(std.testing.allocator, prefix ++ "<future><a/><b/><c/></future>" ++ suffix, .{ .limits = .{ .nodes = 3 } }));
+    inline for (.{ "<future><nested>", "<future></other>", "<future>&missing;</future>" }) |fragment| {
+        var input = std.Io.Reader.fixed(prefix ++ fragment);
+        var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+        defer reader.deinit();
+        _ = try reader.nextItem();
+        try std.testing.expectError(error.InvalidXml, reader.nextItem());
+        try std.testing.expectError(error.FailedState, reader.nextItem());
+    }
+    for ([_][]const u8{
+        prefix ++ "</spectrumList>",
+        prefix ++ "</spectrumList></run><future>",
+        prefix ++ "</spectrumList></run><future/>",
+    }) |source| {
+        var input = std.Io.Reader.fixed(source);
+        var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+        defer reader.deinit();
+        while (reader.nextItem()) |item| {
+            try std.testing.expect(item != null);
+        } else |err| try std.testing.expectEqual(error.InvalidXml, err);
+        try std.testing.expectError(error.FailedState, reader.nextItem());
+    }
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.copyFirst, .{});
+}
+
+test "[integration] - [mzML extensions]: selected decoding keeps unfamiliar metadata" {
+    for ([_]usize{ 1, 7, 31 }) |chunk| {
+        try compareDecoded(support.EXTENSIONS, chunk);
+        try compareDecodedWithSelection(support.EXTENSIONS, chunk, true);
+    }
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, readDecodedRecord, .{ support.EXTENSIONS, mzml.arrays.Limits{} });
+}
+
+test "[failure] - [mzML extensions]: bounds retained XML and stops on malformed subtrees" {
+    for ([_]mzml.StreamReader.Options{
+        .{ .limits = .{ .header_bytes = 128 } },
+        .{ .limits = .{ .record_bytes = 128 } },
+        .{ .limits = .{ .depth = 5 } },
+        .{ .limits = .{ .nodes = 3 } },
+        .{ .limits = .{ .attributes = 2 } },
+    }) |options| try std.testing.expectError(error.LimitExceeded, support.readAll(std.testing.allocator, support.EXTENSIONS, options));
+    const prefix = support.HEADER ++ "<spectrumList count='1'><spectrum id='x' index='0' defaultArrayLength='0'>";
+    const minimal = "<mzML xmlns='http://psi.hupo.org/ms/mzml'><run><spectrumList count='1'><spectrum id='x' index='0' defaultArrayLength='0'>";
+    const suffix = "</spectrum></spectrumList></run></mzML>";
+    const nodes = minimal ++ "<future><a/><b/></future>" ++ suffix;
+    try support.readAll(std.testing.allocator, nodes, .{ .limits = .{ .nodes = 4 } });
+    try std.testing.expectError(error.LimitExceeded, support.readAll(std.testing.allocator, nodes, .{ .limits = .{ .nodes = 3 } }));
+    try std.testing.expectError(error.LimitExceeded, support.readAll(std.testing.allocator, minimal ++ "<future>" ++ "x" ** 4096 ++ "</future>" ++ suffix, .{ .limits = .{ .record_bytes = 2048 } }));
+    inline for (.{ "<future><nested>", "<future></other>", "<future>&missing;</future>" }) |fragment| {
+        var input = std.Io.Reader.fixed(prefix ++ fragment);
+        var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+        defer reader.deinit();
+        try std.testing.expectError(error.InvalidXml, reader.nextRecord());
+        try std.testing.expectError(error.FailedState, reader.nextRecord());
+    }
+}
+
 test "[integration] - [mzML 1.0 reading]: streams exact values and selections across refills" {
     for ([_]usize{ 1, 7, 31 }) |chunk| {
         try compareDecoded(support.HISTORICAL, chunk);
@@ -86,6 +212,7 @@ fn expectSelectedNode(expected: mzml.model.Node, actual: mzml.model.Node) !void 
     try std.testing.expectEqual(expected.kind, actual.kind);
     try std.testing.expectEqualDeep(expected.attributes, actual.attributes);
     try std.testing.expectEqualDeep(expected.params, actual.params);
+    try std.testing.expectEqualDeep(expected.content, actual.content);
     try std.testing.expectEqual(expected.start_offset, actual.start_offset);
     try std.testing.expectEqual(expected.content_offset, actual.content_offset);
     try std.testing.expectEqual(expected.end_offset, actual.end_offset);
@@ -197,10 +324,10 @@ test "[integration] - [mzML parameters]: preserves source order and absent field
     const expected = [_]mzml.cv.Entry{
         .{ .user = .{ .value = "" } },
         .{ .cv = .{ .accession = .{ .raw = "X:first" } } },
-        .{ .group_ref = "encoding" },
+        .{ .group_ref = .{ .ref = "encoding" } },
         .{ .cv = .{} },
         .{ .user = .{ .name = "", .unit = .{ .name = "" } } },
-        .{ .group_ref = null },
+        .{ .group_ref = .{ .ref = null } },
     };
     const source = support.HEADER ++ params ++ "<spectrumList count='1' defaultDataProcessingRef='dp'>" ++
         "<spectrum id='x' index='0' defaultArrayLength='1'>" ++ params ++ support.ARRAYS ++
@@ -240,7 +367,7 @@ test "[integration] - [mzML parameters]: preserves parent parameters between chi
     try std.testing.expectEqualDeep(&[_]mzml.cv.Entry{
         .{ .user = .{ .name = "first" } },
         .{ .cv = .{ .accession = .{ .raw = "MS:1000511" }, .value = "2" } },
-        .{ .group_ref = "encoding" },
+        .{ .group_ref = .{ .ref = "encoding" } },
         .{ .user = .{ .name = "last" } },
     }, record.node.params);
     try std.testing.expectEqual(@as(?i32, 2), try record.msLevel((try reader.readHeader()).groups));
@@ -1332,7 +1459,7 @@ test "[integration] - [mzML reader]: preserves complete metadata across fragment
     const prefixed = support.HEADER ++ "<spectrumList xmlns:p='http://psi.hupo.org/ms/mzml' count='1' defaultDataProcessingRef='dp'>" ++
         "<p:spectrum xmlns:q='http://www.w3.org/2001/XMLSchema-instance' q:schemaLocation='unchanged' id='scan=1' index='0' defaultArrayLength='0'>" ++
         "<p:userParam name='note' value='e&#x301;&#x9;&amp;'/></p:spectrum></spectrumList></run></mzML>";
-    const sources = [_][]const u8{ support.DOCUMENT, prefixed, @embedFile("data/scientific_metadata.mzML"), @embedFile("data/writer_indexed.mzML"), gates.EMPTY_RUN };
+    const sources = [_][]const u8{ support.DOCUMENT, support.EXTENSIONS, prefixed, @embedFile("data/scientific_metadata.mzML"), @embedFile("data/writer_indexed.mzML"), gates.EMPTY_RUN };
     for (sources) |source| {
         for (std.enums.values(mzml.StreamReader.Payload)) |payload| try support.expectFragmentedRead(source, payload);
     }
@@ -1351,10 +1478,7 @@ test "[integration] - [mzML reader]: rejects unreadable metadata without decodin
         .{ "value=''", "value='&#x1;'", error.InvalidXml },
         .{ "value=''", "value='\xff'", error.InvalidEncoding },
         .{ "<activation/>", "<!--a--b--><activation/>", error.InvalidXml },
-        .{ "<activation/>", "<future/>", error.InvalidStructure },
-        .{ "<activation/>", "<activation xmlns:q='urn:foreign' q:value='x'/>", error.UnknownAttribute },
         .{ "<activation/>", "<activation></precursor>", error.InvalidXml },
-        .{ "name='note'", "extra='source'", error.UnknownAttribute },
         .{ "index='0'", "index='bad'", error.InvalidValue },
         .{ "defaultArrayLength='1'", "defaultArrayLength='-1'", error.Overflow },
         .{ "index='0'", "index='0' index='1'", error.InvalidXml },
@@ -1801,7 +1925,7 @@ test "[integration] - [mzML arrays]: classifies explicit encodings without guess
         .{ &[_]mzml.cv.Entry{primitive}, error.MissingCompression },
         .{ &[_]mzml.cv.Entry{ primitive, primitive, compression }, error.ConflictingPrimitive },
         .{ &[_]mzml.cv.Entry{ primitive, compression, compression }, error.ConflictingCompression },
-        .{ &[_]mzml.cv.Entry{.{ .group_ref = "absent" }}, error.MissingGroup },
+        .{ &[_]mzml.cv.Entry{.{ .group_ref = .{ .ref = "absent" } }}, error.MissingGroup },
         .{ &[_]mzml.cv.Entry{.{ .cv = .{ .accession = .{ .raw = "MS:1003780" } } }}, error.UnsupportedEncoding },
     };
     inline for (cases) |case| {
@@ -1816,7 +1940,7 @@ test "[integration] - [mzML arrays]: classifies explicit encodings without guess
         inline for (.{
             &[_]mzml.cv.Entry{ primitive, unsupported, compression },
             &[_]mzml.cv.Entry{ primitive, compression, unsupported },
-            &[_]mzml.cv.Entry{ .{ .group_ref = "codec" }, primitive, compression },
+            &[_]mzml.cv.Entry{ .{ .group_ref = .{ .ref = "codec" } }, primitive, compression },
         }) |entries| {
             var output: [0]f64 = .{};
             var transport: [1]u8 = undefined;

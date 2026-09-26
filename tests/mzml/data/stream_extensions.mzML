@@ -1,0 +1,19 @@
+<mzML xmlns="http://psi.hupo.org/ms/mzml" xmlns:e="urn:source" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1.2">
+  <run>
+    <spectrumList count="2">
+      <e:note where="first" type="e:Label">before<e:part/>after</e:note>
+      <spectrum id="s0" index="0" defaultArrayLength="0"/>
+      <e:note xmlns:e="urn:local" where="middle" type="e:Label"/>
+      <spectrum id="s1" index="1" defaultArrayLength="0"/>
+      <future where="spectrum-tail"/>
+    </spectrumList>
+    <e:note where="between-lists"/>
+    <chromatogramList count="1">
+      <e:note where="chromatogram-head"/>
+      <chromatogram id="c0" index="0" defaultArrayLength="0"/>
+      <e:note where="chromatogram-tail"/>
+    </chromatogramList>
+    <e:note where="run-tail"/>
+  </run>
+  <e:note where="document-tail"/>
+</mzML>
