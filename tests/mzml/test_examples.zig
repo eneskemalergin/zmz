@@ -512,19 +512,25 @@ test "[cli] - [mzML examples]: reencodes all codecs without changing values or r
     }
 }
 
-test "[cli] - [mzML examples]: filters spectra while retaining list attributes and references" {
+test "[cli] - [mzML examples]: filtering assigns missing indexes and retains attributes and references" {
     var dir = std.testing.tmpDir(.{});
     defer dir.cleanup();
-    const source = support.HEADER ++ "<spectrumList count='3' sourceNote='A&amp;B'>" ++
+    const indexed_source = support.HEADER ++ "<spectrumList count='3' sourceNote='A&amp;B'>" ++
         "<spectrum id='scan=0' index='0' defaultArrayLength='0'><cvParam accession='MS:1000511' value='2'/></spectrum>" ++
         "<spectrum id='scan=1' index='1' defaultArrayLength='1' dataProcessingRef='dp' spotID='kept'>" ++
         "<cvParam accession='MS:1000511' value='1'/>" ++ support.ARRAYS ++ "</spectrum>" ++
-        "<spectrum id='scan=2' index='2' defaultArrayLength='1'><cvParam accession='MS:1000511' value='1'/>" ++
+        "<spectrum id='scan=2' defaultArrayLength='1' index='2'><cvParam accession='MS:1000511' value='1'/>" ++
         "<scanList count='1'><scan spectrumRef='scan=0'/></scanList>" ++ support.ARRAYS ++ "</spectrum>" ++
         "</spectrumList><chromatogramList count='1' defaultDataProcessingRef='' sourceNote=''>" ++
         "<chromatogram id='tic' index='0' defaultArrayLength='1'>" ++ support.ARRAYS ++
         "</chromatogram></chromatogramList></run></mzML>";
+    const source = try std.mem.replaceOwned(u8, std.testing.allocator, indexed_source, " index='2'", "");
+    defer std.testing.allocator.free(source);
     try dir.dir.writeFile(std.testing.io, .{ .sub_path = "input.mzML", .data = source });
+    const failed_copy = try run(dir.dir, options.rewrite, &.{ "input.mzML", "copy.mzML" }, 1);
+    defer std.testing.allocator.free(failed_copy);
+    try std.testing.expectEqualStrings("", failed_copy);
+    try std.testing.expectError(error.FileNotFound, dir.dir.openFile(std.testing.io, "copy.mzML", .{}));
     const stdout = try run(dir.dir, options.rewrite, &.{ "input.mzML", "ms1.mzML", "--ms1" }, 0);
     defer std.testing.allocator.free(stdout);
     try std.testing.expectEqualStrings("", stdout);
@@ -535,7 +541,7 @@ test "[cli] - [mzML examples]: filters spectra while retaining list attributes a
     try std.testing.expectEqualDeep([2]usize{ 2, 1 }, index.counts);
     try std.testing.expectEqual(@as(usize, 2), index.header().spectrum_list.?.declared_count);
     try std.testing.expectEqual(null, try index.byId(std.testing.allocator, "scan=0"));
-    var input = std.Io.Reader.fixed(source);
+    var input = std.Io.Reader.fixed(indexed_source);
     var original = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
     defer original.deinit();
     const header = try original.readHeader();
@@ -558,6 +564,7 @@ test "[cli] - [mzML examples]: filters spectra while retaining list attributes a
         try known.writeRecord(expected);
         var found = (try index.byId(std.testing.allocator, record.id)).?;
         defer found.deinit();
+        try std.testing.expectEqual(try mzml.cv.parseInteger(usize, ordinal), found.value.index.?);
         try support.expectNode(expected, found.value.node);
     }
     try known.endList();

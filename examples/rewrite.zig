@@ -78,10 +78,13 @@ pub fn main(init: std.process.Init) !void {
                     if (filter) {
                         try attributes.resize(init.gpa, emitted.attributes.len);
                         @memcpy(attributes.items, emitted.attributes);
+                        const index = try std.fmt.bufPrint(&index_text, "{d}", .{written});
                         for (attributes.items) |*attribute| {
-                            if (attribute.namespace_uri == null and std.mem.eql(u8, attribute.name, "index"))
-                                attribute.value = try std.fmt.bufPrint(&index_text, "{d}", .{written});
-                        }
+                            if (attribute.namespace_uri == null and std.mem.eql(u8, attribute.name, "index")) {
+                                attribute.value = index;
+                                break;
+                            }
+                        } else try attributes.append(init.gpa, .{ .name = "index", .value = index });
                         emitted.attributes = attributes.items;
                     }
                     if (editor) |*value| emitted = try value.apply(init.gpa, emitted);
