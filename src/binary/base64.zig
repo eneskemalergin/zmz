@@ -142,7 +142,7 @@ pub const Decoder = struct {
     }
 
     /// Consumes one text fragment. Empty fragments are valid before finish.
-    pub fn update(self: *Decoder, text: []const u8) Error!void {
+    pub noinline fn update(self: *Decoder, text: []const u8) Error!void {
         if (self.failed) return error.FailedState;
         if (self.finished) return error.AlreadyFinished;
         errdefer self.failed = true;
@@ -192,7 +192,9 @@ pub const Decoder = struct {
         if (has_tail and length == plain_length) tail: {
             const group = decodeQuartet(input[length..][0..4].*) catch break :tail;
             if (group.len > capacity - decoded) break :tail;
-            @memcpy(output[decoded..][0..group.len], group.bytes[0..group.len]);
+            inline for (0..3) |i| {
+                if (i < group.len) output[decoded + i] = group.bytes[i];
+            }
             length += 4;
             decoded += group.len;
             self.padded = true;
@@ -223,7 +225,9 @@ pub const Decoder = struct {
         if (end > self.limits.decoded_bytes) return error.LimitExceeded;
         if (!self.discard_output) {
             if (end > self.output.len) return error.OutputTooSmall;
-            @memcpy(self.output[self.counts.decoded_bytes..end], group.bytes[0..group.len]);
+            inline for (0..3) |i| {
+                if (i < group.len) self.output[self.counts.decoded_bytes + i] = group.bytes[i];
+            }
         }
         self.counts.decoded_bytes = end;
         self.quartet_len = 0;
@@ -335,9 +339,11 @@ fn decodePrefix(output: []u8, source: []const u8) usize {
     return position;
 }
 
-fn decodeQuartet(q: [4]u8) Error!struct { bytes: [3]u8, len: usize } {
-    const a = alphabet(q[0]) orelse return error.InvalidPadding;
-    const b = alphabet(q[1]) orelse return error.InvalidPadding;
+inline fn decodeQuartet(q: [4]u8) Error!struct { bytes: [3]u8, len: usize } {
+    const a = DECODE_TABLE[q[0]];
+    if (a == 0xff) return error.InvalidPadding;
+    const b = DECODE_TABLE[q[1]];
+    if (b == 0xff) return error.InvalidPadding;
     var bytes: [3]u8 = undefined;
     bytes[0] = a << 2 | b >> 4;
     if (q[2] == '=') {
@@ -345,26 +351,22 @@ fn decodeQuartet(q: [4]u8) Error!struct { bytes: [3]u8, len: usize } {
         if (b & 15 != 0) return error.NonCanonicalTail;
         return .{ .bytes = bytes, .len = 1 };
     }
-    const c = alphabet(q[2]) orelse return error.InvalidCharacter;
+    const c = DECODE_TABLE[q[2]];
+    if (c == 0xff) return error.InvalidCharacter;
     bytes[1] = b << 4 | c >> 2;
     if (q[3] == '=') {
         if (c & 3 != 0) return error.NonCanonicalTail;
         return .{ .bytes = bytes, .len = 2 };
     }
-    const d = alphabet(q[3]) orelse return error.InvalidCharacter;
+    const d = DECODE_TABLE[q[3]];
+    if (d == 0xff) return error.InvalidCharacter;
     bytes[2] = c << 6 | d;
     return .{ .bytes = bytes, .len = 3 };
 }
 
 fn alphabet(byte: u8) ?u8 {
-    return switch (byte) {
-        'A'...'Z' => byte - 'A',
-        'a'...'z' => byte - 'a' + 26,
-        '0'...'9' => byte - '0' + 52,
-        '+' => 62,
-        '/' => 63,
-        else => null,
-    };
+    const value = DECODE_TABLE[byte];
+    return if (value == 0xff) null else value;
 }
 
 fn isWhitespace(byte: u8) bool {
