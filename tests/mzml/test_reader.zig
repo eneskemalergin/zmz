@@ -192,6 +192,21 @@ test "[failure] - [mzML diagnostics]: reports a known decoded size without guess
     }
 }
 
+test "[failure] - [mzML diagnostics]: reports a zlib array longer than declared as a buffer error" {
+    // Python's zlib.compress of two doubles, declared as one.
+    const source = try decodedDocument(std.testing.allocator, "eJxjYACBD/YMEOAAAAvnAXA=", 24, 1, "MS:1000574");
+    defer std.testing.allocator.free(source);
+    var input = std.Io.Reader.fixed(source);
+    var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+    defer reader.deinit();
+    var output = mzml.StreamReader.DecodedArrays.init(std.testing.allocator, .{});
+    defer output.deinit();
+    try std.testing.expectError(error.OutputTooSmall, reader.nextDecodedRecord(&output));
+    const report = reader.diagnostic().?;
+    try std.testing.expectEqual(.array, report.stage);
+    try std.testing.expectEqual(.buffer_error, report.id);
+}
+
 test "[integration] - [mzML items]: streams selected arrays and XML across short reads" {
     const source = support.HEADER ++ "<spectrumList count='1'><future/>" ++ support.SPECTRUM ++
         "<tail/></spectrumList><between/><chromatogramList count='0'><empty/></chromatogramList>" ++
@@ -1136,7 +1151,7 @@ test "[integration] - [mzML decoded reading]: grows wire storage across fragment
     var values: [256]f64 = undefined;
     var random: std.Random.DefaultPrng = .init(0);
     random.random().bytes(std.mem.sliceAsBytes(&values));
-    var compressor = try mzml.zlib.Compressor.init(std.testing.allocator, .fastest);
+    var compressor = try mzml.zlib.Compressor.init(std.testing.allocator, .fast);
     defer compressor.deinit();
     var transport: [4096]u8 = undefined;
     var transformed: [2048]u8 = undefined;

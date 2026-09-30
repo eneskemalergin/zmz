@@ -690,7 +690,7 @@ test "[integration] - [mzML prepared writing]: preserves primitive bytes across 
     const header = try reader.readHeader();
     var builder = mzml.Builder.init(std.testing.allocator, .{});
     defer builder.deinit();
-    var compressor = try mzml.zlib.Compressor.init(std.testing.allocator, .fastest);
+    var compressor = try mzml.zlib.Compressor.init(std.testing.allocator, .fast);
     defer compressor.deinit();
     inline for (.{ f32, f64, i32, i64 }) |T| {
         const Bits = @Int(.unsigned, @bitSizeOf(T));

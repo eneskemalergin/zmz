@@ -28,7 +28,7 @@ pub fn main(init: std.process.Init) !void {
     try writer.writeHeader(try makeHeader(&builder));
     builder.reset();
 
-    var compressor = try mzml.zlib.Compressor.init(init.gpa, .fastest);
+    var compressor = try mzml.zlib.Compressor.init(init.gpa, .fast);
     defer compressor.deinit();
     var mz_storage: std.ArrayList(u8) = .empty;
     defer mz_storage.deinit(init.gpa);

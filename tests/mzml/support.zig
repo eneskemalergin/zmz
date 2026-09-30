@@ -139,7 +139,7 @@ pub fn constructFixture(allocator: std.mem.Allocator, sink: *std.Io.Writer, inde
     const header = try metadata.header(source_header);
     var builder = mzml.Builder.init(allocator, .{});
     defer builder.deinit();
-    var compressor = try mzml.zlib.Compressor.init(allocator, .fastest);
+    var compressor = try mzml.zlib.Compressor.init(allocator, .fast);
     defer compressor.deinit();
     var writer = if (indexed) try mzml.Writer.initIndexed(allocator, sink, .{}, .{}) else try mzml.Writer.init(allocator, sink, .{});
     defer writer.deinit();
@@ -230,6 +230,93 @@ pub fn checkIndexed(allocator: std.mem.Allocator, bytes: []const u8) !void {
     }
     try std.testing.expectEqual(null, try index.byId(allocator, "missing"));
     try std.testing.expectEqual(null, try index.at(allocator, .spectrum, 8));
+}
+
+/// Pipelines whose wire bytes are one zlib stream.
+const ZLIB_PIPELINES = [_][]const u8{ "MS:1000574", "MS:1002746", "MS:1002747", "MS:1002748" };
+
+/// Checks written mzML against a frozen fixture without depending on the zlib encoder's bytes.
+/// Both documents must match after encoderIndependent, and an indexed output must carry
+/// offsets and a checksum that are correct for its own bytes.
+pub fn expectWritten(expected: []const u8, actual: []const u8) !void {
+    const allocator = std.testing.allocator;
+    const expected_view = try encoderIndependent(allocator, expected);
+    defer allocator.free(expected_view);
+    const actual_view = try encoderIndependent(allocator, actual);
+    defer allocator.free(actual_view);
+    try std.testing.expectEqualStrings(expected_view, actual_view);
+    const checksum = std.mem.indexOf(u8, actual, "<fileChecksum>") orelse return;
+    const hashed = checksum + "<fileChecksum>".len;
+    var digest: [20]u8 = undefined;
+    std.crypto.hash.Sha1.hash(actual[0..hashed], &digest, .{});
+    try std.testing.expectEqualStrings(&std.fmt.bytesToHex(digest, .lower), actual[hashed..][0..40]);
+    var embedded = try mzml.IndexedReader.build(allocator, .{ .bytes = actual }, .{});
+    defer embedded.deinit();
+    var rebuilt = try mzml.IndexedReader.build(allocator, .{ .bytes = actual }, .{ .policy = .rebuild });
+    defer rebuilt.deinit();
+    try std.testing.expectEqual(rebuilt.entries.items.len, embedded.entries.items.len);
+    for (rebuilt.entries.items, embedded.entries.items) |found, listed| {
+        try std.testing.expectEqualStrings(found.id, listed.id);
+        try std.testing.expectEqual(found.start, listed.start);
+    }
+}
+
+/// Copies a document, replacing each zlib stream with the hex of its decoded bytes and each value
+/// that follows from compressed sizes (zlib encodedLength, index offsets, checksum) with '#'.
+/// Every stream must decode to the same bytes with zmz and with the standard library.
+fn encoderIndependent(allocator: std.mem.Allocator, document: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var at: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, document, at, '<')) |tag| {
+        const rest = document[tag..];
+        if (std.mem.startsWith(u8, rest, "<binaryDataArray ")) {
+            const text = std.mem.indexOfPos(u8, document, tag, "<binary>").? + "<binary>".len;
+            const text_end = std.mem.indexOfPos(u8, document, text, "</binary>").?;
+            const declaration = document[tag..text];
+            for (ZLIB_PIPELINES) |accession| {
+                if (std.mem.indexOf(u8, declaration, accession) != null) break;
+            } else {
+                try out.appendSlice(allocator, document[at..text_end]);
+                at = text_end;
+                continue;
+            }
+            const length = std.mem.indexOf(u8, declaration, "encodedLength=\"").? + "encodedLength=\"".len;
+            const length_end = std.mem.indexOfScalarPos(u8, declaration, length, '"').?;
+            try std.testing.expectEqual(text_end - text, try std.fmt.parseInt(usize, declaration[length..length_end], 10));
+            try out.appendSlice(allocator, document[at .. tag + length]);
+            try out.append(allocator, '#');
+            try out.appendSlice(allocator, document[tag + length_end .. text]);
+            var wire: [512]u8 = undefined;
+            const counts = try mzml.base64.decode(&wire, document[text..text_end], .{});
+            var reference: [512]u8 = undefined;
+            var input = std.Io.Reader.fixed(wire[0..counts.decoded_bytes]);
+            var plain = std.Io.Writer.fixed(&reference);
+            var inflater: std.compress.flate.Decompress = .init(&input, .zlib, &.{});
+            _ = try inflater.reader.streamRemaining(&plain);
+            var decoded: [512]u8 = undefined;
+            try std.testing.expectEqualSlices(u8, plain.buffered(), try mzml.zlib.decompress(&decoded, wire[0..counts.decoded_bytes]));
+            for (plain.buffered()) |byte| try out.print(allocator, "{x:0>2}", .{byte});
+            at = text_end;
+        } else if (sizeDependentValue(rest)) |prefix| {
+            try out.appendSlice(allocator, document[at .. tag + prefix]);
+            try out.append(allocator, '#');
+            at = std.mem.indexOfScalarPos(u8, document, tag + prefix, '<').?;
+        } else {
+            try out.appendSlice(allocator, document[at .. tag + 1]);
+            at = tag + 1;
+        }
+    }
+    try out.appendSlice(allocator, document[at..]);
+    return out.toOwnedSlice(allocator);
+}
+
+fn sizeDependentValue(tag: []const u8) ?usize {
+    inline for (.{ "<indexListOffset>", "<fileChecksum>" }) |open| {
+        if (std.mem.startsWith(u8, tag, open)) return open.len;
+    }
+    if (std.mem.startsWith(u8, tag, "<offset ")) return std.mem.indexOfScalar(u8, tag, '>').? + 1;
+    return null;
 }
 
 pub fn checkLookupAllocator(record_allocator: std.mem.Allocator) !void {

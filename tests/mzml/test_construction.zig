@@ -64,7 +64,7 @@ fn reencodeReferenceAllocated(allocator: std.mem.Allocator) !void {
     try std.testing.expectEqualDeep(header.groups[0].entries[0].cv.xml, prepared_header.header.groups[1].entries[0].cv.xml);
     var builder = mzml.Builder.init(allocator, .{});
     defer builder.deinit();
-    var compressor = try mzml.zlib.Compressor.init(allocator, .fastest);
+    var compressor = try mzml.zlib.Compressor.init(allocator, .fast);
     defer compressor.deinit();
     var wire: [128]u8 = undefined;
     var transformed: [128]u8 = undefined;
@@ -253,7 +253,7 @@ test "[integration] - [group reencoding]: handles partial groups, ID collisions,
     var builder = mzml.Builder.init(std.testing.allocator, .{});
     defer builder.deinit();
     const array: mzml.model.Node = .{ .kind = .binary_data_array, .params = &.{ .{ .group_ref = .{ .ref = "zmz-reencoded-0", .xml = &xml } }, .{ .group_ref = .{ .ref = " codec ", .xml = &xml } } }, .children = &.{.{ .kind = .binary }} };
-    var compressor = try mzml.zlib.Compressor.init(std.testing.allocator, .fastest);
+    var compressor = try mzml.zlib.Compressor.init(std.testing.allocator, .fast);
     defer compressor.deinit();
     var wire: [128]u8 = undefined;
     var transformed: [128]u8 = undefined;
@@ -289,7 +289,7 @@ fn replaceArrayAllocated(allocator: std.mem.Allocator) !void {
     };
     var builder = mzml.Builder.init(allocator, .{ .bytes = 4096 });
     defer builder.deinit();
-    var compressor = try mzml.zlib.Compressor.init(allocator, .fastest);
+    var compressor = try mzml.zlib.Compressor.init(allocator, .fast);
     defer compressor.deinit();
     try std.testing.expectError(error.MissingCompressor, builder.prepareArrayFrom(f32, &.{1}, source, &groups, .{ .pipeline = .zlib }, .{ .transport = &.{}, .transformed = &.{} }, null));
     var retry_scratch: [16]u8 = undefined;
@@ -418,7 +418,7 @@ test "[integration] - [record editing]: changes values and length while retainin
     const old_array = original.binaryArrays()[0];
     var builder = mzml.Builder.init(std.testing.allocator, .{});
     defer builder.deinit();
-    var compressor = try mzml.zlib.Compressor.init(std.testing.allocator, .fastest);
+    var compressor = try mzml.zlib.Compressor.init(std.testing.allocator, .fast);
     defer compressor.deinit();
     var wire_storage: [128]u8 = undefined;
     var transformed: [16]u8 = undefined;
@@ -465,7 +465,7 @@ test "[integration] - [record editing]: changes values and length while retainin
 test "[integration] - [prepared construction]: retains metadata and borrows primitive wire" {
     var builder = mzml.Builder.init(std.testing.allocator, .{});
     defer builder.deinit();
-    var compressor = try mzml.zlib.Compressor.init(std.testing.allocator, .fastest);
+    var compressor = try mzml.zlib.Compressor.init(std.testing.allocator, .fast);
     defer compressor.deinit();
     inline for (.{ f32, f64, i32, i64 }) |T| {
         const values: [5]T = if (@typeInfo(T) == .float)
@@ -541,13 +541,13 @@ test "[integration] - [prepared construction]: keeps builder and writer failure 
     try std.testing.expectError(error.FailedState, writer.writeRecordWithArrays(record.node, &.{ a.wire, b.wire }));
 }
 
-test "[integration] - [mzML prepared writing]: matches frozen plain and indexed codec output" {
+test "[integration] - [mzML prepared writing]: matches frozen plain and indexed output apart from zlib bytes" {
     var bytes: [32768]u8 = undefined;
     for ([_]bool{ false, true }) |indexed| {
         var sink = std.Io.Writer.fixed(&bytes);
         try support.constructFixture(std.testing.allocator, &sink, indexed, std.meta.tags(mzml.arrays.Pipeline), true);
         const expected = if (indexed) @embedFile("data/writer_indexed.mzML") else @embedFile("data/writer_plain.mzML");
-        try std.testing.expectEqualStrings(std.mem.trimEnd(u8, expected, "\n"), sink.buffered());
+        try support.expectWritten(std.mem.trimEnd(u8, expected, "\n"), sink.buffered());
     }
 }
 
@@ -584,7 +584,7 @@ test "[integration] - [mzML construction]: writes and decodes every declared pip
         count += 1;
     }
     try std.testing.expectEqual(@as(usize, 16), count);
-    try std.testing.expectEqualStrings(std.mem.trimEnd(u8, @embedFile("data/writer_plain.mzML"), "\n"), sink.buffered());
+    try support.expectWritten(std.mem.trimEnd(u8, @embedFile("data/writer_plain.mzML"), "\n"), sink.buffered());
     const cases = .{
         .{ @embedFile("data/writer_linear_slof.mzML"), &[_]mzml.arrays.Pipeline{ .none, .zlib, .linear, .slof, .linear_zlib, .slof_zlib } },
         .{ @embedFile("data/writer_raw_zlib.mzML"), &[_]mzml.arrays.Pipeline{ .none, .zlib } },
@@ -593,7 +593,7 @@ test "[integration] - [mzML construction]: writes and decodes every declared pip
         var variant_buffer: [32768]u8 = undefined;
         var variant = std.Io.Writer.fixed(&variant_buffer);
         try support.constructFixture(std.testing.allocator, &variant, true, case[1], false);
-        try std.testing.expectEqualStrings(std.mem.trimEnd(u8, case[0], "\n"), variant.buffered());
+        try support.expectWritten(std.mem.trimEnd(u8, case[0], "\n"), variant.buffered());
     }
 }
 
@@ -703,7 +703,7 @@ test "[integration] - [mzML construction]: preserves partial fields and supplied
 test "[integration] - [mzML construction]: preserves primitive bits through emitted declarations" {
     var builder = mzml.Builder.init(std.testing.allocator, .{});
     defer builder.deinit();
-    var compressor = try mzml.zlib.Compressor.init(std.testing.allocator, .fastest);
+    var compressor = try mzml.zlib.Compressor.init(std.testing.allocator, .fast);
     defer compressor.deinit();
     inline for (.{ f32, f64, i32, i64 }) |T| {
         const values: [5]T = if (@typeInfo(T) == .float)

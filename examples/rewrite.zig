@@ -162,7 +162,7 @@ const Reencoder = struct {
     wires: std.ArrayList([]const u8) = .empty,
 
     fn init(allocator: std.mem.Allocator, reencoding: mzml.Builder.Reencoding) !Reencoder {
-        return .{ .allocator = allocator, .builder = .init(allocator, .{}), .reencoding = reencoding, .compressor = try .init(allocator, .fastest) };
+        return .{ .allocator = allocator, .builder = .init(allocator, .{}), .reencoding = reencoding, .compressor = try .init(allocator, .fast) };
     }
 
     fn deinit(self: *Reencoder) void {
