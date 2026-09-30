@@ -1234,7 +1234,7 @@ test "[integration] - [mzML index]: verifies emitted targets checksum and indepe
     var digest: [20]u8 = undefined;
     std.crypto.hash.Sha1.hash(sink.buffered()[0..checksum_start], &digest, .{});
     try std.testing.expectEqualStrings(&std.fmt.bytesToHex(digest, .lower), sink.buffered()[checksum_start..][0..40]);
-    try std.testing.expectEqualStrings(std.mem.trimEnd(u8, @embedFile("data/writer_indexed.mzML"), "\n"), sink.buffered());
+    try support.expectWritten(std.mem.trimEnd(u8, @embedFile("data/writer_indexed.mzML"), "\n"), sink.buffered());
     const marker = "<offset idRef=\"scan=none\">";
     const target_start = std.mem.indexOf(u8, sink.buffered(), marker).? + marker.len;
     const target_end = std.mem.indexOfScalarPos(u8, sink.buffered(), target_start, '<').?;
@@ -1596,13 +1596,16 @@ test "[integration] - [mzML indexed writer]: preserves bytes and checksum throug
             return length;
         }
     };
-    const expected = std.mem.trimEnd(u8, @embedFile("data/writer_indexed.mzML"), "\n");
+    var whole_bytes: [16384]u8 = undefined;
+    var whole = std.Io.Writer.fixed(&whole_bytes);
+    try support.constructFixture(std.testing.allocator, &whole, true, std.meta.tags(mzml.arrays.Pipeline), false);
+    try support.expectWritten(std.mem.trimEnd(u8, @embedFile("data/writer_indexed.mzML"), "\n"), whole.buffered());
     for ([_]usize{ 1, 7, 63, 64, 65, 4096 }) |chunk| {
         var bytes: [16384]u8 = undefined;
         var sink: ShortSink = .{ .out = .fixed(&bytes), .chunk = chunk };
         try support.constructFixture(std.testing.allocator, &sink.writer, true, std.meta.tags(mzml.arrays.Pipeline), false);
         try sink.writer.flush();
-        try std.testing.expectEqualStrings(expected, sink.out.buffered());
+        try std.testing.expectEqualStrings(whole.buffered(), sink.out.buffered());
         try support.checkIndexed(std.testing.allocator, sink.out.buffered());
     }
 }

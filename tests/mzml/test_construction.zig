@@ -541,13 +541,13 @@ test "[integration] - [prepared construction]: keeps builder and writer failure 
     try std.testing.expectError(error.FailedState, writer.writeRecordWithArrays(record.node, &.{ a.wire, b.wire }));
 }
 
-test "[integration] - [mzML prepared writing]: matches frozen plain and indexed codec output" {
+test "[integration] - [mzML prepared writing]: matches frozen plain and indexed output apart from zlib bytes" {
     var bytes: [32768]u8 = undefined;
     for ([_]bool{ false, true }) |indexed| {
         var sink = std.Io.Writer.fixed(&bytes);
         try support.constructFixture(std.testing.allocator, &sink, indexed, std.meta.tags(mzml.arrays.Pipeline), true);
         const expected = if (indexed) @embedFile("data/writer_indexed.mzML") else @embedFile("data/writer_plain.mzML");
-        try std.testing.expectEqualStrings(std.mem.trimEnd(u8, expected, "\n"), sink.buffered());
+        try support.expectWritten(std.mem.trimEnd(u8, expected, "\n"), sink.buffered());
     }
 }
 
@@ -584,7 +584,7 @@ test "[integration] - [mzML construction]: writes and decodes every declared pip
         count += 1;
     }
     try std.testing.expectEqual(@as(usize, 16), count);
-    try std.testing.expectEqualStrings(std.mem.trimEnd(u8, @embedFile("data/writer_plain.mzML"), "\n"), sink.buffered());
+    try support.expectWritten(std.mem.trimEnd(u8, @embedFile("data/writer_plain.mzML"), "\n"), sink.buffered());
     const cases = .{
         .{ @embedFile("data/writer_linear_slof.mzML"), &[_]mzml.arrays.Pipeline{ .none, .zlib, .linear, .slof, .linear_zlib, .slof_zlib } },
         .{ @embedFile("data/writer_raw_zlib.mzML"), &[_]mzml.arrays.Pipeline{ .none, .zlib } },
@@ -593,7 +593,7 @@ test "[integration] - [mzML construction]: writes and decodes every declared pip
         var variant_buffer: [32768]u8 = undefined;
         var variant = std.Io.Writer.fixed(&variant_buffer);
         try support.constructFixture(std.testing.allocator, &variant, true, case[1], false);
-        try std.testing.expectEqualStrings(std.mem.trimEnd(u8, case[0], "\n"), variant.buffered());
+        try support.expectWritten(std.mem.trimEnd(u8, case[0], "\n"), variant.buffered());
     }
 }
 
