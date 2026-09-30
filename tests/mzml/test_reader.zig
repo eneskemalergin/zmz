@@ -1151,7 +1151,7 @@ test "[integration] - [mzML decoded reading]: grows wire storage across fragment
     var values: [256]f64 = undefined;
     var random: std.Random.DefaultPrng = .init(0);
     random.random().bytes(std.mem.sliceAsBytes(&values));
-    var compressor = try mzml.zlib.Compressor.init(std.testing.allocator, .fastest);
+    var compressor = try mzml.zlib.Compressor.init(std.testing.allocator, .fast);
     defer compressor.deinit();
     var transport: [4096]u8 = undefined;
     var transformed: [2048]u8 = undefined;

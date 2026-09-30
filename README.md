@@ -32,7 +32,7 @@ The first version brings the pieces needed for mzML into one package:
 
 The package imports as `zmz`. The mzML API is available under `@import("zmz").mzml`.
 
-zlib arrays are decoded by [zipir](https://github.com/eneskemalergin/zipir), a Zig package pinned by hash in `build.zig.zon`; building needs only Zig.
+zlib arrays are decoded and encoded by [zipir](https://github.com/eneskemalergin/zipir), a Zig package pinned by hash in `build.zig.zon`; building needs only Zig. Compression takes zipir's presets, `fast`, `even`, and `dense`.
 
 ## Direction
 

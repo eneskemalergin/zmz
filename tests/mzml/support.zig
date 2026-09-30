@@ -139,7 +139,7 @@ pub fn constructFixture(allocator: std.mem.Allocator, sink: *std.Io.Writer, inde
     const header = try metadata.header(source_header);
     var builder = mzml.Builder.init(allocator, .{});
     defer builder.deinit();
-    var compressor = try mzml.zlib.Compressor.init(allocator, .fastest);
+    var compressor = try mzml.zlib.Compressor.init(allocator, .fast);
     defer compressor.deinit();
     var writer = if (indexed) try mzml.Writer.initIndexed(allocator, sink, .{}, .{}) else try mzml.Writer.init(allocator, sink, .{});
     defer writer.deinit();

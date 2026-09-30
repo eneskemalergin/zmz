@@ -7,7 +7,7 @@ const zlib = mzml.zlib;
 const arrays = mzml.arrays;
 
 fn allocateCompressor(allocator: std.mem.Allocator) !void {
-    var compressor = try zlib.Compressor.init(allocator, .default);
+    var compressor = try zlib.Compressor.init(allocator, .even);
     defer compressor.deinit();
     var output: [64]u8 = undefined;
     _ = try compressor.compress(&output, "abc");
@@ -378,7 +378,7 @@ test "[edge] - [zlib]: treats empty slices inside the other buffer as disjoint" 
 }
 
 test "[property] - [zlib]: decodes exact outputs around loop, staging, and window boundaries" {
-    var compressor = try zlib.Compressor.init(std.testing.allocator, .default);
+    var compressor = try zlib.Compressor.init(std.testing.allocator, .even);
     defer compressor.deinit();
     var random = std.Random.DefaultPrng.init(std.testing.random_seed);
     // A random window followed by a copy of its start can only be coded with 32,768-byte distances.
@@ -413,8 +413,8 @@ test "[property] - [zlib]: reuses compression storage after success and capacity
     random.random().bytes(&source);
     var compressed: [72_000]u8 = undefined;
     var decoded: [source.len]u8 = undefined;
-    inline for (.{ zlib.Level.fastest, .default, .best }) |level| {
-        var compressor = try zlib.Compressor.init(std.testing.allocator, level);
+    inline for (.{ zlib.Preset.fast, .even, .dense }) |preset| {
+        var compressor = try zlib.Compressor.init(std.testing.allocator, preset);
         defer compressor.deinit();
         for ([_]usize{ 0, 1, 31, 32768, source.len }) |len| {
             const wire = try compressor.compress(&compressed, source[0..len]);
@@ -436,7 +436,7 @@ test "[failure] - [zlib]: releases partially allocated compression storage" {
 }
 
 test "[property] - [zlib]: matches valid streaming output and bounds corrupt or truncated streams" {
-    var compressor = try zlib.Compressor.init(std.testing.allocator, .default);
+    var compressor = try zlib.Compressor.init(std.testing.allocator, .even);
     defer compressor.deinit();
     var random = std.Random.DefaultPrng.init(std.testing.random_seed);
     var source: [2048]u8 = undefined;
@@ -541,7 +541,7 @@ test "[integration] - [primitive wire]: matches fixed little-endian Base64 vecto
             try std.testing.expectEqual(@intFromPtr(expected[0..].ptr), @intFromPtr(borrowed.ptr));
         }
         // A zlib envelope can decode into typed output without transformed scratch.
-        var compressor = try zlib.Compressor.init(std.testing.allocator, .default);
+        var compressor = try zlib.Compressor.init(std.testing.allocator, .even);
         defer compressor.deinit();
         const compressed = try arrays.encode(T, &encoded, &expected, .{ .pipeline = .zlib }, scratch, &compressor);
         try arrays.decode(T, &output, compressed, .zlib, .{ .transport = &transport, .transformed = &.{} }, .{});
@@ -581,7 +581,7 @@ test "[property] - [array pipelines]: preserves single-bit patterns zeros and al
     var transformed: [2048]u8 = undefined;
     const scratch: arrays.Scratch = .{ .transport = &transport, .transformed = &transformed };
     var encoded: [4096]u8 = undefined;
-    var compressor = try zlib.Compressor.init(std.testing.allocator, .default);
+    var compressor = try zlib.Compressor.init(std.testing.allocator, .even);
     defer compressor.deinit();
     inline for (.{ f32, f64, i32, i64 }) |T| {
         const Bits = @Int(.unsigned, @bitSizeOf(T));
@@ -611,7 +611,7 @@ test "[integration] - [array pipelines]: composes all Numpress modes with option
     var encoded: [512]u8 = undefined;
     var output: [4]f64 = undefined;
     const values = [_]f64{ 0, 1.25, 10.5, 100.125 };
-    var compressor = try zlib.Compressor.init(std.testing.allocator, .default);
+    var compressor = try zlib.Compressor.init(std.testing.allocator, .even);
     defer compressor.deinit();
     inline for (.{
         arrays.Pipeline.linear, .pic, .slof, .linear_zlib, .pic_zlib, .slof_zlib,
@@ -741,7 +741,7 @@ test "[integration] - [empty arrays]: round trips every established pipeline" {
     var output: [0]f64 = .{};
     const scratch: arrays.Scratch = .{ .transport = &transport, .transformed = &transformed };
     var encoded: [256]u8 = undefined;
-    var compressor = try zlib.Compressor.init(std.testing.allocator, .default);
+    var compressor = try zlib.Compressor.init(std.testing.allocator, .even);
     defer compressor.deinit();
     inline for (std.meta.tags(arrays.Pipeline)) |pipeline| {
         const fixed_point: ?f64 = switch (pipeline) {

@@ -1,4 +1,4 @@
-//! Handles independent zlib array streams, decoding with zipir and encoding with Zig's standard library.
+//! Handles independent zlib array streams with zipir.
 
 const std = @import("std");
 const zipir = @import("zipir");
@@ -14,8 +14,9 @@ pub const Error = error{
     OverlappingBuffers,
 };
 
-/// Compression effort, not a promise of byte identity with other implementations.
-pub const Level = enum { fastest, default, best };
+/// zipir's compression presets, from fastest to smallest output. Compressed bytes may change
+/// between zipir versions; they always decode to the same values.
+pub const Preset = enum { fast, even, dense };
 
 /// Decodes exactly one complete zlib stream into disjoint caller storage.
 /// The destination capacity bounds expansion. Checks Adler-32 and rejects concatenation.
@@ -51,21 +52,16 @@ pub fn decompress(output: []u8, source: []const u8) Error![]u8 {
 /// Calls are independent streams; a failed call does not prevent reuse.
 pub const Compressor = struct {
     allocator: std.mem.Allocator,
-    state: *std.compress.flate.Compress,
-    scratch: []u8,
-    level: Level,
+    state: *zipir.zlib.Compressor,
+    preset: Preset,
 
-    /// Allocates reusable state. Release it with deinit.
-    pub fn init(allocator: std.mem.Allocator, level: Level) std.mem.Allocator.Error!Compressor {
-        const state = try allocator.create(std.compress.flate.Compress);
-        errdefer allocator.destroy(state);
-        const scratch = try allocator.alloc(u8, std.compress.flate.max_window_len);
-        return .{ .allocator = allocator, .state = state, .scratch = scratch, .level = level };
+    /// Allocates reusable state (one zipir compressor). Release it with deinit.
+    pub fn init(allocator: std.mem.Allocator, preset: Preset) std.mem.Allocator.Error!Compressor {
+        return .{ .allocator = allocator, .state = try allocator.create(zipir.zlib.Compressor), .preset = preset };
     }
 
     /// Releases all compression storage and invalidates this instance.
     pub fn deinit(self: *Compressor) void {
-        self.allocator.free(self.scratch);
         self.allocator.destroy(self.state);
         self.* = undefined;
     }
@@ -73,25 +69,16 @@ pub const Compressor = struct {
     /// Writes one zlib stream without allocating. Source and output must not overlap.
     pub fn compress(self: *Compressor, output: []u8, source: []const u8) Error![]u8 {
         if (overlaps(output, source)) return error.OverlappingBuffers;
-        // Flate requires a writer buffer larger than eight bytes even for empty input.
-        var small_output: [64]u8 = undefined;
-        var destination = std.Io.Writer.fixed(if (output.len <= 8) &small_output else output);
-        self.state.* = std.compress.flate.Compress.init(
-            &destination,
-            self.scratch,
-            .zlib,
-            switch (self.level) {
-                .fastest => .fastest,
-                .default => .default,
-                .best => .best,
-            },
-        ) catch return error.OutputTooSmall;
+        // zipir's only compression error is a full output writer.
+        var destination = std.Io.Writer.fixed(output);
+        self.state.init(&destination, .{ .preset = switch (self.preset) {
+            .fast => .fast,
+            .even => .even,
+            .dense => .dense,
+        } }) catch return error.OutputTooSmall;
         self.state.writer.writeAll(source) catch return error.OutputTooSmall;
-        self.state.finish() catch return error.OutputTooSmall;
-        const result = destination.buffered();
-        if (result.len > output.len) return error.OutputTooSmall;
-        if (output.len <= 8) @memcpy(output[0..result.len], result);
-        return output[0..result.len];
+        _ = self.state.finish() catch return error.OutputTooSmall;
+        return destination.buffered();
     }
 };
 
