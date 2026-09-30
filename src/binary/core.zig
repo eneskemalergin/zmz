@@ -1,5 +1,6 @@
-//! Detects and caches CPU and OS support for the binary codecs' AVX2 paths.
-//! Codec build options and compiler restrictions stay with their callers.
+//! Shared by the binary codecs: cached CPU and OS support for their AVX2 paths,
+//! and the check that caller buffers do not overlap. Codec build options and
+//! compiler restrictions stay with their callers.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -14,6 +15,14 @@ pub fn hasAvx2() bool {
     const available = detectAvx2();
     avx2_cached.store(if (available) 2 else 1, .monotonic);
     return available;
+}
+
+/// Reports whether two slices share a byte. Empty slices overlap nothing.
+pub fn overlaps(a: []const u8, b: []const u8) bool {
+    if (a.len == 0 or b.len == 0) return false;
+    const start_a = @intFromPtr(a.ptr);
+    const start_b = @intFromPtr(b.ptr);
+    return if (start_a <= start_b) start_b - start_a < a.len else start_a - start_b < b.len;
 }
 
 fn detectAvx2() bool {

@@ -7,7 +7,7 @@ const base64 = @import("base64.zig");
 const zlib = @import("zlib.zig");
 const numpress = @import("numpress.zig");
 const encoding = @import("encoding.zig");
-const overlaps = @import("memory.zig").overlaps;
+const overlaps = @import("core.zig").overlaps;
 
 pub const Pipeline = encoding.Pipeline;
 

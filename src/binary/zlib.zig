@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const zipir = @import("zipir");
-const overlaps = @import("memory.zig").overlaps;
+const overlaps = @import("core.zig").overlaps;
 
 /// Checked stream failures. Partial output is unspecified and never exceeds its buffer.
 pub const Error = error{

@@ -8,7 +8,7 @@ const model = @import("model.zig");
 const schema = @import("schema.zig");
 const xml = @import("../xml/mzml_adapter.zig");
 const base64 = @import("../binary/base64.zig");
-const overlaps = @import("../binary/memory.zig").overlaps;
+const overlaps = @import("../binary/core.zig").overlaps;
 const Diagnostic = @import("diagnostic.zig");
 const Ids = @import("internal/id_index.zig").IdIndex(IndexEntry);
 

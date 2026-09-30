@@ -8,8 +8,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const options = @import("base64_options");
-const cpu = @import("cpu.zig");
-const overlaps = @import("memory.zig").overlaps;
+const core = @import("core.zig");
+const overlaps = core.overlaps;
 // Zig's self-hosted x86 backend cannot assemble vector memory operands yet.
 const USE_AVX2 = builtin.cpu.arch == .x86_64 and options.simd and builtin.zig_backend == .stage2_llvm;
 
@@ -208,7 +208,7 @@ fn encodeInto(output: []u8, source: []const u8) void {
     var position: usize = 0;
     var written: usize = 0;
     if (comptime USE_AVX2) {
-        if (source.len >= 32 and cpu.hasAvx2()) {
+        if (source.len >= 32 and core.hasAvx2()) {
             position = encodeAvx2(source, output);
             written = position / 3 * 4;
         }
@@ -253,7 +253,7 @@ fn decodePrefix(output: []u8, source: []const u8) usize {
     const length = @min(source.len / 4, output.len / 3) * 4;
     var position: usize = 0;
     if (comptime USE_AVX2) {
-        if (length >= 32 and cpu.hasAvx2()) position = decodeAvx2(source[0..length], output);
+        if (length >= 32 and core.hasAvx2()) position = decodeAvx2(source[0..length], output);
     }
     if (length - position >= 32) {
         while (position < length) : (position += 4) {

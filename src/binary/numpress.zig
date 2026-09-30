@@ -6,7 +6,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const math_options = @import("numpress_math_options");
-const cpu = @import("cpu.zig");
+const core = @import("core.zig");
 
 const SlofMathBackend = enum { bundled, glibc_vector };
 const SLOF_MATH_BACKEND = std.meta.stringToEnum(
@@ -781,7 +781,7 @@ pub fn encodeSlof(values: []const f64, fixed_point: f64, output: []u8) Error!usi
     writeFixedPoint(output[0..8], fixed_point);
 
     if (comptime USE_AVX2) {
-        if (cpu.hasAvx2()) {
+        if (core.hasAvx2()) {
             try encodeSlofAvx2(values, fixed_point, output, encoded_len);
             return encoded_len;
         }
@@ -934,7 +934,7 @@ pub fn decodeSlof(input: []const u8, output: []f64) Error!usize {
 
     var index: usize = 0;
     if (comptime SLOF_MATH_BACKEND == .glibc_vector) {
-        if (comptime USE_AVX2) if (cpu.hasAvx2()) {
+        if (comptime USE_AVX2) if (core.hasAvx2()) {
             while (value_count - index >= 4) : (index += 4) {
                 const encoded: @Vector(4, u16) = .{
                     std.mem.readInt(u16, input[8 + index * 2 ..][0..2], .little),
