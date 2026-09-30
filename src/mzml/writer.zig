@@ -8,7 +8,9 @@ const model = @import("model.zig");
 const schema = @import("schema.zig");
 const xml = @import("../xml/mzml_adapter.zig");
 const base64 = @import("../binary/base64.zig");
+const overlaps = @import("../binary/memory.zig").overlaps;
 const Diagnostic = @import("diagnostic.zig");
+const Ids = @import("internal/id_index.zig").IdIndex(IndexEntry);
 
 const Writer = @This();
 const COUNT_PLACEHOLDER = "0" ** std.fmt.comptimePrint("{d}", .{std.math.maxInt(usize)}).len;
@@ -84,13 +86,7 @@ pub fn initFile(allocator: std.mem.Allocator, sink: *std.Io.File.Writer, limits:
 /// Releases XML writer storage without finishing or flushing output.
 pub fn deinit(self: *Writer) void {
     self.engine.deinit();
-    if (self.index_state) |state| {
-        state.entries.deinit(state.allocator);
-        state.historical_ids.deinit(state.allocator);
-        for (&state.ids) |*ids| ids.deinit(state.allocator);
-        state.arena.deinit();
-        state.allocator.destroy(state);
-    }
+    if (self.index_state) |state| state.deinit();
     self.* = undefined;
 }
 
@@ -105,8 +101,8 @@ fn capture(self: *Writer, err: Error, stage: Diagnostic.Stage, detail: Diagnosti
     var report = Diagnostic.init(err, .write_record, stage, detail);
     if (self.engine.failure != null) {
         report.stage = .output;
-        if (err == error.WriterLimit and self.engine.frame_count == 64)
-            report = Diagnostic.init(err, .write_record, .output, .{ .limit = .{ .name = .depth, .maximum = 64 } });
+        if (err == error.WriterLimit and self.engine.frame_count == schema.MAX_DEPTH)
+            report = Diagnostic.init(err, .write_record, .output, .{ .limit = .{ .name = .depth, .maximum = schema.MAX_DEPTH } });
     }
     if (self.engine.byteOffset()) |offset| report.location = .{ .output_byte = offset };
     self.failure = report;
@@ -194,7 +190,7 @@ pub fn beginListWithAttributes(self: *Writer, kind: model.Kind, count: ?usize, a
     if (self.list_kind == kind or self.list_kind == .chromatogram_list) return error.InvalidStructure;
     if (count == null and self.file_sink == null) return error.InvalidOptions;
     var buffer: [32]u8 = undefined;
-    const text = if (count) |value| std.fmt.bufPrint(&buffer, "{d}", .{value}) catch return error.LimitExceeded else COUNT_PLACEHOLDER;
+    const text = if (count) |value| buffer[0..std.fmt.printInt(&buffer, value, 10, .lower, .{})] else COUNT_PLACEHOLDER;
     try self.startKnown(kind.xmlName(), attributes, false);
     try self.engine.attribute("count", text);
     self.count_offset = if (count == null)
@@ -263,7 +259,7 @@ fn writeRecordInner(self: *Writer, node: model.Node, comptime replace_arrays: bo
         self.fail(err, .write_record);
         if (self.failure.?.element == null) self.failure.?.element = node.kind;
         if (self.phase == .list and (node.kind == .spectrum or node.kind == .chromatogram))
-            self.failure.?.record = .{ .kind = if (node.kind == .spectrum) .spectrum else .chromatogram, .ordinal = self.written_count };
+            self.failure.?.record = Diagnostic.RecordPosition.of(node.kind, self.written_count);
     }
     if (self.phase != .list) return error.InvalidState;
     const expected: model.Kind = if (self.list_kind == .spectrum_list) .spectrum else .chromatogram;
@@ -310,7 +306,7 @@ fn writeRecordInner(self: *Writer, node: model.Node, comptime replace_arrays: bo
         const found = try state.ids[if (node.kind == .spectrum) @as(usize, 0) else 1].getOrPutContextAdapted(
             state.allocator,
             copied,
-            IdQuery{ .entries = state.entries.items },
+            Ids.Query{ .entries = state.entries.items },
             .{ .entries = state.entries.items },
         );
         if (found.found_existing) return error.DuplicateId;
@@ -347,7 +343,7 @@ pub fn endList(self: *Writer) Error!void {
         const sink = self.file_sink.?;
         sink.interface.flush() catch |err| return try self.ioFailure(err);
         var buffer: [32]u8 = undefined;
-        const text = std.fmt.bufPrint(&buffer, "{d}", .{self.written_count}) catch return error.LimitExceeded;
+        const text = buffer[0..std.fmt.printInt(&buffer, self.written_count, 10, .lower, .{})];
         var count = COUNT_PLACEHOLDER.*;
         @memcpy(count[count.len - text.len ..], text);
         sink.file.writePositionalAll(sink.io, &count, offset) catch |err| return try self.ioFailure(err);
@@ -389,7 +385,7 @@ fn writeIndex(self: *Writer, state: *IndexState) Error!void {
                     try self.optionalAttribute("spotID", state.historical_ids.items[i].spot_id);
                 }
                 var text: [32]u8 = undefined;
-                try self.engine.text(std.fmt.bufPrint(&text, "{d}", .{entry.offset}) catch return error.LimitExceeded);
+                try self.engine.text(text[0..std.fmt.printInt(&text, entry.offset, 10, .lower, .{})]);
                 try self.engine.endElement();
             }
             try self.engine.endElement();
@@ -398,7 +394,7 @@ fn writeIndex(self: *Writer, state: *IndexState) Error!void {
     try self.engine.endElement();
     try self.engine.startElement("indexListOffset");
     var text: [32]u8 = undefined;
-    try self.engine.text(std.fmt.bufPrint(&text, "{d}", .{offset}) catch return error.LimitExceeded);
+    try self.engine.text(text[0..std.fmt.printInt(&text, offset, 10, .lower, .{})]);
     try self.engine.endElement();
     try self.engine.startElement("fileChecksum");
     try self.engine.text("");
@@ -460,20 +456,11 @@ fn writeContent(self: *Writer, node: model.Node, comptime replace_arrays: bool, 
         self.capture(err, .metadata, .none);
         if (self.failure.?.element == null) self.failure.?.element = node.kind;
     }
-    const rules = schema.CHILD_KINDS.get(node.kind);
     var seen = std.EnumSet(model.Kind).initEmpty();
     if (node.content == null) {
         try self.writeParams(node.params, depth, budget);
-        for (node.children, 0..) |child, position| {
-            errdefer |err| if (node.kind == .binary_data_array_list) {
-                self.capture(err, .metadata, .none);
-                self.failure.?.array_position = position;
-            };
-            if (!rules.allowed.contains(child.kind) or (node.kind == .mzml and child.kind == .run)) return error.InvalidStructure;
-            if (rules.singular.contains(child.kind) and seen.contains(child.kind)) return error.InvalidStructure;
-            seen.insert(child.kind);
-            try self.writeNode(child, replace_arrays, remaining, depth, budget);
-        }
+        for (node.children, 0..) |child, position|
+            try self.writeChild(node, child, position, &seen, replace_arrays, remaining, depth, budget);
         return;
     }
     var params: usize = 0;
@@ -486,17 +473,8 @@ fn writeContent(self: *Writer, node: model.Node, comptime replace_arrays: bool, 
         },
         .children => |count| {
             if (count > node.children.len - children) return error.InvalidStructure;
-            for (node.children[children..][0..count], children..) |child, position| {
-                errdefer |err| if (node.kind == .binary_data_array_list) {
-                    self.capture(err, .metadata, .none);
-                    self.failure.?.array_position = position;
-                };
-                if (!rules.allowed.contains(child.kind) or (node.kind == .mzml and child.kind == .run))
-                    return error.InvalidStructure;
-                if (rules.singular.contains(child.kind) and seen.contains(child.kind)) return error.InvalidStructure;
-                seen.insert(child.kind);
-                try self.writeNode(child, replace_arrays, remaining, depth, budget);
-            }
+            for (node.children[children..][0..count], children..) |child, position|
+                try self.writeChild(node, child, position, &seen, replace_arrays, remaining, depth, budget);
             children += count;
         },
         .xml => |bytes| try self.writeXml(bytes, depth, budget),
@@ -504,12 +482,25 @@ fn writeContent(self: *Writer, node: model.Node, comptime replace_arrays: bool, 
     if (params != node.params.len or children != node.children.len) return error.InvalidStructure;
 }
 
+/// Writes one modeled child after checking it is allowed, and not repeated if singular.
+fn writeChild(self: *Writer, parent: model.Node, child: model.Node, position: usize, seen: *std.EnumSet(model.Kind), comptime replace_arrays: bool, remaining: anytype, depth: usize, budget: *usize) Error!void {
+    errdefer |err| if (parent.kind == .binary_data_array_list) {
+        self.capture(err, .metadata, .none);
+        self.failure.?.array_position = position;
+    };
+    const rules = schema.CHILD_KINDS.get(parent.kind);
+    if (!rules.allowed.contains(child.kind) or (parent.kind == .mzml and child.kind == .run)) return error.InvalidStructure;
+    if (rules.singular.contains(child.kind) and seen.contains(child.kind)) return error.InvalidStructure;
+    seen.insert(child.kind);
+    try self.writeNode(child, replace_arrays, remaining, depth, budget);
+}
+
 // Keep fragment parser storage off ordinary recursive write frames.
 noinline fn writeXml(self: *Writer, bytes: []const u8, depth: usize, budget: *usize) Error!void {
     if (depth == 0) return try self.limitError(.depth, self.limits.depth, null);
     if (bytes.len > self.limits.text_bytes) return try self.limitError(.text_bytes, self.limits.text_bytes, bytes.len);
     var input = std.Io.Reader.fixed(bytes);
-    var cursor = try xml.Cursor.init(self.allocator, &input, @min(depth, 64), @max(1, bytes.len / 4), self.limits.text_bytes);
+    var cursor = try xml.Cursor.init(self.allocator, &input, @min(depth, schema.MAX_DEPTH), @max(1, bytes.len / 4), self.limits.text_bytes);
     defer cursor.deinit();
     errdefer |err| {
         var detail = Diagnostic.xmlDetail(&cursor);
@@ -526,13 +517,6 @@ noinline fn writeXml(self: *Writer, bytes: []const u8, depth: usize, budget: *us
     try cursor.writeElement(&self.engine, budget);
     try cursor.advanceFragment(false);
     if (cursor.current != null) return error.InvalidStructure;
-}
-
-fn overlaps(a: []const u8, b: []const u8) bool {
-    if (a.len == 0 or b.len == 0) return false;
-    const start_a = @intFromPtr(a.ptr);
-    const start_b = @intFromPtr(b.ptr);
-    return if (start_a <= start_b) start_b - start_a < a.len else start_a - start_b < b.len;
 }
 
 fn writeAttributes(self: *Writer, attrs: []const model.Attribute) Error!void {
@@ -655,39 +639,24 @@ const IndexState = struct {
     entries: std.ArrayList(IndexEntry) = .empty,
     historical: bool = false,
     historical_ids: std.ArrayList(struct { native_id: ?[]const u8, spot_id: ?[]const u8 }) = .empty,
-    ids: [2]std.HashMapUnmanaged(usize, void, IdContext, std.hash_map.default_max_load_percentage) = .{ .empty, .empty },
+    ids: [2]Ids.Map = .{ .empty, .empty },
     spectra: usize = 0,
     id_bytes: usize = 0,
+
+    /// Releases the retained IDs and offsets and the state itself.
+    fn deinit(self: *IndexState) void {
+        self.entries.deinit(self.allocator);
+        self.historical_ids.deinit(self.allocator);
+        for (&self.ids) |*ids| ids.deinit(self.allocator);
+        self.arena.deinit();
+        self.allocator.destroy(self);
+    }
 
     fn copyId(self: *IndexState, text: []const u8) Error![]const u8 {
         if (text.len > self.limits.id_bytes -| self.id_bytes) return error.LimitExceeded;
         const result = try self.arena.allocator().dupe(u8, text);
         self.id_bytes += text.len;
         return result;
-    }
-};
-
-const IdContext = struct {
-    entries: []const IndexEntry,
-
-    pub fn hash(self: IdContext, position: usize) u64 {
-        return std.hash_map.hashString(self.entries[position].id);
-    }
-
-    pub fn eql(_: IdContext, left: usize, right: usize) bool {
-        return left == right;
-    }
-};
-
-const IdQuery = struct {
-    entries: []const IndexEntry,
-
-    pub fn hash(_: IdQuery, id: []const u8) u64 {
-        return std.hash_map.hashString(id);
-    }
-
-    pub fn eql(self: IdQuery, id: []const u8, position: usize) bool {
-        return std.mem.eql(u8, id, self.entries[position].id);
     }
 };
 

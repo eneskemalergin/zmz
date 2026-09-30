@@ -2,6 +2,14 @@
 
 const std = @import("std");
 
+/// XML whitespace: space, tab, carriage return, and line feed.
+pub const XML_WHITESPACE = " \t\r\n";
+
+/// Compares ID or IDREF values after collapsing surrounding XML whitespace.
+pub fn sameId(a: []const u8, b: []const u8) bool {
+    return std.mem.eql(u8, std.mem.trim(u8, a, XML_WHITESPACE), std.mem.trim(u8, b, XML_WHITESPACE));
+}
+
 /// Attribute text after XML normalization. Names may include a source prefix;
 /// namespace_uri identifies its namespace. Declarations use the XMLNS URI.
 pub const Attribute = struct {
@@ -162,11 +170,11 @@ pub const EffectiveIterator = struct {
             const entry = self.entries[self.position];
             self.position += 1;
             if (entry != .group_ref) return entry;
-            const id = std.mem.trim(u8, entry.group_ref.ref orelse return error.MissingGroup, " \t\r\n");
+            const id = entry.group_ref.ref orelse return error.MissingGroup;
             var found: ?[]const Entry = null;
             for (self.groups) |group| {
                 try self.charge();
-                if (std.mem.eql(u8, id, std.mem.trim(u8, group.id, " \t\r\n"))) {
+                if (sameId(id, group.id)) {
                     if (found != null) return error.DuplicateGroup;
                     found = group.entries;
                 }
@@ -251,7 +259,7 @@ pub fn parseFloat(comptime T: type, value: ?[]const u8) ValueError!T {
 }
 
 fn lexical(value: ?[]const u8) ValueError![]const u8 {
-    const bytes = std.mem.trim(u8, value orelse return error.MissingValue, " \t\r\n");
+    const bytes = std.mem.trim(u8, value orelse return error.MissingValue, XML_WHITESPACE);
     if (bytes.len == 0) return error.EmptyValue;
     return bytes;
 }

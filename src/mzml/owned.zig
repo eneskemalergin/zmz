@@ -8,101 +8,78 @@ const std = @import("std");
 const cv = @import("../cv/source.zig");
 const model = @import("model.zig");
 const copy = @import("internal/owned_copy.zig");
+const schema = @import("schema.zig");
 
 /// Limits copied storage, excluding arena bookkeeping and alignment padding.
 pub const Limits = struct {
     bytes: usize = 256 * 1024 * 1024,
-    /// Maximum node nesting, counting the root as one; supported range is 1-64.
-    depth: usize = 64,
+    /// Maximum node nesting, counting the root as one; supported range is 1 to schema.MAX_DEPTH.
+    depth: usize = schema.MAX_DEPTH,
 };
 
 pub const Error = copy.Error;
 
 /// Independently owned forward item, including XML or list attributes.
-pub const Item = struct {
-    arena: std.heap.ArenaAllocator,
-    value: model.Item,
-
-    /// Copies every borrowed slice; release the result with deinit.
-    pub fn init(allocator: std.mem.Allocator, source: model.Item, limits: Limits) Error!Item {
-        if (limits.depth == 0 or limits.depth > 64) return error.LimitExceeded;
-        var arena: std.heap.ArenaAllocator = .init(allocator);
-        errdefer arena.deinit();
-        var copier: copy.Copier = .{ .allocator = arena.allocator(), .remaining = limits.bytes };
-        const value: model.Item = switch (source) {
-            .xml => |bytes| .{ .xml = try copier.text(bytes) },
-            .list_start => |start| .{ .list_start = .{ .kind = start.kind, .list = (try copier.list(start.list)).? } },
-            .record => |record| blk: {
-                var result = record;
-                result.node = try copier.node(record.node, limits.depth);
-                result.id = try copier.text(record.id);
-                break :blk .{ .record = result };
-            },
-            .list_end, .run_end => source,
-        };
-        return .{ .arena = arena, .value = value };
-    }
-
-    pub fn deinit(self: *Item) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
+pub const Item = Owned(model.Item, copyItem);
 
 /// Independently owned record. Group references remain references to header metadata.
-pub const Record = struct {
-    arena: std.heap.ArenaAllocator,
-    value: model.Record,
-
-    /// Deep-copies every source slice; the caller releases the result with deinit.
-    pub fn init(allocator: std.mem.Allocator, source: model.Record, limits: Limits) Error!Record {
-        if (limits.depth == 0 or limits.depth > 64) return error.LimitExceeded;
-        var arena = std.heap.ArenaAllocator.init(allocator);
-        errdefer arena.deinit();
-        var copier: copy.Copier = .{ .allocator = arena.allocator(), .remaining = limits.bytes };
-        var value = source;
-        value.node = try copier.node(source.node, limits.depth);
-        value.id = try copier.text(source.id);
-        return .{ .arena = arena, .value = value };
-    }
-
-    /// Releases all copied slices and invalidates value and any borrowed views of it.
-    pub fn deinit(self: *Record) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
+pub const Record = Owned(model.Record, copyRecord);
 
 /// Independently owned metadata, including parameter groups and observed list descriptors.
-pub const Header = struct {
-    arena: std.heap.ArenaAllocator,
-    value: model.Header,
+/// Copies the current header state, not future counts or offsets from its reader.
+pub const Header = Owned(model.Header, copyHeader);
 
-    /// Copies the current header state, not future counts or offsets from its reader.
-    /// The caller releases the result with deinit.
-    pub fn init(allocator: std.mem.Allocator, source: model.Header, limits: Limits) Error!Header {
-        if (limits.depth == 0 or limits.depth > 64) return error.LimitExceeded;
-        var arena = std.heap.ArenaAllocator.init(allocator);
-        errdefer arena.deinit();
-        var copier: copy.Copier = .{ .allocator = arena.allocator(), .remaining = limits.bytes };
-        var value = source;
-        value.namespace_uri = try copier.text(source.namespace_uri);
-        value.document = try copier.node(source.document, limits.depth);
-        value.run = try copier.node(source.run, limits.depth);
-        const groups = try copier.alloc(cv.Group, source.groups.len);
-        for (source.groups, groups) |group, *destination| destination.* = .{
-            .id = try copier.text(group.id),
-            .entries = try copier.entries(group.entries),
-        };
-        value.groups = groups;
-        value.spectrum_list = try copier.list(source.spectrum_list);
-        value.chromatogram_list = try copier.list(source.chromatogram_list);
-        return .{ .arena = arena, .value = value };
-    }
+fn Owned(comptime T: type, comptime copyValue: fn (*copy.Copier, T, usize) Error!T) type {
+    return struct {
+        arena: std.heap.ArenaAllocator,
+        value: T,
 
-    /// Releases all metadata and invalidates value and group-dependent borrowed views.
-    pub fn deinit(self: *Header) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
+        /// Deep-copies every source slice; the caller releases the result with deinit.
+        pub fn init(allocator: std.mem.Allocator, source: T, limits: Limits) Error!@This() {
+            if (limits.depth == 0 or limits.depth > schema.MAX_DEPTH) return error.LimitExceeded;
+            var arena: std.heap.ArenaAllocator = .init(allocator);
+            errdefer arena.deinit();
+            var copier: copy.Copier = .{ .allocator = arena.allocator(), .remaining = limits.bytes };
+            const value = try copyValue(&copier, source, limits.depth);
+            return .{ .arena = arena, .value = value };
+        }
+
+        /// Releases all copied slices and invalidates value and any borrowed views of it.
+        pub fn deinit(self: *@This()) void {
+            self.arena.deinit();
+            self.* = undefined;
+        }
+    };
+}
+
+fn copyItem(copier: *copy.Copier, source: model.Item, depth: usize) Error!model.Item {
+    return switch (source) {
+        .xml => |bytes| .{ .xml = try copier.text(bytes) },
+        .list_start => |start| .{ .list_start = .{ .kind = start.kind, .list = (try copier.list(start.list)).? } },
+        .record => |record| .{ .record = try copyRecord(copier, record, depth) },
+        .list_end, .run_end => source,
+    };
+}
+
+fn copyRecord(copier: *copy.Copier, source: model.Record, depth: usize) Error!model.Record {
+    var value = source;
+    value.node = try copier.node(source.node, depth);
+    value.id = try copier.text(source.id);
+    return value;
+}
+
+fn copyHeader(copier: *copy.Copier, source: model.Header, depth: usize) Error!model.Header {
+    var value = source;
+    value.namespace_uri = try copier.text(source.namespace_uri);
+    value.document = try copier.node(source.document, depth);
+    value.run = try copier.node(source.run, depth);
+    const groups = try copier.alloc(cv.Group, source.groups.len);
+    for (source.groups, groups) |group, *destination| destination.* = .{
+        .id = try copier.text(group.id),
+        .entries = try copier.entries(group.entries),
+    };
+    value.groups = groups;
+    value.spectrum_list = try copier.list(source.spectrum_list);
+    value.chromatogram_list = try copier.list(source.chromatogram_list);
+    return value;
+}

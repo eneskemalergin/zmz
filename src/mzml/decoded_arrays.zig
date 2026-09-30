@@ -12,7 +12,6 @@ const model = @import("model.zig");
 const cv = @import("../cv/source.zig");
 const arrays = @import("../binary/arrays.zig");
 const base64 = @import("../binary/base64.zig");
-const encoding = @import("../binary/encoding.zig");
 const Diagnostic = @import("diagnostic.zig");
 
 const DecodedArrays = @This();
@@ -146,10 +145,7 @@ pub fn finishArray(self: *DecodedArrays) Error!void {
     };
     const output = &self.outputs.items[self.count - 1];
     const wire = self.decoder.output[0..counts.decoded_bytes];
-    const pipeline = if (output.length == 0 and output.encoding.pipeline == .zlib and counts.significant_bytes == 0)
-        arrays.Pipeline.none
-    else
-        output.encoding.pipeline;
+    const pipeline = output.encoding.payloadPipeline(output.length, counts.significant_bytes == 0);
     errdefer |err| {
         self.failure = .{ .stage = .array };
         if (err == error.DecodedSizeMismatch and pipeline == .none)
@@ -178,7 +174,7 @@ const Output = struct {
     length: usize = 0,
 
     fn primitive(self: *const Output) model.Primitive {
-        return if (encoding.isNumpress(self.encoding.pipeline)) .float64 else self.encoding.primitive;
+        return self.encoding.decodedPrimitive();
     }
 
     fn values(self: *const Output, comptime T: type) []T {

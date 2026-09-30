@@ -7,15 +7,15 @@ const base64 = @import("base64.zig");
 const zlib = @import("zlib.zig");
 const numpress = @import("numpress.zig");
 const encoding = @import("encoding.zig");
+const overlaps = @import("memory.zig").overlaps;
 
 pub const Pipeline = encoding.Pipeline;
 
-/// Caller-owned disjoint scratch buffers. Neither buffer aliases input or output.
-/// Uncompressed decode needs neither slice. Otherwise transport holds Base64-decoded bytes.
-/// Decode needs transformed only for
-/// Numpress-plus-zlib; primitive zlib expands directly into the typed destination.
-/// Encoding uses transformed for Numpress or big-endian primitive conversion, and transport
-/// only for zlib. Little-endian primitive encoding borrows the values' bytes directly.
+/// Caller-owned scratch, disjoint from each other and from input and output.
+/// Decoding: transport holds the Base64-decoded bytes of any pipeline except none, and
+/// transformed holds zlib output for Numpress with zlib; primitive zlib expands straight
+/// into the typed output. Encoding: transformed holds Numpress or big-endian primitive
+/// bytes and transport the zlib output; little-endian primitives borrow the values' bytes.
 pub const Scratch = struct {
     transport: []u8,
     transformed: []u8,
@@ -53,12 +53,12 @@ pub fn decode(
     scratch: Scratch,
     limits: Limits,
 ) Error!void {
-    checkType(T);
+    _ = encoding.Primitive.of(T);
     try checkBuffers(std.mem.sliceAsBytes(output), source, scratch);
     const array_bytes = std.math.mul(usize, output.len, @sizeOf(T)) catch
         return error.LengthOverflow;
     if (array_bytes > limits.array_bytes) return error.LimitExceeded;
-    if (transform(pipeline) != .none and T != f64) return error.TypeMismatch;
+    if (pipeline.transform() != .none and T != f64) return error.TypeMismatch;
     const destination = if (pipeline == .none) std.mem.sliceAsBytes(output) else scratch.transport;
     const counts = base64.decode(destination, source, limits.base64_text) catch |err| {
         if (pipeline != .none or err != error.OutputTooSmall) return err;
@@ -79,26 +79,26 @@ pub fn decodeWire(
     transformed: []u8,
     limits: Limits,
 ) Error!void {
-    checkType(T);
+    _ = encoding.Primitive.of(T);
     const bytes = std.mem.sliceAsBytes(output);
     const in_place = pipeline == .none and bytes.ptr == source.ptr;
     try checkBuffers(bytes, if (in_place) &.{} else source, .{ .transport = &.{}, .transformed = transformed });
     if (in_place) try checkBuffers(transformed, source, .{ .transport = &.{}, .transformed = &.{} });
     if (bytes.len > limits.array_bytes or source.len > limits.base64_text.decoded_bytes)
         return error.LimitExceeded;
-    if (transform(pipeline) != .none and T != f64) return error.TypeMismatch;
+    if (pipeline.transform() != .none and T != f64) return error.TypeMismatch;
     try decodeWireInner(T, output, source, pipeline, transformed);
 }
 
 fn decodeWireInner(comptime T: type, output: []T, source: []const u8, pipeline: Pipeline, transformed: []u8) Error!void {
     const array_bytes = std.math.mul(usize, output.len, @sizeOf(T)) catch return error.LengthOverflow;
     var wire = source;
-    if (hasZlib(pipeline)) {
+    if (pipeline.hasZlib()) {
         const maximum = try wireBound(T, output.len, pipeline);
-        const inflated = if (transform(pipeline) == .none) std.mem.sliceAsBytes(output) else transformed[0..@min(maximum, transformed.len)];
+        const inflated = if (pipeline.transform() == .none) std.mem.sliceAsBytes(output) else transformed[0..@min(maximum, transformed.len)];
         wire = try zlib.decompress(inflated, wire);
     }
-    switch (transform(pipeline)) {
+    switch (pipeline.transform()) {
         .none => {
             if (wire.len != array_bytes) return error.DecodedSizeMismatch;
             if (@import("builtin").cpu.arch.endian() == .little) {
@@ -112,9 +112,9 @@ fn decodeWireInner(comptime T: type, output: []T, source: []const u8, pipeline: 
                 value.* = @bitCast(std.mem.readInt(Bits, wire[offset..][0..@sizeOf(T)], .little));
             }
         },
-        .linear => if (T == f64) try numpress.decodeLinearExact(wire, output) else return error.TypeMismatch,
-        .pic => if (T == f64) try numpress.decodePicExact(wire, output) else return error.TypeMismatch,
-        .slof => if (T == f64) try numpress.decodeSlofExact(wire, output) else return error.TypeMismatch,
+        .linear => if (T == f64) try numpress.decodeLinearExact(wire, output) else unreachable,
+        .pic => if (T == f64) try numpress.decodePicExact(wire, output) else unreachable,
+        .slof => if (T == f64) try numpress.decodeSlofExact(wire, output) else unreachable,
     }
 }
 
@@ -128,7 +128,7 @@ pub fn encode(
     scratch: Scratch,
     compressor: ?*zlib.Compressor,
 ) Error![]u8 {
-    checkType(T);
+    _ = encoding.Primitive.of(T);
     try checkBuffers(output, std.mem.sliceAsBytes(values), scratch);
     return base64.encode(output, try encodeWire(T, values, options, scratch, compressor));
 }
@@ -144,18 +144,18 @@ pub fn encodeWire(
     scratch: Scratch,
     compressor: ?*zlib.Compressor,
 ) Error![]const u8 {
-    checkType(T);
+    _ = encoding.Primitive.of(T);
     try checkBuffers(&.{}, std.mem.sliceAsBytes(values), scratch);
-    const selected = transform(options.pipeline);
+    const selected = options.pipeline.transform();
     if (selected != .none and T != f64) return error.TypeMismatch;
-    if (hasZlib(options.pipeline) and compressor == null) return error.MissingCompressor;
+    if (options.pipeline.hasZlib() and compressor == null) return error.MissingCompressor;
     if (selected == .linear or selected == .slof) {
         if (options.fixed_point == null) return error.MissingFixedPoint;
     } else if (options.fixed_point != null) return error.UnexpectedFixedPoint;
 
     if (selected == .none and @import("builtin").cpu.arch.endian() == .little) {
         const wire = std.mem.sliceAsBytes(values);
-        return if (hasZlib(options.pipeline)) try compressor.?.compress(scratch.transport, wire) else wire;
+        return if (options.pipeline.hasZlib()) try compressor.?.compress(scratch.transport, wire) else wire;
     }
 
     const length = switch (selected) {
@@ -172,27 +172,27 @@ pub fn encodeWire(
         .linear => if (T == f64)
             try numpress.encodeLinear(values, options.fixed_point.?, scratch.transformed)
         else
-            return error.TypeMismatch,
+            unreachable,
         .pic => if (T == f64)
             try numpress.encodePic(values, scratch.transformed)
         else
-            return error.TypeMismatch,
+            unreachable,
         .slof => if (T == f64)
             try numpress.encodeSlof(values, options.fixed_point.?, scratch.transformed)
         else
-            return error.TypeMismatch,
+            unreachable,
     };
     var wire: []const u8 = scratch.transformed[0..length];
-    if (hasZlib(options.pipeline)) wire = try compressor.?.compress(scratch.transport, wire);
+    if (options.pipeline.hasZlib()) wire = try compressor.?.compress(scratch.transport, wire);
     return wire;
 }
 
 /// Returns the primitive or Numpress wire capacity before optional zlib compression.
 /// This is not a bound for the zlib stream or its Base64 representation.
 pub fn wireBound(comptime T: type, count: usize, pipeline: Pipeline) Error!usize {
-    checkType(T);
-    if (transform(pipeline) != .none and T != f64) return error.TypeMismatch;
-    return switch (transform(pipeline)) {
+    _ = encoding.Primitive.of(T);
+    if (pipeline.transform() != .none and T != f64) return error.TypeMismatch;
+    return switch (pipeline.transform()) {
         .none => std.math.mul(usize, count, @sizeOf(T)) catch error.LengthOverflow,
         .linear => numpress.linearMaxEncodedLen(count),
         .pic => numpress.picMaxEncodedLen(count),
@@ -200,42 +200,11 @@ pub fn wireBound(comptime T: type, count: usize, pipeline: Pipeline) Error!usize
     };
 }
 
-const Transform = enum { none, linear, pic, slof };
-
-fn transform(pipeline: Pipeline) Transform {
-    return switch (pipeline) {
-        .none, .zlib => .none,
-        .linear, .linear_zlib => .linear,
-        .pic, .pic_zlib => .pic,
-        .slof, .slof_zlib => .slof,
-    };
-}
-
-fn hasZlib(pipeline: Pipeline) bool {
-    return switch (pipeline) {
-        .zlib, .linear_zlib, .pic_zlib, .slof_zlib => true,
-        else => false,
-    };
-}
-
-fn checkType(comptime T: type) void {
-    if (T != f32 and T != f64 and T != i32 and T != i64)
-        @compileError("array values must be f32, f64, i32, or i64");
-}
-
 fn checkBuffers(output: []u8, source: []const u8, scratch: Scratch) Error!void {
     const buffers = [_][]const u8{ output, source, scratch.transport, scratch.transformed };
     for (buffers, 0..) |a, i| {
-        if (a.len == 0) continue;
         for (buffers[i + 1 ..]) |b| {
-            if (b.len == 0) continue;
-            const start_a = @intFromPtr(a.ptr);
-            const start_b = @intFromPtr(b.ptr);
-            const overlap = if (start_a <= start_b)
-                start_b - start_a < a.len
-            else
-                start_a - start_b < b.len;
-            if (overlap) return error.OverlappingBuffers;
+            if (overlaps(a, b)) return error.OverlappingBuffers;
         }
     }
 }

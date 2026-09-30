@@ -9,12 +9,12 @@ const std = @import("std");
 const model = @import("model.zig");
 const cv = @import("../cv/source.zig");
 const owned = @import("owned.zig");
-const reader_bridge = @import("internal/indexed_reader_bridge.zig");
 const PublicStreamReader = @import("stream_reader.zig").StreamReader;
 const DecodedArrays = PublicStreamReader.DecodedArrays;
-const StreamReader = reader_bridge.Reader;
+const StreamReader = @import("internal/reader_engine.zig");
 const xml = @import("../xml/mzml_adapter.zig");
 const Diagnostic = @import("diagnostic.zig");
+const Ids = @import("internal/id_index.zig").IdIndex(Entry);
 
 const IndexedReader = @This();
 
@@ -62,7 +62,7 @@ size: u64,
 stamp: ?std.Io.File.Stat = null,
 remaining: usize,
 entries: std.ArrayList(Entry) = .empty,
-ids: [2]std.HashMapUnmanaged(usize, void, IdContext, std.hash_map.default_max_load_percentage) = .{ .empty, .empty },
+ids: [2]Ids.Map = .{ .empty, .empty },
 metadata: ?owned.Header = null,
 contexts: [2]?FragmentAncestors = .{ null, null },
 counts: [2]usize = .{ 0, 0 },
@@ -134,10 +134,10 @@ fn buildInner(allocator: std.mem.Allocator, source: Source, options: Options, fa
         try self.checkSource();
         return self;
     }
-    while (try reader_bridge.nextIndexRecord(&reader)) |record| {
+    while (try reader.nextIndexRecord()) |record| {
         errdefer |err| {
             self.capture(err, .index, .none);
-            self.failure.?.record = .{ .kind = if (record.node.kind == .spectrum) .spectrum else .chromatogram, .ordinal = self.counts[kindIndex(record.node.kind)] };
+            self.failure.?.record = Diagnostic.RecordPosition.of(record.node.kind, self.counts[kindIndex(record.node.kind)]);
             self.failure.?.location = .{ .input_event = record.node.start_offset };
             self.failure.?.element = record.node.kind;
         }
@@ -148,7 +148,7 @@ fn buildInner(allocator: std.mem.Allocator, source: Source, options: Options, fa
         if (self.contexts[k] == null) self.contexts[k] = try self.captureAncestors(&reader, k);
         try self.charge(@sizeOf(Entry) + @sizeOf(usize) * 4);
         const id = try self.copy(record.id);
-        const entry = try self.ids[k].getOrPutContextAdapted(allocator, id, IdQuery{ .entries = self.entries.items }, .{ .entries = self.entries.items });
+        const entry = try self.ids[k].getOrPutContextAdapted(allocator, id, Ids.Query{ .entries = self.entries.items }, .{ .entries = self.entries.items });
         if (entry.found_existing) return error.DuplicateId;
         entry.key_ptr.* = self.entries.items.len;
         try self.entries.ensureUnusedCapacity(allocator, 1);
@@ -226,7 +226,7 @@ pub fn atDecoded(self: *IndexedReader, allocator: std.mem.Allocator, kind: model
 
 fn idPosition(self: *IndexedReader, id: []const u8) Error!?usize {
     try self.checkSource();
-    const query: IdQuery = .{ .entries = self.entries.items };
+    const query: Ids.Query = .{ .entries = self.entries.items };
     const spectrum = self.ids[0].getKeyAdapted(id, query);
     const chromatogram = self.ids[1].getKeyAdapted(id, query);
     if (spectrum != null and chromatogram != null) return error.AmbiguousId;
@@ -249,7 +249,7 @@ fn readDecodedEntry(self: *IndexedReader, allocator: std.mem.Allocator, entry: E
 fn readEntry(self: *IndexedReader, allocator: std.mem.Allocator, entry: Entry, output: ?*DecodedArrays) Error!owned.Record {
     errdefer |err| {
         self.capture(err, .index, .none);
-        self.failure.?.record = .{ .kind = if (entry.kind == .spectrum) .spectrum else .chromatogram, .ordinal = entry.index };
+        self.failure.?.record = Diagnostic.RecordPosition.of(entry.kind, entry.index);
     }
     const context = self.contexts[kindIndex(entry.kind)].?;
     const length = std.math.cast(usize, entry.end - entry.start) orelse return error.LimitExceeded;
@@ -263,9 +263,9 @@ fn readEntry(self: *IndexedReader, allocator: std.mem.Allocator, entry: Entry, o
     if (self.lookup_reader == null) {
         var empty_input = std.Io.Reader.fixed(&.{});
         self.lookup_reader = try StreamReader.init(self.allocator, &empty_input, self.options.reader);
-        reader_bridge.resetFragmentParser(&self.lookup_reader.?);
+        self.lookup_reader.?.cursor.resetEmpty();
     }
-    var record = reader_bridge.readFragment(&self.lookup_reader.?, allocator, &input.interface, context.ancestors, entry.start, context.prefix.len, self.options.policy != .open_embedded, self.header().groups, output, reuse_ancestors, .{ .kind = entry.kind, .id = entry.id }) catch |err| {
+    var record = readFragment(&self.lookup_reader.?, allocator, &input.interface, context.ancestors, entry.start, context.prefix.len, self.options.policy != .open_embedded, self.header().groups, output, reuse_ancestors, .{ .kind = entry.kind, .id = entry.id }) catch |err| {
         self.failure = self.lookup_reader.?.diagnostic();
         if (self.failure) |*report| report.translate(entry.start, length, context.prefix.len);
         return try self.inputError(&input, err);
@@ -277,6 +277,30 @@ fn readEntry(self: *IndexedReader, allocator: std.mem.Allocator, entry: Entry, o
     try self.checkSource();
     self.lookup_kind = entry.kind;
     return record;
+}
+
+/// Reads one record fragment with the index's groups and optional decoded output,
+/// cleared again afterwards so the lookup reader never keeps them.
+fn readFragment(
+    reader: *StreamReader,
+    allocator: std.mem.Allocator,
+    input: *std.Io.Reader,
+    ancestors: usize,
+    physical_start: u64,
+    prefix_length: usize,
+    complete: bool,
+    groups: []const cv.Group,
+    output: ?*DecodedArrays,
+    reuse_ancestors: bool,
+    expected: StreamReader.FragmentTarget,
+) Error!owned.Record {
+    reader.header.groups = groups;
+    reader.decoded_arrays = output;
+    defer {
+        reader.header.groups = &.{};
+        reader.decoded_arrays = null;
+    }
+    return reader.readFragment(allocator, input, ancestors, physical_start, prefix_length, complete, reuse_ancestors, expected);
 }
 
 fn capture(self: *IndexedReader, err: Error, stage: Diagnostic.Stage, detail: Diagnostic.Detail) void {
@@ -378,7 +402,7 @@ fn trailerLimits(self: *const IndexedReader) PublicStreamReader.Limits {
 }
 
 fn openEmbedded(self: *IndexedReader, reader: *StreamReader) Error!void {
-    const scopes = reader_bridge.scopes(reader);
+    const scopes = reader.scopes[0..reader.scope_count];
     const prefix_len = std.math.cast(usize, scopes[0].end) orelse return error.LimitExceeded;
     if (prefix_len > self.options.reader.limits.header_bytes) return try self.limitError(.header_bytes, self.options.reader.limits.header_bytes, prefix_len);
     const prefix = try self.allocator.alloc(u8, prefix_len);
@@ -404,7 +428,7 @@ fn openEmbedded(self: *IndexedReader, reader: *StreamReader) Error!void {
         @memcpy(bytes[0..prefix_len], prefix);
         @memcpy(bytes[prefix_len..], tail[start..]);
         var footer_failure: ?Diagnostic = null;
-        var parsed = reader_bridge.parseFooter(self.allocator, bytes, trailer_options, physical_start, prefix_len, &footer_failure) catch |err| switch (err) {
+        var parsed = StreamReader.parseFooter(self.allocator, bytes, trailer_options, physical_start, prefix_len, &footer_failure) catch |err| switch (err) {
             error.OutOfMemory, error.LimitExceeded => {
                 self.failure = footer_failure;
                 if (self.failure) |*report| if (report.detail == .limit and report.detail.limit.name == .header_bytes) {
@@ -432,11 +456,11 @@ fn openEmbedded(self: *IndexedReader, reader: *StreamReader) Error!void {
         if (i + 1 < self.entries.items.len) entry.end = self.entries.items[i + 1].start;
         if (entry.start >= entry.end) return error.InvalidIndex;
     }
-    if (reader_bridge.listScope(reader, 0) != null) self.contexts[0] = try self.captureAncestors(reader, 0);
-    if (reader_bridge.listScope(reader, 1) != null) self.contexts[1] = try self.captureAncestors(reader, 1);
+    if (reader.list_scopes[0] != null) self.contexts[0] = try self.captureAncestors(reader, 0);
+    if (reader.list_scopes[1] != null) self.contexts[1] = try self.captureAncestors(reader, 1);
     if (self.counts[1] != 0 and self.contexts[1] == null) {
         if (self.counts[0] == 0) {
-            try reader_bridge.finishEmptySpectrumList(reader);
+            try reader.finishEmptySpectrumList();
         } else {
             const last = self.entries.items[self.counts[0] - 1];
             const context = self.contexts[0] orelse return error.InvalidIndex;
@@ -444,7 +468,7 @@ fn openEmbedded(self: *IndexedReader, reader: *StreamReader) Error!void {
             if (span > self.options.record_span_bytes) return try self.limitError(.record_span_bytes, self.options.record_span_bytes, span);
             const fragment_len = std.math.add(usize, context.prefix.len, span) catch return error.LimitExceeded;
             var fragment = FragmentInput.init(self, context.prefix, last.start, span, &.{}, buffer[0..@max(4, @min(buffer.len, fragment_len))]);
-            reader_bridge.resumeFollowingList(reader, &fragment.interface, context.ancestors, last.start, context.prefix.len) catch |err| {
+            reader.resumeFollowingList(&fragment.interface, context.ancestors, last.start, context.prefix.len) catch |err| {
                 self.failure = reader.diagnostic();
                 if (self.failure) |*report| report.translate(last.start, span, context.prefix.len);
                 return try self.inputError(&fragment, err);
@@ -452,12 +476,12 @@ fn openEmbedded(self: *IndexedReader, reader: *StreamReader) Error!void {
         }
         self.contexts[1] = try self.captureAncestors(reader, 1);
     }
-    const source_header = reader_bridge.header(reader);
+    const source_header = &reader.header;
     for ([_]?model.RecordList{ source_header.spectrum_list, source_header.chromatogram_list }, 0..) |list, k| {
         if (list != null) {
             if (self.counts[k] != 0) {
                 const first = self.entries.items[if (k == 0) 0 else self.counts[0]];
-                if (first.start < reader_bridge.listScope(reader, k).?.end) return error.InvalidIndex;
+                if (first.start < reader.list_scopes[k].?.end) return error.InvalidIndex;
             }
         } else if (self.counts[k] != 0) return error.InvalidIndex;
     }
@@ -494,7 +518,7 @@ fn readEmbeddedEntries(self: *IndexedReader, input: *std.Io.Reader, index_start:
             errdefer |err| {
                 self.capture(err, if (cursor.failure != null) .xml else .index, Diagnostic.xmlDetail(&cursor));
                 self.failure.?.element = .offset;
-                self.failure.?.record = .{ .kind = if (kind == .spectrum) .spectrum else .chromatogram, .ordinal = self.counts[k] };
+                self.failure.?.record = Diagnostic.RecordPosition.of(kind, self.counts[k]);
             }
             const id_ref = (offset.attribute(null, "idRef") orelse return try self.attributeError(.id_ref)).value;
             if (self.entries.items.len == self.options.max_records) return try self.limitError(.records, self.options.max_records, null);
@@ -504,7 +528,7 @@ fn readEmbeddedEntries(self: *IndexedReader, input: *std.Io.Reader, index_start:
             if (target <= previous or target >= index_start or target < minimum or
                 (endian != null and target % 2 != 0) or target > std.math.maxInt(i64)) return error.InvalidIndex;
             previous = target;
-            const entry = try self.ids[k].getOrPutContextAdapted(self.allocator, id, IdQuery{ .entries = self.entries.items }, .{ .entries = self.entries.items });
+            const entry = try self.ids[k].getOrPutContextAdapted(self.allocator, id, Ids.Query{ .entries = self.entries.items }, .{ .entries = self.entries.items });
             if (entry.found_existing) return error.DuplicateId;
             entry.key_ptr.* = self.entries.items.len;
             try self.entries.append(self.allocator, .{ .kind = kind, .id = id, .index = self.counts[k], .start = target, .end = index_start });
@@ -593,36 +617,12 @@ fn encoding(self: *const IndexedReader) Error!?std.builtin.Endian {
     return if (signature[0] == 0xff or (signature[0] == '<' and signature[1] == 0)) .little else if (signature[0] == 0xfe or (signature[0] == 0 and signature[1] == '<')) .big else null;
 }
 
-const IdContext = struct {
-    entries: []const Entry,
-
-    pub fn hash(self: IdContext, position: usize) u64 {
-        return std.hash_map.hashString(self.entries[position].id);
-    }
-
-    pub fn eql(_: IdContext, left: usize, right: usize) bool {
-        return left == right;
-    }
-};
-
-const IdQuery = struct {
-    entries: []const Entry,
-
-    pub fn hash(_: IdQuery, id: []const u8) u64 {
-        return std.hash_map.hashString(id);
-    }
-
-    pub fn eql(self: IdQuery, id: []const u8, position: usize) bool {
-        return std.mem.eql(u8, id, self.entries[position].id);
-    }
-};
-
 fn captureAncestors(self: *IndexedReader, reader: *StreamReader, k: usize) Error!FragmentAncestors {
-    const current_scopes = reader_bridge.scopes(reader);
-    var scopes: [4]reader_bridge.Scope = undefined;
+    const current_scopes = reader.scopes[0..reader.scope_count];
+    var scopes: [4]StreamReader.Scope = undefined;
     @memcpy(scopes[0..current_scopes.len], current_scopes);
     scopes[0].start = 0;
-    scopes[current_scopes.len] = reader_bridge.listScope(reader, k).?;
+    scopes[current_scopes.len] = reader.list_scopes[k].?;
     const count = current_scopes.len + 1;
     var length: usize = 0;
     for (scopes[0..count]) |scope| length = std.math.add(usize, length, std.math.cast(usize, scope.end - scope.start) orelse return error.LimitExceeded) catch return error.LimitExceeded;

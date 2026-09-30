@@ -29,49 +29,22 @@ fn expectSlofBound(expected: []const f64, actual: []const f64, fixed_point: f64)
 
 // --- Base64 ---
 
-test "[property] - [base64]: streaming encoding matches independent bytes with reusable output" {
+/// Decodes text in one call: the reference for split updates.
+fn decodeWhole(text: []const u8) base64.Error!base64.Counts {
+    var output: [1536]u8 = undefined;
+    return base64.decode(&output, text, .{});
+}
+
+test "[property] - [base64]: encoding matches independent bytes around vector blocks" {
     var source: [1025]u8 = undefined;
     var random = std.Random.DefaultPrng.init(std.testing.random_seed);
     random.random().bytes(&source);
     var expected: [1368]u8 = undefined;
-    var actual: [1368]u8 = undefined;
     var output: [1368]u8 = undefined;
     for ([_]usize{ 0, 1, 2, 3, 23, 24, 25, 31, 32, 33, 103, 104, 105, 127, 128, 129, 1023, 1024, 1025 }) |length| {
         const reference = std.base64.standard.Encoder.encode(&expected, source[0..length]);
-        for ([_]usize{ 1, 2, 3, 4, 23, 24, 31, 32, 33, 95, 96, 103, 104, 127, 128, 1025 }) |chunk| {
-            var encoder: base64.Encoder = .{};
-            var position: usize = 0;
-            var used: usize = 0;
-            while (position < length) {
-                try std.testing.expectEqual(@as(usize, 0), (try encoder.update(&output, "")).len);
-                const end = @min(length, position + chunk);
-                const result = try encoder.update(&output, source[position..end]);
-                @memcpy(actual[used..][0..result.len], result);
-                used += result.len;
-                position = end;
-            }
-            const tail = try encoder.finish(&output);
-            @memcpy(actual[used..][0..tail.len], tail);
-            used += tail.len;
-            try std.testing.expectEqualSlices(u8, reference, actual[0..used]);
-            try std.testing.expectError(error.AlreadyFinished, encoder.update(&output, ""));
-            try std.testing.expectError(error.AlreadyFinished, encoder.finish(&output));
-        }
+        try std.testing.expectEqualStrings(reference, try base64.encode(&output, source[0..length]));
     }
-}
-
-test "[failure] - [base64]: encoding retries leave carry and output unchanged" {
-    var output = [_]u8{0xa5} ** 8;
-    var encoder: base64.Encoder = .{};
-    try std.testing.expectEqual(@as(usize, 0), (try encoder.update(&.{}, "f")).len);
-    try std.testing.expectError(error.OutputTooSmall, encoder.update(output[0..3], "oo"));
-    try std.testing.expectError(error.OverlappingBuffers, encoder.update(&output, output[0..2]));
-    try std.testing.expectError(error.OutputTooSmall, encoder.finish(output[0..3]));
-    try std.testing.expectEqualSlices(u8, &([_]u8{0xa5} ** 8), &output);
-    try std.testing.expectEqualStrings("Zm9v", try encoder.update(output[0..4], "oo"));
-    try std.testing.expectEqual(@as(usize, 0), (try encoder.update(&.{}, "ba")).len);
-    try std.testing.expectError(error.OutputTooSmall, encoder.finish(output[0..3]));
-    try std.testing.expectEqualStrings("YmE=", try encoder.finish(output[0..4]));
 }
 
 test "[property] - [base64]: exact unaligned slices match independent encoding and decoding" {
@@ -137,7 +110,7 @@ test "[property] - [base64]: matches RFC 4648 vectors across every text split" {
             try std.testing.expectEqualStrings(case[0], output[0..counts.decoded_bytes]);
             try std.testing.expectEqual(case[1].len, counts.significant_bytes);
             try std.testing.expectEqual(len, counts.text_bytes);
-            try std.testing.expectEqualDeep(counts, try base64.validate(spaced[0..len], .{}));
+            try std.testing.expectEqualDeep(counts, try decodeWhole(spaced[0..len]));
         }
     }
 }
@@ -156,7 +129,7 @@ test "[failure] - [base64]: rejects malformed tails and remains failed" {
         .{ "Zm9v\x0b", error.InvalidCharacter },
     };
     inline for (cases) |case| {
-        try std.testing.expectError(case[1], base64.validate(case[0], .{}));
+        try std.testing.expectError(case[1], decodeWhole(case[0]));
         for (0..case[0].len + 1) |split| {
             var output: [32]u8 = undefined;
             var decoder = base64.Decoder.init(&output, .{});
@@ -246,7 +219,7 @@ test "[property] - [base64]: bulk input matches quartet decoding at errors limit
             try decoder.update(short[split..]);
             const counts = try decoder.finish();
             try std.testing.expectEqualSlices(u8, source[0..len], output[0..counts.decoded_bytes]);
-            try std.testing.expectEqualDeep(counts, try base64.validate(short, .{}));
+            try std.testing.expectEqualDeep(counts, try decodeWhole(short));
         }
     }
     for (0..text.len) |position| {
@@ -282,7 +255,7 @@ test "[property] - [base64]: bulk input matches quartet decoding at errors limit
                 try decoder.update(wrapped[split..used]);
                 const counts = try decoder.finish();
                 try std.testing.expectEqualSlices(u8, &source, &output);
-                try std.testing.expectEqualDeep(counts, try base64.validate(wrapped[0..used], .{}));
+                try std.testing.expectEqualDeep(counts, try decodeWhole(wrapped[0..used]));
             }
             for ([_]usize{ width - 1, width, width + whitespace.len, used - 1 }) |position| {
                 for ([_]u8{ '=', '!', 0x80 }) |replacement| {

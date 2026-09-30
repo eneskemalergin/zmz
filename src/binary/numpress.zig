@@ -330,28 +330,31 @@ pub fn decodeLinear(input: []const u8, output: []f64) Error!usize {
     const use_short_body = isShortIntegerPayload(tail_input.len, tail_output.len);
     if (tail_output.len <= MAX_UNCHECKED_LINEAR_TAIL and !use_word_body and !use_short_body) {
         const tail_count = if (outputs_are_finite)
-            try decodeLinearTailBounded(false, tail_input, tail_output, fixed_point, previous_2, previous_1)
+            try decodeLinearTail(false, false, false, false, tail_input, tail_output, fixed_point, previous_2, previous_1)
         else
-            try decodeLinearTailBounded(true, tail_input, tail_output, fixed_point, previous_2, previous_1);
+            try decodeLinearTail(false, true, false, false, tail_input, tail_output, fixed_point, previous_2, previous_1);
         return 2 + tail_count;
     }
     const tail_count = if (outputs_are_finite)
         if (use_word_body)
-            try decodeLinearTail(false, true, false, tail_input, tail_output, fixed_point, previous_2, previous_1)
+            try decodeLinearTail(true, false, true, false, tail_input, tail_output, fixed_point, previous_2, previous_1)
         else if (use_short_body)
-            try decodeLinearTail(false, false, true, tail_input, tail_output, fixed_point, previous_2, previous_1)
+            try decodeLinearTail(true, false, false, true, tail_input, tail_output, fixed_point, previous_2, previous_1)
         else
-            try decodeLinearTail(false, false, false, tail_input, tail_output, fixed_point, previous_2, previous_1)
+            try decodeLinearTail(true, false, false, false, tail_input, tail_output, fixed_point, previous_2, previous_1)
     else if (use_word_body)
-        try decodeLinearTail(true, true, false, tail_input, tail_output, fixed_point, previous_2, previous_1)
+        try decodeLinearTail(true, true, true, false, tail_input, tail_output, fixed_point, previous_2, previous_1)
     else if (use_short_body)
-        try decodeLinearTail(true, false, true, tail_input, tail_output, fixed_point, previous_2, previous_1)
+        try decodeLinearTail(true, true, false, true, tail_input, tail_output, fixed_point, previous_2, previous_1)
     else
-        try decodeLinearTail(true, false, false, tail_input, tail_output, fixed_point, previous_2, previous_1);
+        try decodeLinearTail(true, true, false, false, tail_input, tail_output, fixed_point, previous_2, previous_1);
     return 2 + tail_count;
 }
 
+/// Decodes Linear residuals after the two initial values. Without overflow checks the
+/// output must hold at most MAX_UNCHECKED_LINEAR_TAIL values, where i64 cannot overflow.
 noinline fn decodeLinearTail(
+    comptime overflow_checked: bool,
     comptime check_finite: bool,
     comptime use_word_body: bool,
     comptime use_short_body: bool,
@@ -371,12 +374,14 @@ noinline fn decodeLinearTail(
         if (count == output.len) return error.OutputTooSmall;
         const residual_bits = try readNumpressInt(&reader, use_word_body, false, use_short_body);
         const residual: i32 = @bitCast(residual_bits);
-        const step = std.math.sub(i64, previous_1, previous_2) catch
-            return error.InvalidData;
-        const extrapolated = std.math.add(i64, previous_1, step) catch
-            return error.InvalidData;
-        const current = std.math.add(i64, extrapolated, residual) catch
-            return error.InvalidData;
+        const current = if (comptime overflow_checked) checked: {
+            const step = std.math.sub(i64, previous_1, previous_2) catch
+                return error.InvalidData;
+            const extrapolated = std.math.add(i64, previous_1, step) catch
+                return error.InvalidData;
+            break :checked std.math.add(i64, extrapolated, residual) catch
+                return error.InvalidData;
+        } else previous_1 + (previous_1 - previous_2) + @as(i64, residual);
         const decoded = @as(f64, @floatFromInt(current)) / fixed_point;
         if (comptime check_finite) {
             if (!std.math.isFinite(decoded)) return error.InvalidData;
@@ -398,37 +403,6 @@ comptime {
     const value_bound = initial_bound + last_index * initial_bound +
         residual_bound * last_index * (last_index - 1) / 2;
     if (value_bound > std.math.maxInt(i64)) @compileError("unchecked Linear recurrence can overflow");
-}
-
-noinline fn decodeLinearTailBounded(
-    comptime check_finite: bool,
-    input: []const u8,
-    output: []f64,
-    fixed_point: f64,
-    initial_2: i64,
-    initial_1: i64,
-) Error!usize {
-    var previous_2 = initial_2;
-    var previous_1 = initial_1;
-    var count: usize = 0;
-    var reader = NibbleReader.init(input);
-
-    while (!reader.atEnd()) {
-        if (reader.onlyZeroPaddingRemains()) break;
-        if (count == output.len) return error.OutputTooSmall;
-        const residual_bits = try readNumpressInt(&reader, false, false, false);
-        const residual: i32 = @bitCast(residual_bits);
-        const current = previous_1 + (previous_1 - previous_2) + @as(i64, residual);
-        const decoded = @as(f64, @floatFromInt(current)) / fixed_point;
-        if (comptime check_finite) {
-            if (!std.math.isFinite(decoded)) return error.InvalidData;
-        }
-        output[count] = decoded;
-        count += 1;
-        previous_2 = previous_1;
-        previous_1 = current;
-    }
-    return count;
 }
 
 /// Decodes exactly `output.len` Linear values.

@@ -3,18 +3,58 @@
 const std = @import("std");
 const cv = @import("../cv/source.zig");
 
-pub const Primitive = enum { float32, float64, int32, int64 };
+pub const Primitive = enum {
+    float32,
+    float64,
+    int32,
+    int64,
+
+    /// The primitive stored as Zig type T.
+    pub fn of(comptime T: type) Primitive {
+        return switch (T) {
+            f32 => .float32,
+            f64 => .float64,
+            i32 => .int32,
+            i64 => .int64,
+            else => @compileError("array values must be f32, f64, i32, or i64"),
+        };
+    }
+};
+
+/// The Numpress step of a pipeline, applied before optional zlib.
+pub const Transform = enum { none, linear, pic, slof };
 
 /// Names follow encoding order before Base64.
-pub const Pipeline = enum { none, zlib, linear, pic, slof, linear_zlib, pic_zlib, slof_zlib };
+pub const Pipeline = enum {
+    none,
+    zlib,
+    linear,
+    pic,
+    slof,
+    linear_zlib,
+    pic_zlib,
+    slof_zlib,
 
-/// Returns whether a pipeline changes numeric values into the Numpress wire format.
-pub fn isNumpress(pipeline: Pipeline) bool {
-    return switch (pipeline) {
-        .linear, .pic, .slof, .linear_zlib, .pic_zlib, .slof_zlib => true,
-        .none, .zlib => false,
-    };
-}
+    pub fn transform(self: Pipeline) Transform {
+        return switch (self) {
+            .none, .zlib => .none,
+            .linear, .linear_zlib => .linear,
+            .pic, .pic_zlib => .pic,
+            .slof, .slof_zlib => .slof,
+        };
+    }
+
+    pub fn hasZlib(self: Pipeline) bool {
+        return switch (self) {
+            .zlib, .linear_zlib, .pic_zlib, .slof_zlib => true,
+            .none, .linear, .pic, .slof => false,
+        };
+    }
+
+    pub fn isNumpress(self: Pipeline) bool {
+        return self.transform() != .none;
+    }
+};
 
 pub const Term = struct { accession: []const u8, name: []const u8 };
 
@@ -55,7 +95,21 @@ pub fn codecFromAccession(accession: []const u8) ?Pipeline {
 }
 
 /// A recognized established encoding. Unknown metadata remains in the source node.
-pub const Descriptor = struct { primitive: Primitive, pipeline: Pipeline };
+pub const Descriptor = struct {
+    primitive: Primitive,
+    pipeline: Pipeline,
+
+    /// The primitive of decoded values: f64 for Numpress, the declared primitive otherwise.
+    pub fn decodedPrimitive(self: Descriptor) Primitive {
+        return if (self.pipeline.isNumpress()) .float64 else self.primitive;
+    }
+
+    /// The pipeline to decode a payload with. Some producers omit the zlib stream of an
+    /// empty array, so an empty zlib array without Base64 characters decodes uncompressed.
+    pub fn payloadPipeline(self: Descriptor, value_count: usize, empty_text: bool) Pipeline {
+        return if (value_count == 0 and self.pipeline == .zlib and empty_text) .none else self.pipeline;
+    }
+};
 
 /// Failures when selecting an encoding, distinct from malformed payload bytes.
 pub const Error = cv.ExpansionError || error{

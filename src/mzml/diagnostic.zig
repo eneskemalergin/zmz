@@ -93,7 +93,15 @@ pub const Id = enum(u16) {
 pub const Operation = enum { read_header, read_record, read_item, open_index, rebuild_index, lookup_record, write_header, open_list, write_record, write_item, close_list, finish };
 pub const Stage = enum { xml, metadata, base64, array, index, output };
 pub const Location = union(enum) { input_event: u64, input_byte: u64, output_byte: u64 };
-pub const RecordPosition = struct { kind: enum { spectrum, chromatogram }, ordinal: usize };
+pub const RecordPosition = struct {
+    kind: enum { spectrum, chromatogram },
+    ordinal: usize,
+
+    /// Positions a record; any kind other than spectrum counts as a chromatogram.
+    pub fn of(kind: model.Kind, ordinal: usize) RecordPosition {
+        return .{ .kind = if (kind == .spectrum) .spectrum else .chromatogram, .ordinal = ordinal };
+    }
+};
 pub const Attribute = enum {
     id,
     index,

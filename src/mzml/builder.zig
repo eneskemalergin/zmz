@@ -86,7 +86,7 @@ pub fn reset(self: *Builder) void {
 
 /// Copies source fields within the byte and depth limits, without interpreting payloads.
 pub fn node(self: *Builder, source: model.Node) Error!model.Node {
-    if (self.limits.depth == 0 or self.limits.depth > 64) return error.LimitExceeded;
+    if (self.limits.depth == 0 or self.limits.depth > schema.MAX_DEPTH) return error.LimitExceeded;
     var copier = self.makeCopier();
     defer self.remaining = copier.remaining;
     return copier.node(source, self.limits.depth);
@@ -97,7 +97,7 @@ pub fn list(self: *Builder, kind: model.Kind, children: []const model.Node) Erro
     var count: [32]u8 = undefined;
     return self.node(.{ .kind = kind, .attributes = &.{.{
         .name = "count",
-        .value = std.fmt.bufPrint(&count, "{d}", .{children.len}) catch return error.LimitExceeded,
+        .value = count[0..std.fmt.printInt(&count, children.len, 10, .lower, .{})],
     }}, .children = children });
 }
 
@@ -169,10 +169,10 @@ pub fn prepareArrayFrom(
 }
 
 fn prepareArrayFromInner(self: *Builder, comptime T: type, values: []const T, source: model.Node, groups: []const cv.Group, options: arrays.EncodeOptions, scratch: arrays.Scratch, compressor: ?*zlib.Compressor, replacements: ?[]const GroupReplacement) Error!PreparedArray {
-    if (self.limits.depth < 2 or self.limits.depth > 64) return error.LimitExceeded;
+    if (self.limits.depth < 2 or self.limits.depth > schema.MAX_DEPTH) return error.LimitExceeded;
     _ = try model.arrayEncoding(source, groups);
     if (source.children.len != 1 or source.children[0].kind != .binary) return error.InvalidStructure;
-    const target: model.Encoding = .{ .primitive = primitiveFor(T), .pipeline = options.pipeline };
+    const target: model.Encoding = .{ .primitive = encoding.Primitive.of(T), .pipeline = options.pipeline };
     const counted = try reencodedParams(null, source.params, groups, target, replacements, self.remaining / @sizeOf(cv.Entry));
     const wire = try arrays.encodeWire(T, values, options, scratch, compressor);
     var copier = self.makeCopier();
@@ -183,8 +183,8 @@ fn prepareArrayFromInner(self: *Builder, comptime T: type, values: []const T, so
     const is_default = counted.is_default;
     var encoded_length: [32]u8 = undefined;
     var array_length: [32]u8 = undefined;
-    const encoded_text = std.fmt.bufPrint(&encoded_length, "{d}", .{try base64.encodedSize(wire.len)}) catch return error.LimitExceeded;
-    const length_text = std.fmt.bufPrint(&array_length, "{d}", .{values.len}) catch return error.LimitExceeded;
+    const encoded_text = encoded_length[0..std.fmt.printInt(&encoded_length, try base64.encodedSize(wire.len), 10, .lower, .{})];
+    const length_text = array_length[0..std.fmt.printInt(&array_length, values.len, 10, .lower, .{})];
     const add_encoded_length = source.attribute("encodedLength") == null;
     const add_array_length = !is_default and source.attribute("arrayLength") == null;
     const added = @as(usize, @intFromBool(add_encoded_length)) + @intFromBool(add_array_length);
@@ -277,7 +277,7 @@ pub fn reencoding(self: *Builder, source: model.Header, targets: []const model.E
                 serial = std.math.add(usize, serial, 1) catch return error.LimitExceeded;
                 var collision = false;
                 for (groups[0..next]) |existing| {
-                    if (sameGroupId(candidate, existing.id)) {
+                    if (cv.sameId(candidate, existing.id)) {
                         collision = true;
                         break;
                     }
@@ -305,7 +305,7 @@ pub fn reencoding(self: *Builder, source: model.Header, targets: []const model.E
             next += 1;
         };
         var count_buffer: [32]u8 = undefined;
-        const count_text = try copier.text(std.fmt.bufPrint(&count_buffer, "{d}", .{total}) catch return error.LimitExceeded);
+        const count_text = try copier.text(count_buffer[0..std.fmt.printInt(&count_buffer, total, 10, .lower, .{})]);
         const attributes = try copier.alloc(model.Attribute, list_node.attributes.len + 1);
         @memcpy(attributes[0..list_node.attributes.len], list_node.attributes);
         var found = false;
@@ -341,7 +341,7 @@ fn extraGroupIdUsed(allocator: std.mem.Allocator, header_value: model.Header, id
     for (content.items) |item| {
         if (item != .xml) continue;
         var input = std.Io.Reader.fixed(item.xml);
-        var cursor = try xml.Cursor.init(allocator, &input, 64, @max(1, item.xml.len / 4), item.xml.len);
+        var cursor = try xml.Cursor.init(allocator, &input, schema.MAX_DEPTH, @max(1, item.xml.len / 4), item.xml.len);
         defer cursor.deinit();
         try cursor.advanceFragment(false);
         const root = cursor.current orelse return error.InvalidXml;
@@ -352,14 +352,10 @@ fn extraGroupIdUsed(allocator: std.mem.Allocator, header_value: model.Header, id
             if (event.data != .start_element or cursor.depth != 2) continue;
             const start = event.data.start_element;
             if (!start.name.eql(header_value.namespace_uri, "referenceableParamGroup")) continue;
-            if (start.attribute(null, "id")) |attribute| if (sameGroupId(attribute.value, id)) return true;
+            if (start.attribute(null, "id")) |attribute| if (cv.sameId(attribute.value, id)) return true;
         }
     }
     return false;
-}
-
-fn sameGroupId(left: []const u8, right: []const u8) bool {
-    return std.mem.eql(u8, std.mem.trim(u8, left, " \t\r\n"), std.mem.trim(u8, right, " \t\r\n"));
 }
 
 fn changedGroupEncoding(entries: []const cv.Entry, target: model.Encoding) ?GroupEncoding {
@@ -407,7 +403,11 @@ fn reencodedParam(source: cv.Entry, target: model.Encoding) cv.Entry {
 
 fn isDefaultParam(entry: cv.Entry) bool {
     if (entry != .cv) return false;
-    const accession = entry.cv.accession orelse return false;
+    return isDefaultRole(entry.cv.accession orelse return false);
+}
+
+/// Default m/z, intensity, and time arrays take the record's defaultArrayLength.
+fn isDefaultRole(accession: cv.Accession) bool {
     return accession.eql(model.Terms.MZ_ARRAY) or accession.eql(model.Terms.INTENSITY_ARRAY) or accession.eql(model.Terms.TIME_ARRAY);
 }
 
@@ -419,14 +419,14 @@ fn reencodedParams(output: ?[]cv.Entry, params: []const cv.Entry, groups: []cons
         if (entry == .group_ref and (entry.group_ref.xml != null or replacements != null)) {
             const id = entry.group_ref.ref orelse return error.MissingGroup;
             const entries = entries: {
-                for (groups) |group| if (sameGroupId(id, group.id)) break :entries group.entries;
+                for (groups) |group| if (cv.sameId(id, group.id)) break :entries group.entries;
                 return error.MissingGroup;
             };
             var retained = entry;
             if (changedGroupEncoding(entries, target)) |key| {
                 retained.group_ref.ref = replacement: {
                     for (replacements orelse return error.GroupRewriteRequired) |replacement| {
-                        if (sameGroupId(id, replacement.source_id) and std.meta.eql(key, replacement.encoding)) break :replacement replacement.id;
+                        if (cv.sameId(id, replacement.source_id) and std.meta.eql(key, replacement.encoding)) break :replacement replacement.id;
                     }
                     return error.GroupRewriteRequired;
                 };
@@ -449,12 +449,11 @@ fn reencodedParams(output: ?[]cv.Entry, params: []const cv.Entry, groups: []cons
 }
 
 fn buildArray(self: *Builder, comptime T: type, values: []const T, options: ArrayOptions, output: []u8, scratch: arrays.Scratch, compressor: ?*zlib.Compressor, comptime prepared: bool) Error!PreparedArray {
-    if (self.limits.depth < 2 or self.limits.depth > 64) return error.LimitExceeded;
+    if (self.limits.depth < 2 or self.limits.depth > schema.MAX_DEPTH) return error.LimitExceeded;
     if (options.cv_ref.len == 0 or options.role.cv_ref == null or options.role.accession == null or
         options.role.name == null) return error.InvalidDeclaration;
-    const role = options.role.accession.?;
-    const is_default = role.eql(model.Terms.MZ_ARRAY) or role.eql(model.Terms.INTENSITY_ARRAY) or role.eql(model.Terms.TIME_ARRAY);
-    const primitive = encoding.primitiveTerm(primitiveFor(T));
+    const is_default = isDefaultRole(options.role.accession.?);
+    const primitive = encoding.primitiveTerm(encoding.Primitive.of(T));
     const codec = encoding.codecTerm(options.encoding.pipeline);
     const wire = if (prepared) try arrays.encodeWire(T, values, options.encoding, scratch, compressor) else &.{};
     const encoded: ?[]const u8 = if (prepared) null else try arrays.encode(T, output, values, options.encoding, scratch, compressor);
@@ -462,8 +461,8 @@ fn buildArray(self: *Builder, comptime T: type, values: []const T, options: Arra
     var length: [32]u8 = undefined;
     var count: [32]u8 = undefined;
     var attrs = [_]model.Attribute{
-        .{ .name = "encodedLength", .value = std.fmt.bufPrint(&length, "{d}", .{encoded_length}) catch return error.LimitExceeded },
-        .{ .name = "arrayLength", .value = std.fmt.bufPrint(&count, "{d}", .{values.len}) catch return error.LimitExceeded },
+        .{ .name = "encodedLength", .value = length[0..std.fmt.printInt(&length, encoded_length, 10, .lower, .{})] },
+        .{ .name = "arrayLength", .value = count[0..std.fmt.printInt(&count, values.len, 10, .lower, .{})] },
         .{ .name = "dataProcessingRef", .value = options.data_processing_ref orelse "" },
     };
     var attribute_count: usize = if (is_default) 1 else 2;
@@ -510,7 +509,7 @@ pub fn preparedRecord(self: *Builder, kind: model.Kind, id: []const u8, index: u
 }
 
 fn recordInner(self: *Builder, kind: model.Kind, id: []const u8, index: usize, default_length: usize, params: []const cv.Entry, children: []const model.Node, binary_arrays: []const Array, comptime prepared: bool) Error!model.Record {
-    if (self.limits.depth == 0 or self.limits.depth > 64 or
+    if (self.limits.depth == 0 or self.limits.depth > schema.MAX_DEPTH or
         (binary_arrays.len != 0 and self.limits.depth < 4)) return error.LimitExceeded;
     if ((kind != .spectrum and kind != .chromatogram) or id.len == 0) return error.InvalidRecord;
     for (children) |child| if (child.kind == .binary_data_array_list) return error.InvalidRecord;
@@ -536,7 +535,7 @@ fn recordInner(self: *Builder, kind: model.Kind, id: []const u8, index: usize, d
             .kind = .binary_data_array_list,
             .attributes = &.{.{
                 .name = "count",
-                .value = std.fmt.bufPrint(&count_text, "{d}", .{binary_arrays.len}) catch return error.LimitExceeded,
+                .value = count_text[0..std.fmt.printInt(&count_text, binary_arrays.len, 10, .lower, .{})],
             }},
         }, self.limits.depth);
         list_node.children = array_nodes;
@@ -546,8 +545,8 @@ fn recordInner(self: *Builder, kind: model.Kind, id: []const u8, index: usize, d
     var length_text: [32]u8 = undefined;
     var result = try copier.node(.{ .kind = kind, .attributes = &.{
         .{ .name = "id", .value = id },
-        .{ .name = "index", .value = std.fmt.bufPrint(&index_text, "{d}", .{index}) catch return error.LimitExceeded },
-        .{ .name = "defaultArrayLength", .value = std.fmt.bufPrint(&length_text, "{d}", .{default_length}) catch return error.LimitExceeded },
+        .{ .name = "index", .value = index_text[0..std.fmt.printInt(&index_text, index, 10, .lower, .{})] },
+        .{ .name = "defaultArrayLength", .value = length_text[0..std.fmt.printInt(&length_text, default_length, 10, .lower, .{})] },
     }, .params = params }, self.limits.depth);
     result.children = record_children;
     return .{ .node = result, .id = result.attribute("id").?, .index = index, .default_array_length = default_length };
@@ -555,7 +554,7 @@ fn recordInner(self: *Builder, kind: model.Kind, id: []const u8, index: usize, d
 
 /// Copies header metadata and derives group entries from the copied definitions.
 pub fn header(self: *Builder, source: model.Header) Error!model.Header {
-    if (self.limits.depth == 0 or self.limits.depth > 64) return error.LimitExceeded;
+    if (self.limits.depth == 0 or self.limits.depth > schema.MAX_DEPTH) return error.LimitExceeded;
     try schema.checkHeader(source);
     var copier = self.makeCopier();
     defer self.remaining = copier.remaining;
@@ -572,14 +571,4 @@ pub fn header(self: *Builder, source: model.Header) Error!model.Header {
 
 fn makeCopier(self: *Builder) copy.Copier {
     return .{ .allocator = self.arena.allocator(), .remaining = self.remaining };
-}
-
-fn primitiveFor(comptime T: type) encoding.Primitive {
-    return switch (T) {
-        f32 => .float32,
-        f64 => .float64,
-        i32 => .int32,
-        i64 => .int64,
-        else => @compileError("array construction requires f32, f64, i32, or i64"),
-    };
 }

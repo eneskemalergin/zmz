@@ -1,0 +1,34 @@
+//! Hash maps that store entry positions and find them by the entries' IDs.
+
+const std = @import("std");
+
+/// Types for a set of positions into a slice of Entry, looked up by Entry.id.
+pub fn IdIndex(comptime Entry: type) type {
+    return struct {
+        pub const Map = std.HashMapUnmanaged(usize, void, Context, std.hash_map.default_max_load_percentage);
+
+        pub const Context = struct {
+            entries: []const Entry,
+
+            pub fn hash(self: Context, position: usize) u64 {
+                return std.hash_map.hashString(self.entries[position].id);
+            }
+
+            pub fn eql(_: Context, left: usize, right: usize) bool {
+                return left == right;
+            }
+        };
+
+        pub const Query = struct {
+            entries: []const Entry,
+
+            pub fn hash(_: Query, id: []const u8) u64 {
+                return std.hash_map.hashString(id);
+            }
+
+            pub fn eql(self: Query, id: []const u8, position: usize) bool {
+                return std.mem.eql(u8, id, self.entries[position].id);
+            }
+        };
+    };
+}

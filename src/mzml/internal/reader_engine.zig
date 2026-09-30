@@ -37,7 +37,7 @@ const PARAM_ATTRIBUTES = std.StaticStringMap(std.meta.FieldEnum(ParamAttributes)
 /// Independent bounds on parser state, retained objects, lists, and payload text.
 /// Retained-byte limits count stored slices, not allocator bookkeeping or temporary list capacity.
 pub const Limits = struct {
-    depth: usize = 64,
+    depth: usize = schema.MAX_DEPTH,
     attributes: usize = 64,
     attribute_bytes: usize = 1024 * 1024,
     header_bytes: usize = 32 * 1024 * 1024,
@@ -115,7 +115,7 @@ pub const FragmentTarget = struct { kind: model.Kind, id: []const u8 };
 /// Streaming input needs buffer capacity for peekGreedy(1); otherwise init returns InvalidOptions.
 /// Empty fixed readers are valid inputs and report malformed XML when read.
 pub fn init(allocator: std.mem.Allocator, input: *std.Io.Reader, options: Options) Error!StreamReader {
-    if (options.limits.depth == 0 or options.limits.depth > 64 or options.limits.nodes == 0 or
+    if (options.limits.depth == 0 or options.limits.depth > schema.MAX_DEPTH or options.limits.nodes == 0 or
         options.limits.list_entries == 0) return error.InvalidOptions;
     if (input.buffer.len == 0 and input.vtable != std.Io.Reader.ending.vtable)
         return error.InvalidOptions;
@@ -212,23 +212,6 @@ fn captureScope(self: *StreamReader) Error!Scope {
     return .{ .start = event.span.start, .end = event.span.end, .name = try self.header_store.copy(u8, event.data.start_element.name.raw) };
 }
 
-/// Internal indexed-read entry point. The synthetic ancestor prefix is followed by one
-/// complete record; returned offsets refer to physical_start in the original source.
-pub fn parseFragment(
-    allocator: std.mem.Allocator,
-    bytes: []const u8,
-    options: Options,
-    ancestors: usize,
-    physical_start: u64,
-    prefix_length: usize,
-) Error!owned.Record {
-    if (prefix_length > bytes.len) return error.InvalidOptions;
-    var input = std.Io.Reader.fixed(bytes);
-    var reader = try init(allocator, &input, options);
-    defer reader.deinit();
-    return reader.readFragment(allocator, &input, ancestors, physical_start, prefix_length, true, false, null);
-}
-
 /// Internal reusable fragment reader. Returned records use the requested allocator;
 /// parser and list scratch remain owned by this reader. No source bytes remain borrowed.
 pub fn readFragment(self: *StreamReader, allocator: std.mem.Allocator, input: *std.Io.Reader, ancestors: usize, physical_start: u64, prefix_length: usize, complete: bool, reuse_ancestors: bool, expected: ?FragmentTarget) Error!owned.Record {
@@ -265,7 +248,7 @@ pub fn readFragment(self: *StreamReader, allocator: std.mem.Allocator, input: *s
         if (!std.mem.eql(u8, id.value, target.id)) return error.InvalidIndex;
     }
     if (kind_value != .spectrum and kind_value != .chromatogram) return error.InvalidStructure;
-    var node = try self.parseNode(&self.record_store, 1, complete, self.options.payload);
+    var node = try self.parseNodeFor(&self.record_store, 1, complete, self.options.payload, .tree);
     if (complete) {
         for (0..ancestors) |_| {
             if ((self.cursor.current orelse return error.UnexpectedEnd).data != .end_element)
@@ -311,7 +294,7 @@ pub fn parseFooter(allocator: std.mem.Allocator, bytes: []const u8, options: Opt
     var nodes: [2]model.Node = .{ .{ .kind = .index_list_offset }, .{ .kind = .file_checksum } };
     for (&nodes) |*node| {
         if (try reader.kind() != node.kind) return error.InvalidStructure;
-        node.* = try reader.parseNode(&reader.header_store, 1, true, reader.options.payload);
+        node.* = try reader.parseNodeFor(&reader.header_store, 1, true, reader.options.payload, .tree);
         try shiftOffsets(node, physical_start - prefix_length);
     }
     try reader.consumeEnd(.indexed_mzml, true);
@@ -429,7 +412,7 @@ fn readHeaderInner(self: *StreamReader) Error!void {
     if (try self.kind() != .mzml) return error.InvalidStructure;
     self.scopes[self.scope_count] = try self.captureScope();
     self.scope_count += 1;
-    var document = try self.startNode(&self.header_store, .mzml);
+    var document = try self.startNodeFor(&self.header_store, .mzml, true);
     try self.cursor.advance(false);
     const sections = schema.children(.mzml);
     var seen = std.EnumSet(model.Kind).initEmpty();
@@ -458,7 +441,7 @@ fn readHeaderInner(self: *StreamReader) Error!void {
         };
         if (kind_value == .run) break;
         seen.insert(kind_value);
-        try metadata.append(self.allocator, try self.parseNode(&self.header_store, 1, true, self.options.payload));
+        try metadata.append(self.allocator, try self.parseNodeFor(&self.header_store, 1, true, self.options.payload, .tree));
         if (content.items.len != 0) try content.append(self.allocator, .{ .children = 1 });
     }
     document.params = try self.header_store.copy(cv.Entry, self.param_scratch.items);
@@ -467,7 +450,7 @@ fn readHeaderInner(self: *StreamReader) Error!void {
     document.content = try saveContent(&self.header_store, content.items);
     content.clearRetainingCapacity();
     metadata.clearRetainingCapacity();
-    var run = try self.startNode(&self.header_store, .run);
+    var run = try self.startNodeFor(&self.header_store, .run, true);
     self.scopes[self.scope_count] = try self.captureScope();
     self.scope_count += 1;
     try self.cursor.advance(false);
@@ -486,7 +469,7 @@ fn readHeaderInner(self: *StreamReader) Error!void {
         const kind_value = self.childKind(.run);
         if (kind_value != null and kind_value != .source_file_ref_list) break;
         if (kind_value == .source_file_ref_list and metadata.items.len == 0) {
-            try metadata.append(self.allocator, try self.parseNode(&self.header_store, 1, true, self.options.payload));
+            try metadata.append(self.allocator, try self.parseNodeFor(&self.header_store, 1, true, self.options.payload, .tree));
             if (content.items.len != 0) try content.append(self.allocator, .{ .children = 1 });
         } else {
             if (content.items.len == 0) try self.startContent(&content, param_count, metadata.items.len);
@@ -518,7 +501,7 @@ fn openList(self: *StreamReader) Error!void {
         .chromatogram_list => if (self.header.chromatogram_list != null) return error.InvalidStructure,
         else => return error.InvalidStructure,
     }
-    const node = try self.startNode(&self.header_store, kind_value);
+    const node = try self.startNodeFor(&self.header_store, kind_value, true);
     const list: model.RecordList = .{
         .attributes = node.attributes,
         .declared_count = try self.number(node, .count),
@@ -605,7 +588,7 @@ fn nextItemInner(self: *StreamReader, comptime retention: Retention, comptime re
     if (self.header.indexed) {
         inline for (.{ model.Kind.index_list, .index_list_offset, .file_checksum }, 0..) |expected, i| {
             if (try self.kind() != expected) return error.InvalidStructure;
-            self.index_trailer[i] = try self.parseNode(&self.header_store, 1, true, self.options.payload);
+            self.index_trailer[i] = try self.parseNodeFor(&self.header_store, 1, true, self.options.payload, .tree);
         }
         try self.consumeEnd(.indexed_mzml, true);
     }
@@ -633,7 +616,6 @@ fn knownKind(self: *StreamReader) ?model.Kind {
     if (event.data != .start_element) return null;
     const name = event.data.start_element.name.expanded;
     if (!std.mem.eql(u8, name.namespace_uri orelse "", self.cursor.mzml_namespace)) return null;
-    // The cursor resolves namespaces and matches closing tags.
     const value = ELEMENT_KINDS.get(name.local) orelse return null;
     self.current_kind = value;
     return value;
@@ -648,10 +630,6 @@ fn firstChildKind(self: *StreamReader, parent: model.Kind, seen: std.EnumSet(mod
     const value = self.childKind(parent) orelse return null;
     if (value != .binary and seen.contains(value) and schema.CHILD_KINDS.get(parent).singular.contains(value)) return null;
     return value;
-}
-
-fn startNode(self: *StreamReader, storage: *Storage, kind_value: model.Kind) Error!model.Node {
-    return self.startNodeFor(storage, kind_value, true);
 }
 
 fn startNodeFor(self: *StreamReader, storage: *Storage, kind_value: model.Kind, comptime retain: bool) Error!model.Node {
@@ -673,10 +651,6 @@ fn startNodeFor(self: *StreamReader, storage: *Storage, kind_value: model.Kind, 
         .start_offset = event.span.start,
         .content_offset = event.span.end,
     };
-}
-
-fn parseNode(self: *StreamReader, storage: *Storage, depth: usize, advance_after: bool, payload: Payload) Error!model.Node {
-    return self.parseNodeFor(storage, depth, advance_after, payload, .tree);
 }
 
 fn parseNodeFor(self: *StreamReader, storage: *Storage, depth: usize, advance_after: bool, payload: Payload, comptime retention: Retention) Error!model.Node {
@@ -1044,7 +1018,7 @@ fn readXml(self: *StreamReader, storage: *Storage, comptime retain: bool) Error!
     self.cursor.writeElement(&writer, &remaining) catch |err| return switch (err) {
         error.WriteFailed => if ((output.failure orelse error.InvalidXml) == error.LimitExceeded) try storage.limitError() else output.failure orelse error.InvalidXml,
         error.InvalidName, error.InvalidCharacter, error.InvalidNamespace, error.DuplicateAttribute => error.InvalidXml,
-        error.WriterLimit => try self.limitError(.depth, 64, null),
+        error.WriterLimit => try self.limitError(.depth, schema.MAX_DEPTH, null),
         error.LimitExceeded => if (self.cursor.limit_failure == .nodes) try self.limitError(.nodes, self.options.limits.nodes, null) else error.LimitExceeded,
         else => |other| other,
     };
@@ -1164,6 +1138,23 @@ const Storage = struct {
         return result;
     }
 };
+
+/// Test helper: reads one record after a synthetic ancestor prefix, with offsets
+/// relative to physical_start in the original source.
+fn parseFragment(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+    options: Options,
+    ancestors: usize,
+    physical_start: u64,
+    prefix_length: usize,
+) Error!owned.Record {
+    if (prefix_length > bytes.len) return error.InvalidOptions;
+    var input = std.Io.Reader.fixed(bytes);
+    var reader = try init(allocator, &input, options);
+    defer reader.deinit();
+    return reader.readFragment(allocator, &input, ancestors, physical_start, prefix_length, true, false, null);
+}
 
 test "[integration] - [mzML fragment parsing]: preserves text boundaries and physical offsets" {
     const prefix = "<mzML xmlns='http://psi.hupo.org/ms/mzml'>";

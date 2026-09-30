@@ -112,28 +112,23 @@ pub const Match = struct { term: *const Term, alternate_id: bool };
 
 /// Returns exact primary or alternate identity matches without name-based fallback.
 pub fn lookup(self: Vocabulary, accession: []const u8) ?Match {
+    if (search(Term, self.terms, accession)) |index| return .{ .term = &self.terms[index], .alternate_id = false };
+    const alias = search(Alias, self.aliases, accession) orelse return null;
+    const index = self.aliases[alias].term_index;
+    if (index >= self.terms.len) return null;
+    return .{ .term = &self.terms[index], .alternate_id = true };
+}
+
+/// Binary search over items sorted by exact id bytes.
+fn search(comptime T: type, items: []const T, id: []const u8) ?usize {
     var low: usize = 0;
-    var high = self.terms.len;
+    var high = items.len;
     while (low < high) {
         const mid = low + (high - low) / 2;
-        switch (std.mem.order(u8, accession, self.terms[mid].id)) {
+        switch (std.mem.order(u8, id, items[mid].id)) {
             .lt => high = mid,
             .gt => low = mid + 1,
-            .eq => return .{ .term = &self.terms[mid], .alternate_id = false },
-        }
-    }
-    low = 0;
-    high = self.aliases.len;
-    while (low < high) {
-        const mid = low + (high - low) / 2;
-        switch (std.mem.order(u8, accession, self.aliases[mid].id)) {
-            .lt => high = mid,
-            .gt => low = mid + 1,
-            .eq => {
-                const index = self.aliases[mid].term_index;
-                if (index >= self.terms.len) return null;
-                return .{ .term = &self.terms[index], .alternate_id = true };
-            },
+            .eq => return mid,
         }
     }
     return null;

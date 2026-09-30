@@ -153,7 +153,7 @@ fn find(
     for (self.declarations) |*declaration| {
         try charge(remaining);
         const id = declaration.id orelse continue;
-        if (!sameId(id, ref)) continue;
+        if (!cv.sameId(id, ref)) continue;
         if (result.declaration != null) return error.DuplicateDeclaration;
         result.declaration = declaration;
     }
@@ -164,7 +164,7 @@ fn find(
     var bound: ?[]const u8 = null;
     for (self.bindings) |binding| {
         try charge(remaining);
-        if (!sameId(binding.declaration_id, ref)) continue;
+        if (!cv.sameId(binding.declaration_id, ref)) continue;
         if (bound != null) return error.InvalidBinding;
         bound = binding.resource_key;
     }
@@ -232,10 +232,6 @@ fn version(self: Resolver, resource: Vocabulary, declared: ?[]const u8, remainin
 fn charge(remaining: *usize) Error!void {
     if (remaining.* == 0) return error.LimitExceeded;
     remaining.* -= 1;
-}
-
-fn sameId(a: []const u8, b: []const u8) bool {
-    return std.mem.eql(u8, std.mem.trim(u8, a, " \t\r\n"), std.mem.trim(u8, b, " \t\r\n"));
 }
 
 fn matches(source: ?[]const u8, known: []const u8) bool {

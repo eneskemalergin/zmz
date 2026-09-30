@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const zipir = @import("zipir");
+const overlaps = @import("memory.zig").overlaps;
 
 /// Checked stream failures. Partial output is unspecified and never exceeds its buffer.
 pub const Error = error{
@@ -25,7 +26,7 @@ pub fn decompress(output: []u8, source: []const u8) Error![]u8 {
     // zipir asserts distinct addresses even for empty slices, which are disjoint here.
     if (source.len == 0) return error.TruncatedInput;
     const destination = if (output.len == 0) @constCast(source[0..0]) else output;
-    // The workspace is zipir's decoding tables (7,704 bytes); nothing is allocated.
+    // zipir's decoding workspace lives on the stack; nothing is allocated.
     var decoder: zipir.zlib.SliceDecoder = .{};
     const length = decoder.decode(source, destination) catch |err| return switch (err) {
         error.Truncated => error.TruncatedInput,
@@ -41,9 +42,11 @@ pub fn decompress(output: []u8, source: []const u8) Error![]u8 {
         error.BadDistance,
         error.BadStored,
         error.BadBlock,
+        // Reader errors are in zipir's set, but a slice source cannot fail a read.
+        error.ReadFailed,
+        error.InputBufferTooSmall,
+        error.PeekTooLarge,
         => error.InvalidData,
-        // Reader errors in zipir's set; a slice source cannot fail a read.
-        error.ReadFailed, error.InputBufferTooSmall, error.PeekTooLarge => error.InvalidData,
     };
     return output[0..length];
 }
@@ -81,10 +84,3 @@ pub const Compressor = struct {
         return destination.buffered();
     }
 };
-
-fn overlaps(output: []u8, source: []const u8) bool {
-    if (output.len == 0 or source.len == 0) return false;
-    const a = @intFromPtr(output.ptr);
-    const b = @intFromPtr(source.ptr);
-    return if (a <= b) b - a < output.len else a - b < source.len;
-}

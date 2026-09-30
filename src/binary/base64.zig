@@ -1,14 +1,15 @@
 //! Streams padded Base64 through caller-owned buffers without allocation.
 //!
-//! The decoder accepts fragmented XML text and retains only an incomplete quartet;
-//! the encoder carries at most two input bytes between updates. CPU and OS detection
-//! selects bounded AVX2 blocks on x86-64, with scalar handling elsewhere and for tails.
+//! The decoder accepts fragmented XML text and retains only an incomplete quartet.
+//! CPU and OS detection selects bounded AVX2 blocks on x86-64, with scalar handling
+//! elsewhere and for tails.
 //! Input and output must be disjoint. SIMD never needs padding outside either slice.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const options = @import("base64_options");
 const cpu = @import("cpu.zig");
+const overlaps = @import("memory.zig").overlaps;
 // Zig's self-hosted x86 backend cannot assemble vector memory operands yet.
 const USE_AVX2 = builtin.cpu.arch == .x86_64 and options.simd and builtin.zig_backend == .stage2_llvm;
 
@@ -64,62 +65,6 @@ pub fn decode(output: []u8, source: []const u8, limits: Limits) Error!Counts {
     return decoder.finish();
 }
 
-/// Checks the same lexical rules and limits as decode without allocating or writing output.
-pub fn validate(source: []const u8, limits: Limits) Error!Counts {
-    var decoder = Decoder.init(&.{}, limits);
-    decoder.discard_output = true;
-    try decoder.update(source);
-    return decoder.finish();
-}
-
-/// Encodes arbitrary chunks into reusable output, retaining only an incomplete triple.
-/// Consume each returned slice before reusing output. Short output or overlap leaves
-/// state unchanged for retry. finish emits padding and ends the array; no allocation occurs.
-pub const Encoder = struct {
-    carry: [3]u8 = undefined,
-    carry_len: u2 = 0,
-    finished: bool = false,
-
-    pub fn update(self: *Encoder, output: []u8, source: []const u8) Error![]u8 {
-        if (self.finished) return error.AlreadyFinished;
-        if (overlaps(output, source)) return error.OverlappingBuffers;
-        const total = std.math.add(usize, source.len, self.carry_len) catch return error.LengthOverflow;
-        const required = std.math.mul(usize, total / 3, 4) catch return error.LengthOverflow;
-        if (output.len < required) return error.OutputTooSmall;
-        var position: usize = 0;
-        var written: usize = 0;
-        if (self.carry_len != 0) {
-            while (self.carry_len < 3 and position < source.len) : (position += 1) {
-                self.carry[self.carry_len] = source[position];
-                self.carry_len += 1;
-            }
-            if (self.carry_len == 3) {
-                encodeTriple(output[0..4], &self.carry);
-                written = 4;
-                self.carry_len = 0;
-            }
-        }
-        const complete = (source.len - position) / 3 * 3;
-        if (complete != 0) {
-            encodeInto(output[written..required], source[position..][0..complete]);
-            position += complete;
-        }
-        while (position < source.len) : (position += 1) {
-            self.carry[self.carry_len] = source[position];
-            self.carry_len += 1;
-        }
-        return output[0..required];
-    }
-
-    pub fn finish(self: *Encoder, output: []u8) Error![]u8 {
-        if (self.finished) return error.AlreadyFinished;
-        const result = try encode(output, self.carry[0..self.carry_len]);
-        self.carry_len = 0;
-        self.finished = true;
-        return result;
-    }
-};
-
 /// A bounded decoder borrowing its destination until finish or abandonment.
 /// Input slices need remain alive only during update and must not overlap the destination.
 /// Failures are sticky; counters and partially written output are not a successful result.
@@ -132,7 +77,6 @@ pub const Decoder = struct {
     padded: bool = false,
     finished: bool = false,
     failed: bool = false,
-    discard_output: bool = false,
     /// Offset in concatenated logical text, not the physical XML source.
     error_offset: ?usize = null,
 
@@ -181,8 +125,7 @@ pub const Decoder = struct {
 
     fn decodeRun(self: *Decoder, text: []const u8) usize {
         if (self.quartet_len != 0 or self.padded or text.len < 4) return 0;
-        var discarded: [192]u8 = undefined;
-        const output = if (self.discard_output) &discarded else self.output[self.counts.decoded_bytes..];
+        const output = self.output[self.counts.decoded_bytes..];
         const capacity = @min(output.len, self.limits.decoded_bytes -| self.counts.decoded_bytes);
         const input = text[0..@min(text.len, self.limits.significant_bytes -| self.counts.significant_bytes)];
         const has_tail = input.len >= 4 and input.len % 4 == 0 and input[input.len - 1] == '=';
@@ -223,11 +166,9 @@ pub const Decoder = struct {
         const end = std.math.add(usize, self.counts.decoded_bytes, group.len) catch
             return error.LengthOverflow;
         if (end > self.limits.decoded_bytes) return error.LimitExceeded;
-        if (!self.discard_output) {
-            if (end > self.output.len) return error.OutputTooSmall;
-            inline for (0..3) |i| {
-                if (i < group.len) self.output[self.counts.decoded_bytes + i] = group.bytes[i];
-            }
+        if (end > self.output.len) return error.OutputTooSmall;
+        inline for (0..3) |i| {
+            if (i < group.len) self.output[self.counts.decoded_bytes + i] = group.bytes[i];
         }
         self.counts.decoded_bytes = end;
         self.quartet_len = 0;
@@ -371,13 +312,6 @@ fn alphabet(byte: u8) ?u8 {
 
 fn isWhitespace(byte: u8) bool {
     return byte == ' ' or byte == '\t' or byte == '\r' or byte == '\n';
-}
-
-fn overlaps(output: []u8, source: []const u8) bool {
-    if (output.len == 0 or source.len == 0) return false;
-    const a = @intFromPtr(output.ptr);
-    const b = @intFromPtr(source.ptr);
-    return if (a <= b) b - a < output.len else a - b < source.len;
 }
 
 // --- AVX2 ---

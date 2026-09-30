@@ -80,67 +80,8 @@ pub const Kind = enum {
     pub fn xmlName(self: Kind) []const u8 {
         return switch (self) {
             .mzml => "mzML",
-            .cv_list => "cvList",
-            .cv => "cv",
-            .file_description => "fileDescription",
-            .file_content => "fileContent",
-            .source_file_list => "sourceFileList",
-            .source_file => "sourceFile",
-            .contact => "contact",
-            .referenceable_param_group_list => "referenceableParamGroupList",
-            .referenceable_param_group => "referenceableParamGroup",
-            .sample_list => "sampleList",
-            .sample => "sample",
-            .software_list => "softwareList",
-            .software => "software",
-            .software_param => "softwareParam",
-            .acquisition_settings_list => "acquisitionSettingsList",
-            .acquisition_settings => "acquisitionSettings",
-            .scan_settings_list => "scanSettingsList",
-            .scan_settings => "scanSettings",
-            .source_file_ref_list => "sourceFileRefList",
-            .source_file_ref => "sourceFileRef",
-            .target_list => "targetList",
-            .target => "target",
-            .instrument_configuration_list => "instrumentConfigurationList",
-            .instrument_configuration => "instrumentConfiguration",
-            .component_list => "componentList",
-            .source => "source",
-            .analyzer => "analyzer",
-            .detector => "detector",
-            .software_ref => "softwareRef",
-            .data_processing_list => "dataProcessingList",
-            .data_processing => "dataProcessing",
-            .processing_method => "processingMethod",
-            .run => "run",
-            .spectrum_list => "spectrumList",
-            .spectrum => "spectrum",
-            .spectrum_description => "spectrumDescription",
-            .acquisition_list => "acquisitionList",
-            .acquisition => "acquisition",
-            .scan_list => "scanList",
-            .scan => "scan",
-            .scan_window_list => "scanWindowList",
-            .scan_window => "scanWindow",
-            .precursor_list => "precursorList",
-            .precursor => "precursor",
-            .isolation_window => "isolationWindow",
-            .selected_ion_list => "selectedIonList",
-            .selected_ion => "selectedIon",
-            .activation => "activation",
-            .product_list => "productList",
-            .product => "product",
-            .binary_data_array_list => "binaryDataArrayList",
-            .binary_data_array => "binaryDataArray",
-            .binary => "binary",
-            .chromatogram_list => "chromatogramList",
-            .chromatogram => "chromatogram",
             .indexed_mzml => "indexedmzML",
-            .index_list => "indexList",
-            .index => "index",
-            .offset => "offset",
-            .index_list_offset => "indexListOffset",
-            .file_checksum => "fileChecksum",
+            inline else => |kind| comptime camelCase(@tagName(kind)),
         };
     }
 };
@@ -257,11 +198,11 @@ pub const Node = struct {
     }
 
     /// Parses this selected ion's independent fields; no missing field is inferred.
-    /// Falls back to historical m/z term MS:1000040; charge uses signed xs:int range.
+    /// Falls back to the historical m/z term; charge uses signed xs:int range.
     pub fn selectedIonValues(self: Node, groups: []const cv.Group) MetadataError!SelectedIon {
         if (self.kind != .selected_ion) return error.UnexpectedElement;
         return .{
-            .mz = try self.number(groups, Terms.SELECTED_ION_MZ) orelse try self.number(groups, .{ .raw = "MS:1000040" }),
+            .mz = try self.number(groups, Terms.SELECTED_ION_MZ) orelse try self.number(groups, Terms.HISTORICAL_SELECTED_ION_MZ),
             .charge = try self.integer(i32, groups, Terms.CHARGE_STATE),
             .intensity = try self.number(groups, Terms.PEAK_INTENSITY),
         };
@@ -317,6 +258,8 @@ pub const Terms = struct {
     pub const SCAN_START_TIME: cv.Accession = .{ .raw = "MS:1000016" };
     /// Selected ion mass-to-charge ratio.
     pub const SELECTED_ION_MZ: cv.Accession = .{ .raw = "MS:1000744" };
+    /// Obsolete m/z term that historical files use for the selected ion.
+    pub const HISTORICAL_SELECTED_ION_MZ: cv.Accession = .{ .raw = "MS:1000040" };
     /// Signed charge state.
     pub const CHARGE_STATE: cv.Accession = .{ .raw = "MS:1000041" };
     /// Selected peak intensity; source units are not inferred.
@@ -398,11 +341,7 @@ pub const Record = struct {
     /// Returns modeled scans in source order. Chromatograms have no scan list.
     /// Like binaryArrays, list access borrows a structurally valid record hierarchy.
     pub fn scans(self: Record) []const Node {
-        if (self.node.child(.spectrum_description)) |description| {
-            for (description.children, 0..) |child, i|
-                if (child.kind == .scan) return description.children[i .. i + 1];
-            return &.{};
-        }
+        if (self.node.child(.spectrum_description)) |description| return firstChild(description, .scan);
         return listItems(self.node, .scan_list);
     }
 
@@ -482,19 +421,12 @@ pub const BinaryArray = struct {
         scratch: arrays.Scratch,
         limits: arrays.Limits,
     ) (EncodingError || arrays.Error)!void {
-        if (encoding.isNumpress(self.encoding.pipeline)) {
-            if (T != f64) return error.TypeMismatch;
-        } else if (self.encoding.primitive != primitiveFor(T)) return error.TypeMismatch;
+        if (self.encoding.decodedPrimitive() != Primitive.of(T)) return error.TypeMismatch;
         if (self.length != output.len) return error.DecodedSizeMismatch;
         const binary = self.node.child(.binary) orelse return error.PayloadNotRetained;
         const text = binary.text orelse return error.PayloadNotRetained;
-        // Some producers omit the zlib stream for an empty array. Nonempty streams
-        // still pass through the codec, including its checksum and truncation checks.
-        if (self.length == 0 and self.encoding.pipeline == .zlib and std.mem.trim(u8, text, " \t\r\n").len == 0) {
-            try arrays.decode(T, output, text, .none, scratch, limits);
-            return;
-        }
-        try arrays.decode(T, output, text, self.encoding.pipeline, scratch, limits);
+        const pipeline = self.encoding.payloadPipeline(self.length, std.mem.trim(u8, text, cv.XML_WHITESPACE).len == 0);
+        try arrays.decode(T, output, text, pipeline, scratch, limits);
     }
 };
 
@@ -540,9 +472,7 @@ pub fn decodeArray(
     limits: arrays.Limits,
 ) (EncodingError || cv.ValueError || arrays.Error)!void {
     const declared_encoding = try arrayEncoding(node, groups);
-    if (encoding.isNumpress(declared_encoding.pipeline)) {
-        if (T != f64) return error.TypeMismatch;
-    } else if (declared_encoding.primitive != primitiveFor(T)) return error.TypeMismatch;
+    if (declared_encoding.decodedPrimitive() != Primitive.of(T)) return error.TypeMismatch;
     const array = try initWithEncoding(node, default_length, declared_encoding);
     try array.decode(T, output, scratch, limits);
 }
@@ -555,14 +485,19 @@ fn initWithEncoding(node: Node, default_length: ?usize, descriptor: Encoding) cv
     return .{ .node = node, .encoding = descriptor, .length = length };
 }
 
-fn primitiveFor(comptime T: type) Primitive {
-    return switch (T) {
-        f32 => .float32,
-        f64 => .float64,
-        i32 => .int32,
-        i64 => .int64,
-        else => @compileError("array destination must be f32, f64, i32, or i64"),
-    };
+fn camelCase(comptime snake: []const u8) []const u8 {
+    @setEvalBranchQuota(10_000);
+    var result: []const u8 = "";
+    var upper = false;
+    for (snake) |byte| {
+        if (byte == '_') {
+            upper = true;
+            continue;
+        }
+        result = result ++ &[_]u8{if (upper) std.ascii.toUpper(byte) else byte};
+        upper = false;
+    }
+    return result;
 }
 
 fn listItems(node: Node, kind: Kind) []const Node {
@@ -572,8 +507,13 @@ fn listItems(node: Node, kind: Kind) []const Node {
 
 fn recordChildren(node: Node, list_kind: Kind, item_kind: Kind) []const Node {
     if (node.kind != .chromatogram) return listItems(node, list_kind);
-    for (node.children, 0..) |item, i|
-        if (item.kind == item_kind) return node.children[i .. i + 1];
+    return firstChild(node, item_kind);
+}
+
+/// The first child of this kind as a one-element slice, or an empty slice.
+fn firstChild(node: Node, kind: Kind) []const Node {
+    for (node.children, 0..) |child, i|
+        if (child.kind == kind) return node.children[i .. i + 1];
     return &.{};
 }
 
