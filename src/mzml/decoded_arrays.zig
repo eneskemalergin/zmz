@@ -1,4 +1,5 @@
-//! Stores decoded arrays for sequential and indexed reads without retaining Base64 text.
+//! Stores decoded arrays from decoded reads (nextDecodedRecord, byIdDecoded, atDecoded)
+//! and from records whose Base64 text was retained (decodeRecord, decodeArray).
 //!
 //! Each array keeps its source primitive, except Numpress output is always f64. Numeric
 //! buffers and shared wire scratch grow as needed and are reused between records.
@@ -6,6 +7,9 @@
 //! Results become visible only after the complete record succeeds. Returned slices last
 //! until the next decoded read using this owner, reset, or deinit; ordinary reads do not
 //! invalidate them. No source metadata is borrowed by this owner.
+//!
+//! startRecord, beginArray, text, finishArray, and complete are the reader engine's
+//! entry points while it parses a record; callers use the reads and decode functions.
 
 const std = @import("std");
 const model = @import("model.zig");
@@ -102,6 +106,8 @@ fn decodeRetained(self: *DecodedArrays, node: model.Node, groups: []const cv.Gro
     try self.text(binary.text orelse return error.PayloadNotRetained);
     try self.finishArray();
 }
+
+// --- Reader engine entry points ---
 
 pub fn startRecord(self: *DecodedArrays, node: model.Node) Error!void {
     self.default_length = if (node.attribute("defaultArrayLength")) |value| try cv.parseInteger(usize, value) else null;
