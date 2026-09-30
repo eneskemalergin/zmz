@@ -50,17 +50,26 @@ pub const Limits = struct {
 /// Payload selection does not discard retained XML fragments.
 pub const Payload = enum { retain, skip };
 
+/// What a selection callback sees. Every slice borrows only for the call.
+pub const Selection = struct {
+    /// The binaryDataArray for select, the record for select_record: its attributes and the
+    /// unexpanded parameters read so far, without children or text.
+    node: model.Node,
+    /// Zero-based array position within the record; zero for select_record.
+    position: usize = 0,
+    /// The header's parameter groups, for lookups such as node.parameter.
+    groups: []const cv.Group,
+};
+
 /// Chooses arrays after their leading parameters and before their binary text.
-/// The callback receives its zero-based array position within the record, source attributes,
-/// and unexpanded parameters. All slices borrow only for the call. Keep user_data valid
-/// while reading; it can hold header groups. Do not reenter the reader. Later checks can fail.
+/// Keep user_data valid while reading and do not reenter the reader. A returned error
+/// fails the read with a diagnostic. Later checks can still fail a selected array.
 pub const ArraySelector = struct {
     user_data: ?*anyopaque = null,
-    select: *const fn (?*anyopaque, usize, []const model.Attribute, []const cv.Entry) Payload,
-    /// Called once before the array list with the record kind, attributes, and parameters
-    /// read so far. Returning skip skips every array without calling select. Neither
-    /// callback sees later parameters; selection never removes record or array metadata.
-    select_record: ?*const fn (?*anyopaque, model.Kind, []const model.Attribute, []const cv.Entry) Payload = null,
+    select: *const fn (?*anyopaque, Selection) model.MetadataError!Payload,
+    /// Called once before the array list. Returning skip skips every array without calling
+    /// select. Neither callback sees later parameters; selection never removes metadata.
+    select_record: ?*const fn (?*anyopaque, Selection) model.MetadataError!Payload = null,
 };
 
 pub const Options = struct {
@@ -74,7 +83,7 @@ pub const Options = struct {
     retain_index: bool = false,
 };
 
-pub const Error = xml.Error || cv.ValueError || DecodedArrays.Error || std.mem.Allocator.Error || error{
+pub const Error = xml.Error || model.MetadataError || DecodedArrays.Error || std.mem.Allocator.Error || error{
     InvalidStructure,
     MissingAttribute,
     FailedState,
@@ -717,7 +726,7 @@ fn parseNodeFor(self: *StreamReader, storage: *Storage, depth: usize, advance_af
             storage.arrays += 1;
             if (child_payload == .retain) {
                 if (self.options.array_selector) |selector|
-                    child_payload = selector.select(selector.user_data, position, node.attributes, node.params);
+                    child_payload = try selector.select(selector.user_data, .{ .node = node, .position = position, .groups = self.header.groups });
             }
             if (self.decoded_arrays) |output| {
                 decode_array = child_payload == .retain;
@@ -775,8 +784,11 @@ fn parseNodeFor(self: *StreamReader, storage: *Storage, depth: usize, advance_af
             if (child_count == self.options.limits.list_entries) return try self.limitError(.list_entries, self.options.limits.list_entries, null);
             if (child_kind == .binary_data_array_list and storage == &self.record_store and child_payload == .retain) {
                 if (self.options.array_selector) |selector| {
-                    if (selector.select_record) |select|
-                        child_payload = select(selector.user_data, kind_value, node.attributes, self.param_scratch.items[params_start..]);
+                    if (selector.select_record) |select| {
+                        var view = node;
+                        view.params = self.param_scratch.items[params_start..];
+                        child_payload = try select(selector.user_data, .{ .node = view, .groups = self.header.groups });
+                    }
                 }
             }
             const child = try self.parseNodeFor(storage, depth + 1, true, child_payload, if (retention == .tree) .tree else .none);

@@ -11,6 +11,7 @@ pub const StreamReader = struct {
     pub const Limits = impl.Limits;
     pub const Payload = impl.Payload;
     pub const ArraySelector = impl.ArraySelector;
+    pub const Selection = impl.Selection;
     pub const Options = impl.Options;
     pub const Error = impl.Error;
     pub const Diagnostic = impl.Diagnostic;

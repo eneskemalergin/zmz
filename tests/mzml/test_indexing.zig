@@ -78,8 +78,8 @@ test "[failure] - [mzML diagnostics]: translates fresh and reused UTF-16 lookup 
 
 test "[integration] - [mzML 1.0 indexes]: retains IDs offsets and selected values in every lookup" {
     const Check = struct {
-        fn select(_: ?*anyopaque, position: usize, _: []const mzml.model.Attribute, _: []const mzml.cv.Entry) mzml.StreamReader.Payload {
-            return if (position == 0) .retain else .skip;
+        fn select(_: ?*anyopaque, view: mzml.StreamReader.Selection) mzml.model.MetadataError!mzml.StreamReader.Payload {
+            return if (view.position == 0) .retain else .skip;
         }
 
         fn run(allocator: std.mem.Allocator, bytes: []const u8, policy: mzml.IndexedReader.Policy, selected: bool) !void {
@@ -213,8 +213,8 @@ fn expectDecodedRecord(record: mzml.model.Record, groups: []const mzml.cv.Group,
 
 fn checkDecodedLookupAllocations(allocator: std.mem.Allocator, selected: bool) !void {
     const Selection = struct {
-        fn select(_: ?*anyopaque, position: usize, _: []const mzml.model.Attribute, _: []const mzml.cv.Entry) mzml.StreamReader.Payload {
-            return if (position == 1) .retain else .skip;
+        fn select(_: ?*anyopaque, view: mzml.StreamReader.Selection) mzml.model.MetadataError!mzml.StreamReader.Payload {
+            return if (view.position == 1) .retain else .skip;
         }
     };
     var index = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = @embedFile("data/writer_indexed.mzML") }, .{
@@ -276,16 +276,16 @@ test "[integration] - [mzML indexed decoding]: selects arrays and records withou
         calls: usize = 0,
         records: usize = 0,
 
-        fn record(data: ?*anyopaque, _: mzml.model.Kind, _: []const mzml.model.Attribute, _: []const mzml.cv.Entry) mzml.StreamReader.Payload {
+        fn record(data: ?*anyopaque, _: mzml.StreamReader.Selection) mzml.model.MetadataError!mzml.StreamReader.Payload {
             const self: *@This() = @ptrCast(@alignCast(data.?));
             self.records += 1;
             return if (self.skip_record) .skip else .retain;
         }
 
-        fn array(data: ?*anyopaque, position: usize, _: []const mzml.model.Attribute, _: []const mzml.cv.Entry) mzml.StreamReader.Payload {
+        fn array(data: ?*anyopaque, view: mzml.StreamReader.Selection) mzml.model.MetadataError!mzml.StreamReader.Payload {
             const self: *@This() = @ptrCast(@alignCast(data.?));
             self.calls += 1;
-            return if (position == 1) .retain else .skip;
+            return if (view.position == 1) .retain else .skip;
         }
     };
     const allocator = std.testing.allocator;
@@ -465,8 +465,8 @@ test "[integration] - [mzML index]: decodes explicit array lengths without a rec
     defer file.close(std.testing.io);
     try file.writeStreamingAll(std.testing.io, sink.written());
     const Selection = struct {
-        fn select(_: ?*anyopaque, position: usize, _: []const mzml.model.Attribute, _: []const mzml.cv.Entry) mzml.StreamReader.Payload {
-            return if (position == 1) .retain else .skip;
+        fn select(_: ?*anyopaque, view: mzml.StreamReader.Selection) mzml.model.MetadataError!mzml.StreamReader.Payload {
+            return if (view.position == 1) .retain else .skip;
         }
     };
     for ([_]mzml.IndexedReader.Source{ .{ .bytes = sink.written() }, .{ .file = .{ .handle = file, .io = std.testing.io } } }) |source| {
@@ -716,11 +716,11 @@ test "[integration] - [mzML indexed selection]: selects only fetched arrays and 
         calls: usize = 0,
         wrong_position: bool = false,
 
-        fn select(user_data: ?*anyopaque, position: usize, _: []const mzml.model.Attribute, _: []const mzml.cv.Entry) mzml.StreamReader.Payload {
+        fn select(user_data: ?*anyopaque, view: mzml.StreamReader.Selection) mzml.model.MetadataError!mzml.StreamReader.Payload {
             const self: *@This() = @ptrCast(@alignCast(user_data.?));
-            self.wrong_position = self.wrong_position or position != self.calls % 2;
+            self.wrong_position = self.wrong_position or view.position != self.calls % 2;
             self.calls += 1;
-            return if (position == 0) .retain else .skip;
+            return if (view.position == 0) .retain else .skip;
         }
     };
     const allocator = std.testing.allocator;
@@ -1517,7 +1517,7 @@ test "[failure] - [mzML indexed lookup]: checks the source after array selection
         changed: bool = false,
         failed: bool = false,
 
-        fn select(data: ?*anyopaque, _: usize, _: []const mzml.model.Attribute, _: []const mzml.cv.Entry) mzml.StreamReader.Payload {
+        fn select(data: ?*anyopaque, _: mzml.StreamReader.Selection) mzml.model.MetadataError!mzml.StreamReader.Payload {
             const self: *@This() = @ptrCast(@alignCast(data.?));
             self.file.setLength(std.testing.io, support.DOCUMENT.len - 1) catch {
                 self.failed = true;

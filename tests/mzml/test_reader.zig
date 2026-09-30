@@ -622,24 +622,18 @@ test "[failure] - [mzML 1.0 reading]: stops at truncated historical metadata or 
 
 const Selection = struct {
     mode: enum { second, named, group, all, none },
-    groups: []const mzml.cv.Group = &.{},
     calls: usize = 0,
     wrong_position: bool = false,
-    failure: ?mzml.model.LookupError = null,
 
-    fn select(user_data: ?*anyopaque, position: usize, attributes: []const mzml.model.Attribute, params: []const mzml.cv.Entry) mzml.StreamReader.Payload {
+    fn select(user_data: ?*anyopaque, view: mzml.StreamReader.Selection) mzml.model.MetadataError!mzml.StreamReader.Payload {
         const self: *Selection = @ptrCast(@alignCast(user_data.?));
-        self.wrong_position = self.wrong_position or position != self.calls % 2;
+        self.wrong_position = self.wrong_position or view.position != self.calls % 2;
         self.calls += 1;
-        const node: mzml.model.Node = .{ .kind = .binary_data_array, .attributes = attributes, .params = params };
         const keep = switch (self.mode) {
-            .second => position == 1,
+            .second => view.position == 1,
             .named, .group => blk: {
                 const accession = if (self.mode == .named) "X:unknown-role" else "MS:1000523";
-                const parameter = node.parameter(self.groups, .{ .raw = accession }) catch |err| {
-                    self.failure = err;
-                    return .retain;
-                } orelse break :blk false;
+                const parameter = try view.node.parameter(view.groups, .{ .raw = accession }) orelse break :blk false;
                 break :blk self.mode == .group or (std.mem.eql(u8, parameter.name.?, "future array") and parameter.value == null);
             },
             .all => true,
@@ -649,8 +643,8 @@ const Selection = struct {
     }
 };
 
-fn selectSecond(_: ?*anyopaque, position: usize, _: []const mzml.model.Attribute, _: []const mzml.cv.Entry) mzml.StreamReader.Payload {
-    return if (position == 1) .retain else .skip;
+fn selectSecond(_: ?*anyopaque, view: mzml.StreamReader.Selection) mzml.model.MetadataError!mzml.StreamReader.Payload {
+    return if (view.position == 1) .retain else .skip;
 }
 
 fn expectSelectedNode(expected: mzml.model.Node, actual: mzml.model.Node) !void {
@@ -977,32 +971,22 @@ test "[integration] - [mzML decoded selection]: preserves source positions, meta
 
 test "[integration] - [mzML decoded selection]: selects MS1 from record parameters available before the array list" {
     const RecordSelection = struct {
-        groups: []const mzml.cv.Group = &.{},
         records: usize = 0,
         arrays: usize = 0,
         saw_late: bool = false,
-        failure: ?mzml.model.MetadataError = null,
 
-        fn record(data: ?*anyopaque, kind: mzml.model.Kind, attributes: []const mzml.model.Attribute, params: []const mzml.cv.Entry) mzml.StreamReader.Payload {
+        fn record(data: ?*anyopaque, view: mzml.StreamReader.Selection) mzml.model.MetadataError!mzml.StreamReader.Payload {
             const self: *@This() = @ptrCast(@alignCast(data.?));
             self.records += 1;
-            if (kind != .spectrum) return .skip;
-            const node: mzml.model.Node = .{ .kind = kind, .attributes = attributes, .params = params };
-            self.saw_late = self.saw_late or node.parameter(self.groups, .{ .raw = "X:late" }) catch |err| {
-                self.failure = err;
-                return .skip;
-            } != null;
-            const level = node.integer(i32, self.groups, mzml.model.Terms.MS_LEVEL) catch |err| {
-                self.failure = err;
-                return .skip;
-            };
-            return if (level == 1) .retain else .skip;
+            if (view.node.kind != .spectrum) return .skip;
+            self.saw_late = self.saw_late or try view.node.parameter(view.groups, .{ .raw = "X:late" }) != null;
+            return if (try view.node.integer(i32, view.groups, mzml.model.Terms.MS_LEVEL) == 1) .retain else .skip;
         }
 
-        fn array(data: ?*anyopaque, position: usize, _: []const mzml.model.Attribute, _: []const mzml.cv.Entry) mzml.StreamReader.Payload {
+        fn array(data: ?*anyopaque, view: mzml.StreamReader.Selection) mzml.model.MetadataError!mzml.StreamReader.Payload {
             const self: *@This() = @ptrCast(@alignCast(data.?));
             self.arrays += 1;
-            return if (position == 1) .retain else .skip;
+            return if (view.position == 1) .retain else .skip;
         }
     };
     const header = try std.mem.replaceOwned(u8, std.testing.allocator, support.HEADER, "</referenceableParamGroup>", "<cvParam accession='MS:1000511' value='1'/></referenceableParamGroup>");
@@ -1028,14 +1012,14 @@ test "[integration] - [mzML decoded selection]: selects MS1 from record paramete
             .array_selector = .{ .user_data = &selection, .select = RecordSelection.array, .select_record = RecordSelection.record },
         });
         defer reader.deinit();
-        selection.groups = (try reader.readHeader()).groups;
+        const groups = (try reader.readHeader()).groups;
         var output = mzml.StreamReader.DecodedArrays.init(std.testing.allocator, .{});
         defer output.deinit();
         var count: usize = 0;
         while (if (numeric) try reader.nextDecodedRecord(&output) else try reader.nextRecord()) |record| {
             defer count += 1;
             if (count == 0) {
-                try std.testing.expect((try record.node.parameter(selection.groups, .{ .raw = "X:late" })) != null);
+                try std.testing.expect((try record.node.parameter(groups, .{ .raw = "X:late" })) != null);
                 if (numeric) {
                     try std.testing.expectEqual(@as(usize, 1), output.len());
                     try std.testing.expectEqual(@as(usize, 1), output.get(0).?.source_position);
@@ -1049,7 +1033,29 @@ test "[integration] - [mzML decoded selection]: selects MS1 from record paramete
         try std.testing.expectEqual(@as(usize, 4), selection.records);
         try std.testing.expectEqual(@as(usize, 2), selection.arrays);
         try std.testing.expect(!selection.saw_late);
-        try std.testing.expectEqual(null, selection.failure);
+    }
+}
+
+test "[failure] - [mzML selection]: fails the read with a diagnostic when a callback fails" {
+    const Level = struct {
+        fn record(_: ?*anyopaque, view: mzml.StreamReader.Selection) mzml.model.MetadataError!mzml.StreamReader.Payload {
+            return if (try view.node.integer(i32, view.groups, mzml.model.Terms.MS_LEVEL) == 1) .retain else .skip;
+        }
+    };
+    const level = "<cvParam cvRef='MS' accession='MS:1000511' name='ms level' value='1'/>";
+    const source = try std.mem.replaceOwned(u8, std.testing.allocator, support.DOCUMENT, "defaultArrayLength='1'><scanList", "defaultArrayLength='1'>" ++ level ++ level ++ "<scanList");
+    defer std.testing.allocator.free(source);
+    for ([_]bool{ false, true }) |numeric| {
+        var input = std.Io.Reader.fixed(source);
+        var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{
+            .array_selector = .{ .select = selectSecond, .select_record = Level.record },
+        });
+        defer reader.deinit();
+        var output = mzml.StreamReader.DecodedArrays.init(std.testing.allocator, .{});
+        defer output.deinit();
+        try std.testing.expectError(error.RepeatedParameter, if (numeric) reader.nextDecodedRecord(&output) else reader.nextRecord());
+        try std.testing.expectEqual(.invalid_value, reader.diagnostic().?.id);
+        try std.testing.expectError(error.FailedState, reader.nextRecord());
     }
 }
 
@@ -2130,7 +2136,6 @@ test "[integration] - [mzML array selection]: preserves metadata and selected va
                 });
                 defer reader.deinit();
                 const header = try reader.readHeader();
-                selection.groups = header.groups;
                 try std.testing.expectEqual(@as(usize, 0), selection.calls);
 
                 var reference_input = std.Io.Reader.fixed(source);
@@ -2176,7 +2181,6 @@ test "[integration] - [mzML array selection]: preserves metadata and selected va
                 try std.testing.expectEqualDeep((try reference.readHeader()).*, header.*);
                 try std.testing.expectEqual(@as(usize, 4), selection.calls);
                 try std.testing.expect(!selection.wrong_position);
-                try std.testing.expectEqual(null, selection.failure);
             }
         }
     }
