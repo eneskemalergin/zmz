@@ -1,9 +1,8 @@
 //! Builds explicit record indexes over stable bytes or a borrowed regular file.
 //!
-//! Opening reads the header and embedded index without scanning every record or
-//! hashing the file. Rebuilding requires an explicit policy and parses the file once.
-//! Lookups use saved ancestor opening tags and read one record span; they never
-//! rebuild or scan preceding records. Keep the source unchanged.
+//! Opening reads only the header and the embedded index, and a damaged or missing index is an
+//! error, never a silent rebuild; rebuilding is its own policy and parses the file once. Each
+//! lookup reads one record span using saved ancestor opening tags. Keep the source unchanged.
 
 const std = @import("std");
 const model = @import("model.zig");
@@ -32,7 +31,7 @@ pub const Options = struct {
     policy: Policy = .open_embedded,
     max_records: usize = 1_000_000,
     index_bytes: usize = 256 * 1024 * 1024,
-    /// Maximum raw XML record span read by a lookup, separate from retained-node limits.
+    /// Largest raw XML record span a lookup reads.
     record_span_bytes: usize = 256 * 1024 * 1024,
     /// Bounded backward search for indexListOffset when opening an embedded index.
     tail_bytes: usize = 64 * 1024,
@@ -71,8 +70,8 @@ lookup_reader: ?StreamReader = null,
 lookup_kind: ?model.Kind = null,
 failure: ?Diagnostic = null,
 
-/// Builds an index under the selected policy, retaining metadata but not payloads.
-/// No automatic fallback occurs. Release with deinit; do not copy the returned owner.
+/// Builds an index under options.policy, keeping metadata but no payloads. Do not copy the
+/// returned reader.
 pub fn build(allocator: std.mem.Allocator, source: Source, options: Options) Error!IndexedReader {
     var failure: ?Diagnostic = null;
     return buildWithDiagnostic(allocator, source, options, &failure);
@@ -161,7 +160,7 @@ fn buildInner(allocator: std.mem.Allocator, source: Source, options: Options, fa
     return self;
 }
 
-/// Releases index and metadata storage, not the borrowed source or returned owned records.
+/// Leaves the source and returned records alive.
 pub fn deinit(self: *IndexedReader) void {
     if (self.lookup_reader) |*reader| reader.deinit();
     if (self.metadata) |*metadata| metadata.deinit();
@@ -171,8 +170,8 @@ pub fn deinit(self: *IndexedReader) void {
     self.* = undefined;
 }
 
-/// Returns metadata until deinit. Observed counts remain zero with open_embedded;
-/// its counts come from the index, not a complete traversal of the record lists.
+/// Valid until deinit. With open_embedded, list observed counts stay zero; the index gives the
+/// record counts.
 pub fn header(self: *const IndexedReader) *const model.Header {
     return &self.metadata.?.value;
 }
@@ -201,11 +200,8 @@ pub fn at(self: *IndexedReader, allocator: std.mem.Allocator, kind: model.Kind, 
     return try self.readEntry(allocator, self.entries.items[position], null);
 }
 
-/// Returns independent metadata and decodes selected arrays into caller-owned reusable storage.
-/// Without reader.array_selector, decodes every modeled array. Extra XML stays uninterpreted.
-/// Modeled binary text is omitted; payload is ignored.
-/// Missing IDs and failures clear output. A failed lookup stops immediately; later lookups may retry.
-/// Numeric slices last until output is reused, reset, or deinitialized, independently of metadata.
+/// Like byId, decoding the selected arrays into output as StreamReader.nextDecodedRecord does,
+/// without their binary text. An absent ID or a failure leaves output empty.
 pub fn byIdDecoded(self: *IndexedReader, allocator: std.mem.Allocator, id: []const u8, output: *DecodedArrays) Error!?owned.Record {
     self.failure = null;
     errdefer |err| self.capture(err, .index, .none);
@@ -280,8 +276,7 @@ fn readEntry(self: *IndexedReader, allocator: std.mem.Allocator, entry: Entry, o
     return record;
 }
 
-/// Reads one record fragment with the index's groups and optional decoded output,
-/// cleared again afterwards so the lookup reader never keeps them.
+// Lends the index's groups and the decoded output to the lookup reader for one fragment only.
 fn readFragment(
     reader: *StreamReader,
     allocator: std.mem.Allocator,

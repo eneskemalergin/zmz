@@ -1,6 +1,7 @@
 //! Composes primitive or Numpress bytes, optional zlib, and padded Base64.
 //!
-//! These operations do not interpret CV terms or infer an array's scientific role.
+//! Only Encoder allocates. Caller buffers must be disjoint unless a function says otherwise,
+//! and their contents after a failure are unspecified.
 
 const std = @import("std");
 const base64 = @import("base64.zig");
@@ -21,14 +22,12 @@ pub const Scratch = struct {
     transformed: []u8,
 };
 
-/// Lossy transforms require explicit caller selection; Linear and SLOF require a fixed point.
-/// An unused fixed point is rejected instead of silently ignored.
+/// Linear and SLOF need fixed_point; every other pipeline rejects one.
 pub const EncodeOptions = struct {
     pipeline: Pipeline = .none,
     fixed_point: ?f64 = null,
 };
 
-/// Composition errors retain the underlying lexical and codec distinctions.
 pub const Error = base64.Error || zlib.Error || numpress.Error || error{
     TypeMismatch,
     MissingFixedPoint,
@@ -36,9 +35,8 @@ pub const Error = base64.Error || zlib.Error || numpress.Error || error{
     MissingCompressor,
 };
 
-/// Decodes exactly output.len values. T is f32, f64, i32, or i64; Numpress requires f64.
-/// Primitive bytes are little endian and float bits are preserved without conversion.
-/// No allocation occurs. Output and scratch contents after failure are unspecified.
+/// Decodes exactly output.len values. T is f32, f64, i32, or i64, and Numpress needs f64.
+/// Primitive bytes are little endian, and float bits are kept exactly.
 pub fn decode(
     comptime T: type,
     output: []T,
@@ -57,10 +55,8 @@ pub fn decode(
     try decodeWireInner(T, output, destination[0..counts.decoded_bytes], pipeline, scratch.transformed);
 }
 
-/// Decodes bytes after Base64 into exactly output.len values without allocation.
-/// T and primitive byte order follow decode. Transformed scratch is needed only for
-/// Numpress with zlib. Buffers must be disjoint, except that .none permits source and
-/// output to start at the same address.
+/// Like decode, starting from the bytes after Base64. transformed is used only by Numpress
+/// with zlib. With pipeline none, source may start at output's address to convert in place.
 pub fn decodeWire(
     comptime T: type,
     output: []T,
@@ -108,8 +104,8 @@ fn decodeWireInner(comptime T: type, output: []T, source: []const u8, pipeline: 
     }
 }
 
-/// Encodes values into caller-owned Base64 storage and returns its written prefix.
-/// A reusable compressor is required only for zlib pipelines. No allocation occurs here.
+/// Encodes values as Base64 into output and returns the written prefix. compressor is needed
+/// only for zlib pipelines.
 pub fn encode(
     comptime T: type,
     output: []u8,
@@ -123,10 +119,8 @@ pub fn encode(
     return base64.encode(output, try encodeWire(T, values, options, scratch, compressor));
 }
 
-/// Prepares primitive or Numpress bytes with optional zlib, without Base64 or allocation.
-/// The result borrows values on little-endian primitive paths without zlib; otherwise it
-/// borrows scratch until that buffer is reused. All supplied buffers must remain disjoint.
-/// A reusable compressor is required only for zlib pipelines.
+/// Like encode, stopping before Base64. The result borrows values for little-endian
+/// primitives without zlib, and scratch otherwise.
 pub fn encodeWire(
     comptime T: type,
     values: []const T,
@@ -177,12 +171,11 @@ pub fn encodeWire(
     return wire;
 }
 
-/// Encoder failures: composition errors or failed allocation of its storage.
 pub const EncodeError = Error || std.mem.Allocator.Error;
 
 /// Encodes arrays with storage it owns: scratch, the zlib compressor (allocated on first
-/// use), and one output buffer per array encoded since the last reset. Callers size and
-/// retry nothing. Do not copy an initialized encoder.
+/// use), and one output buffer per array encoded since the last reset. Do not copy an
+/// initialized encoder.
 pub const Encoder = struct {
     allocator: std.mem.Allocator,
     preset: zlib.Preset,

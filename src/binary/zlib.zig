@@ -1,10 +1,10 @@
-//! Handles independent zlib array streams with zipir.
+//! Handles independent zlib array streams with zipir. Buffers must be disjoint.
 
 const std = @import("std");
 const zipir = @import("zipir");
 const overlaps = @import("core.zig").overlaps;
 
-/// Checked stream failures. Partial output is unspecified and never exceeds its buffer.
+/// Output after a failure is unspecified but stays within its buffer.
 pub const Error = error{
     InvalidData,
     TruncatedInput,
@@ -19,8 +19,8 @@ pub const Error = error{
 /// between zipir versions; they always decode to the same values.
 pub const Preset = enum { fast, even, dense };
 
-/// Decodes exactly one complete zlib stream into disjoint caller storage.
-/// The destination capacity bounds expansion. Checks Adler-32 and rejects concatenation.
+/// Decodes exactly one zlib stream into output, checking its Adler-32. Trailing bytes, such as
+/// a second stream, are an error, and expanding past output's capacity is OutputTooSmall.
 pub fn decompress(output: []u8, source: []const u8) Error![]u8 {
     if (overlaps(output, source)) return error.OverlappingBuffers;
     // zipir asserts distinct addresses even for empty slices, which are disjoint here.
@@ -65,18 +65,17 @@ pub const Compressor = struct {
     state: *zipir.zlib.Compressor,
     preset: Preset,
 
-    /// Allocates reusable state (one zipir compressor). Release it with deinit.
+    /// Allocates one zipir compressor.
     pub fn init(allocator: std.mem.Allocator, preset: Preset) std.mem.Allocator.Error!Compressor {
         return .{ .allocator = allocator, .state = try allocator.create(zipir.zlib.Compressor), .preset = preset };
     }
 
-    /// Releases all compression storage and invalidates this instance.
     pub fn deinit(self: *Compressor) void {
         self.allocator.destroy(self.state);
         self.* = undefined;
     }
 
-    /// Writes one zlib stream without allocating. Source and output must not overlap.
+    /// Writes one zlib stream without allocating.
     pub fn compress(self: *Compressor, output: []u8, source: []const u8) Error![]u8 {
         if (overlaps(output, source)) return error.OverlappingBuffers;
         // zipir's only compression error is a full output writer.

@@ -11,7 +11,7 @@ const arrays = @import("../binary/arrays.zig");
 
 // --- Source hierarchy ---
 
-/// mzML element identities; parameter entries are represented separately.
+/// mzML element identities; cvParam, userParam, and group references live in Node.params.
 pub const Kind = enum {
     mzml,
     cv_list,
@@ -88,9 +88,8 @@ pub const Kind = enum {
 
 pub const Attribute = cv.Attribute;
 
-/// Forward items after the header, in source order. Reader-owned records and XML
-/// expire on the next traversal call. List attributes live with the header.
-/// XML is self-contained UTF-8; copy its bytes to keep it beyond that call.
+/// Forward items after the header, in source order. List attributes live with the header;
+/// XML is self-contained UTF-8.
 pub const Item = union(enum) {
     list_start: struct { kind: Kind, list: RecordList },
     record: Record,
@@ -107,10 +106,9 @@ pub const Content = struct {
     pub const Item = union(enum) { params: usize, children: usize, xml: []const u8 };
 };
 
-/// A faithful mzML node, bounded to header metadata or one record, never a complete run.
-/// Parameter order and multiplicity are preserved. Extra XML keeps namespace bindings;
-/// known mzML prefixes, comments, and formatting need not match the source.
-/// Later occurrences of singular metadata containers remain in content as XML, not children.
+/// An mzML node from header metadata or one record, keeping parameter order and multiplicity.
+/// Extra XML keeps its namespace bindings; prefixes, comments, and formatting may differ from
+/// the source. Repeats of a singular metadata container stay in content as XML.
 pub const Node = struct {
     kind: Kind,
     attributes: []const Attribute = &.{},
@@ -126,7 +124,7 @@ pub const Node = struct {
     /// Zero until the closing tag has been consumed, or for caller-constructed nodes.
     end_offset: u64 = 0,
 
-    /// Looks up an unqualified attribute without changing its source spelling.
+    /// Looks up an attribute by unqualified name.
     pub fn attribute(self: Node, name: []const u8) ?[]const u8 {
         for (self.attributes) |attr| {
             if (attr.namespace_uri == null and std.mem.eql(u8, name, attr.name)) return attr.value;
@@ -134,8 +132,7 @@ pub const Node = struct {
         return null;
     }
 
-    /// Returns the first immediate child with this schema identity.
-    /// Repeated children remain available through children; this helper does not assert uniqueness.
+    /// Returns the first immediate child of this kind; repeats stay in children.
     pub fn child(self: Node, kind: Kind) ?Node {
         for (self.children) |node| if (node.kind == kind) return node;
         return null;
@@ -147,8 +144,7 @@ pub const Node = struct {
         return try cv.parseInteger(usize, value);
     }
 
-    /// Borrows this cv element's fields without resolving them.
-    /// Other node kinds return UnexpectedElement.
+    /// Reads this cv element's declaration fields as written.
     pub fn cvDeclaration(self: Node) error{UnexpectedElement}!cv.Declaration {
         if (self.kind != .cv) return error.UnexpectedElement;
         return .{
@@ -159,8 +155,8 @@ pub const Node = struct {
         };
     }
 
-    /// Returns one effective parameter, null when absent, or RepeatedParameter.
-    /// Group expansion errors propagate; returned text borrows from this node and groups.
+    /// Returns the one parameter with this accession, looking through group references: null
+    /// when absent, RepeatedParameter when there are several. Text borrows from node and groups.
     pub fn parameter(self: Node, groups: []const cv.Group, accession: cv.Accession) LookupError!?cv.Param {
         return switch (try cv.findOne(self.params, groups, accession)) {
             .missing => null,
@@ -169,36 +165,34 @@ pub const Node = struct {
         };
     }
 
-    /// Parses a unique parameter's decimal integer without changing its source fields.
-    /// Null means the parameter is absent, not that its value is missing or malformed.
+    /// Parses the unique parameter's value as a decimal integer. Null means the parameter is
+    /// absent; a missing or malformed value is an error.
     pub fn integer(self: Node, comptime T: type, groups: []const cv.Group, accession: cv.Accession) (LookupError || cv.ValueError)!?T {
         const param = try self.parameter(groups, accession) orelse return null;
         return try cv.parseInteger(T, param.value);
     }
 
-    /// Parses a unique floating parameter and retains its complete source parameter.
-    /// Units remain unresolved and unconverted.
+    /// Parses the unique parameter's value as a float, returned with its source parameter.
+    /// Units are not converted.
     pub fn number(self: Node, groups: []const cv.Group, accession: cv.Accession) (LookupError || cv.ValueError)!?Number {
         const param = try self.parameter(groups, accession) orelse return null;
         return .{ .value = try cv.parseFloat(f64, param.value), .parameter = param };
     }
 
-    /// Reads this scan's start time without choosing a scan or converting its units.
-    /// Other node kinds return UnexpectedElement; null means no start-time parameter.
+    /// Reads this scan's start time in its source units; null when absent.
     pub fn scanStartTime(self: Node, groups: []const cv.Group) MetadataError!?Number {
         if (self.kind != .scan) return error.UnexpectedElement;
         return self.number(groups, Terms.SCAN_START_TIME);
     }
 
-    /// Returns selected ions from the first list in source order, without copying.
-    /// Other node kinds return UnexpectedElement; an absent list returns an empty slice.
+    /// Returns the selected ions of the first selectedIonList in source order; empty without one.
     pub fn selectedIons(self: Node) error{UnexpectedElement}![]const Node {
         if (self.kind != .precursor) return error.UnexpectedElement;
         return listItems(self, .selected_ion_list);
     }
 
-    /// Parses this selected ion's independent fields; no missing field is inferred.
-    /// Falls back to the historical m/z term; charge uses signed xs:int range.
+    /// Parses this selected ion's fields; each absent one stays null. m/z falls back to the
+    /// historical term; charge is a signed xs:int.
     pub fn selectedIonValues(self: Node, groups: []const cv.Group) MetadataError!SelectedIon {
         if (self.kind != .selected_ion) return error.UnexpectedElement;
         return .{
@@ -208,8 +202,7 @@ pub const Node = struct {
         };
     }
 
-    /// Parses this isolation window without computing boundaries or assuming symmetry.
-    /// Other node kinds return UnexpectedElement; each absent parameter remains null.
+    /// Parses this isolation window's target and offsets as written; each absent one stays null.
     pub fn isolationWindowValues(self: Node, groups: []const cv.Group) MetadataError!IsolationWindow {
         if (self.kind != .isolation_window) return error.UnexpectedElement;
         return .{
@@ -220,65 +213,52 @@ pub const Node = struct {
     }
 };
 
-/// Lookup failures never collapse repeated parameters into a first or last value.
+/// A repeated parameter or array is an error, never resolved to one of its copies.
 pub const LookupError = cv.ExpansionError || error{ RepeatedParameter, RepeatedArray };
 
-/// A parsed number with borrowed source spelling and independently optional unit fields.
+/// A parsed number with its source spelling and optional unit fields.
 pub const Number = struct { value: f64, parameter: cv.Param };
 
 /// Scientific access failures, including wrong node kinds and contradictory flags.
 pub const MetadataError = LookupError || cv.ValueError || error{ UnexpectedElement, ConflictingParameter };
 
-/// Recognized source polarity, never inferred from an ion's charge state.
+/// Polarity as declared by the source.
 pub const Polarity = enum { positive, negative };
 
-/// Recognized spectrum representation, never inferred from binary values.
+/// Spectrum representation as declared by the source.
 pub const Representation = enum { centroid, profile };
 
-/// Independent selected-ion values; numeric quantities retain their source parameters.
-/// Missing charge stays null rather than becoming zero. No charge or intensity is inferred.
+/// Selected-ion values as declared; each keeps its source parameter, and absent ones are null.
 pub const SelectedIon = struct { mz: ?Number, charge: ?i32, intensity: ?Number };
 
-/// Source target and offsets with independent presence and unchanged units.
-/// Offsets are extents below and above the target, not absolute bounds.
+/// Isolation target and offsets as declared, each optional, in source units. Offsets are
+/// distances below and above the target, not absolute bounds.
 pub const IsolationWindow = struct { target: ?Number, lower_offset: ?Number, upper_offset: ?Number };
 
-/// Exact common PSI-MS accessions, not an ontology or an exhaustive list of valid terms.
+/// Common PSI-MS accessions used by the helpers; other terms are equally valid.
 pub const Terms = struct {
     pub const MS_LEVEL: cv.Accession = .{ .raw = "MS:1000511" };
     /// Positive scan polarity, also used on chromatograms.
     pub const POSITIVE_SCAN: cv.Accession = .{ .raw = "MS:1000130" };
     /// Negative scan polarity, also used on chromatograms.
     pub const NEGATIVE_SCAN: cv.Accession = .{ .raw = "MS:1000129" };
-    /// Discrete peak-coordinate representation.
     pub const CENTROID_SPECTRUM: cv.Accession = .{ .raw = "MS:1000127" };
-    /// Distributed signal representation across each peak's coordinate range.
     pub const PROFILE_SPECTRUM: cv.Accession = .{ .raw = "MS:1000128" };
-    /// Scan start time; source units may be seconds or minutes.
+    /// Source units may be seconds or minutes.
     pub const SCAN_START_TIME: cv.Accession = .{ .raw = "MS:1000016" };
-    /// Selected ion mass-to-charge ratio.
     pub const SELECTED_ION_MZ: cv.Accession = .{ .raw = "MS:1000744" };
     /// Obsolete m/z term that historical files use for the selected ion.
     pub const HISTORICAL_SELECTED_ION_MZ: cv.Accession = .{ .raw = "MS:1000040" };
-    /// Signed charge state.
     pub const CHARGE_STATE: cv.Accession = .{ .raw = "MS:1000041" };
-    /// Selected peak intensity; source units are not inferred.
     pub const PEAK_INTENSITY: cv.Accession = .{ .raw = "MS:1000042" };
-    /// Isolation window target mass-to-charge ratio.
     pub const ISOLATION_TARGET_MZ: cv.Accession = .{ .raw = "MS:1000827" };
-    /// Isolation window lower offset from the target.
     pub const ISOLATION_LOWER_OFFSET: cv.Accession = .{ .raw = "MS:1000828" };
-    /// Isolation window upper offset from the target.
     pub const ISOLATION_UPPER_OFFSET: cv.Accession = .{ .raw = "MS:1000829" };
-    /// Mass-to-charge array role.
     pub const MZ_ARRAY: cv.Accession = .{ .raw = "MS:1000514" };
-    /// Intensity array role.
     pub const INTENSITY_ARRAY: cv.Accession = .{ .raw = "MS:1000515" };
-    /// Time array role; source units are not inferred.
     pub const TIME_ARRAY: cv.Accession = .{ .raw = "MS:1000595" };
 };
 
-/// Header metadata stays alive independently of the reusable record storage.
 pub const Header = struct {
     document: Node,
     run: Node,
@@ -286,35 +266,33 @@ pub const Header = struct {
     namespace_uri: []const u8 = "http://psi.hupo.org/ms/mzml",
     /// Definitions from the first group list; extra lists remain uninterpreted XML.
     groups: []const cv.Group = &.{},
-    /// An indexed wrapper was observed; its index and checksum have not been verified.
+    /// An indexed wrapper was seen; its index and checksum are not verified.
     indexed: bool = false,
     /// List descriptors become available when their opening tag is reached.
     spectrum_list: ?RecordList = null,
     chromatogram_list: ?RecordList = null,
 };
 
-/// Preserves the source count, or null when absent, without comparing it to traversed records.
-/// observed_count increases as records are consumed, independently of declared_count.
+/// declared_count is the source count attribute (null when absent); observed_count counts the
+/// records consumed so far. The two are not compared.
 pub const RecordList = struct {
     attributes: []const Attribute,
     declared_count: ?usize,
     observed_count: usize = 0,
 };
 
-/// A spectrum or chromatogram with exact source identity and its complete child hierarchy.
-/// Identity and length fields are parsed snapshots, not setters for node.attributes.
-/// Missing source numbers remain null, distinct from zero or an indexed lookup ordinal.
-/// Writers consume node; arrays() uses default_array_length. Edit caller-owned node views
-/// for writing, and keep cached fields consistent if using the edited Record for reading.
-/// Helpers read modeled nodes, not extra containers retained in Node.content.
+/// A spectrum or chromatogram with its complete child hierarchy. id, index, and
+/// default_array_length are parsed copies of node attributes (null when absent): writers use
+/// node, so edit node to change output and keep these fields consistent when reading the
+/// edited record. Helpers read modeled children, not extra containers kept in Node.content.
 pub const Record = struct {
     node: Node,
     id: []const u8,
     index: ?usize,
     default_array_length: ?usize,
 
-    /// Parses the spectrum's MS level in xs:int range without imposing an analysis policy.
-    /// Null means absent. Chromatograms and other node kinds return UnexpectedElement.
+    /// Parses the spectrum's MS level (xs:int range); null when absent. Chromatograms return
+    /// UnexpectedElement.
     pub fn msLevel(self: Record, groups: []const cv.Group) MetadataError!?i32 {
         if (self.node.kind != .spectrum) return error.UnexpectedElement;
         return self.node.integer(i32, groups, Terms.MS_LEVEL);
@@ -338,15 +316,13 @@ pub const Record = struct {
         return if (centroid) .centroid else .profile;
     }
 
-    /// Returns modeled scans in source order. Chromatograms have no scan list.
-    /// Like binaryArrays, list access borrows a structurally valid record hierarchy.
+    /// Returns modeled scans in source order; empty for chromatograms.
     pub fn scans(self: Record) []const Node {
         if (self.node.child(.spectrum_description)) |description| return firstChild(description, .scan);
         return listItems(self.node, .scan_list);
     }
 
     /// Returns modeled spectrum precursors or the first direct chromatogram precursor.
-    /// Borrows nodes without copying or parameter interpretation.
     pub fn precursors(self: Record) []const Node {
         return recordChildren(self.node.child(.spectrum_description) orelse self.node, .precursor_list, .precursor);
     }
@@ -362,10 +338,8 @@ pub const Record = struct {
         return list.children;
     }
 
-    /// Returns typed array descriptors in source order without allocating.
-    /// Classification and array-length parsing happen once when each item is read.
-    /// Unknown roles remain available; unknown primitive or compression terms return an error.
-    /// The record nodes and groups must remain valid until iteration ends.
+    /// Iterates typed array descriptors in source order without allocating. Unknown roles are
+    /// returned; unknown primitive or compression terms are errors.
     pub fn arrays(self: Record, groups: []const cv.Group) BinaryArrayIterator {
         return .{
             .nodes = self.binaryArrays(),
@@ -374,9 +348,8 @@ pub const Record = struct {
         };
     }
 
-    /// Finds a unique array by exact role accession, including caller-defined roles.
-    /// Repeated role parameters or matching arrays fail rather than discarding multiplicity.
-    /// Other roles and unknown metadata remain available through binaryArrays.
+    /// Finds the one array with this role accession, including caller-defined roles; several
+    /// matches are an error.
     pub fn arrayByRole(self: Record, groups: []const cv.Group, role: cv.Accession) LookupError!?Node {
         var result: ?Node = null;
         for (self.binaryArrays()) |node| {
@@ -394,8 +367,7 @@ pub const Primitive = encoding.Primitive;
 pub const Encoding = encoding.Descriptor;
 pub const EncodingError = encoding.Error;
 
-/// A source-preserving binary array with its reviewed wire descriptor and value count.
-/// The node and all of its slices remain borrowed from the current record or owned copy.
+/// A binary array node with its classified encoding and value count.
 pub const BinaryArray = struct {
     node: Node,
     encoding: Encoding,
@@ -429,8 +401,7 @@ pub const BinaryArray = struct {
     }
 };
 
-/// Iterates borrowed record arrays as typed descriptors without retaining new storage.
-/// The source nodes and groups must remain valid until iteration ends.
+/// Keep the source nodes and groups alive while iterating.
 pub const BinaryArrayIterator = struct {
     nodes: []const Node,
     groups: []const cv.Group,
@@ -453,14 +424,14 @@ pub const BinaryArrayIterator = struct {
 
 const BinaryArrayError = EncodingError || cv.ValueError;
 
-/// Classifies reviewed wire terms without guessing defaults or resolving an ontology.
+/// Classifies a binary array's primitive and compression terms; a missing term is an error.
 pub fn arrayEncoding(node: Node, groups: []const cv.Group) EncodingError!Encoding {
     if (node.kind != .binary_data_array) return error.NotBinaryArray;
     return encoding.classify(node.params, groups);
 }
 
-/// Decodes one current record array into an exact-size caller buffer without allocation.
-/// Unknown roles do not block decoding. No primitive conversion or unit conversion is performed.
+/// Decodes one array into an exact-size caller buffer without allocating, whatever its role.
+/// Values keep their declared primitive and units.
 pub fn decodeArray(
     comptime T: type,
     output: []T,

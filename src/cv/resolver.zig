@@ -1,7 +1,7 @@
 //! Resolves source parameters through document declarations without rewriting them.
 //!
-//! Inputs, resource tables, bindings, and returned views are borrowed. No operation
-//! performs I/O, allocates, selects codecs, reconstructs historical resources, or converts units.
+//! Inputs, resource tables, bindings, and returned views are borrowed. Nothing allocates or
+//! does I/O, and units are never converted.
 
 const std = @import("std");
 const cv = @import("source.zig");
@@ -18,8 +18,8 @@ max_work: usize = 100_000,
 /// Explicit association for a local declaration ID, including stale or custom declarations.
 pub const Binding = struct { declaration_id: []const u8, resource_key: []const u8 };
 
-/// A reviewed relationship to a selected resource, never inferred by sorting version strings.
-/// This classifies a producer claim; it does not supply historical term metadata.
+/// The caller's reviewed relationship between a declared version and the selected resource;
+/// version strings are never compared to infer one.
 pub const KnownVersion = struct {
     resource_key: []const u8,
     version: []const u8,
@@ -53,7 +53,7 @@ pub const Issues = struct {
     unrecognized_declaration_name: bool = false,
 };
 
-/// Borrows the selected declaration and table entry, retaining the actual lookup identity.
+/// The selected declaration and table entry, with the accession actually looked up.
 pub const Term = struct {
     declaration: ?*const cv.Declaration = null,
     resource: ?*const Vocabulary = null,
@@ -72,20 +72,19 @@ pub const Parameter = struct {
     unit_allowed: enum { unresolved, not_declared, allowed, disallowed },
 };
 
-/// A caller-selected numeric type with borrowed source and independent resolution results.
-/// Inspect parameter.unit_fields, parameter.unit, and parameter.unit_allowed before
-/// interpreting the numeric units. The source value is not converted.
+/// A number of the caller's chosen type with its resolved parameter. Check parameter.unit_fields,
+/// unit, and unit_allowed before interpreting its units; the value is not converted.
 pub fn Quantity(comptime T: type) type {
     if (@typeInfo(T) != .int and T != f32 and T != f64)
         @compileError("quantity requires an integer, f32, or f64");
     return struct { value: T, parameter: Parameter };
 }
 
-/// Ambiguous declarations or configuration do not silently select the first match.
+/// Ambiguity is an error; no first match is chosen.
 pub const Error = error{ LimitExceeded, DuplicateDeclaration, InvalidBinding, AmbiguousResource, ConflictingVersion };
 
-/// Uses the bundled current snapshots only when the caller explicitly creates a resolver.
-/// `declarations` must outlive all resolutions. No historical snapshots are bundled.
+/// Resolves against the bundled current vocabulary snapshots; `declarations` must outlive every
+/// resolution. Historical snapshots are not bundled.
 pub fn init(declarations: []const cv.Declaration) Resolver {
     return .{
         .resources = @import("generated_data.zig").RESOURCES,
@@ -126,9 +125,8 @@ pub fn resolve(self: Resolver, parameter: cv.Param) Error!Parameter {
     return result;
 }
 
-/// Parses a supplied parameter, then resolves its term and source unit without conversion.
-/// Numeric errors precede resolver errors. Unknown, absent, partial, and disallowed units
-/// remain diagnostics alongside the value. No ontology datatype or finite-value policy is imposed.
+/// Parses the parameter's value, then resolves its term and unit. Numeric errors come first;
+/// unit problems are diagnostics alongside the value.
 pub fn quantity(self: Resolver, comptime T: type, parameter: cv.Param) (cv.ValueError || Error)!Quantity(T) {
     const value = if (@typeInfo(T) == .int)
         try cv.parseInteger(T, parameter.value)

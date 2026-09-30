@@ -1,9 +1,9 @@
-//! Constructs owned mzML metadata and encoded arrays with explicit allocation limits.
+//! Constructs owned mzML metadata and encoded arrays within a byte limit.
 //!
-//! Returned metadata lasts until reset or deinit. Metadata and ordinary Base64 inputs are
-//! copied; prepared wire borrows values or caller scratch until writing completes. Constructed
-//! arrays are reused by records in the same builder. Failed operations
-//! may consume arena capacity; reset releases that storage and invalidates previous views.
+//! Returned metadata is copied from its inputs and lasts until reset or deinit. Prepared wire
+//! belongs to the arrays.Encoder until its reset, or borrows little-endian primitive values.
+//! Failed operations may consume arena capacity; reset releases it and invalidates earlier
+//! views. Do not copy an initialized builder.
 
 const std = @import("std");
 const cv = @import("../cv/source.zig");
@@ -18,7 +18,6 @@ const xml = @import("../xml/mzml_adapter.zig");
 
 const Builder = @This();
 
-/// Construction checks, codec errors, and bounded allocation failures.
 pub const Error = owned.Error || schema.Error || arrays.Error || model.EncodingError || model.LookupError || error{
     InvalidDeclaration,
     InvalidRecord,
@@ -26,7 +25,7 @@ pub const Error = owned.Error || schema.Error || arrays.Error || model.EncodingE
     GroupRewriteRequired,
 };
 
-/// A caller-selected array role and its source unit. No role or lossy codec is inferred.
+/// The caller chooses the role, its unit, and the encoding; none is inferred.
 pub const ArrayOptions = struct {
     role: cv.Param,
     /// Document-local declaration ID used by the emitted primitive and codec terms.
@@ -44,7 +43,6 @@ pub const Array = struct {
     owner: *const Builder,
 };
 
-/// Metadata belongs to the builder; wire borrows values or scratch until writing completes.
 pub const PreparedArray = struct { array: Array, wire: []const u8 };
 
 /// Prepared header and reference replacements, owned by the creating builder.
@@ -55,8 +53,7 @@ pub const Reencoding = struct {
     source_groups: []const cv.Group,
     replacements: []const GroupReplacement,
 
-    /// Keeps array references and their XML, selecting prepared group definitions as needed.
-    /// Array metadata belongs to builder; wire follows prepareArrayFrom's lifetime rules.
+    /// Like builder.prepareArrayFrom, moving references to the prepared group definitions.
     pub fn prepareArray(self: Reencoding, builder: *Builder, comptime T: type, values: []const T, source: model.Node, options: arrays.EncodeOptions, encoder: *arrays.Encoder) Error!PreparedArray {
         return builder.prepareArrayFromInner(T, values, source, self.source_groups, options, encoder, self.replacements);
     }
@@ -66,12 +63,10 @@ arena: std.heap.ArenaAllocator,
 limits: owned.Limits,
 remaining: usize,
 
-/// Creates an empty owner without allocating. Do not copy an initialized builder.
 pub fn init(allocator: std.mem.Allocator, limits: owned.Limits) Builder {
     return .{ .arena = .init(allocator), .limits = limits, .remaining = limits.bytes };
 }
 
-/// Releases all constructed objects.
 pub fn deinit(self: *Builder) void {
     self.arena.deinit();
     self.* = undefined;
@@ -83,7 +78,7 @@ pub fn reset(self: *Builder) void {
     self.remaining = self.limits.bytes;
 }
 
-/// Copies source fields within the byte limit and schema.MAX_DEPTH, without interpreting payloads.
+/// Copies a node, including any binary text, within the byte limit and MAX_DEPTH.
 pub fn node(self: *Builder, source: model.Node) Error!model.Node {
     var copier = self.makeCopier();
     defer self.remaining = copier.remaining;
@@ -112,8 +107,8 @@ pub fn vocabulary(self: *Builder, declaration: cv.Declaration) Error!model.Node 
     return self.node(.{ .kind = .cv, .attributes = attrs[0..if (declaration.version == null) @as(usize, 3) else 4] });
 }
 
-/// Formats a floating parameter using XML Schema spellings, preserving explicit units.
-/// The caller supplies the accession and label; this does not resolve or type-check the term.
+/// Builds a cvParam whose value is the number in XML Schema spelling, with the caller's
+/// accession, name, and unit as given.
 pub fn number(self: *Builder, parameter: cv.Param, value: f64) Error!cv.Param {
     var buffer: [64]u8 = undefined;
     var param = parameter;
@@ -125,22 +120,19 @@ pub fn number(self: *Builder, parameter: cv.Param, value: f64) Error!cv.Param {
     return result.params[0].cv;
 }
 
-/// Encodes values once with encoder and emits their primitive, codec, and encodedLength,
-/// without retaining Base64. Default arrays omit arrayLength; auxiliary arrays carry it.
-/// Role labels and units are supplied explicitly. The wire lasts until the encoder is reset.
+/// Encodes values with encoder and builds array metadata with its primitive, codec, and
+/// encodedLength. Default arrays (m/z, intensity, time) omit arrayLength; others carry it.
 pub fn prepareArray(self: *Builder, comptime T: type, values: []const T, options: ArrayOptions, encoder: *arrays.Encoder) Error!PreparedArray {
     try checkArrayOptions(options);
     const wire = try encoder.encode(T, values, options.encoding);
     return .{ .array = try self.arrayMetadata(T, values.len, options, try base64.encodedSize(wire.len)), .wire = wire };
 }
 
-/// Reencodes values using copied source metadata, without copying the old payload.
-/// Bare group references become local parameters; annotated references stay intact.
-/// Changing an annotated group's encoding requires reencoding's prepared header;
-/// otherwise returns GroupRewriteRequired rather than discarding its XML.
-/// Replaces primitive/codec terms and lengths, preserving other fields and parameter order.
-/// If a default array omits arrayLength, the caller must update the enclosing record's
-/// defaultArrayLength when changing its length. Wire lasts until the encoder is reset.
+/// Encodes values with encoder under a copy of the source array's metadata, replacing its
+/// primitive, codec, and length terms and keeping other fields in order. Bare group references
+/// become local parameters; changing an annotated group's encoding needs a Reencoding header
+/// and otherwise returns GroupRewriteRequired. If a default array omits arrayLength, update
+/// the record's defaultArrayLength when the length changes.
 pub fn prepareArrayFrom(
     self: *Builder,
     comptime T: type,
@@ -228,9 +220,8 @@ fn prepareArrayFromInner(self: *Builder, comptime T: type, values: []const T, so
     }, .wire = wire };
 }
 
-/// Copies a header and adds changed group definitions for the requested output encodings.
-/// Original definitions remain for unchanged arrays. Repeated equivalent replacements
-/// share a definition; no records are read and unused group references are not resolved.
+/// Copies a header and adds a group definition for each requested output encoding, keeping
+/// the originals for unchanged arrays; equivalent replacements share one definition.
 pub fn reencoding(self: *Builder, source: model.Header, targets: []const model.Encoding) Error!Reencoding {
     var header_copy = try self.header(source);
     const source_groups = header_copy.groups;
@@ -390,7 +381,7 @@ fn isDefaultParam(entry: cv.Entry) bool {
     return isDefaultRole(entry.cv.accession orelse return false);
 }
 
-/// Default m/z, intensity, and time arrays take the record's defaultArrayLength.
+// Default m/z, intensity, and time arrays take the record's defaultArrayLength.
 fn isDefaultRole(accession: cv.Accession) bool {
     return accession.eql(model.Terms.MZ_ARRAY) or accession.eql(model.Terms.INTENSITY_ARRAY) or accession.eql(model.Terms.TIME_ARRAY);
 }
@@ -437,7 +428,6 @@ fn checkArrayOptions(options: ArrayOptions) Error!void {
         options.role.name == null) return error.InvalidDeclaration;
 }
 
-/// Copies array metadata for prepared wire of this many values.
 fn arrayMetadata(self: *Builder, comptime T: type, value_count: usize, options: ArrayOptions, encoded_length: usize) Error!Array {
     const is_default = isDefaultRole(options.role.accession.?);
     const primitive = encoding.primitiveTerm(encoding.Primitive.of(T));
@@ -469,11 +459,10 @@ fn arrayMetadata(self: *Builder, comptime T: type, value_count: usize, options: 
     return .{ .node = try self.node(result), .length = value_count, .is_default = is_default, .owner = self };
 }
 
-/// Creates a spectrum or chromatogram with generated numeric attributes and copied children,
-/// for writing with writeRecordWithArrays and the arrays' wire. Arrays must come from
-/// prepareArray or prepareArrayFrom on this builder; their storage is reused, not copied.
-/// Other input slices are copied. Default arrays must match default_length.
-/// This constructs new record attributes; use source node views to preserve existing ones.
+/// Builds a spectrum or chromatogram with new id, index, and defaultArrayLength attributes,
+/// for writeRecordWithArrays with the arrays' wire. Arrays must come from this builder, and
+/// default arrays must match default_length. To keep a source record's attributes, edit a
+/// view of its node instead.
 pub fn record(self: *Builder, kind: model.Kind, id: []const u8, index: usize, default_length: usize, params: []const cv.Entry, children: []const model.Node, binary_arrays: []const Array) Error!model.Record {
     if ((kind != .spectrum and kind != .chromatogram) or id.len == 0) return error.InvalidRecord;
     for (children) |child| if (child.kind == .binary_data_array_list) return error.InvalidRecord;

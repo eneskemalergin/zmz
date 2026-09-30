@@ -123,9 +123,8 @@ pub const Error = cv.ExpansionError || error{
     TypeMismatch,
 };
 
-/// Classifies only reviewed wire terms. It never selects a default for missing declarations.
-/// Repeated terms may agree; different primitive or codec identities conflict.
-/// This does not change source parameters or resolve arbitrary ontology descendants.
+/// Classifies the reviewed primitive and compression terms. A missing term is an error, and
+/// repeated terms must agree.
 pub fn classify(params: []const cv.Entry, groups: []const cv.Group) Error!Descriptor {
     var primitive: ?Primitive = null;
     var pipeline: ?Pipeline = null;

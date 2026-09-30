@@ -76,13 +76,13 @@ pub const Term = struct {
     /// All source term fields, including unknown tags and trailing modifiers.
     fields: []const Field = &.{},
 
-    /// Iterates direct targets without inferring inheritance or expanding datatypes.
+    /// Iterates this term's direct targets for one relation.
     pub fn targets(self: Term, relation: []const u8) Targets {
         return .{ .term = self, .relation = relation };
     }
 };
 
-/// A borrowed, allocation-free iterator over one relation's direct targets.
+/// Allocates nothing.
 pub const Targets = struct {
     term: Term,
     relation: []const u8,
@@ -110,7 +110,7 @@ pub const Alias = struct { id: []const u8, term_index: usize };
 /// The canonical metadata and the identity basis used to find it.
 pub const Match = struct { term: *const Term, alternate_id: bool };
 
-/// Returns exact primary or alternate identity matches without name-based fallback.
+/// Finds a term by exact primary or alternate accession.
 pub fn lookup(self: Vocabulary, accession: []const u8) ?Match {
     if (search(Term, self.terms, accession)) |index| return .{ .term = &self.terms[index], .alternate_id = false };
     const alias = search(Alias, self.aliases, accession) orelse return null;
@@ -148,7 +148,6 @@ pub fn isA(self: Vocabulary, child: []const u8, parent: []const u8, max_work: us
 
 /// Expands direct `has_value_type` edges recursively into caller-owned slots.
 /// XSD targets and semantic terms without further value-type edges are leaves.
-/// Source targets remain available through `Term.targets`; no list parsing is inferred.
 /// Returns the filled prefix, preserving multiplicity. On failure its contents are partial.
 pub fn valueTypes(
     self: Vocabulary,

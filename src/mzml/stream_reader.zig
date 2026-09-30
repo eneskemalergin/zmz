@@ -4,7 +4,10 @@ const std = @import("std");
 const model = @import("model.zig");
 const impl = @import("internal/reader_engine.zig");
 
-/// Reads header metadata and current records from a forward byte stream.
+/// Reads header metadata, then records or items, from a forward byte stream it borrows until
+/// deinit; copy neither the input nor the reader. Header metadata lasts until deinit, and each
+/// record or item call invalidates the previous one. The first failure sets diagnostic() and
+/// later reads return FailedState.
 pub const StreamReader = struct {
     const Reader = @This();
 
@@ -19,59 +22,59 @@ pub const StreamReader = struct {
 
     inner: impl,
 
-    /// Borrows input for the reader's lifetime and allocates parser state.
+    /// Allocates parser state without consuming input. Streaming input needs buffer capacity
+    /// for peekGreedy(1), otherwise InvalidOptions; an empty fixed reader reads as malformed XML.
     pub fn init(allocator: std.mem.Allocator, input: *std.Io.Reader, options: Options) Error!Reader {
         return .{ .inner = try impl.init(allocator, input, options) };
     }
 
-    /// Releases parser, metadata, and record storage without closing the input.
+    /// Leaves the input open.
     pub fn deinit(self: *Reader) void {
         self.inner.deinit();
         self.* = undefined;
     }
 
-    /// Returns header metadata before the first record; repeated calls do not advance input.
+    /// Repeated calls return the same header without advancing input. List observations in it
+    /// update as records are consumed.
     pub fn readHeader(self: *Reader) Error!*const model.Header {
         return self.inner.readHeader();
     }
 
-    /// Returns records only, skipping XML outside them and list transitions.
-    /// Use nextItem for a rewrite that retains those fields and their positions.
-    /// Indexed trailers are read only with retain_index; input buffering may fetch ahead.
+    /// Returns the next spectrum or chromatogram, or null after the mzML content, skipping list
+    /// transitions and XML between records (nextItem keeps them). The indexed trailer is read
+    /// only with retain_index and its offsets and checksum are not verified; buffered input may
+    /// already hold bytes past the mzML content.
     pub fn nextRecord(self: *Reader) Error!?model.Record {
         return self.inner.nextRecord();
     }
 
-    /// Returns list transitions, records, and XML after the header in source order.
-    /// Each call invalidates the previous record or XML item. Null marks mzML end;
-    /// retain_index controls trailer reading as for nextRecord.
+    /// Returns list transitions, records, and XML after the header in source order, or null at
+    /// the mzML end; the trailer follows the nextRecord rules.
     pub fn nextItem(self: *Reader) Error!?model.Item {
         return self.inner.nextItem();
     }
 
-    /// Like nextItem, with selected record arrays decoded into output. Non-record
-    /// items, EOF, and errors clear visible arrays. Lifetimes follow nextDecodedRecord.
+    /// Like nextItem, decoding each record's selected arrays as nextDecodedRecord does. Other
+    /// items, EOF, and errors leave output empty.
     pub fn nextDecodedItem(self: *Reader, output: *DecodedArrays) Error!?model.Item {
         return self.inner.nextDecodedItem(output);
     }
 
-    /// Reads a complete record and decodes selected arrays into reusable output storage.
-    /// Without array_selector, decodes every modeled array. Skipped arrays keep their metadata.
-    /// Metadata borrows this reader as in nextRecord; modeled binary text is not retained.
-    /// Output slices last until output is reused, reset, or deinitialized. EOF and errors
-    /// clear its visible results. Payload does not affect this call.
-    /// The first failure stops reading and sets the diagnostic;
-    /// subsequent reads return FailedState. No automatic record skipping occurs.
+    /// Like nextRecord, decoding the selected arrays into output instead of retaining their
+    /// Base64 text: every modeled array without array_selector, whatever payload says. Skipped
+    /// arrays keep their metadata. Output slices last until output is reused, reset, or
+    /// deinitialized; EOF and errors leave it empty. A failed record is not skipped.
     pub fn nextDecodedRecord(self: *Reader, output: *DecodedArrays) Error!?model.Record {
         return self.inner.nextDecodedRecord(output);
     }
 
-    /// Returns the first sticky failure without borrowing parser event memory.
+    /// Returns a copy of the first failure that outlives later reads.
     pub fn diagnostic(self: *const Reader) ?Diagnostic {
         return self.inner.diagnostic();
     }
 
-    /// Returns retained indexed wrapper nodes after traversal, valid until deinit, or null when none were retained.
+    /// Returns the indexed wrapper nodes kept by retain_index once traversal ends, valid until
+    /// deinit; null otherwise.
     pub fn indexTrailer(self: *const Reader) ?[]const model.Node {
         if (!self.inner.done or !self.inner.header.indexed or !self.inner.options.retain_index)
             return null;

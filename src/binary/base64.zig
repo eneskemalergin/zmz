@@ -1,9 +1,6 @@
-//! Streams padded Base64 through caller-owned buffers without allocation.
-//!
-//! The decoder accepts fragmented XML text and retains only an incomplete quartet.
-//! CPU and OS detection selects bounded AVX2 blocks on x86-64, with scalar handling
-//! elsewhere and for tails.
-//! Input and output must be disjoint. SIMD never needs padding outside either slice.
+//! Encodes and decodes padded Base64 in caller-owned buffers without allocating. Input and
+//! output must be disjoint, and output after a failure is unspecified. On x86-64, AVX2 is used
+//! when available and touches nothing outside the given slices.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -13,7 +10,6 @@ const overlaps = core.overlaps;
 // Zig's self-hosted x86 backend cannot assemble vector memory operands yet.
 const USE_AVX2 = builtin.cpu.arch == .x86_64 and options.simd and builtin.zig_backend == .stage2_llvm;
 
-/// Checked lexical, capacity, and state failures. Output after failure is unspecified.
 pub const Error = error{
     InvalidCharacter,
     InvalidPadding,
@@ -39,7 +35,7 @@ pub fn encodedSize(source_len: usize) Error!usize {
     return std.math.mul(usize, groups, 4) catch error.LengthOverflow;
 }
 
-/// Writes canonical padded Base64. Source and destination must not overlap.
+/// Writes canonical padded Base64.
 pub fn encode(output: []u8, source: []const u8) Error![]u8 {
     if (overlaps(output, source)) return error.OverlappingBuffers;
     const required = try encodedSize(source.len);
@@ -48,18 +44,17 @@ pub fn encode(output: []u8, source: []const u8) Error![]u8 {
     return output[0..required];
 }
 
-/// Decodes logical XML text, accepting only XML whitespace between Base64 characters.
-/// The output bounds the decoded bytes. No allocation or whitespace-stripped copy is made.
+/// Decodes XML text, allowing XML whitespace between Base64 characters. Decoding past output's
+/// capacity fails with OutputTooSmall.
 pub fn decode(output: []u8, source: []const u8) Error!Counts {
     var decoder = Decoder.init(output);
     try decoder.update(source);
     return decoder.finish();
 }
 
-/// A decoder borrowing its destination until finish or abandonment, bounded by its output.
-/// Bounds on the XML text belong to the XML reader.
-/// Input slices need remain alive only during update and must not overlap the destination.
-/// Failures are sticky; counters and partially written output are not a successful result.
+/// Decodes XML text given in fragments into a borrowed output, keeping at most one incomplete
+/// quartet between updates; fragments are borrowed only during update. Failures are sticky,
+/// and counts and output are valid only after finish succeeds.
 pub const Decoder = struct {
     output: []u8,
     counts: Counts = .{},
@@ -71,7 +66,6 @@ pub const Decoder = struct {
     /// Offset in concatenated logical text, not the physical XML source.
     error_offset: ?usize = null,
 
-    /// Borrows the destination without allocating or writing it.
     pub fn init(output: []u8) Decoder {
         return .{ .output = output };
     }
@@ -135,7 +129,7 @@ pub const Decoder = struct {
         return length;
     }
 
-    /// Checks the final quartet and returns counts once. Does not free the destination.
+    /// Checks the final quartet and returns the counts; call it once.
     pub fn finish(self: *Decoder) Error!Counts {
         if (self.failed) return error.FailedState;
         if (self.finished) return error.AlreadyFinished;

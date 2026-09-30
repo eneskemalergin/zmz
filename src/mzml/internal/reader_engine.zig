@@ -34,8 +34,7 @@ const PARAM_ATTRIBUTES = std.StaticStringMap(std.meta.FieldEnum(ParamAttributes)
     .{ "unitCvRef", .unit_cv_ref }, .{ "unitAccession", .unit_accession }, .{ "unitName", .unit_name },
 });
 
-/// Independent bounds on parser state, retained objects, lists, and payload text.
-/// Retained-byte limits count stored slices, not allocator bookkeeping or temporary list capacity.
+/// Byte limits count stored slices, excluding allocator bookkeeping and scratch capacity.
 pub const Limits = struct {
     attributes: usize = 64,
     attribute_bytes: usize = 1024 * 1024,
@@ -46,8 +45,7 @@ pub const Limits = struct {
     binary_text_bytes: usize = 256 * 1024 * 1024,
 };
 
-/// Ordinary reads retain or skip text; decoded reads decode or skip array bytes.
-/// Payload selection does not discard retained XML fragments.
+/// Whether ordinary reads keep each array's binary text; other XML is always kept.
 pub const Payload = enum { retain, skip };
 
 /// What a selection callback sees. Every slice borrows only for the call.
@@ -75,9 +73,8 @@ pub const ArraySelector = struct {
 pub const Options = struct {
     limits: Limits = .{},
     payload: Payload = .retain,
-    /// Selects retained text or decoded arrays without dropping metadata.
-    /// Ignored by ordinary reads when payload is skip; decoded reads ignore payload.
-    /// Does not classify encodings or resolve parameters on the caller's behalf.
+    /// Chooses the arrays whose text ordinary reads keep (with payload retain) or whose
+    /// values decoded reads decode.
     array_selector: ?ArraySelector = null,
     /// Retains the index trailer within header limits for StreamReader.indexTrailer().
     retain_index: bool = false,
@@ -118,10 +115,6 @@ fragment_ancestors: ?xml.Ancestors = null,
 pub const Scope = struct { start: u64, end: u64, name: []const u8 };
 pub const FragmentTarget = struct { kind: model.Kind, id: []const u8 };
 
-/// Borrows input for the reader's lifetime. Input and initialized reader must not be copied.
-/// This allocates parser state but does not consume input. Release all owned storage with deinit.
-/// Streaming input needs buffer capacity for peekGreedy(1); otherwise init returns InvalidOptions.
-/// Empty fixed readers are valid inputs and report malformed XML when read.
 pub fn init(allocator: std.mem.Allocator, input: *std.Io.Reader, options: Options) Error!StreamReader {
     if (options.limits.nodes == 0 or options.limits.list_entries == 0) return error.InvalidOptions;
     if (input.buffer.len == 0 and input.vtable != std.Io.Reader.ending.vtable)
@@ -135,7 +128,6 @@ pub fn init(allocator: std.mem.Allocator, input: *std.Io.Reader, options: Option
     };
 }
 
-/// Releases parser, metadata, and record storage. Does not close or deinitialize input.
 pub fn deinit(self: *StreamReader) void {
     self.cursor.deinit();
     self.child_scratch.deinit(self.allocator);
@@ -145,8 +137,6 @@ pub fn deinit(self: *StreamReader) void {
     self.* = undefined;
 }
 
-/// Returns header metadata before the first record. Repeated calls do not advance the source.
-/// Metadata slices last until deinit; streaming list observations update as records are consumed.
 pub fn readHeader(self: *StreamReader) Error!*const model.Header {
     if (self.failure != null) return error.FailedState;
     if (!self.header_ready) self.readHeaderInner() catch |err| {
@@ -156,9 +146,6 @@ pub fn readHeader(self: *StreamReader) Error!*const model.Header {
     return &self.header;
 }
 
-/// Returns a borrowed spectrum or chromatogram, or null after the mzML content.
-/// Every call invalidates the previous record, including its encoded payload. Failures are sticky.
-/// Indexed trailers are read only with retain_index; targets and checksums are not checked.
 pub fn nextRecord(self: *StreamReader) Error!?model.Record {
     return self.nextRecordFor(.tree);
 }
@@ -209,7 +196,6 @@ pub fn nextDecodedRecord(self: *StreamReader, output: *DecodedArrays) Error!?mod
     return record;
 }
 
-/// Returns the first failure without borrowing parser event memory.
 pub fn diagnostic(self: *const StreamReader) ?Diagnostic {
     return self.failure;
 }

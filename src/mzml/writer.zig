@@ -1,6 +1,10 @@
-//! Writes plain or indexed mzML without retaining records or a run. Forward-only
-//! sinks require list counts up front. File-backed output can patch unknown counts
-//! when lists close; indexed file output hashes the completed prefix at finish.
+//! Writes plain or indexed mzML without retaining records or a run. Forward-only sinks need
+//! list counts up front; file output can patch unknown counts when lists close.
+//!
+//! Arguments are borrowed only until each call returns. The writer borrows its sink until
+//! deinit, and the caller flushes and closes the sink, including after finish. Failures are
+//! sticky: the first sets diagnostic() and later calls return FailedState, and partial output
+//! is never a complete document.
 
 const std = @import("std");
 const cv = @import("../cv/source.zig");
@@ -18,7 +22,6 @@ const COUNT_PLACEHOLDER = "0" ** std.fmt.comptimePrint("{d}", .{std.math.maxInt(
 
 pub const Limits = schema.Limits;
 
-/// Writer failures are sticky. No error permits treating partially written output as complete.
 pub const Error = xml.WriterError || xml.Error || cv.ValueError || base64.Error || schema.Error || std.Io.File.WritePositionalError || std.Io.File.ReadPositionalError || error{
     InvalidStructure,
     MissingAttribute,
@@ -51,15 +54,13 @@ namespace_uri: []const u8 = xml.NAMESPACE,
 /// Bounds retained index entries and ID bytes, including historical native/spot IDs.
 pub const IndexLimits = struct { records: usize = 1_000_000, id_bytes: usize = 64 * 1024 * 1024 };
 
-/// Borrows the sink; finish closes XML but the caller must flush and close its own sink.
-/// Release writer-owned XML storage with deinit, including after failure. Do not copy it.
+/// Call deinit even after a failure; do not copy the writer.
 pub fn init(allocator: std.mem.Allocator, sink: *std.Io.Writer, limits: Limits) Error!Writer {
     try schema.checkLimits(limits);
     return .{ .engine = try xml.Writer.init(allocator, sink, .{}), .allocator = allocator, .limits = limits };
 }
 
-/// Writes indexedmzML with physical byte offsets and the schema-defined SHA-1 range.
-/// Retains IDs and offsets, not records. The caller still owns flushing the sink.
+/// Writes indexedmzML, keeping each record's ID and offset (within index_limits) until deinit.
 pub fn initIndexed(allocator: std.mem.Allocator, sink: *std.Io.Writer, limits: Limits, index_limits: IndexLimits) Error!Writer {
     try schema.checkLimits(limits);
     const state = try allocator.create(IndexState);
@@ -70,10 +71,9 @@ pub fn initIndexed(allocator: std.mem.Allocator, sink: *std.Io.Writer, limits: L
     return .{ .engine = try xml.Writer.init(allocator, &state.hashed.writer, .{}), .allocator = allocator, .limits = limits, .index_state = state };
 }
 
-/// Borrows a positional file writer at offset zero on an empty file. Do not write
-/// through it independently until finish. Null index_limits selects plain mzML.
-/// Indexed output needs a readable file and reads its prefix once for the checksum.
-/// List counts may be null. The caller must still flush the final bytes.
+/// Writes to a positional file writer at offset zero on an empty file; nothing else may write
+/// through it until finish. List counts may be null. Null index_limits selects plain mzML;
+/// indexed output needs a readable file, whose prefix finish rereads for the checksum.
 pub fn initFile(allocator: std.mem.Allocator, sink: *std.Io.File.Writer, limits: Limits, index_limits: ?IndexLimits) Error!Writer {
     if (sink.logicalPos() != 0 or (sink.mode != .positional and sink.mode != .positional_simple))
         return error.InvalidOptions;
@@ -86,15 +86,15 @@ pub fn initFile(allocator: std.mem.Allocator, sink: *std.Io.File.Writer, limits:
     return writer;
 }
 
-/// Releases XML writer storage without finishing or flushing output.
+/// Neither finishes nor flushes output.
 pub fn deinit(self: *Writer) void {
     self.engine.deinit();
     if (self.index_state) |state| state.deinit();
     self.* = undefined;
 }
 
-/// Returns the first failure, unchanged by later FailedState returns. Reports do
-/// not make partial output usable. A final caller-owned flush is not reported here.
+/// Returns the first failure; later FailedState returns leave it unchanged. The caller's own
+/// final flush is not covered.
 pub fn diagnostic(self: *const Writer) ?Diagnostic {
     return self.failure;
 }
@@ -146,8 +146,7 @@ fn copyId(self: *Writer, state: *IndexState, id: []const u8) Error![]const u8 {
     };
 }
 
-/// Emits source metadata and opens the run. Initialization selects plain or indexed output.
-/// Nodes and parameters are borrowed only for the duration of this call.
+/// Writes the header metadata and opens the run.
 pub fn writeHeader(self: *Writer, header: model.Header) Error!void {
     if (self.failure != null) return error.FailedState;
     errdefer |err| self.fail(err, .write_header);
@@ -179,9 +178,9 @@ pub fn beginList(self: *Writer, kind: model.Kind, count: ?usize, processing_ref:
     return self.beginListWithAttributes(kind, count, &.{.{ .name = "defaultDataProcessingRef", .value = processing_ref }});
 }
 
-/// Opens a list using source attributes borrowed until return. Writes the supplied count
-/// first, ignoring source count attributes; other attributes keep their order and values.
-/// An absent processing reference stays absent. Null count and list order follow beginList.
+/// Opens a list with source attributes, writing the supplied count first in place of any
+/// source count; other attributes keep their order and values, and an absent processing
+/// reference stays absent. Count and list order follow beginList.
 pub fn beginListWithAttributes(self: *Writer, kind: model.Kind, count: ?usize, attributes: []const model.Attribute) Error!void {
     if (self.failure != null) return error.FailedState;
     errdefer |err| {
@@ -210,16 +209,15 @@ pub fn beginListWithAttributes(self: *Writer, kind: model.Kind, count: ?usize, a
     self.phase = .list;
 }
 
-/// Writes a complete source record with retained encoded arrays, without retaining it afterward.
-/// Text is escaped as XML, without checking Base64 or interpreting encodedLength.
-/// Numeric array construction uses the separate arrays encoder before this call.
+/// Writes a record with its retained binary text, escaped as XML; the Base64 and encodedLength
+/// are not checked.
 pub fn writeRecord(self: *Writer, node: model.Node) Error!void {
     return self.writeRecordInner(node, false, @as([]const []const u8, &.{}));
 }
 
-/// Writes one forward item without retaining it. List openings use source counts;
-/// use beginListWithAttributes instead when filtering or choosing unknown counts.
-/// Decoded records still need writeRecordWithArrays for their omitted binary text.
+/// Writes one forward item. List openings keep their source counts; use
+/// beginListWithAttributes when filtering changes a count or leaves it unknown. Records from
+/// decoded reads have no binary text; write them with writeRecordWithArrays.
 pub fn writeItem(self: *Writer, item: model.Item) Error!void {
     if (self.failure != null) return error.FailedState;
     errdefer |err| self.fail(err, .write_item);
@@ -240,18 +238,15 @@ pub fn writeItem(self: *Writer, item: model.Item) Error!void {
     }
 }
 
-/// Writes prepared primitive, Numpress, or compressed bytes as canonical Base64 in array order.
-/// Existing binary text is ignored. Metadata, encodedLength, and array count must match.
-/// Bytes are borrowed until return, must not alias the sink buffer, and are not decompressed.
-/// Uses bounded temporary storage; list, index, and failure rules match writeRecord.
+/// Writes a record with one prepared wire slice per modeled array, encoded as Base64 in place
+/// of any binary text. The array count and each encodedLength must match, and wire must not
+/// share memory with the output buffers.
 pub fn writeRecordWithArrays(self: *Writer, node: model.Node, wire_arrays: []const []const u8) Error!void {
     return self.writeRecordInner(node, true, wire_arrays);
 }
 
-/// Takes one choice per modeled array in source order: null retains binary text;
-/// a wire slice replaces it, including an empty slice. Only supplied bytes receive
-/// the prepared-array checks of writeRecordWithArrays; retained codecs are not read.
-/// Metadata, choices, and wire borrow until return. Choices must not alias the sink.
+/// Like writeRecordWithArrays with one choice per modeled array: null keeps that array's
+/// binary text, and a slice, even an empty one, replaces it. Only supplied slices are checked.
 pub fn writeRecordWithSelectedArrays(self: *Writer, node: model.Node, wire_arrays: []const ?[]const u8) Error!void {
     return self.writeRecordInner(node, true, wire_arrays);
 }
@@ -505,7 +500,7 @@ fn writeContent(self: *Writer, node: model.Node, comptime replace_arrays: bool, 
     if (params != node.params.len or children != node.children.len) return error.InvalidStructure;
 }
 
-/// Writes one modeled child after checking it is allowed, and not repeated if singular.
+// Checks that the child is allowed here and, if singular, not repeated.
 fn writeChild(self: *Writer, parent: model.Node, child: model.Node, position: usize, seen: *std.EnumSet(model.Kind), comptime replace_arrays: bool, remaining: anytype, budget: *usize) Error!void {
     errdefer |err| if (parent.kind == .binary_data_array_list) {
         self.capture(err, .metadata, .none);
@@ -649,13 +644,13 @@ fn optionalAttribute(self: *Writer, name: []const u8, value: ?[]const u8) Error!
 
 const IndexEntry = struct { id: []const u8, offset: u64 };
 
-/// Indexed stream output is hashed and forwarded, and file output reread, in chunks of this
-/// size. Rewrite time was flat from 8 to 256 KiB; 16 KiB kept peak RSS at the unhashed level.
+// Indexed stream output is hashed and forwarded, and file output reread, in chunks of this
+// size. Rewrite time was flat from 8 to 256 KiB; 16 KiB kept peak RSS at the unhashed level.
 const CHUNK_BYTES = 16 * 1024;
 
 const IndexState = struct {
     allocator: std.mem.Allocator,
-    /// Hashes and forwards streamed output in whole chunks; file output rereads the file instead.
+    // Hashes and forwards streamed output in whole chunks; file output rereads the file instead.
     hashed: std.Io.Writer.Hashed(Sha1),
     arena: std.heap.ArenaAllocator,
     limits: IndexLimits,
@@ -666,7 +661,6 @@ const IndexState = struct {
     spectra: usize = 0,
     id_bytes: usize = 0,
 
-    /// Releases the retained IDs and offsets and the state itself.
     fn deinit(self: *IndexState) void {
         self.entries.deinit(self.allocator);
         self.historical_ids.deinit(self.allocator);
