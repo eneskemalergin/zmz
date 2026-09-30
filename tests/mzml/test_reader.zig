@@ -191,7 +191,7 @@ test "[failure] - [mzML diagnostics]: reports a known decoded size without guess
     }
 }
 
-test "[failure] - [mzML diagnostics]: reports a zlib array longer than declared as a buffer error" {
+test "[failure] - [mzML diagnostics]: reports a zlib array longer than declared as a size mismatch" {
     // Python's zlib.compress of two doubles, declared as one.
     const source = try decodedDocument(std.testing.allocator, "eJxjYACBD/YMEOAAAAvnAXA=", 24, 1, "MS:1000574");
     defer std.testing.allocator.free(source);
@@ -200,10 +200,10 @@ test "[failure] - [mzML diagnostics]: reports a zlib array longer than declared 
     defer reader.deinit();
     var output = mzml.StreamReader.DecodedArrays.init(std.testing.allocator, .{});
     defer output.deinit();
-    try std.testing.expectError(error.OutputTooSmall, reader.nextDecodedRecord(&output));
+    try std.testing.expectError(error.DecodedSizeMismatch, reader.nextDecodedRecord(&output));
     const report = reader.diagnostic().?;
     try std.testing.expectEqual(.array, report.stage);
-    try std.testing.expectEqual(.buffer_error, report.id);
+    try std.testing.expectEqual(.decoded_size_mismatch, report.id);
 }
 
 fn expectSameValues(expected: mzml.StreamReader.DecodedArrays.Values, actual: mzml.StreamReader.DecodedArrays.Values) !void {

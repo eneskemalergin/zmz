@@ -659,7 +659,7 @@ test "[integration] - [array limits]: rejects short scratch and mismatched count
     );
 }
 
-test "[failure] - [zlib arrays]: returns OutputTooSmall when a stream outgrows its declared values" {
+test "[failure] - [zlib arrays]: returns DecodedSizeMismatch when a stream outgrows its declared values" {
     // Python's zlib.compress of the little-endian doubles 1 and 2.
     const two = "eJxjYACBD/YMEOAAAAvnAXA=";
     var transport: [64]u8 = undefined;
@@ -668,12 +668,16 @@ test "[failure] - [zlib arrays]: returns OutputTooSmall when a stream outgrows i
     var output: [3]f64 = undefined;
     try arrays.decode(f64, output[0..2], two, .zlib, scratch);
     try std.testing.expectEqualSlices(f64, &.{ 1, 2 }, output[0..2]);
-    try std.testing.expectError(error.OutputTooSmall, arrays.decode(f64, output[0..1], two, .zlib, scratch));
+    try std.testing.expectError(error.DecodedSizeMismatch, arrays.decode(f64, output[0..1], two, .zlib, scratch));
     try std.testing.expectError(error.DecodedSizeMismatch, arrays.decode(f64, &output, two, .zlib, scratch));
     const counts = try base64.decode(&transport, two);
-    try std.testing.expectError(error.OutputTooSmall, arrays.decodeWire(f64, output[0..1], transport[0..counts.decoded_bytes], .zlib, &.{}));
-    // Three SLOF values exceed the wire bound of one.
-    try std.testing.expectError(error.OutputTooSmall, arrays.decode(f64, output[0..1], "eJxzWO/AAAFXuSpUARP4Aqw=", .slof_zlib, scratch));
+    try std.testing.expectError(error.DecodedSizeMismatch, arrays.decodeWire(f64, output[0..1], transport[0..counts.decoded_bytes], .zlib, &.{}));
+    // Three SLOF values exceed the wire bound of one; short transformed scratch is still the caller's.
+    try std.testing.expectError(error.DecodedSizeMismatch, arrays.decode(f64, output[0..1], "eJxzWO/AAAFXuSpUARP4Aqw=", .slof_zlib, scratch));
+    try std.testing.expectError(error.OutputTooSmall, arrays.decode(f64, &output, "eJxzWO/AAAFXuSpUARP4Aqw=", .slof_zlib, .{
+        .transport = &transport,
+        .transformed = transformed[0..1],
+    }));
 }
 
 test "[integration] - [array encoder]: keeps every wire until reset for all pipelines" {

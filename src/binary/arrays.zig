@@ -83,7 +83,10 @@ fn decodeWireInner(comptime T: type, output: []T, source: []const u8, pipeline: 
     if (pipeline.hasZlib()) {
         const maximum = try wireBound(T, output.len, pipeline);
         const inflated = if (pipeline.transform() == .none) std.mem.sliceAsBytes(output) else transformed[0..@min(maximum, transformed.len)];
-        wire = try zlib.decompress(inflated, wire);
+        // Filling the full bound means the stream holds more than the declared values;
+        // shorter transformed scratch is the caller's buffer.
+        wire = zlib.decompress(inflated, wire) catch |err|
+            return if (err == error.OutputTooSmall and inflated.len == maximum) error.DecodedSizeMismatch else err;
     }
     switch (pipeline.transform()) {
         .none => {
