@@ -40,7 +40,7 @@ pub fn main(init: std.process.Init) !void {
         .role = .{ .cv_ref = "MS", .accession = mzml.model.Terms.INTENSITY_ARRAY, .name = "intensity array" },
         .encoding = .{ .pipeline = .zlib },
     }, &encoder);
-    const record = try builder.preparedRecord(.spectrum, "scan=1", 0, 3, &.{.{ .cv = .{
+    const record = try builder.record(.spectrum, "scan=1", 0, 3, &.{.{ .cv = .{
         .cv_ref = "MS",
         .accession = mzml.model.Terms.MS_LEVEL,
         .name = "ms level",

@@ -13,7 +13,6 @@ const copy = @import("internal/owned_copy.zig");
 const arrays = @import("../binary/arrays.zig");
 const base64 = @import("../binary/base64.zig");
 const encoding = @import("../binary/encoding.zig");
-const zlib = @import("../binary/zlib.zig");
 const schema = @import("schema.zig");
 const xml = @import("../xml/mzml_adapter.zig");
 
@@ -127,30 +126,13 @@ pub fn number(self: *Builder, parameter: cv.Param, value: f64) Error!cv.Param {
     return result.params[0].cv;
 }
 
-/// Encodes actual values and emits their primitive, codec, and encodedLength.
-/// Default arrays omit arrayLength; auxiliary arrays carry arrayLength.
-/// Output and scratch are caller-owned disjoint buffers; encoded bytes are copied into this owner.
-/// Role labels and units are supplied explicitly, not looked up in an ontology.
-pub fn binaryArray(
-    self: *Builder,
-    comptime T: type,
-    values: []const T,
-    options: ArrayOptions,
-    output: []u8,
-    scratch: arrays.Scratch,
-    compressor: ?*zlib.Compressor,
-) Error!Array {
-    try self.checkArrayOptions(options);
-    const text = try arrays.encode(T, output, values, options.encoding, scratch, compressor);
-    return self.arrayMetadata(T, values.len, options, text.len, text);
-}
-
-/// Encodes wire once with encoder and constructs metadata without retaining Base64.
-/// The wire lasts until the encoder is reset.
+/// Encodes values once with encoder and emits their primitive, codec, and encodedLength,
+/// without retaining Base64. Default arrays omit arrayLength; auxiliary arrays carry it.
+/// Role labels and units are supplied explicitly. The wire lasts until the encoder is reset.
 pub fn prepareArray(self: *Builder, comptime T: type, values: []const T, options: ArrayOptions, encoder: *arrays.Encoder) Error!PreparedArray {
     try self.checkArrayOptions(options);
     const wire = try encoder.encode(T, values, options.encoding);
-    return .{ .array = try self.arrayMetadata(T, values.len, options, try base64.encodedSize(wire.len), null), .wire = wire };
+    return .{ .array = try self.arrayMetadata(T, values.len, options, try base64.encodedSize(wire.len)), .wire = wire };
 }
 
 /// Reencodes values using copied source metadata, without copying the old payload.
@@ -458,8 +440,8 @@ fn checkArrayOptions(self: *const Builder, options: ArrayOptions) Error!void {
         options.role.name == null) return error.InvalidDeclaration;
 }
 
-/// Copies array metadata for encoded values; text is null for prepared wire.
-fn arrayMetadata(self: *Builder, comptime T: type, value_count: usize, options: ArrayOptions, encoded_length: usize, text: ?[]const u8) Error!Array {
+/// Copies array metadata for prepared wire of this many values.
+fn arrayMetadata(self: *Builder, comptime T: type, value_count: usize, options: ArrayOptions, encoded_length: usize) Error!Array {
     const is_default = isDefaultRole(options.role.accession.?);
     const primitive = encoding.primitiveTerm(encoding.Primitive.of(T));
     const codec = encoding.codecTerm(options.encoding.pipeline);
@@ -484,35 +466,18 @@ fn arrayMetadata(self: *Builder, comptime T: type, value_count: usize, options: 
         .kind = .binary_data_array,
         .attributes = attrs[0..attribute_count],
         .params = &params,
-        .children = &.{.{ .kind = .binary, .text = text }},
+        .children = &.{.{ .kind = .binary }},
     };
     _ = try model.arrayEncoding(result, &.{});
     return .{ .node = try self.node(result), .length = value_count, .is_default = is_default, .owner = self };
 }
 
-/// Creates a spectrum or chromatogram with generated numeric attributes and copied children.
-/// Arrays must belong to this builder; their storage is reused, not copied.
+/// Creates a spectrum or chromatogram with generated numeric attributes and copied children,
+/// for writing with writeRecordWithArrays and the arrays' wire. Arrays must come from
+/// prepareArray or prepareArrayFrom on this builder; their storage is reused, not copied.
 /// Other input slices are copied. Default arrays must match default_length.
 /// This constructs new record attributes; use source node views to preserve existing ones.
-pub fn record(
-    self: *Builder,
-    kind: model.Kind,
-    id: []const u8,
-    index: usize,
-    default_length: usize,
-    params: []const cv.Entry,
-    children: []const model.Node,
-    binary_arrays: []const Array,
-) Error!model.Record {
-    return self.recordInner(kind, id, index, default_length, params, children, binary_arrays, false);
-}
-
-/// Constructs metadata for writeRecordWithArrays; wire remains caller-owned.
-pub fn preparedRecord(self: *Builder, kind: model.Kind, id: []const u8, index: usize, default_length: usize, params: []const cv.Entry, children: []const model.Node, binary_arrays: []const Array) Error!model.Record {
-    return self.recordInner(kind, id, index, default_length, params, children, binary_arrays, true);
-}
-
-fn recordInner(self: *Builder, kind: model.Kind, id: []const u8, index: usize, default_length: usize, params: []const cv.Entry, children: []const model.Node, binary_arrays: []const Array, comptime prepared: bool) Error!model.Record {
+pub fn record(self: *Builder, kind: model.Kind, id: []const u8, index: usize, default_length: usize, params: []const cv.Entry, children: []const model.Node, binary_arrays: []const Array) Error!model.Record {
     if (self.limits.depth == 0 or self.limits.depth > schema.MAX_DEPTH or
         (binary_arrays.len != 0 and self.limits.depth < 4)) return error.LimitExceeded;
     if ((kind != .spectrum and kind != .chromatogram) or id.len == 0) return error.InvalidRecord;
@@ -520,10 +485,6 @@ fn recordInner(self: *Builder, kind: model.Kind, id: []const u8, index: usize, d
     for (binary_arrays) |array| {
         if (array.owner != self) return error.InvalidRecord;
         if (array.is_default and array.length != default_length) return error.InvalidArrayLength;
-        if (!prepared) {
-            const binary = array.node.child(.binary) orelse return error.PayloadNotRetained;
-            if (binary.text == null) return error.PayloadNotRetained;
-        }
     }
     const child_count = std.math.add(usize, children.len, @intFromBool(binary_arrays.len != 0)) catch return error.LimitExceeded;
     var copier = self.makeCopier();

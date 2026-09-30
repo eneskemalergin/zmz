@@ -960,7 +960,7 @@ test "[integration] - [mzML decoded reading]: preserves metadata and values acro
     }
     var buffer: [32768]u8 = undefined;
     var sink = std.Io.Writer.fixed(&buffer);
-    try support.constructFixture(std.testing.allocator, &sink, true, std.meta.tags(mzml.arrays.Pipeline), false);
+    try support.constructFixture(std.testing.allocator, &sink, true, std.meta.tags(mzml.arrays.Pipeline));
     try compareDecoded(sink.buffered(), 7);
     for ([_][]const u8{ "", " \t\r\n" }) |text| {
         const source = try decodedDocument(std.testing.allocator, text, 0, 0, "MS:1000574");
@@ -1171,7 +1171,7 @@ test "[failure] - [mzML decoded reading]: bounds storage and releases failed all
     try std.testing.checkAllAllocationFailures(std.testing.allocator, readDecoded, .{ support.DOCUMENT, mzml.arrays.Limits{} });
     var storage: [32768]u8 = undefined;
     var compressed = std.Io.Writer.fixed(&storage);
-    try support.constructFixture(std.testing.allocator, &compressed, false, std.meta.tags(mzml.arrays.Pipeline), false);
+    try support.constructFixture(std.testing.allocator, &compressed, false, std.meta.tags(mzml.arrays.Pipeline));
     try std.testing.checkAllAllocationFailures(std.testing.allocator, readDecoded, .{ compressed.buffered(), mzml.arrays.Limits{} });
     for ([_]mzml.arrays.Limits{
         .{ .array_bytes = 7 },

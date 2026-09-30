@@ -121,7 +121,7 @@ pub fn indexedRewriteAllocated(allocator: std.mem.Allocator) !void {
     try rewriteDocument(allocator, REFERENCED_DOCUMENT, &discard.writer, true);
 }
 
-pub fn constructFixture(allocator: std.mem.Allocator, sink: *std.Io.Writer, indexed: bool, pipelines: []const mzml.arrays.Pipeline, prepared: bool) !void {
+pub fn constructFixture(allocator: std.mem.Allocator, sink: *std.Io.Writer, indexed: bool, pipelines: []const mzml.arrays.Pipeline) !void {
     var input = std.Io.Reader.fixed(DOCUMENT);
     var reader = try mzml.StreamReader.init(allocator, &input, .{});
     defer reader.deinit();
@@ -141,8 +141,6 @@ pub fn constructFixture(allocator: std.mem.Allocator, sink: *std.Io.Writer, inde
     const header = try metadata.header(source_header);
     var builder = mzml.Builder.init(allocator, .{});
     defer builder.deinit();
-    var compressor = try mzml.zlib.Compressor.init(allocator, .fast);
-    defer compressor.deinit();
     var writer = if (indexed) try mzml.Writer.initIndexed(allocator, sink, .{}, .{}) else try mzml.Writer.init(allocator, sink, .{});
     defer writer.deinit();
     try writer.writeHeader(header);
@@ -150,9 +148,7 @@ pub fn constructFixture(allocator: std.mem.Allocator, sink: *std.Io.Writer, inde
         try writer.beginList(list_kind, pipelines.len, "dp");
         for (pipelines, 0..) |pipeline, index| {
             builder.reset();
-            var encoded: [1024]u8 = undefined;
-            var transport: [512]u8 = undefined;
-            var transformed: [512]u8 = undefined;
+            encoder.reset();
             const options: mzml.arrays.EncodeOptions = .{ .pipeline = pipeline, .fixed_point = switch (pipeline) {
                 .linear, .linear_zlib => 1000,
                 .slof, .slof_zlib => 10000,
@@ -170,27 +166,22 @@ pub fn constructFixture(allocator: std.mem.Allocator, sink: *std.Io.Writer, inde
                         .name = if (i == 1) "intensity array" else if (list_kind == .spectrum_list) "m/z array" else "time array",
                     },
                 };
-                if (prepared) {
-                    const built = try builder.prepareArray(f64, &.{ 1, 2, 3 }, array_options, &encoder);
-                    nodes[i] = built.array;
-                    wires[i] = built.wire;
-                } else nodes[i] = try builder.binaryArray(f64, &.{ 1, 2, 3 }, array_options, &encoded, .{ .transport = &transport, .transformed = &transformed }, &compressor);
+                const built = try builder.prepareArray(f64, &.{ 1, 2, 3 }, array_options, &encoder);
+                nodes[i] = built.array;
+                wires[i] = built.wire;
             }
             var id: [64]u8 = undefined;
-            const build_record: *const @TypeOf(mzml.Builder.record) = if (prepared) mzml.Builder.preparedRecord else mzml.Builder.record;
-            const record = try build_record(&builder, if (list_kind == .spectrum_list) .spectrum else .chromatogram, try std.fmt.bufPrint(&id, "{s}={s}", .{ if (list_kind == .spectrum_list) "scan" else "chromatogram", @tagName(pipeline) }), index, 3, if (list_kind == .spectrum_list) &.{.{ .group_ref = .{ .ref = "record-type" } }} else &.{}, &.{}, &nodes);
-            if (prepared) {
-                try writer.writeRecordWithArrays(record.node, &wires);
-            } else try writer.writeRecord(record.node);
+            const record = try builder.record(if (list_kind == .spectrum_list) .spectrum else .chromatogram, try std.fmt.bufPrint(&id, "{s}={s}", .{ if (list_kind == .spectrum_list) "scan" else "chromatogram", @tagName(pipeline) }), index, 3, if (list_kind == .spectrum_list) &.{.{ .group_ref = .{ .ref = "record-type" } }} else &.{}, &.{}, &nodes);
+            try writer.writeRecordWithArrays(record.node, &wires);
         }
         try writer.endList();
     }
     try writer.finish();
 }
 
-pub fn constructAllocated(allocator: std.mem.Allocator, prepared: bool) !void {
+pub fn constructAllocated(allocator: std.mem.Allocator) !void {
     var discard: std.Io.Writer.Discarding = .init(&.{});
-    try constructFixture(allocator, &discard.writer, true, std.meta.tags(mzml.arrays.Pipeline), prepared);
+    try constructFixture(allocator, &discard.writer, true, std.meta.tags(mzml.arrays.Pipeline));
 }
 
 pub fn checkIndexed(allocator: std.mem.Allocator, bytes: []const u8) !void {

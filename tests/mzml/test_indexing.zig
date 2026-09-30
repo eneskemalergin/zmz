@@ -1028,7 +1028,7 @@ test "[property] - [mzML index]: preserves ID lookups across growth and reversed
 test "[integration] - [mzML index]: opens embedded targets without checking unread records or checksums" {
     var buffer: [32768]u8 = undefined;
     var sink = std.Io.Writer.fixed(&buffer);
-    try support.constructFixture(std.testing.allocator, &sink, true, std.meta.tags(mzml.arrays.Pipeline), false);
+    try support.constructFixture(std.testing.allocator, &sink, true, std.meta.tags(mzml.arrays.Pipeline));
     try support.checkOpenEmbedded(std.testing.allocator, sink.buffered());
     try std.testing.checkAllAllocationFailures(std.testing.allocator, support.checkOpenEmbedded, .{sink.buffered()});
     try std.testing.expectError(error.InvalidOptions, mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = sink.buffered() }, .{ .policy = .open_embedded, .tail_bytes = 0 }));
@@ -1227,7 +1227,7 @@ test "[integration] - [mzML index]: checks targets without interpreting checksum
 test "[integration] - [mzML index]: verifies emitted targets checksum and independent lookups" {
     var buffer: [32768]u8 = undefined;
     var sink = std.Io.Writer.fixed(&buffer);
-    try support.constructFixture(std.testing.allocator, &sink, true, std.meta.tags(mzml.arrays.Pipeline), false);
+    try support.constructFixture(std.testing.allocator, &sink, true, std.meta.tags(mzml.arrays.Pipeline));
     try support.checkIndexed(std.testing.allocator, sink.buffered());
     try std.testing.checkAllAllocationFailures(std.testing.allocator, support.checkIndexed, .{sink.buffered()});
     const checksum_start = std.mem.indexOf(u8, sink.buffered(), "<fileChecksum>").? + "<fileChecksum>".len;
@@ -1598,12 +1598,12 @@ test "[integration] - [mzML indexed writer]: preserves bytes and checksum throug
     };
     var whole_bytes: [16384]u8 = undefined;
     var whole = std.Io.Writer.fixed(&whole_bytes);
-    try support.constructFixture(std.testing.allocator, &whole, true, std.meta.tags(mzml.arrays.Pipeline), false);
+    try support.constructFixture(std.testing.allocator, &whole, true, std.meta.tags(mzml.arrays.Pipeline));
     try support.expectWritten(std.mem.trimEnd(u8, @embedFile("data/writer_indexed.mzML"), "\n"), whole.buffered());
     for ([_]usize{ 1, 7, 63, 64, 65, 4096 }) |chunk| {
         var bytes: [16384]u8 = undefined;
         var sink: ShortSink = .{ .out = .fixed(&bytes), .chunk = chunk };
-        try support.constructFixture(std.testing.allocator, &sink.writer, true, std.meta.tags(mzml.arrays.Pipeline), false);
+        try support.constructFixture(std.testing.allocator, &sink.writer, true, std.meta.tags(mzml.arrays.Pipeline));
         try sink.writer.flush();
         try std.testing.expectEqualStrings(whole.buffered(), sink.out.buffered());
         try support.checkIndexed(std.testing.allocator, sink.out.buffered());

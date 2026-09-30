@@ -692,6 +692,8 @@ test "[integration] - [mzML prepared writing]: preserves primitive bytes across 
     defer builder.deinit();
     var compressor = try mzml.zlib.Compressor.init(std.testing.allocator, .fast);
     defer compressor.deinit();
+    var encoder = mzml.arrays.Encoder.init(std.testing.allocator, .fast);
+    defer encoder.deinit();
     inline for (.{ f32, f64, i32, i64 }) |T| {
         const Bits = @Int(.unsigned, @bitSizeOf(T));
         var values: [769]T = undefined;
@@ -703,8 +705,9 @@ test "[integration] - [mzML prepared writing]: preserves primitive bytes across 
                 var transport: [16384]u8 = undefined;
                 var transformed: [8192]u8 = undefined;
                 const scratch: mzml.arrays.Scratch = .{ .transport = &transport, .transformed = &transformed };
+                encoder.reset();
                 var arrays: [2]mzml.Builder.Array = undefined;
-                for (&arrays, 0..) |*array, i| array.* = try builder.binaryArray(T, values[0..count], .{
+                for (&arrays, 0..) |*array, i| array.* = (try builder.prepareArray(T, values[0..count], .{
                     .cv_ref = "MS",
                     .encoding = .{ .pipeline = pipeline },
                     .role = .{
@@ -712,19 +715,27 @@ test "[integration] - [mzML prepared writing]: preserves primitive bytes across 
                         .accession = if (i == 0) mzml.model.Terms.MZ_ARRAY else mzml.model.Terms.INTENSITY_ARRAY,
                         .name = if (i == 0) "m/z array" else "intensity array",
                     },
-                }, &text, scratch, &compressor);
-                const record = try builder.record(.spectrum, "scan=1", 0, count, &.{}, &.{}, &arrays);
-                var nodes = [_]mzml.model.Node{ arrays[0].node, arrays[1].node };
-                for (&nodes) |*node| node.children = &.{.{ .kind = .binary }};
-                var list = record.node.child(.binary_data_array_list).?;
-                list.children = &nodes;
-                var metadata = record.node;
-                metadata.children = &.{list};
+                }, &encoder)).array;
+                const metadata = (try builder.record(.spectrum, "scan=1", 0, count, &.{}, &.{}, &arrays)).node;
                 const wire = try mzml.arrays.encodeWire(T, values[0..count], .{ .pipeline = pipeline }, scratch, &compressor);
+                // The same record carrying the wire as retained Base64 text.
+                const encoded_text = try mzml.base64.encode(&text, wire);
+                var binaries: [2]mzml.model.Node = undefined;
+                var nodes = [_]mzml.model.Node{ arrays[0].node, arrays[1].node };
+                for (&nodes, 0..) |*node, i| {
+                    binaries[i] = node.children[0];
+                    binaries[i].text = encoded_text;
+                    node.children = binaries[i..][0..1];
+                }
+                var list = metadata.child(.binary_data_array_list).?;
+                list.children = &nodes;
+                const lists = [_]mzml.model.Node{list};
+                var retained = metadata;
+                retained.children = &lists;
                 for ([_]bool{ false, true }) |indexed| {
                     var expected_bytes: [32768]u8 = undefined;
                     var expected = std.Io.Writer.fixed(&expected_bytes);
-                    try support.writeSingleRecord(std.testing.allocator, &expected, header.*, record.node, indexed, null);
+                    try support.writeSingleRecord(std.testing.allocator, &expected, header.*, retained, indexed, null);
                     var actual_bytes: [32768]u8 = undefined;
                     var actual = std.Io.Writer.fixed(&actual_bytes);
                     try support.writeSingleRecord(std.testing.allocator, &actual, header.*, metadata, indexed, &.{ wire, wire });
@@ -735,7 +746,7 @@ test "[integration] - [mzML prepared writing]: preserves primitive bytes across 
                         defer writer.deinit();
                         try writer.writeHeader(header.*);
                         try writer.beginList(.spectrum_list, 1, "dp");
-                        try writer.writeRecordWithSelectedArrays(record.node, &choices);
+                        try writer.writeRecordWithSelectedArrays(retained, &choices);
                         try writer.endList();
                         try writer.finish();
                         try std.testing.expectEqualStrings(expected.buffered(), mixed.buffered());
