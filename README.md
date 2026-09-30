@@ -32,6 +32,8 @@ The first version brings the pieces needed for mzML into one package:
 
 The package imports as `zmz`. The mzML API is available under `@import("zmz").mzml`.
 
+zlib arrays are decoded by [zipir](https://github.com/eneskemalergin/zipir), a Zig package pinned by hash in `build.zig.zon`; building needs only Zig.
+
 ## Direction
 
 The near-term design aims for:
@@ -66,7 +68,7 @@ The local mzML reader inventory, reproducible installer, C++ and Rust MS-Numpres
 
 ## License
 
-The project license has not been selected yet. The bundled vocabulary resources retain their source terms and attribution requirements; see [`vocabularies/README.md`](vocabularies/README.md).
+The project license has not been selected yet. The bundled vocabulary resources retain their source terms and attribution requirements; see [`vocabularies/README.md`](vocabularies/README.md). zlib support uses zipir under the [MIT license](https://github.com/eneskemalergin/zipir/blob/main/LICENSE); include that notice with binary distributions.
 
 ---
 

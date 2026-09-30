@@ -352,17 +352,17 @@ test "[failure] - [zlib]: rejects truncation corruption trailing input and alias
     try std.testing.expectError(error.OverlappingBuffers, zlib.decompress(&corrupt, &corrupt));
 }
 
-test "[failure] - [zlib]: rejects more than 30 distance codes as zlib does" {
+test "[edge] - [zlib]: decodes streams declaring 31 or 32 unused distance codes" {
     // One dynamic block holding "a", with literal lengths for 'a' and end of block and one
-    // distance code of length 1 then zeros, so only HDIST differs. Built bit by bit; Python's
-    // zlib decodes the first and rejects the others as too many length or distance symbols.
+    // distance code of length 1 then zeros, so only HDIST differs. Built bit by bit. zlib
+    // rejects 31 and 32 as too many distance symbols; codes 30 and 31 never occur, and none is used.
     const thirty = "\x78\x01\x05\xdd\x21\x01\x00\x00\x00\x00\x90\xad\xfe\x9f\x60\x89\x00\x62\x00\x62";
     const thirty_one = "\x78\x01\x05\xde\x21\x01\x00\x00\x00\x00\x90\xad\xfe\x9f\xe0\x89\x00\x62\x00\x62";
     const thirty_two = "\x78\x01\x05\xdf\x21\x01\x00\x00\x00\x00\x90\xad\xfe\x9f\x60\x8a\x00\x62\x00\x62";
     var output: [4]u8 = undefined;
-    try std.testing.expectEqualStrings("a", try zlib.decompress(&output, thirty));
-    try std.testing.expectError(error.InvalidData, zlib.decompress(&output, thirty_one));
-    try std.testing.expectError(error.InvalidData, zlib.decompress(&output, thirty_two));
+    inline for (.{ thirty, thirty_one, thirty_two }) |stream| {
+        try std.testing.expectEqualStrings("a", try zlib.decompress(&output, stream));
+    }
 }
 
 test "[edge] - [zlib]: treats empty slices inside the other buffer as disjoint" {

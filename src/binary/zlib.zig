@@ -1,7 +1,7 @@
-//! Handles independent zlib array streams using only Zig's standard library.
+//! Handles independent zlib array streams, decoding with zipir and encoding with Zig's standard library.
 
 const std = @import("std");
-const inflate = @import("inflate.zig");
+const zipir = @import("zipir");
 
 /// Checked stream failures. Partial output is unspecified and never exceeds its buffer.
 pub const Error = error{
@@ -21,19 +21,30 @@ pub const Level = enum { fastest, default, best };
 /// The destination capacity bounds expansion. Checks Adler-32 and rejects concatenation.
 pub fn decompress(output: []u8, source: []const u8) Error![]u8 {
     if (overlaps(output, source)) return error.OverlappingBuffers;
-    if (source.len < 2) return error.TruncatedInput;
-    const header = std.mem.readInt(u16, source[0..2], .big);
-    if (source[0] & 15 != 8 or source[0] >> 4 > 7 or header % 31 != 0)
-        return error.InvalidData;
-    if (source[1] & 32 != 0) return error.UnsupportedDictionary;
-
-    const result = try inflate.decode(output, source[2..]);
-    const footer = result.consumed + 2;
-    if (source.len - footer < 4) return error.TruncatedInput;
-    if (source.len - footer != 4) return error.TrailingInput;
-    if (std.hash.Adler32.hash(result.bytes) != std.mem.readInt(u32, source[footer..][0..4], .big))
-        return error.ChecksumMismatch;
-    return result.bytes;
+    // zipir asserts distinct addresses even for empty slices, which are disjoint here.
+    if (source.len == 0) return error.TruncatedInput;
+    const destination = if (output.len == 0) @constCast(source[0..0]) else output;
+    // The workspace is zipir's decoding tables (7,704 bytes); nothing is allocated.
+    var decoder: zipir.zlib.SliceDecoder = .{};
+    const length = decoder.decode(source, destination) catch |err| return switch (err) {
+        error.Truncated => error.TruncatedInput,
+        error.BadAdler => error.ChecksumMismatch,
+        error.TrailingData => error.TrailingInput,
+        error.DictionaryUnsupported => error.UnsupportedDictionary,
+        error.OutputLimitExceeded => error.OutputTooSmall,
+        error.BadHeader,
+        error.UnsupportedMethod,
+        error.WindowTooLarge,
+        error.BadHuffman,
+        error.BadSymbol,
+        error.BadDistance,
+        error.BadStored,
+        error.BadBlock,
+        => error.InvalidData,
+        // Reader errors in zipir's set; a slice source cannot fail a read.
+        error.ReadFailed, error.InputBufferTooSmall, error.PeekTooLarge => error.InvalidData,
+    };
+    return output[0..length];
 }
 
 /// Reusable compression storage with one owner. Do not copy a live instance.
