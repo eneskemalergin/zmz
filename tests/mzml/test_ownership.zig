@@ -99,7 +99,7 @@ test "[integration] - [mzML ownership]: copies optional text and bounds storage 
             .{ .group_ref = .{ .ref = &text } },
         }, .children = &.{.{ .kind = .binary, .text = null }} },
     };
-    var copy = try mzml.owned.Record.init(std.testing.allocator, source, .{ .depth = 2 });
+    var copy = try mzml.owned.Record.init(std.testing.allocator, source, .{});
     defer copy.deinit();
     text[0] = 'y';
     try std.testing.expectEqualStrings("x", copy.value.id);
@@ -109,10 +109,17 @@ test "[integration] - [mzML ownership]: copies optional text and bounds storage 
     try std.testing.expectEqualStrings("x", copy.value.node.params[1].cv.value.?);
     try std.testing.expectEqualStrings("x", copy.value.node.params[2].group_ref.ref.?);
     try std.testing.expectEqual(null, copy.value.node.children[0].text);
-    try std.testing.expectError(error.LimitExceeded, mzml.owned.Record.init(std.testing.allocator, source, .{ .depth = 1 }));
+    // The record node is the first level.
+    var chain: [mzml.MAX_DEPTH]mzml.model.Node = undefined;
+    var deep = source;
+    deep.node.children = &.{support.nest(chain[1..])};
+    var deepest = try mzml.owned.Record.init(std.testing.allocator, deep, .{});
+    deepest.deinit();
+    deep.node.children = &.{support.nest(&chain)};
+    try std.testing.expectError(error.LimitExceeded, mzml.owned.Record.init(std.testing.allocator, deep, .{}));
     try std.testing.expectError(error.LimitExceeded, mzml.owned.Record.init(std.testing.allocator, source, .{ .bytes = 0 }));
     const minimal: mzml.model.Record = .{ .id = "x", .index = 0, .default_array_length = 0, .node = .{ .kind = .spectrum } };
-    var exact = try mzml.owned.Record.init(std.testing.allocator, minimal, .{ .bytes = 1, .depth = 1 });
+    var exact = try mzml.owned.Record.init(std.testing.allocator, minimal, .{ .bytes = 1 });
     defer exact.deinit();
     try std.testing.expectEqualStrings("x", exact.value.id);
 }

@@ -13,8 +13,6 @@ const schema = @import("schema.zig");
 /// Limits copied storage, excluding arena bookkeeping and alignment padding.
 pub const Limits = struct {
     bytes: usize = 256 * 1024 * 1024,
-    /// Maximum node nesting, counting the root as one; supported range is 1 to schema.MAX_DEPTH.
-    depth: usize = schema.MAX_DEPTH,
 };
 
 pub const Error = copy.Error;
@@ -36,11 +34,10 @@ fn Owned(comptime T: type, comptime copyValue: fn (*copy.Copier, T, usize) Error
 
         /// Deep-copies every source slice; the caller releases the result with deinit.
         pub fn init(allocator: std.mem.Allocator, source: T, limits: Limits) Error!@This() {
-            if (limits.depth == 0 or limits.depth > schema.MAX_DEPTH) return error.LimitExceeded;
             var arena: std.heap.ArenaAllocator = .init(allocator);
             errdefer arena.deinit();
             var copier: copy.Copier = .{ .allocator = arena.allocator(), .remaining = limits.bytes };
-            const value = try copyValue(&copier, source, limits.depth);
+            const value = try copyValue(&copier, source, schema.MAX_DEPTH);
             return .{ .arena = arena, .value = value };
         }
 

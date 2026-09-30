@@ -419,14 +419,13 @@ pub const BinaryArray = struct {
         comptime T: type,
         output: []T,
         scratch: arrays.Scratch,
-        limits: arrays.Limits,
     ) (EncodingError || arrays.Error)!void {
         if (self.encoding.decodedPrimitive() != Primitive.of(T)) return error.TypeMismatch;
         if (self.length != output.len) return error.DecodedSizeMismatch;
         const binary = self.node.child(.binary) orelse return error.PayloadNotRetained;
         const text = binary.text orelse return error.PayloadNotRetained;
         const pipeline = self.encoding.payloadPipeline(self.length, std.mem.trim(u8, text, cv.XML_WHITESPACE).len == 0);
-        try arrays.decode(T, output, text, pipeline, scratch, limits);
+        try arrays.decode(T, output, text, pipeline, scratch);
     }
 };
 
@@ -469,12 +468,11 @@ pub fn decodeArray(
     default_length: ?usize,
     groups: []const cv.Group,
     scratch: arrays.Scratch,
-    limits: arrays.Limits,
 ) (EncodingError || cv.ValueError || arrays.Error)!void {
     const declared_encoding = try arrayEncoding(node, groups);
     if (declared_encoding.decodedPrimitive() != Primitive.of(T)) return error.TypeMismatch;
     const array = try initWithEncoding(node, default_length, declared_encoding);
-    try array.decode(T, output, scratch, limits);
+    try array.decode(T, output, scratch);
 }
 
 fn initWithEncoding(node: Node, default_length: ?usize, descriptor: Encoding) cv.ValueError!BinaryArray {

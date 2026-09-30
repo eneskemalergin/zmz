@@ -103,7 +103,7 @@ test "[property] - [base64]: matches RFC 4648 vectors across every text split" {
         }
         for (0..len + 1) |split| {
             var output: [32]u8 = undefined;
-            var decoder = base64.Decoder.init(&output, std.math.maxInt(usize));
+            var decoder = base64.Decoder.init(&output);
             try decoder.update(spaced[0..split]);
             try decoder.update(spaced[split..len]);
             const counts = try decoder.finish();
@@ -132,7 +132,7 @@ test "[failure] - [base64]: rejects malformed tails and remains failed" {
         try std.testing.expectError(case[1], decodeWhole(case[0]));
         for (0..case[0].len + 1) |split| {
             var output: [32]u8 = undefined;
-            var decoder = base64.Decoder.init(&output, std.math.maxInt(usize));
+            var decoder = base64.Decoder.init(&output);
             const result = blk: {
                 decoder.update(case[0][0..split]) catch |err| break :blk err;
                 decoder.update(case[0][split..]) catch |err| break :blk err;
@@ -145,14 +145,9 @@ test "[failure] - [base64]: rejects malformed tails and remains failed" {
     }
 }
 
-test "[edge] - [base64]: enforces the text limit, output capacity, and destination ownership" {
+test "[edge] - [base64]: enforces output capacity and destination ownership" {
     var output: [4]u8 = undefined;
     _ = try base64.decode(output[0..1], " Zg== ");
-    var exact = base64.Decoder.init(&output, 6);
-    try exact.update(" Zg== ");
-    _ = try exact.finish();
-    var short = base64.Decoder.init(&output, 5);
-    try std.testing.expectError(error.LimitExceeded, short.update(" Zg== "));
     try std.testing.expectError(error.OutputTooSmall, base64.decode(output[0..0], "Zg=="));
     try std.testing.expectError(error.OutputTooSmall, base64.encode(output[0..3], "f"));
     try std.testing.expectError(error.OverlappingBuffers, base64.encode(&output, output[0..1]));
@@ -162,7 +157,7 @@ test "[edge] - [base64]: enforces the text limit, output capacity, and destinati
 
 test "[failure] - [base64]: rejects reuse after finish" {
     var output: [4]u8 = undefined;
-    var decoder = base64.Decoder.init(&output, std.math.maxInt(usize));
+    var decoder = base64.Decoder.init(&output);
     _ = try decoder.finish();
     try std.testing.expectError(error.AlreadyFinished, decoder.finish());
     try std.testing.expectError(error.AlreadyFinished, decoder.update(""));
@@ -175,7 +170,7 @@ test "[property] - [base64]: preserves all one-byte and two-byte inputs" {
     for (0..65536) |number| {
         std.mem.writeInt(u16, &input, @intCast(number), .little);
         const text = try base64.encode(&encoded, &input);
-        var decoder = base64.Decoder.init(&decoded, std.math.maxInt(usize));
+        var decoder = base64.Decoder.init(&decoded);
         for (text) |byte| try decoder.update(&.{byte});
         const counts = try decoder.finish();
         try std.testing.expectEqualSlices(u8, &input, decoded[0..counts.decoded_bytes]);
@@ -203,7 +198,7 @@ test "[property] - [base64]: bulk input matches quartet decoding at errors capac
         for ([_]usize{ 0, 1, 3, 31, 32, 33, 255, 256, 257, short.len }) |split| {
             if (split > short.len) continue;
             var output: [384]u8 = undefined;
-            var decoder = base64.Decoder.init(&output, std.math.maxInt(usize));
+            var decoder = base64.Decoder.init(&output);
             try decoder.update(short[0..split]);
             try decoder.update(short[split..]);
             const counts = try decoder.finish();
@@ -235,7 +230,7 @@ test "[property] - [base64]: bulk input matches quartet decoding at errors capac
             for ([_]usize{ 1, width - 1, width, width + 1, 31, 32, 33, 255, 256, 257, used }) |split| {
                 if (split > used) continue;
                 var output: [384]u8 = undefined;
-                var decoder = base64.Decoder.init(&output, std.math.maxInt(usize));
+                var decoder = base64.Decoder.init(&output);
                 try decoder.update(wrapped[0..split]);
                 try decoder.update(wrapped[split..used]);
                 const counts = try decoder.finish();
@@ -259,8 +254,8 @@ test "[property] - [base64]: bulk input matches quartet decoding at errors capac
 fn compareBase64Updates(text: []const u8, capacity: usize) !void {
     var bulk_output: [384]u8 = undefined;
     var scalar_output: [384]u8 = undefined;
-    var bulk = base64.Decoder.init(bulk_output[0..capacity], std.math.maxInt(usize));
-    var scalar = base64.Decoder.init(scalar_output[0..capacity], std.math.maxInt(usize));
+    var bulk = base64.Decoder.init(bulk_output[0..capacity]);
+    var scalar = base64.Decoder.init(scalar_output[0..capacity]);
     const bulk_error: ?base64.Error = result: {
         bulk.update(text) catch |err| break :result err;
         _ = bulk.finish() catch |err| break :result err;
@@ -492,7 +487,7 @@ test "[integration] - [primitive wire]: matches fixed little-endian Base64 vecto
         const T = case[0];
         const expected = case[1];
         var output: [expected.len]T = undefined;
-        try arrays.decode(T, &output, case[2], .none, .{ .transport = &.{}, .transformed = &.{} }, .{});
+        try arrays.decode(T, &output, case[2], .none, .{ .transport = &.{}, .transformed = &.{} });
         try std.testing.expectEqualSlices(
             u8,
             std.mem.sliceAsBytes(&expected),
@@ -503,10 +498,10 @@ test "[integration] - [primitive wire]: matches fixed little-endian Base64 vecto
         const prepared = try arrays.encodeWire(T, &expected, .{}, .{ .transport = &.{}, .transformed = &transformed }, null);
         try std.testing.expectEqualStrings(case[2], try base64.encode(&encoded, prepared));
         @memset(std.mem.sliceAsBytes(&output), 0xa5);
-        try arrays.decodeWire(T, &output, prepared, .none, &.{}, .{});
+        try arrays.decodeWire(T, &output, prepared, .none, &.{});
         try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&expected), std.mem.sliceAsBytes(&output));
         @memcpy(std.mem.sliceAsBytes(&output), prepared);
-        try arrays.decodeWire(T, &output, std.mem.sliceAsBytes(&output), .none, &.{}, .{});
+        try arrays.decodeWire(T, &output, std.mem.sliceAsBytes(&output), .none, &.{});
         try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&expected), std.mem.sliceAsBytes(&output));
         if (@import("builtin").cpu.arch.endian() == .little) {
             const borrowed = try arrays.encodeWire(T, &expected, .{}, .{ .transport = &.{}, .transformed = &.{} }, null);
@@ -516,7 +511,7 @@ test "[integration] - [primitive wire]: matches fixed little-endian Base64 vecto
         var compressor = try zlib.Compressor.init(std.testing.allocator, .even);
         defer compressor.deinit();
         const compressed = try arrays.encode(T, &encoded, &expected, .{ .pipeline = .zlib }, scratch, &compressor);
-        try arrays.decode(T, &output, compressed, .zlib, .{ .transport = &transport, .transformed = &.{} }, .{});
+        try arrays.decode(T, &output, compressed, .zlib, .{ .transport = &transport, .transformed = &.{} });
         try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&expected), std.mem.sliceAsBytes(&output));
     }
 }
@@ -526,15 +521,13 @@ test "[failure] - [wire decoding]: rejects overlap type size and limit errors" {
     const bytes = std.mem.sliceAsBytes(&output);
     const source = [_]u8{ 4, 3, 2, 1 };
     var values: [1]i32 = undefined;
-    try arrays.decodeWire(i32, &values, &source, .none, &.{}, .{ .text_bytes = 8 });
+    try arrays.decodeWire(i32, &values, &source, .none, &.{});
     try std.testing.expectEqual(@as(i32, 0x01020304), values[0]);
-    try std.testing.expectError(error.OverlappingBuffers, arrays.decodeWire(i64, std.mem.bytesAsSlice(i64, bytes)[0..1], bytes[1..9], .none, &.{}, .{}));
-    try std.testing.expectError(error.OverlappingBuffers, arrays.decodeWire(i64, std.mem.bytesAsSlice(i64, bytes)[0..1], bytes[0..8], .zlib, &.{}, .{}));
-    try std.testing.expectError(error.OverlappingBuffers, arrays.decodeWire(i64, std.mem.bytesAsSlice(i64, bytes)[0..1], bytes[0..16], .none, bytes[8..16], .{}));
-    try std.testing.expectError(error.DecodedSizeMismatch, arrays.decodeWire(i32, &values, source[0..3], .none, &.{}, .{}));
-    try std.testing.expectError(error.TypeMismatch, arrays.decodeWire(i32, &values, &source, .pic, &.{}, .{}));
-    try std.testing.expectError(error.LimitExceeded, arrays.decodeWire(i32, &values, &source, .none, &.{}, .{ .array_bytes = 3 }));
-    try std.testing.expectError(error.LimitExceeded, arrays.decodeWire(i32, &values, &source, .none, &.{}, .{ .text_bytes = 4 }));
+    try std.testing.expectError(error.OverlappingBuffers, arrays.decodeWire(i64, std.mem.bytesAsSlice(i64, bytes)[0..1], bytes[1..9], .none, &.{}));
+    try std.testing.expectError(error.OverlappingBuffers, arrays.decodeWire(i64, std.mem.bytesAsSlice(i64, bytes)[0..1], bytes[0..8], .zlib, &.{}));
+    try std.testing.expectError(error.OverlappingBuffers, arrays.decodeWire(i64, std.mem.bytesAsSlice(i64, bytes)[0..1], bytes[0..16], .none, bytes[8..16]));
+    try std.testing.expectError(error.DecodedSizeMismatch, arrays.decodeWire(i32, &values, source[0..3], .none, &.{}));
+    try std.testing.expectError(error.TypeMismatch, arrays.decodeWire(i32, &values, &source, .pic, &.{}));
 }
 
 test "[integration] - [SLOF pipeline]: decodes a frozen zlib envelope" {
@@ -544,7 +537,7 @@ test "[integration] - [SLOF pipeline]: decodes a frozen zlib envelope" {
     var output: [3]f64 = undefined;
 
     // Frozen Numpress vector with fixed point 4000, wrapped by Python zlib and Base64.
-    try arrays.decode(f64, &output, "eJxzWO/AAAFXuSpUARP4Aqw=", .slof_zlib, scratch, .{});
+    try arrays.decode(f64, &output, "eJxzWO/AAAFXuSpUARP4Aqw=", .slof_zlib, scratch);
     try expectSlofBound(&.{ 0, 1, 10 }, &output, 4000);
 }
 
@@ -566,7 +559,7 @@ test "[property] - [array pipelines]: preserves single-bit patterns zeros and al
         values[@bitSizeOf(T) + 1] = @bitCast(@as(Bits, std.math.maxInt(Bits)));
         inline for (.{ arrays.Pipeline.none, .zlib }) |pipeline| {
             const wire = try arrays.encode(T, &encoded, &values, .{ .pipeline = pipeline }, scratch, &compressor);
-            try arrays.decode(T, &output, wire, pipeline, scratch, .{});
+            try arrays.decode(T, &output, wire, pipeline, scratch);
             try std.testing.expectEqualSlices(
                 u8,
                 std.mem.sliceAsBytes(&values),
@@ -602,7 +595,7 @@ test "[integration] - [array pipelines]: composes all Numpress modes with option
         }, scratch, &compressor);
         var encoded_wire: [512]u8 = undefined;
         try std.testing.expectEqualStrings(wire, try base64.encode(&encoded_wire, prepared));
-        try arrays.decode(f64, &output, wire, pipeline, scratch, .{});
+        try arrays.decode(f64, &output, wire, pipeline, scratch);
         switch (pipeline) {
             .pic, .pic_zlib => try std.testing.expectEqualSlices(f64, &.{ 0, 1, 11, 100 }, &output),
             .linear, .linear_zlib => {
@@ -641,7 +634,7 @@ test "[integration] - [array options]: rejects invalid configuration and aliasin
     var floats: [4]f32 = undefined;
     try std.testing.expectError(
         error.TypeMismatch,
-        arrays.decode(f32, &floats, "", .pic, scratch, .{}),
+        arrays.decode(f32, &floats, "", .pic, scratch),
     );
 }
 
@@ -653,20 +646,16 @@ test "[integration] - [array limits]: rejects short scratch and mismatched count
     try std.testing.expectError(error.OutputTooSmall, arrays.decode(f64, &output, source, .slof_zlib, .{
         .transport = transport[0..1],
         .transformed = &transformed,
-    }, .{}));
+    }));
     try std.testing.expectError(error.OutputTooSmall, arrays.decode(f64, &output, source, .slof_zlib, .{
         .transport = &transport,
         .transformed = transformed[0..1],
-    }, .{}));
+    }));
     const scratch: arrays.Scratch = .{ .transport = &transport, .transformed = &transformed };
     const plain = "AAAAAAAA8D8AAAAAAAAAgAAAAAAAAPB/";
     try std.testing.expectError(
         error.DecodedSizeMismatch,
-        arrays.decode(f64, output[0..2], plain, .none, scratch, .{}),
-    );
-    try std.testing.expectError(
-        error.LimitExceeded,
-        arrays.decode(f64, &output, plain, .none, scratch, .{ .array_bytes = 23 }),
+        arrays.decode(f64, output[0..2], plain, .none, scratch),
     );
 }
 
@@ -677,14 +666,14 @@ test "[failure] - [zlib arrays]: returns OutputTooSmall when a stream outgrows i
     var transformed: [64]u8 = undefined;
     const scratch: arrays.Scratch = .{ .transport = &transport, .transformed = &transformed };
     var output: [3]f64 = undefined;
-    try arrays.decode(f64, output[0..2], two, .zlib, scratch, .{});
+    try arrays.decode(f64, output[0..2], two, .zlib, scratch);
     try std.testing.expectEqualSlices(f64, &.{ 1, 2 }, output[0..2]);
-    try std.testing.expectError(error.OutputTooSmall, arrays.decode(f64, output[0..1], two, .zlib, scratch, .{}));
-    try std.testing.expectError(error.DecodedSizeMismatch, arrays.decode(f64, &output, two, .zlib, scratch, .{}));
+    try std.testing.expectError(error.OutputTooSmall, arrays.decode(f64, output[0..1], two, .zlib, scratch));
+    try std.testing.expectError(error.DecodedSizeMismatch, arrays.decode(f64, &output, two, .zlib, scratch));
     const counts = try base64.decode(&transport, two);
-    try std.testing.expectError(error.OutputTooSmall, arrays.decodeWire(f64, output[0..1], transport[0..counts.decoded_bytes], .zlib, &.{}, .{}));
+    try std.testing.expectError(error.OutputTooSmall, arrays.decodeWire(f64, output[0..1], transport[0..counts.decoded_bytes], .zlib, &.{}));
     // Three SLOF values exceed the wire bound of one.
-    try std.testing.expectError(error.OutputTooSmall, arrays.decode(f64, output[0..1], "eJxzWO/AAAFXuSpUARP4Aqw=", .slof_zlib, scratch, .{}));
+    try std.testing.expectError(error.OutputTooSmall, arrays.decode(f64, output[0..1], "eJxzWO/AAAFXuSpUARP4Aqw=", .slof_zlib, scratch));
 }
 
 test "[integration] - [array encoder]: keeps every wire until reset for all pipelines" {
@@ -703,7 +692,7 @@ test "[integration] - [array encoder]: keeps every wire until reset for all pipe
     var transformed: [512]u8 = undefined;
     inline for (std.meta.tags(arrays.Pipeline), 0..) |pipeline, i| {
         var output: [values.len]f64 = undefined;
-        try arrays.decodeWire(f64, &output, wires[i], pipeline, &transformed, .{});
+        try arrays.decodeWire(f64, &output, wires[i], pipeline, &transformed);
         if (pipeline == .none or pipeline == .zlib) try std.testing.expectEqualSlices(f64, &values, &output);
         if (pipeline == .pic or pipeline == .pic_zlib) try std.testing.expectEqualSlices(f64, &.{ 0, 1, 11, 100 }, &output);
     }
@@ -713,7 +702,7 @@ test "[integration] - [array encoder]: keeps every wire until reset for all pipe
     inline for (.{ f32, i32, i64 }) |T| {
         const typed = [_]T{ 1, 2, 3 };
         var output: [3]T = undefined;
-        try arrays.decodeWire(T, &output, try encoder.encode(T, &typed, .{ .pipeline = .zlib }), .zlib, &.{}, .{});
+        try arrays.decodeWire(T, &output, try encoder.encode(T, &typed, .{ .pipeline = .zlib }), .zlib, &.{});
         try std.testing.expectEqualSlices(T, &typed, &output);
     }
 }
@@ -729,7 +718,7 @@ test "[property] - [array encoder]: compresses incompressible arrays without ret
     const wire = try encoder.encode(i64, numbers, .{ .pipeline = .zlib });
     const output = try std.testing.allocator.alloc(i64, numbers.len);
     defer std.testing.allocator.free(output);
-    try arrays.decodeWire(i64, output, wire, .zlib, &.{}, .{});
+    try arrays.decodeWire(i64, output, wire, .zlib, &.{});
     try std.testing.expectEqualSlices(i64, numbers, output);
 }
 
@@ -747,21 +736,20 @@ test "[failure] - [array encoder]: releases storage after allocation failures" {
 test "[integration] - [uncompressed arrays]: reports the first decode error without rescanning" {
     const scratch: arrays.Scratch = .{ .transport = &.{}, .transformed = &.{} };
     var output: [2]i32 = undefined;
-    try arrays.decode(i32, output[0..1], " B\tAMC\rAQ==\n", .none, scratch, .{});
+    try arrays.decode(i32, output[0..1], " B\tAMC\rAQ==\n", .none, scratch);
     try std.testing.expectEqual(@as(i32, 0x01020304), output[0]);
-    try arrays.decode(i32, output[0..0], " \n", .none, scratch, .{});
-    try std.testing.expectError(error.DecodedSizeMismatch, arrays.decode(i32, &output, "BAMCAQ==", .none, scratch, .{}));
-    try std.testing.expectError(error.DecodedSizeMismatch, arrays.decode(i32, output[0..0], "BAMCAQ==", .none, scratch, .{}));
-    try std.testing.expectError(error.DecodedSizeMismatch, arrays.decode(i32, output[0..1], "BAMCAQAAAAAA", .none, scratch, .{}));
-    try std.testing.expectError(error.DecodedSizeMismatch, arrays.decode(i32, output[0..1], "BAMCAQAAAAAA!", .none, scratch, .{}));
-    try std.testing.expectError(error.DecodedSizeMismatch, arrays.decode(i32, output[0..1], "BAMCAQAAAAAAA", .none, scratch, .{}));
-    try std.testing.expectError(error.DecodedSizeMismatch, arrays.decode(i32, output[0..1], "BAMCAQAAAAAABR==", .none, scratch, .{}));
-    try std.testing.expectError(error.InvalidCharacter, arrays.decode(i32, output[0..1], "!AMCAQAAAAAA", .none, scratch, .{}));
-    try std.testing.expectError(error.TruncatedInput, arrays.decode(i32, output[0..1], "BAM", .none, scratch, .{}));
-    try std.testing.expectError(error.NonCanonicalTail, arrays.decode(i32, output[0..1], "BR==", .none, scratch, .{}));
-    try std.testing.expectError(error.LimitExceeded, arrays.decode(i32, output[0..1], "BAMCAQAAAAAA", .none, scratch, .{ .text_bytes = 11 }));
-    try std.testing.expectError(error.OverlappingBuffers, arrays.decode(i32, &output, std.mem.sliceAsBytes(&output), .none, scratch, .{}));
-    try std.testing.expectError(error.OverlappingBuffers, arrays.decode(i32, &output, "BAMCAQ==", .none, .{ .transport = std.mem.sliceAsBytes(&output), .transformed = &.{} }, .{}));
+    try arrays.decode(i32, output[0..0], " \n", .none, scratch);
+    try std.testing.expectError(error.DecodedSizeMismatch, arrays.decode(i32, &output, "BAMCAQ==", .none, scratch));
+    try std.testing.expectError(error.DecodedSizeMismatch, arrays.decode(i32, output[0..0], "BAMCAQ==", .none, scratch));
+    try std.testing.expectError(error.DecodedSizeMismatch, arrays.decode(i32, output[0..1], "BAMCAQAAAAAA", .none, scratch));
+    try std.testing.expectError(error.DecodedSizeMismatch, arrays.decode(i32, output[0..1], "BAMCAQAAAAAA!", .none, scratch));
+    try std.testing.expectError(error.DecodedSizeMismatch, arrays.decode(i32, output[0..1], "BAMCAQAAAAAAA", .none, scratch));
+    try std.testing.expectError(error.DecodedSizeMismatch, arrays.decode(i32, output[0..1], "BAMCAQAAAAAABR==", .none, scratch));
+    try std.testing.expectError(error.InvalidCharacter, arrays.decode(i32, output[0..1], "!AMCAQAAAAAA", .none, scratch));
+    try std.testing.expectError(error.TruncatedInput, arrays.decode(i32, output[0..1], "BAM", .none, scratch));
+    try std.testing.expectError(error.NonCanonicalTail, arrays.decode(i32, output[0..1], "BR==", .none, scratch));
+    try std.testing.expectError(error.OverlappingBuffers, arrays.decode(i32, &output, std.mem.sliceAsBytes(&output), .none, scratch));
+    try std.testing.expectError(error.OverlappingBuffers, arrays.decode(i32, &output, "BAMCAQ==", .none, .{ .transport = std.mem.sliceAsBytes(&output), .transformed = &.{} }));
 }
 
 test "[integration] - [empty arrays]: round trips every established pipeline" {
@@ -781,6 +769,6 @@ test "[integration] - [empty arrays]: round trips every established pipeline" {
             .pipeline = pipeline,
             .fixed_point = fixed_point,
         }, scratch, &compressor);
-        try arrays.decode(f64, output[0..0], wire, pipeline, scratch, .{});
+        try arrays.decode(f64, output[0..0], wire, pipeline, scratch);
     }
 }

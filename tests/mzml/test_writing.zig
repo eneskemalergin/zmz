@@ -459,7 +459,7 @@ test "[failure] - [mzML extensions]: rejects incomplete content and bounds fragm
         .{ .items = &.{.{ .params = 1 }}, .err = error.InvalidStructure },
         .{ .items = &.{.{ .children = 1 }}, .err = error.InvalidStructure },
         .{ .items = &.{.{ .xml = "<extra>" }}, .err = error.InvalidXml },
-        .{ .items = &.{.{ .xml = "<extra/>" }}, .limits = .{ .depth = 1 }, .err = error.LimitExceeded },
+        .{ .items = &.{.{ .xml = "<extra>" ** mzml.MAX_DEPTH ++ "</extra>" ** mzml.MAX_DEPTH }}, .err = error.WriterLimit },
         .{ .items = &.{.{ .xml = "<extra/>" }}, .limits = .{ .nodes = 1 }, .err = error.LimitExceeded },
         .{ .items = &.{.{ .xml = "<extra/>" }}, .limits = .{ .text_bytes = 7 }, .err = error.LimitExceeded },
     };
@@ -671,7 +671,7 @@ test "[integration] - [mzML references]: preserves unresolved and external links
                 try support.expectNode(record.node, found.value.node);
                 for (next.binaryArrays()) |array| {
                     var values: [1]f64 = undefined;
-                    try mzml.model.decodeArray(f64, &values, array, next.default_array_length, rewritten_header.groups, .{ .transport = &.{}, .transformed = &.{} }, .{});
+                    try mzml.model.decodeArray(f64, &values, array, next.default_array_length, rewritten_header.groups, .{ .transport = &.{}, .transformed = &.{} });
                     try std.testing.expectEqual(@as(f64, 1), values[0]);
                 }
                 count += 1;
@@ -1062,8 +1062,7 @@ test "[failure] - [mzML writer]: checks node bounds and missing payloads during 
         .run = .{ .kind = .run },
     };
     const cases = [_]struct { mzml.Writer.Limits, ?mzml.Writer.Error }{
-        .{ .{ .depth = 4, .nodes = 4, .text_bytes = 4 }, null },
-        .{ .{ .depth = 3 }, error.LimitExceeded },
+        .{ .{ .nodes = 4, .text_bytes = 4 }, null },
         .{ .{ .nodes = 3 }, error.LimitExceeded },
         .{ .{ .text_bytes = 3 }, error.LimitExceeded },
     };

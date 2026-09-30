@@ -95,7 +95,7 @@ pub const CHILD_KINDS = blk: {
 /// Deepest element nesting any reader, writer, copy, or builder supports, counting the root.
 pub const MAX_DEPTH = 64;
 
-pub const Limits = struct { depth: usize = MAX_DEPTH, nodes: usize = 100_000, text_bytes: usize = 256 * 1024 * 1024 };
+pub const Limits = struct { nodes: usize = 100_000, text_bytes: usize = 256 * 1024 * 1024 };
 pub const Error = error{
     InvalidStructure,
     MissingAttribute,
@@ -112,7 +112,7 @@ pub fn checkHeader(header: model.Header) Error!void {
 }
 
 pub fn checkLimits(limits: Limits) Error!void {
-    if (limits.depth == 0 or limits.depth > MAX_DEPTH or limits.nodes == 0) return error.InvalidOptions;
+    if (limits.nodes == 0) return error.InvalidOptions;
 }
 
 const MANY = std.math.maxInt(usize);

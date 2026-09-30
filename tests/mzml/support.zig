@@ -52,6 +52,14 @@ pub const REFERENCED_DOCUMENT = HEADER ++ "<spectrumList count='2' defaultDataPr
 
 // --- Shared helpers ---
 
+/// Links nodes into one chain, each the only child of the one before, and returns the outermost.
+pub fn nest(nodes: []mzml.model.Node) mzml.model.Node {
+    var index = nodes.len - 1;
+    nodes[index] = .{ .kind = .scan };
+    while (index != 0) : (index -= 1) nodes[index - 1] = .{ .kind = .scan, .children = nodes[index..][0..1] };
+    return nodes[0];
+}
+
 pub fn expectItem(expected: mzml.model.Item, actual: mzml.model.Item) !void {
     try std.testing.expectEqual(std.meta.activeTag(expected), std.meta.activeTag(actual));
     switch (expected) {
@@ -215,7 +223,7 @@ pub fn checkIndexed(allocator: std.mem.Allocator, bytes: []const u8) !void {
             var output: [3]f64 = undefined;
             var transport: [128]u8 = undefined;
             var transformed: [128]u8 = undefined;
-            try mzml.model.decodeArray(f64, &output, array, 3, index.header().groups, .{ .transport = &transport, .transformed = &transformed }, .{});
+            try mzml.model.decodeArray(f64, &output, array, 3, index.header().groups, .{ .transport = &transport, .transformed = &transformed });
             for (output, [_]f64{ 1, 2, 3 }) |value, expected| try std.testing.expectApproxEqAbs(expected, value, 0.001);
         }
     }
@@ -334,7 +342,7 @@ pub fn checkLookupAllocator(record_allocator: std.mem.Allocator) !void {
     try std.testing.expectEqualStrings("scan=none", retained.value.id);
     var values: [3]f64 = undefined;
     var transport: [128]u8 = undefined;
-    try mzml.model.decodeArray(f64, &values, retained.value.binaryArrays()[0], 3, &.{}, .{ .transport = &transport, .transformed = &.{} }, .{});
+    try mzml.model.decodeArray(f64, &values, retained.value.binaryArrays()[0], 3, &.{}, .{ .transport = &transport, .transformed = &.{} });
     try std.testing.expectEqualSlices(f64, &.{ 1, 2, 3 }, &values);
 }
 
@@ -354,7 +362,7 @@ pub fn checkOpenEmbedded(allocator: std.mem.Allocator, bytes: []const u8) !void 
             var values: [3]f64 = undefined;
             var transport: [128]u8 = undefined;
             var transformed: [128]u8 = undefined;
-            try mzml.model.decodeArray(f64, &values, array, 3, index.header().groups, .{ .transport = &transport, .transformed = &transformed }, .{});
+            try mzml.model.decodeArray(f64, &values, array, 3, index.header().groups, .{ .transport = &transport, .transformed = &transformed });
             for (values, [_]f64{ 1, 2, 3 }) |value, expected| try std.testing.expectApproxEqAbs(expected, value, 0.001);
         }
     }
@@ -393,7 +401,7 @@ pub fn copyRetained(allocator: std.mem.Allocator) !void {
         try mzml.model.decodeArray(f64, &output, array, record.value.default_array_length, header.value.groups, .{
             .transport = &transport,
             .transformed = &transformed,
-        }, .{});
+        });
         try std.testing.expectEqual(@as(f64, 1), output[0]);
     }
 }

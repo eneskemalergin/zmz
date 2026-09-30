@@ -37,7 +37,6 @@ const PARAM_ATTRIBUTES = std.StaticStringMap(std.meta.FieldEnum(ParamAttributes)
 /// Independent bounds on parser state, retained objects, lists, and payload text.
 /// Retained-byte limits count stored slices, not allocator bookkeeping or temporary list capacity.
 pub const Limits = struct {
-    depth: usize = schema.MAX_DEPTH,
     attributes: usize = 64,
     attribute_bytes: usize = 1024 * 1024,
     header_bytes: usize = 32 * 1024 * 1024,
@@ -115,13 +114,12 @@ pub const FragmentTarget = struct { kind: model.Kind, id: []const u8 };
 /// Streaming input needs buffer capacity for peekGreedy(1); otherwise init returns InvalidOptions.
 /// Empty fixed readers are valid inputs and report malformed XML when read.
 pub fn init(allocator: std.mem.Allocator, input: *std.Io.Reader, options: Options) Error!StreamReader {
-    if (options.limits.depth == 0 or options.limits.depth > schema.MAX_DEPTH or options.limits.nodes == 0 or
-        options.limits.list_entries == 0) return error.InvalidOptions;
+    if (options.limits.nodes == 0 or options.limits.list_entries == 0) return error.InvalidOptions;
     if (input.buffer.len == 0 and input.vtable != std.Io.Reader.ending.vtable)
         return error.InvalidOptions;
     return .{
         .allocator = allocator,
-        .cursor = try xml.Cursor.init(allocator, input, options.limits.depth, options.limits.attributes, options.limits.attribute_bytes),
+        .cursor = try xml.Cursor.init(allocator, input, schema.MAX_DEPTH, options.limits.attributes, options.limits.attribute_bytes),
         .options = options,
         .header_store = Storage.init(allocator, options.limits.header_bytes),
         .record_store = Storage.init(allocator, options.limits.record_bytes),
@@ -309,7 +307,7 @@ pub fn parseFooter(allocator: std.mem.Allocator, bytes: []const u8, options: Opt
 pub fn resumeFollowingList(self: *StreamReader, input: *std.Io.Reader, ancestors: usize, physical_start: u64, prefix_length: usize) Error!void {
     if (self.active_list != .spectrum_list or
         ancestors != self.scope_count + 1 or physical_start < prefix_length) return error.InvalidOptions;
-    const replacement = try xml.Cursor.init(self.allocator, input, self.options.limits.depth, self.options.limits.attributes, self.options.limits.attribute_bytes);
+    const replacement = try xml.Cursor.init(self.allocator, input, schema.MAX_DEPTH, self.options.limits.attributes, self.options.limits.attribute_bytes);
     self.cursor.deinit();
     self.cursor = replacement;
     errdefer |err| self.fail(err, .open_index);
@@ -654,7 +652,7 @@ fn startNodeFor(self: *StreamReader, storage: *Storage, kind_value: model.Kind, 
 }
 
 fn parseNodeFor(self: *StreamReader, storage: *Storage, depth: usize, advance_after: bool, payload: Payload, comptime retention: Retention) Error!model.Node {
-    if (depth > self.options.limits.depth) return try self.limitError(.depth, self.options.limits.depth, depth);
+    if (depth > schema.MAX_DEPTH) return try self.limitError(.depth, schema.MAX_DEPTH, depth);
     const kind_value = try self.kind();
     const array_position = storage.arrays;
     var node: model.Node = .{ .kind = kind_value };

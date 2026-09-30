@@ -20,7 +20,6 @@ pub const Error = error{
     NonCanonicalTail,
     TruncatedInput,
     OutputTooSmall,
-    LimitExceeded,
     LengthOverflow,
     OverlappingBuffers,
     AlreadyFinished,
@@ -52,19 +51,17 @@ pub fn encode(output: []u8, source: []const u8) Error![]u8 {
 /// Decodes logical XML text, accepting only XML whitespace between Base64 characters.
 /// The output bounds the decoded bytes. No allocation or whitespace-stripped copy is made.
 pub fn decode(output: []u8, source: []const u8) Error!Counts {
-    var decoder = Decoder.init(output, std.math.maxInt(usize));
+    var decoder = Decoder.init(output);
     try decoder.update(source);
     return decoder.finish();
 }
 
-/// A decoder borrowing its destination until finish or abandonment, bounded by its output
-/// and by text_limit bytes of logical text (whitespace included); physical XML byte
-/// limits belong to the XML reader, before entity expansion.
+/// A decoder borrowing its destination until finish or abandonment, bounded by its output.
+/// Bounds on the XML text belong to the XML reader.
 /// Input slices need remain alive only during update and must not overlap the destination.
 /// Failures are sticky; counters and partially written output are not a successful result.
 pub const Decoder = struct {
     output: []u8,
-    text_limit: usize,
     counts: Counts = .{},
     quartet: [4]u8 = undefined,
     quartet_len: u3 = 0,
@@ -75,8 +72,8 @@ pub const Decoder = struct {
     error_offset: ?usize = null,
 
     /// Borrows the destination without allocating or writing it.
-    pub fn init(output: []u8, text_limit: usize) Decoder {
-        return .{ .output = output, .text_limit = text_limit };
+    pub fn init(output: []u8) Decoder {
+        return .{ .output = output };
     }
 
     /// Consumes one text fragment. Empty fragments are valid before finish.
@@ -85,9 +82,7 @@ pub const Decoder = struct {
         if (self.finished) return error.AlreadyFinished;
         errdefer self.failed = true;
         if (overlaps(self.output, text)) return error.OverlappingBuffers;
-        const total = std.math.add(usize, self.counts.text_bytes, text.len) catch
-            return error.LengthOverflow;
-        if (total > self.text_limit) return error.LimitExceeded;
+        if (text.len > std.math.maxInt(usize) - self.counts.text_bytes) return error.LengthOverflow;
         return self.updateParts(text);
     }
 

@@ -12,3 +12,5 @@ pub const IndexedReader = @import("indexed_reader.zig");
 pub const StreamReader = @import("stream_reader.zig").StreamReader;
 pub const Writer = @import("writer.zig");
 pub const Diagnostic = @import("diagnostic.zig");
+/// Deepest element nesting, counting the root, that readers, writers, copies, and builders accept.
+pub const MAX_DEPTH = @import("schema.zig").MAX_DEPTH;

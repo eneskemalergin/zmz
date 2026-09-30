@@ -83,12 +83,11 @@ pub fn reset(self: *Builder) void {
     self.remaining = self.limits.bytes;
 }
 
-/// Copies source fields within the byte and depth limits, without interpreting payloads.
+/// Copies source fields within the byte limit and schema.MAX_DEPTH, without interpreting payloads.
 pub fn node(self: *Builder, source: model.Node) Error!model.Node {
-    if (self.limits.depth == 0 or self.limits.depth > schema.MAX_DEPTH) return error.LimitExceeded;
     var copier = self.makeCopier();
     defer self.remaining = copier.remaining;
-    return copier.node(source, self.limits.depth);
+    return copier.node(source, schema.MAX_DEPTH);
 }
 
 /// Generates a schema list's count from its children and copies their complete content.
@@ -130,7 +129,7 @@ pub fn number(self: *Builder, parameter: cv.Param, value: f64) Error!cv.Param {
 /// without retaining Base64. Default arrays omit arrayLength; auxiliary arrays carry it.
 /// Role labels and units are supplied explicitly. The wire lasts until the encoder is reset.
 pub fn prepareArray(self: *Builder, comptime T: type, values: []const T, options: ArrayOptions, encoder: *arrays.Encoder) Error!PreparedArray {
-    try self.checkArrayOptions(options);
+    try checkArrayOptions(options);
     const wire = try encoder.encode(T, values, options.encoding);
     return .{ .array = try self.arrayMetadata(T, values.len, options, try base64.encodedSize(wire.len)), .wire = wire };
 }
@@ -155,7 +154,6 @@ pub fn prepareArrayFrom(
 }
 
 fn prepareArrayFromInner(self: *Builder, comptime T: type, values: []const T, source: model.Node, groups: []const cv.Group, options: arrays.EncodeOptions, encoder: *arrays.Encoder, replacements: ?[]const GroupReplacement) Error!PreparedArray {
-    if (self.limits.depth < 2 or self.limits.depth > schema.MAX_DEPTH) return error.LimitExceeded;
     _ = try model.arrayEncoding(source, groups);
     if (source.children.len != 1 or source.children[0].kind != .binary) return error.InvalidStructure;
     const target: model.Encoding = .{ .primitive = encoding.Primitive.of(T), .pipeline = options.pipeline };
@@ -197,7 +195,7 @@ fn prepareArrayFromInner(self: *Builder, comptime T: type, values: []const T, so
     var binary = source.children[0];
     binary.text = null;
     const children = try copier.alloc(model.Node, 1);
-    children[0] = try copier.node(binary, self.limits.depth - 1);
+    children[0] = try copier.node(binary, schema.MAX_DEPTH - 1);
     var result = source;
     result.attributes = attributes;
     result.params = params;
@@ -434,8 +432,7 @@ fn reencodedParams(output: ?[]cv.Entry, params: []const cv.Entry, groups: []cons
     return result;
 }
 
-fn checkArrayOptions(self: *const Builder, options: ArrayOptions) Error!void {
-    if (self.limits.depth < 2 or self.limits.depth > schema.MAX_DEPTH) return error.LimitExceeded;
+fn checkArrayOptions(options: ArrayOptions) Error!void {
     if (options.cv_ref.len == 0 or options.role.cv_ref == null or options.role.accession == null or
         options.role.name == null) return error.InvalidDeclaration;
 }
@@ -478,8 +475,6 @@ fn arrayMetadata(self: *Builder, comptime T: type, value_count: usize, options: 
 /// Other input slices are copied. Default arrays must match default_length.
 /// This constructs new record attributes; use source node views to preserve existing ones.
 pub fn record(self: *Builder, kind: model.Kind, id: []const u8, index: usize, default_length: usize, params: []const cv.Entry, children: []const model.Node, binary_arrays: []const Array) Error!model.Record {
-    if (self.limits.depth == 0 or self.limits.depth > schema.MAX_DEPTH or
-        (binary_arrays.len != 0 and self.limits.depth < 4)) return error.LimitExceeded;
     if ((kind != .spectrum and kind != .chromatogram) or id.len == 0) return error.InvalidRecord;
     for (children) |child| if (child.kind == .binary_data_array_list) return error.InvalidRecord;
     for (binary_arrays) |array| {
@@ -491,7 +486,7 @@ pub fn record(self: *Builder, kind: model.Kind, id: []const u8, index: usize, de
     defer self.remaining = copier.remaining;
     const record_children = try copier.alloc(model.Node, child_count);
     for (children, record_children[0..children.len]) |child, *destination|
-        destination.* = try copier.node(child, self.limits.depth -| 1);
+        destination.* = try copier.node(child, schema.MAX_DEPTH - 1);
     if (binary_arrays.len != 0) {
         const array_nodes = try copier.alloc(model.Node, binary_arrays.len);
         for (binary_arrays, array_nodes) |array, *destination| destination.* = array.node;
@@ -502,7 +497,7 @@ pub fn record(self: *Builder, kind: model.Kind, id: []const u8, index: usize, de
                 .name = "count",
                 .value = count_text[0..std.fmt.printInt(&count_text, binary_arrays.len, 10, .lower, .{})],
             }},
-        }, self.limits.depth);
+        }, schema.MAX_DEPTH);
         list_node.children = array_nodes;
         record_children[children.len] = list_node;
     }
@@ -512,19 +507,18 @@ pub fn record(self: *Builder, kind: model.Kind, id: []const u8, index: usize, de
         .{ .name = "id", .value = id },
         .{ .name = "index", .value = index_text[0..std.fmt.printInt(&index_text, index, 10, .lower, .{})] },
         .{ .name = "defaultArrayLength", .value = length_text[0..std.fmt.printInt(&length_text, default_length, 10, .lower, .{})] },
-    }, .params = params }, self.limits.depth);
+    }, .params = params }, schema.MAX_DEPTH);
     result.children = record_children;
     return .{ .node = result, .id = result.attribute("id").?, .index = index, .default_array_length = default_length };
 }
 
 /// Copies header metadata and derives group entries from the copied definitions.
 pub fn header(self: *Builder, source: model.Header) Error!model.Header {
-    if (self.limits.depth == 0 or self.limits.depth > schema.MAX_DEPTH) return error.LimitExceeded;
     try schema.checkHeader(source);
     var copier = self.makeCopier();
     defer self.remaining = copier.remaining;
-    const document = try copier.node(source.document, self.limits.depth);
-    const run = try copier.node(source.run, self.limits.depth);
+    const document = try copier.node(source.document, schema.MAX_DEPTH);
+    const run = try copier.node(source.run, schema.MAX_DEPTH);
     const group_nodes = if (document.child(.referenceable_param_group_list)) |groups| groups.children else &.{};
     const groups = try copier.alloc(cv.Group, group_nodes.len);
     for (group_nodes, groups) |group, *destination| destination.* = .{

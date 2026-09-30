@@ -324,7 +324,7 @@ fn replaceArrayAllocated(allocator: std.mem.Allocator) !void {
             try std.testing.expectEqualDeep(result.array.node.params[2], result.array.node.params[7]);
             try std.testing.expectEqualStrings("MS:1000576", groups[0].entries[2].cv.accession.?.raw);
             var decoded: [2]f32 = undefined;
-            try mzml.arrays.decodeWire(f32, decoded[0..length], result.wire, pipeline, &.{}, .{});
+            try mzml.arrays.decodeWire(f32, decoded[0..length], result.wire, pipeline, &.{});
             try std.testing.expectEqualSlices(f32, values[0..length], decoded[0..length]);
         }
     }
@@ -335,7 +335,7 @@ test "[integration] - [array replacement]: preserves source metadata while chang
 }
 
 test "[regression] - [array replacement]: charges only final metadata and outlives the source" {
-    var builder = mzml.Builder.init(std.testing.allocator, .{ .depth = 2 });
+    var builder = mzml.Builder.init(std.testing.allocator, .{});
     defer builder.deinit();
     var encoder = mzml.arrays.Encoder.init(std.testing.allocator, .fast);
     defer encoder.deinit();
@@ -354,12 +354,10 @@ test "[regression] - [array replacement]: charges only final metadata and outliv
         expected_source.children = &.{binary};
         const expected = try copied.node(expected_source);
         const bytes = copied.limits.bytes - copied.remaining;
-        for ([_]mzml.owned.Limits{ .{ .bytes = bytes - 1 }, .{ .depth = 1 } }) |limits| {
-            var limited = mzml.Builder.init(std.testing.allocator, limits);
-            defer limited.deinit();
-            try std.testing.expectError(error.LimitExceeded, limited.prepareArrayFrom(f64, &values, source, header.groups, .{}, &encoder));
-        }
-        var exact = mzml.Builder.init(std.testing.allocator, .{ .bytes = bytes, .depth = 2 });
+        var limited = mzml.Builder.init(std.testing.allocator, .{ .bytes = bytes - 1 });
+        defer limited.deinit();
+        try std.testing.expectError(error.LimitExceeded, limited.prepareArrayFrom(f64, &values, source, header.groups, .{}, &encoder));
+        var exact = mzml.Builder.init(std.testing.allocator, .{ .bytes = bytes });
         defer exact.deinit();
         const bounded = try exact.prepareArrayFrom(f64, &values, source, header.groups, .{}, &encoder);
         try std.testing.expectEqual(@as(usize, 0), exact.remaining);
@@ -484,7 +482,7 @@ test "[integration] - [prepared construction]: retains metadata and borrows prim
                 if (pipeline == .none and @import("builtin").cpu.arch.endian() == .little)
                     try std.testing.expectEqual(std.mem.sliceAsBytes(values[0..length]).ptr, result.wire.ptr);
                 var output: [5]T = undefined;
-                try mzml.arrays.decodeWire(T, output[0..length], result.wire, pipeline, &.{}, .{});
+                try mzml.arrays.decodeWire(T, output[0..length], result.wire, pipeline, &.{});
                 try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(values[0..length]), std.mem.sliceAsBytes(output[0..length]));
             }
         }
@@ -566,7 +564,7 @@ test "[integration] - [mzML construction]: writes and decodes every declared pip
             var output: [3]f64 = undefined;
             var transport: [512]u8 = undefined;
             var transformed: [512]u8 = undefined;
-            try array.decode(f64, &output, .{ .transport = &transport, .transformed = &transformed }, .{});
+            try array.decode(f64, &output, .{ .transport = &transport, .transformed = &transformed });
             for (output, [_]f64{ 1, 2, 3 }) |value, expected| try std.testing.expectApproxEqAbs(expected, value, 0.001);
             if (encoding.pipeline == .pic or encoding.pipeline == .pic_zlib) {
                 const counts = try mzml.base64.decode(&transport, array.node.child(.binary).?.text.?);
@@ -640,18 +638,13 @@ test "[integration] - [mzML construction]: cleans failed allocations and preserv
     try std.testing.expectError(error.TypeMismatch, builder.prepareArray(f32, &.{1}, bad, &encoder));
 }
 
-test "[failure] - [mzML construction]: rejects depth options before copying or encoding" {
-    for ([_]usize{ 0, 65 }) |depth| {
-        var empty = std.heap.FixedBufferAllocator.init(&.{});
-        var builder = mzml.Builder.init(empty.allocator(), .{ .depth = depth });
-        defer builder.deinit();
-        var encoder = mzml.arrays.Encoder.init(empty.allocator(), .fast);
-        defer encoder.deinit();
-        try std.testing.expectError(error.LimitExceeded, builder.record(.spectrum, "one", 0, 0, &.{}, &.{}, &.{}));
-        try std.testing.expectError(error.LimitExceeded, builder.prepareArrayFrom(f64, &.{1}, .{ .kind = .binary_data_array }, &.{}, .{}, &encoder));
-        const options: mzml.Builder.ArrayOptions = .{ .cv_ref = "MS", .role = .{ .cv_ref = "MS", .accession = mzml.model.Terms.MZ_ARRAY, .name = "m/z" } };
-        try std.testing.expectError(error.LimitExceeded, builder.prepareArray(f64, &.{1}, options, &encoder));
-    }
+test "[failure] - [mzML construction]: rejects nodes nested past the depth ceiling" {
+    var builder = mzml.Builder.init(std.testing.allocator, .{});
+    defer builder.deinit();
+    var chain: [mzml.MAX_DEPTH + 1]mzml.model.Node = undefined;
+    _ = try builder.node(support.nest(chain[1..]));
+    try std.testing.expectError(error.LimitExceeded, builder.node(support.nest(&chain)));
+    try std.testing.expectError(error.LimitExceeded, builder.record(.spectrum, "one", 0, 0, &.{}, &.{support.nest(chain[1..])}, &.{}));
 }
 
 test "[integration] - [mzML construction]: preserves partial fields and supplied array order" {
@@ -721,7 +714,7 @@ test "[integration] - [mzML construction]: preserves primitive bits through emit
                 const declared = try mzml.model.arrayEncoding(prepared.array.node, &.{});
                 try std.testing.expectEqual(mzml.model.Primitive.of(T), declared.primitive);
                 var decoded: [5]T = undefined;
-                try mzml.arrays.decodeWire(T, decoded[0..length], prepared.wire, declared.pipeline, &.{}, .{});
+                try mzml.arrays.decodeWire(T, decoded[0..length], prepared.wire, declared.pipeline, &.{});
                 try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(values[0..length]), std.mem.sliceAsBytes(decoded[0..length]));
             }
         }

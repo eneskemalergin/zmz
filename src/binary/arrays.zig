@@ -21,13 +21,6 @@ pub const Scratch = struct {
     transformed: []u8,
 };
 
-/// Per-array bounds, independent of scratch capacity: Base64 text bytes (XML whitespace
-/// included) and decoded typed output bytes. Decoded wire is bounded by the text limit.
-pub const Limits = struct {
-    text_bytes: usize = 256 * 1024 * 1024,
-    array_bytes: usize = 192 * 1024 * 1024,
-};
-
 /// Lossy transforms require explicit caller selection; Linear and SLOF require a fixed point.
 /// An unused fixed point is rejected instead of silently ignored.
 pub const EncodeOptions = struct {
@@ -52,15 +45,10 @@ pub fn decode(
     source: []const u8,
     pipeline: Pipeline,
     scratch: Scratch,
-    limits: Limits,
 ) Error!void {
     _ = encoding.Primitive.of(T);
     try checkBuffers(std.mem.sliceAsBytes(output), source, scratch);
-    const array_bytes = std.math.mul(usize, output.len, @sizeOf(T)) catch
-        return error.LengthOverflow;
-    if (array_bytes > limits.array_bytes) return error.LimitExceeded;
     if (pipeline.transform() != .none and T != f64) return error.TypeMismatch;
-    if (source.len > limits.text_bytes) return error.LimitExceeded;
     const destination = if (pipeline == .none) std.mem.sliceAsBytes(output) else scratch.transport;
     const counts = base64.decode(destination, source) catch |err| {
         if (pipeline != .none or err != error.OutputTooSmall) return err;
@@ -72,23 +60,19 @@ pub fn decode(
 /// Decodes bytes after Base64 into exactly output.len values without allocation.
 /// T and primitive byte order follow decode. Transformed scratch is needed only for
 /// Numpress with zlib. Buffers must be disjoint, except that .none permits source and
-/// output to start at the same address. array_bytes applies, and the wire may not exceed
-/// the decoded size of text_bytes of Base64.
+/// output to start at the same address.
 pub fn decodeWire(
     comptime T: type,
     output: []T,
     source: []const u8,
     pipeline: Pipeline,
     transformed: []u8,
-    limits: Limits,
 ) Error!void {
     _ = encoding.Primitive.of(T);
     const bytes = std.mem.sliceAsBytes(output);
     const in_place = pipeline == .none and bytes.ptr == source.ptr;
     try checkBuffers(bytes, if (in_place) &.{} else source, .{ .transport = &.{}, .transformed = transformed });
     if (in_place) try checkBuffers(transformed, source, .{ .transport = &.{}, .transformed = &.{} });
-    if (bytes.len > limits.array_bytes or source.len > limits.text_bytes / 4 * 3)
-        return error.LimitExceeded;
     if (pipeline.transform() != .none and T != f64) return error.TypeMismatch;
     try decodeWireInner(T, output, source, pipeline, transformed);
 }

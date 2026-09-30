@@ -162,10 +162,10 @@ pub fn writeHeader(self: *Writer, header: model.Header) Error!void {
     try self.writeAttributes(header.document.attributes);
     var no_arrays: []const []const u8 = &.{};
     var budget = self.limits.nodes;
-    try self.writeContent(header.document, false, &no_arrays, self.limits.depth, &budget);
+    try self.writeContent(header.document, false, &no_arrays, &budget);
     try self.startKnown("run", header.run.attributes, false);
     try self.writeAttributes(header.run.attributes);
-    try self.writeContent(header.run, false, &no_arrays, self.limits.depth, &budget);
+    try self.writeContent(header.run, false, &no_arrays, &budget);
     self.phase = .run;
 }
 
@@ -232,7 +232,7 @@ pub fn writeItem(self: *Writer, item: model.Item) Error!void {
         .xml => |bytes| {
             if (self.phase != .run and self.phase != .list and self.phase != .document) return error.InvalidState;
             var budget = self.limits.nodes;
-            try self.writeXml(bytes, self.limits.depth, &budget);
+            try self.writeXml(bytes, &budget);
         },
     }
 }
@@ -322,7 +322,7 @@ fn writeRecordInner(self: *Writer, node: model.Node, comptime replace_arrays: bo
     }
     var remaining = wire_arrays;
     var budget = self.limits.nodes;
-    try self.writeNode(node, replace_arrays, &remaining, self.limits.depth, &budget);
+    try self.writeNode(node, replace_arrays, &remaining, &budget);
     if (remaining.len != 0) return try self.sizeError(error.CountMismatch, wire_arrays.len - remaining.len, wire_arrays.len, .arrays);
     self.written_count += 1;
 }
@@ -419,12 +419,11 @@ fn writeIndex(self: *Writer, state: *IndexState) Error!void {
     try self.engine.endElement();
 }
 
-fn writeNode(self: *Writer, node: model.Node, comptime replace_arrays: bool, remaining: anytype, depth: usize, budget: *usize) Error!void {
+fn writeNode(self: *Writer, node: model.Node, comptime replace_arrays: bool, remaining: anytype, budget: *usize) Error!void {
     errdefer |err| {
         self.capture(err, .metadata, .none);
         if (self.failure.?.element == null) self.failure.?.element = node.kind;
     }
-    if (depth == 0) return try self.limitError(.depth, self.limits.depth, null);
     if (budget.* == 0) return try self.limitError(.nodes, self.limits.nodes, null);
     budget.* -= 1;
     const wire: ?[]const u8 = if (replace_arrays and node.kind == .binary) blk: {
@@ -443,7 +442,7 @@ fn writeNode(self: *Writer, node: model.Node, comptime replace_arrays: bool, rem
         if (text.len > self.limits.text_bytes) return try self.limitError(.text_bytes, self.limits.text_bytes, text.len);
         try self.engine.text(text);
     }
-    try self.writeContent(node, replace_arrays, remaining, depth - 1, budget);
+    try self.writeContent(node, replace_arrays, remaining, budget);
     try self.engine.endElement();
     if (replace_arrays and node.kind == .binary_data_array) {
         if (remaining.len == 0) return error.CountMismatch;
@@ -451,16 +450,16 @@ fn writeNode(self: *Writer, node: model.Node, comptime replace_arrays: bool, rem
     }
 }
 
-fn writeContent(self: *Writer, node: model.Node, comptime replace_arrays: bool, remaining: anytype, depth: usize, budget: *usize) Error!void {
+fn writeContent(self: *Writer, node: model.Node, comptime replace_arrays: bool, remaining: anytype, budget: *usize) Error!void {
     errdefer |err| {
         self.capture(err, .metadata, .none);
         if (self.failure.?.element == null) self.failure.?.element = node.kind;
     }
     var seen = std.EnumSet(model.Kind).initEmpty();
     if (node.content == null) {
-        try self.writeParams(node.params, depth, budget);
+        try self.writeParams(node.params, budget);
         for (node.children, 0..) |child, position|
-            try self.writeChild(node, child, position, &seen, replace_arrays, remaining, depth, budget);
+            try self.writeChild(node, child, position, &seen, replace_arrays, remaining, budget);
         return;
     }
     var params: usize = 0;
@@ -468,22 +467,22 @@ fn writeContent(self: *Writer, node: model.Node, comptime replace_arrays: bool, 
     for (node.content.?.items) |item| switch (item) {
         .params => |count| {
             if (count > node.params.len - params) return error.InvalidStructure;
-            try self.writeParams(node.params[params..][0..count], depth, budget);
+            try self.writeParams(node.params[params..][0..count], budget);
             params += count;
         },
         .children => |count| {
             if (count > node.children.len - children) return error.InvalidStructure;
             for (node.children[children..][0..count], children..) |child, position|
-                try self.writeChild(node, child, position, &seen, replace_arrays, remaining, depth, budget);
+                try self.writeChild(node, child, position, &seen, replace_arrays, remaining, budget);
             children += count;
         },
-        .xml => |bytes| try self.writeXml(bytes, depth, budget),
+        .xml => |bytes| try self.writeXml(bytes, budget),
     };
     if (params != node.params.len or children != node.children.len) return error.InvalidStructure;
 }
 
 /// Writes one modeled child after checking it is allowed, and not repeated if singular.
-fn writeChild(self: *Writer, parent: model.Node, child: model.Node, position: usize, seen: *std.EnumSet(model.Kind), comptime replace_arrays: bool, remaining: anytype, depth: usize, budget: *usize) Error!void {
+fn writeChild(self: *Writer, parent: model.Node, child: model.Node, position: usize, seen: *std.EnumSet(model.Kind), comptime replace_arrays: bool, remaining: anytype, budget: *usize) Error!void {
     errdefer |err| if (parent.kind == .binary_data_array_list) {
         self.capture(err, .metadata, .none);
         self.failure.?.array_position = position;
@@ -492,23 +491,18 @@ fn writeChild(self: *Writer, parent: model.Node, child: model.Node, position: us
     if (!rules.allowed.contains(child.kind) or (parent.kind == .mzml and child.kind == .run)) return error.InvalidStructure;
     if (rules.singular.contains(child.kind) and seen.contains(child.kind)) return error.InvalidStructure;
     seen.insert(child.kind);
-    try self.writeNode(child, replace_arrays, remaining, depth, budget);
+    try self.writeNode(child, replace_arrays, remaining, budget);
 }
 
 // Keep fragment parser storage off ordinary recursive write frames.
-noinline fn writeXml(self: *Writer, bytes: []const u8, depth: usize, budget: *usize) Error!void {
-    if (depth == 0) return try self.limitError(.depth, self.limits.depth, null);
+noinline fn writeXml(self: *Writer, bytes: []const u8, budget: *usize) Error!void {
     if (bytes.len > self.limits.text_bytes) return try self.limitError(.text_bytes, self.limits.text_bytes, bytes.len);
     var input = std.Io.Reader.fixed(bytes);
-    var cursor = try xml.Cursor.init(self.allocator, &input, @min(depth, schema.MAX_DEPTH), @max(1, bytes.len / 4), self.limits.text_bytes);
+    var cursor = try xml.Cursor.init(self.allocator, &input, schema.MAX_DEPTH, @max(1, bytes.len / 4), self.limits.text_bytes);
     defer cursor.deinit();
     errdefer |err| {
         var detail = Diagnostic.xmlDetail(&cursor);
-        if (detail == .limit) switch (detail.limit.name) {
-            .nodes => detail.limit.maximum = self.limits.nodes,
-            .depth => detail.limit.maximum = self.limits.depth,
-            else => {},
-        };
+        if (detail == .limit and detail.limit.name == .nodes) detail.limit.maximum = self.limits.nodes;
         self.capture(err, .xml, detail);
         if (self.engine.failure == null) self.failure.?.location = null;
     }
@@ -578,7 +572,7 @@ fn startKnown(self: *Writer, name: []const u8, attrs: []const model.Attribute, r
     };
 }
 
-fn writeParams(self: *Writer, params: []const cv.Entry, depth: usize, budget: *usize) Error!void {
+fn writeParams(self: *Writer, params: []const cv.Entry, budget: *usize) Error!void {
     for (params) |entry| {
         const extra = switch (entry) {
             .group_ref => |ref| ref.xml,
@@ -609,7 +603,7 @@ fn writeParams(self: *Writer, params: []const cv.Entry, depth: usize, budget: *u
         }
         try self.writeAttributes(attrs);
         if (extra) |value| for (value.content) |part| switch (part) {
-            .xml => |bytes| try self.writeXml(bytes, depth -| 1, budget),
+            .xml => |bytes| try self.writeXml(bytes, budget),
             .text => |bytes| {
                 if (bytes.len > self.limits.text_bytes) return try self.limitError(.text_bytes, self.limits.text_bytes, bytes.len);
                 try self.engine.text(bytes);

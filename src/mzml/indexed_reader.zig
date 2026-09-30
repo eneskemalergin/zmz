@@ -9,6 +9,7 @@ const std = @import("std");
 const model = @import("model.zig");
 const cv = @import("../cv/source.zig");
 const owned = @import("owned.zig");
+const schema = @import("schema.zig");
 const PublicStreamReader = @import("stream_reader.zig").StreamReader;
 const DecodedArrays = PublicStreamReader.DecodedArrays;
 const StreamReader = @import("internal/reader_engine.zig");
@@ -489,7 +490,7 @@ fn openEmbedded(self: *IndexedReader, reader: *StreamReader) Error!void {
 
 fn readEmbeddedEntries(self: *IndexedReader, input: *std.Io.Reader, index_start: u64, prefix_length: usize, minimum: u64, endian: ?std.builtin.Endian) Error!void {
     const limits = self.options.reader.limits;
-    var cursor = try xml.Cursor.init(self.allocator, input, limits.depth, limits.attributes, limits.attribute_bytes);
+    var cursor = try xml.Cursor.init(self.allocator, input, schema.MAX_DEPTH, limits.attributes, limits.attribute_bytes);
     defer cursor.deinit();
     errdefer |err| {
         self.capture(err, if (cursor.failure != null) .xml else .index, Diagnostic.xmlDetail(&cursor));

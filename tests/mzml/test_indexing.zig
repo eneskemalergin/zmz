@@ -204,7 +204,7 @@ fn expectDecodedRecord(record: mzml.model.Record, groups: []const mzml.cv.Group,
                 defer std.testing.allocator.free(transport);
                 const transformed = try std.testing.allocator.alloc(u8, try mzml.arrays.wireBound(T, array.length, array.encoding.pipeline));
                 defer std.testing.allocator.free(transformed);
-                try array.decode(T, expected, .{ .transport = transport, .transformed = transformed }, .{});
+                try array.decode(T, expected, .{ .transport = transport, .transformed = transformed });
                 try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(expected), std.mem.sliceAsBytes(values));
             },
         }
@@ -329,7 +329,7 @@ test "[integration] - [mzML indexed decoding]: selects arrays and records withou
                     var values: [3]f64 = undefined;
                     var transport: [128]u8 = undefined;
                     var transformed: [128]u8 = undefined;
-                    try array.decode(f64, &values, .{ .transport = &transport, .transformed = &transformed }, .{});
+                    try array.decode(f64, &values, .{ .transport = &transport, .transformed = &transformed });
                     try std.testing.expectEqualDeep(array.encoding, decoded.encoding);
                     try std.testing.expectEqualSlices(f64, &values, decoded.values.float64);
                 }
@@ -919,7 +919,7 @@ test "[integration] - [mzML indexed lookup]: crosses file refills with UTF-16 an
                         try expectDecodedRecord(record.value, index.header().groups, decoded.value, &output);
                         var arrays = record.value.arrays(index.header().groups);
                         var value: [1]f64 = undefined;
-                        try (try arrays.next()).?.decode(f64, &value, .{ .transport = &.{}, .transformed = &.{} }, .{});
+                        try (try arrays.next()).?.decode(f64, &value, .{ .transport = &.{}, .transformed = &.{} });
                         try std.testing.expectEqual(@as(f64, 1), value[0]);
                     }
                 }
