@@ -3,6 +3,7 @@
 const std = @import("std");
 
 const NumpressSlofMathBackend = enum { bundled, glibc_vector };
+const ZipirKernelBackend = enum { dispatch, portable };
 const LibraryTest = struct {
     root_source_file: []const u8,
     add_gates_support: bool = false,
@@ -24,7 +25,9 @@ fn configureLibraryModule(
     numpress_options: *std.Build.Step.Options,
     base64_options: *std.Build.Step.Options,
     use_glibc_vector: bool,
+    zipir: *std.Build.Module,
 ) void {
+    module.addImport("zipir", zipir);
     module.addOptions("numpress_math_options", numpress_options);
     module.addOptions("base64_options", base64_options);
     if (use_glibc_vector) module.linkSystemLibrary("mvec", .{ .use_pkg_config = .no });
@@ -34,6 +37,16 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{ .default_target = .{ .cpu_model = .baseline } });
     const optimize = b.standardOptimizeOption(.{});
     const strip = optimize == .ReleaseFast or optimize == .ReleaseSmall;
+    const zipir_kernel_backend = b.option(
+        ZipirKernelBackend,
+        "zipir_kernel_backend",
+        "Select zipir's runtime-dispatched or portable checksum kernels",
+    ) orelse .dispatch;
+    const zipir = b.dependency("zipir", .{
+        .target = target,
+        .optimize = optimize,
+        .@"kernel-backend" = zipir_kernel_backend,
+    }).module("zipir");
     const numpress_slof_math_backend = b.option(
         NumpressSlofMathBackend,
         "numpress_slof_math_backend",
@@ -54,7 +67,7 @@ pub fn build(b: *std.Build) void {
     );
     const base64_options = b.addOptions();
     base64_options.addOption(bool, "simd", b.option(bool, "base64_simd", "Select AVX2 at runtime when available; false forces scalar") orelse true);
-    configureLibraryModule(zmz, numpress_options, base64_options, use_glibc_vector);
+    configureLibraryModule(zmz, numpress_options, base64_options, use_glibc_vector, zipir);
 
     const test_step = b.step("test", "Run library tests");
     const gates_test_support = b.createModule(.{
@@ -83,7 +96,7 @@ pub fn build(b: *std.Build) void {
         .strip = strip,
         .link_libc = link_libc,
     });
-    configureLibraryModule(package_tests_module, numpress_options, base64_options, use_glibc_vector);
+    configureLibraryModule(package_tests_module, numpress_options, base64_options, use_glibc_vector, zipir);
     const package_tests = b.addTest(.{ .root_module = package_tests_module });
     test_step.dependOn(&b.addRunArtifact(package_tests).step);
 
