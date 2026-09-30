@@ -207,6 +207,75 @@ test "[failure] - [mzML diagnostics]: reports a zlib array longer than declared 
     try std.testing.expectEqual(.buffer_error, report.id);
 }
 
+fn expectSameValues(expected: mzml.StreamReader.DecodedArrays.Values, actual: mzml.StreamReader.DecodedArrays.Values) !void {
+    try std.testing.expectEqual(std.meta.activeTag(expected), std.meta.activeTag(actual));
+    switch (expected) {
+        inline else => |values, tag| try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(values), std.mem.sliceAsBytes(@field(actual, @tagName(tag)))),
+    }
+}
+
+test "[integration] - [decoded arrays]: decodes retained records exactly like streamed decoding" {
+    const source = @embedFile("data/writer_indexed.mzML");
+    var retained_input = std.Io.Reader.fixed(source);
+    var retained = try mzml.StreamReader.init(std.testing.allocator, &retained_input, .{});
+    defer retained.deinit();
+    var streamed_input = std.Io.Reader.fixed(source);
+    var streamed = try mzml.StreamReader.init(std.testing.allocator, &streamed_input, .{});
+    defer streamed.deinit();
+    const header = try retained.readHeader();
+    _ = try streamed.readHeader();
+    var from_text = mzml.StreamReader.DecodedArrays.init(std.testing.allocator, .{});
+    defer from_text.deinit();
+    var from_stream = mzml.StreamReader.DecodedArrays.init(std.testing.allocator, .{});
+    defer from_stream.deinit();
+    var records: usize = 0;
+    while (try retained.nextRecord()) |record| {
+        _ = (try streamed.nextDecodedRecord(&from_stream)).?;
+        try from_text.decodeRecord(record, header.groups);
+        try std.testing.expectEqual(from_stream.len(), from_text.len());
+        for (0..from_text.len()) |i| {
+            const expected = from_stream.get(i).?;
+            const actual = from_text.get(i).?;
+            try std.testing.expectEqual(expected.source_position, actual.source_position);
+            try std.testing.expectEqual(expected.encoding, actual.encoding);
+            try expectSameValues(expected.values, actual.values);
+        }
+        const single = try from_text.decodeArray(record.binaryArrays()[1], record.default_array_length, header.groups);
+        try std.testing.expectEqual(@as(usize, 1), from_text.len());
+        try expectSameValues(from_stream.get(1).?.values, single);
+        records += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 16), records);
+}
+
+test "[failure] - [decoded arrays]: rejects missing or invalid retained text and clears results" {
+    var output = mzml.StreamReader.DecodedArrays.init(std.testing.allocator, .{});
+    defer output.deinit();
+    const good = try decodedDocument(std.testing.allocator, "AAAAAAAA8D8=", 12, 1, "MS:1000576");
+    defer std.testing.allocator.free(good);
+    var input = std.Io.Reader.fixed(good);
+    var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+    defer reader.deinit();
+    const header = try reader.readHeader();
+    const record = (try reader.nextRecord()).?;
+    try output.decodeRecord(record, header.groups);
+    try std.testing.expectEqual(@as(usize, 2), output.len());
+    var broken = record.binaryArrays()[0];
+    var binary = broken.children[0];
+    binary.text = "!AAAAAAA8D8=";
+    broken.children = &.{binary};
+    try std.testing.expectError(error.InvalidCharacter, output.decodeArray(broken, 1, header.groups));
+    try std.testing.expectEqual(@as(usize, 0), output.len());
+
+    var skipped_input = std.Io.Reader.fixed(good);
+    var skipped = try mzml.StreamReader.init(std.testing.allocator, &skipped_input, .{ .payload = .skip });
+    defer skipped.deinit();
+    const skipped_header = try skipped.readHeader();
+    const skipped_record = (try skipped.nextRecord()).?;
+    try std.testing.expectError(error.PayloadNotRetained, output.decodeRecord(skipped_record, skipped_header.groups));
+    try std.testing.expectEqual(@as(usize, 0), output.len());
+}
+
 test "[integration] - [mzML items]: streams selected arrays and XML across short reads" {
     const source = support.HEADER ++ "<spectrumList count='1'><future/>" ++ support.SPECTRUM ++
         "<tail/></spectrumList><between/><chromatogramList count='0'><empty/></chromatogramList>" ++

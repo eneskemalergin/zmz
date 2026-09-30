@@ -74,6 +74,35 @@ pub fn get(self: *const DecodedArrays, position: usize) ?Array {
     };
 }
 
+/// Decodes every modeled array of a record read with its Base64 text retained (for example
+/// from nextRecord or an IndexedReader lookup), replacing earlier results. Order, types,
+/// and limits follow nextDecodedRecord; after a failure no results are visible.
+pub fn decodeRecord(self: *DecodedArrays, record: model.Record, groups: []const cv.Group) Error!void {
+    self.reset();
+    errdefer self.reset();
+    try self.startRecord(record.node);
+    for (record.binaryArrays(), 0..) |node, position| try self.decodeRetained(node, groups, position);
+    self.complete();
+}
+
+/// Decodes one binary array node with retained text, replacing earlier results, and returns
+/// its values; get(0) returns the same array. default_length is the record's defaultArrayLength.
+pub fn decodeArray(self: *DecodedArrays, node: model.Node, default_length: ?usize, groups: []const cv.Group) Error!Values {
+    self.reset();
+    errdefer self.reset();
+    self.default_length = default_length;
+    try self.decodeRetained(node, groups, 0);
+    self.complete();
+    return self.get(0).?.values;
+}
+
+fn decodeRetained(self: *DecodedArrays, node: model.Node, groups: []const cv.Group, source_position: usize) Error!void {
+    try self.beginArray(node, groups, source_position);
+    const binary = node.child(.binary) orelse return error.PayloadNotRetained;
+    try self.text(binary.text orelse return error.PayloadNotRetained);
+    try self.finishArray();
+}
+
 pub fn startRecord(self: *DecodedArrays, node: model.Node) Error!void {
     self.default_length = if (node.attribute("defaultArrayLength")) |value| try cv.parseInteger(usize, value) else null;
 }

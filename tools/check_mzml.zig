@@ -69,6 +69,8 @@ fn checkFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Totals
     const resolver = mzml.cv.Resolver.init(declarations);
     const count = index.entries.items.len;
     var totals: Totals = .{};
+    var decoded = mzml.StreamReader.DecodedArrays.init(allocator, .{});
+    defer decoded.deinit();
     var ordinals = [_]usize{ 0, 0 };
     while (true) {
         const next = reader.nextRecord() catch |err| {
@@ -87,20 +89,14 @@ fn checkFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Totals
         }
         totals.records += 1;
         try checkMetadata(record, header.groups, resolver, &totals);
-        var arrays = record.arrays(header.groups);
-        while (try arrays.next()) |array| {
-            const values = switch (array.encoding.pipeline) {
-                .linear, .pic, .slof, .linear_zlib, .pic_zlib, .slof_zlib => try decodeArray(allocator, f64, array),
-                .none, .zlib => switch (array.encoding.primitive) {
-                    .float32 => try decodeArray(allocator, f32, array),
-                    .float64 => try decodeArray(allocator, f64, array),
-                    .int32 => try decodeArray(allocator, i32, array),
-                    .int64 => try decodeArray(allocator, i64, array),
-                },
+        try decoded.decodeRecord(record, header.groups);
+        for (0..decoded.len()) |position| {
+            const values = switch (decoded.get(position).?.values) {
+                inline else => |numbers| numbers.len,
             };
             totals.values = std.math.add(usize, totals.values, values) catch return error.LimitExceeded;
-            totals.arrays = std.math.add(usize, totals.arrays, 1) catch return error.LimitExceeded;
         }
+        totals.arrays = std.math.add(usize, totals.arrays, decoded.len()) catch return error.LimitExceeded;
     }
     if (totals.records != count) return error.RecordCountMismatch;
     return totals;
@@ -155,30 +151,6 @@ fn checkQuantity(number: ?mzml.model.Number, resolver: mzml.cv.Resolver, totals:
     totals.quantities += 1;
     if (quantity.parameter.unit_allowed == .unresolved) totals.unresolved_units += 1;
     if (quantity.parameter.unit_allowed == .disallowed) totals.disallowed_units += 1;
-}
-
-fn decodeArray(
-    allocator: std.mem.Allocator,
-    comptime T: type,
-    array: mzml.model.BinaryArray,
-) !usize {
-    const binary = array.node.child(.binary) orelse return error.PayloadNotRetained;
-    const text = binary.text orelse return error.PayloadNotRetained;
-    const count = array.length;
-    const limits: mzml.arrays.Limits = .{};
-    const size = std.math.mul(usize, count, @sizeOf(T)) catch return error.LimitExceeded;
-    if (size > limits.array_bytes) return error.LimitExceeded;
-    const values = try allocator.alloc(T, count);
-    defer allocator.free(values);
-    const transport = try allocator.alloc(u8, text.len);
-    defer allocator.free(transport);
-    const transformed = try allocator.alloc(u8, try mzml.arrays.wireBound(T, count, array.encoding.pipeline));
-    defer allocator.free(transformed);
-    try array.decode(T, values, .{
-        .transport = transport,
-        .transformed = transformed,
-    }, limits);
-    return count;
 }
 
 fn sameNode(a: mzml.model.Node, b: mzml.model.Node) bool {
