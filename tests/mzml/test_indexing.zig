@@ -131,7 +131,7 @@ test "[integration] - [mzML 1.0 indexes]: retains IDs offsets and selected value
     const bytes = sink.written();
     try std.testing.expect(std.mem.indexOf(u8, bytes, "<offset idRef=\"S20\" nativeID=\"20\" spotID=\"A1\">") != null);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "<offset idRef=\"tic\" nativeID=\"tic native\">") != null);
-    const checksum_start = std.mem.indexOf(u8, bytes, "<fileChecksum>").? + "<fileChecksum>".len;
+    const checksum_start = try support.checksumStart(bytes);
     var digest: [20]u8 = undefined;
     std.crypto.hash.Sha1.hash(bytes[0..checksum_start], &digest, .{});
     try std.testing.expectEqualStrings(&std.fmt.bytesToHex(digest, .lower), bytes[checksum_start..][0..40]);
@@ -1034,7 +1034,7 @@ test "[integration] - [mzML index]: opens embedded targets without checking unre
     try std.testing.expectError(error.InvalidOptions, mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = sink.buffered() }, .{ .policy = .open_embedded, .tail_bytes = 0 }));
     try std.testing.expectError(error.LimitExceeded, mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = sink.buffered() }, .{ .policy = .open_embedded, .max_records = 1 }));
     try std.testing.expectError(error.MissingIndex, mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = support.DOCUMENT }, .{ .policy = .open_embedded }));
-    const checksum_start = std.mem.indexOf(u8, sink.buffered(), "<fileChecksum>").? + "<fileChecksum>".len;
+    const checksum_start = try support.checksumStart(sink.buffered());
     const saved = buffer[checksum_start];
     buffer[checksum_start] = if (saved == '0') '1' else '0';
     try support.checkOpenEmbedded(std.testing.allocator, sink.buffered());
@@ -1116,7 +1116,7 @@ test "[integration] - [mzML index]: opens indented encoded targets and restores 
                     std.mem.writeInt(u16, bytes[0..2], 0xfeff, order);
                     for (source.written(), 0..) |byte, i| std.mem.writeInt(u16, bytes[2 + 2 * i ..][0..2], byte, order);
                 } else @memcpy(bytes, source.written());
-                const checksum_start = bom + width * (std.mem.indexOf(u8, source.written(), "<p:fileChecksum>").? + "<p:fileChecksum>".len);
+                const checksum_start = bom + width * ((std.mem.indexOf(u8, source.written(), "<p:fileChecksum>") orelse return error.TestUnexpectedResult) + "<p:fileChecksum>".len);
                 var digest: [20]u8 = undefined;
                 std.crypto.hash.Sha1.hash(bytes[0..checksum_start], &digest, .{});
                 const hex = std.fmt.bytesToHex(digest, .lower);
@@ -1206,7 +1206,7 @@ test "[integration] - [mzML index]: checks targets without interpreting checksum
     const source = @embedFile("data/writer_indexed.mzML");
     const bytes = try allocator.dupe(u8, source);
     defer allocator.free(bytes);
-    const checksum_start = std.mem.indexOf(u8, bytes, "<fileChecksum>").? + "<fileChecksum>".len;
+    const checksum_start = try support.checksumStart(bytes);
     bytes[checksum_start] = if (bytes[checksum_start] == '0') '1' else '0';
     var changed_checksum = try mzml.IndexedReader.build(allocator, .{ .bytes = bytes }, .{});
     changed_checksum.deinit();
@@ -1230,7 +1230,7 @@ test "[integration] - [mzML index]: verifies emitted targets checksum and indepe
     try support.constructFixture(std.testing.allocator, &sink, true, std.meta.tags(mzml.arrays.Pipeline));
     try support.checkIndexed(std.testing.allocator, sink.buffered());
     try std.testing.checkAllAllocationFailures(std.testing.allocator, support.checkIndexed, .{sink.buffered()});
-    const checksum_start = std.mem.indexOf(u8, sink.buffered(), "<fileChecksum>").? + "<fileChecksum>".len;
+    const checksum_start = try support.checksumStart(sink.buffered());
     var digest: [20]u8 = undefined;
     std.crypto.hash.Sha1.hash(sink.buffered()[0..checksum_start], &digest, .{});
     try std.testing.expectEqualStrings(&std.fmt.bytesToHex(digest, .lower), sink.buffered()[checksum_start..][0..40]);
@@ -1471,7 +1471,7 @@ test "[failure] - [mzML index]: rejects unusable and truncated indexes without r
     try std.testing.expectError(error.InvalidXml, mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = &bytes }, .{}));
     bytes[list_offset] = source[list_offset];
     try std.testing.expectError(error.InvalidValue, mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = &bytes }, .{}));
-    const closing = std.mem.indexOf(u8, &bytes, "</fileChecksum>").?;
+    const closing = std.mem.indexOf(u8, &bytes, "</fileChecksum>") orelse return error.TestUnexpectedResult;
     bytes[closing + 2] = 'x';
     try std.testing.expectError(error.MissingIndex, mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = &bytes }, .{}));
     const trailer = std.mem.indexOf(u8, &bytes, "<indexList ").?;
@@ -1634,7 +1634,7 @@ test "[failure] - [mzML indexed writer]: keeps record-limit and sink failures st
     var full = std.Io.Writer.fixed(&.{});
     var failed = try mzml.Writer.initIndexed(std.testing.allocator, &full, .{}, .{});
     defer failed.deinit();
-    // Indexed output reaches the sink in 64 KiB chunks; this one fails when finish flushes it.
+    // Indexed output reaches the sink in buffered chunks; this one fails when finish flushes it.
     try failed.writeHeader(header.*);
     try std.testing.expectError(error.WriteFailed, failed.finish());
     try std.testing.expectEqual(.write_failed, failed.diagnostic().?.id);
@@ -1733,7 +1733,7 @@ test "[property] - [mzML indexed writer]: preserves IDs and offsets across index
             }
         }
         if (counts[0] != 0 and counts[1] != 0) try std.testing.expectError(error.AmbiguousId, index.byId(std.testing.allocator, "id&0"));
-        const checksum_start = std.mem.indexOf(u8, sink.buffered(), "<fileChecksum>").? + "<fileChecksum>".len;
+        const checksum_start = try support.checksumStart(sink.buffered());
         var digest: [20]u8 = undefined;
         std.crypto.hash.Sha1.hash(sink.buffered()[0..checksum_start], &digest, .{});
         try std.testing.expectEqualStrings(&std.fmt.bytesToHex(digest, .lower), sink.buffered()[checksum_start..][0..40]);
@@ -1742,4 +1742,136 @@ test "[property] - [mzML indexed writer]: preserves IDs and offsets across index
         try std.testing.expectError(error.DuplicateId, Growing.write(std.testing.allocator, &failed_sink, counts, true));
     }
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Growing.allocated, .{});
+}
+
+// Six spectra with 40 KB arrays: output spans many writer chunks, and each uncompressed
+// array's Base64 crosses chunk boundaries on the writer's direct encoding path.
+const LARGE_RECORDS = 6;
+const LARGE_VALUES = 5000;
+
+fn writeLargeIndexed(writer: *mzml.Writer) !void {
+    var input = std.Io.Reader.fixed(support.DOCUMENT);
+    var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+    defer reader.deinit();
+    try writer.writeHeader((try reader.readHeader()).*);
+    var builder = mzml.Builder.init(std.testing.allocator, .{});
+    defer builder.deinit();
+    var encoder = mzml.arrays.Encoder.init(std.testing.allocator, .fast);
+    defer encoder.deinit();
+    var values: [LARGE_VALUES]f64 = undefined;
+    try writer.beginList(.spectrum_list, LARGE_RECORDS, "dp");
+    for (0..LARGE_RECORDS) |index| {
+        builder.reset();
+        encoder.reset();
+        for (&values, 0..) |*value, i| value.* = @as(f64, @floatFromInt(i)) * 0.5 + @as(f64, @floatFromInt(index));
+        var arrays: [2]mzml.Builder.Array = undefined;
+        var wires: [2][]const u8 = undefined;
+        inline for (.{ mzml.arrays.Pipeline.none, mzml.arrays.Pipeline.zlib }, 0..) |pipeline, i| {
+            const prepared = try builder.prepareArray(f64, &values, .{
+                .cv_ref = "MS",
+                .encoding = .{ .pipeline = pipeline },
+                .role = if (i == 0)
+                    .{ .cv_ref = "MS", .accession = mzml.model.Terms.MZ_ARRAY, .name = "m/z array" }
+                else
+                    .{ .cv_ref = "MS", .accession = mzml.model.Terms.INTENSITY_ARRAY, .name = "intensity array" },
+            }, &encoder);
+            arrays[i] = prepared.array;
+            wires[i] = prepared.wire;
+        }
+        var id: [16]u8 = undefined;
+        const record = try builder.record(.spectrum, try std.fmt.bufPrint(&id, "scan={d}", .{index}), index, LARGE_VALUES, &.{}, &.{}, &arrays);
+        try writer.writeRecordWithArrays(record.node, &wires);
+    }
+    try writer.endList();
+    try writer.finish();
+}
+
+fn checkLargeIndexed(bytes: []const u8) !void {
+    try support.expectCompleteIndexed(bytes);
+    const end = try support.checksumStart(bytes);
+    var digest: [20]u8 = undefined;
+    std.crypto.hash.Sha1.hash(bytes[0..end], &digest, .{});
+    try std.testing.expectEqualStrings(&std.fmt.bytesToHex(digest, .lower), bytes[end..][0..40]);
+    var index = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = bytes }, .{});
+    defer index.deinit();
+    try std.testing.expectEqual(@as(usize, LARGE_RECORDS), index.entries.items.len);
+    var decoded = mzml.StreamReader.DecodedArrays.init(std.testing.allocator, .{});
+    defer decoded.deinit();
+    for (0..LARGE_RECORDS) |position| {
+        var record = (try index.at(std.testing.allocator, .spectrum, position)).?;
+        defer record.deinit();
+        try decoded.decodeRecord(record.value, index.header().groups);
+        for (0..2) |array| {
+            const values = decoded.get(array).?.values.float64;
+            try std.testing.expectEqual(@as(usize, LARGE_VALUES), values.len);
+            try std.testing.expectEqual(@as(f64, @floatFromInt(position)) + 0.5 * (LARGE_VALUES - 1), values[LARGE_VALUES - 1]);
+        }
+    }
+}
+
+test "[integration] - [mzML indexed writer]: streams multi-chunk output through short sinks and files" {
+    var whole: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer whole.deinit();
+    {
+        var writer = try mzml.Writer.initIndexed(std.testing.allocator, &whole.writer, .{}, .{});
+        defer writer.deinit();
+        try writeLargeIndexed(&writer);
+    }
+    try std.testing.expect(whole.written().len > 20 * 16 * 1024);
+    try checkLargeIndexed(whole.written());
+
+    const ShortSink = struct {
+        out: std.Io.Writer.Allocating,
+        chunk: usize,
+        writer: std.Io.Writer = .{ .vtable = &.{ .drain = drain }, .buffer = &.{} },
+
+        fn drain(writer: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+            const self: *@This() = @alignCast(@fieldParentPtr("writer", writer));
+            for (data, 0..) |bytes, i| {
+                if (bytes.len == 0 or (i == data.len - 1 and splat == 0)) continue;
+                const length = @min(bytes.len, self.chunk);
+                try self.out.writer.writeAll(bytes[0..length]);
+                return length;
+            }
+            return 0;
+        }
+    };
+    for ([_]usize{ 7, 4097, 20000 }) |chunk| {
+        var sink: ShortSink = .{ .out = .init(std.testing.allocator), .chunk = chunk };
+        defer sink.out.deinit();
+        var writer = try mzml.Writer.initIndexed(std.testing.allocator, &sink.writer, .{}, .{});
+        defer writer.deinit();
+        try writeLargeIndexed(&writer);
+        try std.testing.expectEqualStrings(whole.written(), sink.out.written());
+    }
+
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    {
+        const file = try dir.dir.createFile(std.testing.io, "large.mzML", .{ .read = true });
+        defer file.close(std.testing.io);
+        var buffer: [1000]u8 = undefined;
+        var sink = file.writer(std.testing.io, &buffer);
+        var writer = try mzml.Writer.initFile(std.testing.allocator, &sink, .{}, .{});
+        defer writer.deinit();
+        try writeLargeIndexed(&writer);
+        try sink.interface.flush();
+    }
+    const bytes = try dir.dir.readFileAlloc(std.testing.io, "large.mzML", std.testing.allocator, .limited(4 * 1024 * 1024));
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqualStrings(whole.written(), bytes);
+
+    // A sink that fills mid-document fails a record write when the chunk drains, not finish.
+    const capacity = 100 * 1024;
+    const storage = try std.testing.allocator.alloc(u8, capacity);
+    defer std.testing.allocator.free(storage);
+    var full = std.Io.Writer.fixed(storage);
+    var writer = try mzml.Writer.initIndexed(std.testing.allocator, &full, .{}, .{});
+    defer writer.deinit();
+    try std.testing.expectError(error.WriteFailed, writeLargeIndexed(&writer));
+    const report = writer.diagnostic().?;
+    try std.testing.expectEqual(.write_failed, report.id);
+    try std.testing.expectEqual(.write_record, report.operation);
+    try std.testing.expectEqual(null, report.location);
+    try std.testing.expectError(error.FailedState, writer.finish());
 }

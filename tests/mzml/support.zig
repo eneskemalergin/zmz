@@ -244,8 +244,9 @@ pub fn expectWritten(expected: []const u8, actual: []const u8) !void {
     const actual_view = try encoderIndependent(allocator, actual);
     defer allocator.free(actual_view);
     try std.testing.expectEqualStrings(expected_view, actual_view);
-    const checksum = std.mem.indexOf(u8, actual, "<fileChecksum>") orelse return;
-    const hashed = checksum + "<fileChecksum>".len;
+    if (std.mem.indexOf(u8, actual, "<fileChecksum>") == null) return;
+    try expectCompleteIndexed(actual);
+    const hashed = try checksumStart(actual);
     var digest: [20]u8 = undefined;
     std.crypto.hash.Sha1.hash(actual[0..hashed], &digest, .{});
     try std.testing.expectEqualStrings(&std.fmt.bytesToHex(digest, .lower), actual[hashed..][0..40]);
@@ -263,6 +264,20 @@ pub fn expectWritten(expected: []const u8, actual: []const u8) !void {
 /// Copies a document, replacing each zlib stream with the hex of its decoded bytes and each value
 /// that follows from compressed sizes (zlib encodedLength, index offsets, checksum) with '#'.
 /// Every stream must decode to the same bytes with zmz and with the standard library.
+/// Returns where the 40-digit checksum starts, or fails when the output lacks it.
+pub fn checksumStart(bytes: []const u8) !usize {
+    const tag = "<fileChecksum>";
+    const start = (std.mem.indexOf(u8, bytes, tag) orelse return error.TestUnexpectedResult) + tag.len;
+    if (bytes.len - start < 40 + "</fileChecksum>".len or
+        !std.mem.startsWith(u8, bytes[start + 40 ..], "</fileChecksum>")) return error.TestUnexpectedResult;
+    return start;
+}
+
+/// Indexed output must end with its wrapper, so a lost final flush fails here.
+pub fn expectCompleteIndexed(bytes: []const u8) !void {
+    try std.testing.expect(std.mem.endsWith(u8, std.mem.trimEnd(u8, bytes, "\n"), "</fileChecksum></indexedmzML>"));
+}
+
 fn encoderIndependent(allocator: std.mem.Allocator, document: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -270,8 +285,8 @@ fn encoderIndependent(allocator: std.mem.Allocator, document: []const u8) ![]u8 
     while (std.mem.indexOfScalarPos(u8, document, at, '<')) |tag| {
         const rest = document[tag..];
         if (std.mem.startsWith(u8, rest, "<binaryDataArray ")) {
-            const text = std.mem.indexOfPos(u8, document, tag, "<binary>").? + "<binary>".len;
-            const text_end = std.mem.indexOfPos(u8, document, text, "</binary>").?;
+            const text = (std.mem.indexOfPos(u8, document, tag, "<binary>") orelse return error.TestUnexpectedResult) + "<binary>".len;
+            const text_end = std.mem.indexOfPos(u8, document, text, "</binary>") orelse return error.TestUnexpectedResult;
             const declaration = document[tag..text];
             for (ZLIB_PIPELINES) |accession| {
                 if (std.mem.indexOf(u8, declaration, accession) != null) break;
@@ -280,8 +295,8 @@ fn encoderIndependent(allocator: std.mem.Allocator, document: []const u8) ![]u8 
                 at = text_end;
                 continue;
             }
-            const length = std.mem.indexOf(u8, declaration, "encodedLength=\"").? + "encodedLength=\"".len;
-            const length_end = std.mem.indexOfScalarPos(u8, declaration, length, '"').?;
+            const length = (std.mem.indexOf(u8, declaration, "encodedLength=\"") orelse return error.TestUnexpectedResult) + "encodedLength=\"".len;
+            const length_end = std.mem.indexOfScalarPos(u8, declaration, length, '"') orelse return error.TestUnexpectedResult;
             try std.testing.expectEqual(text_end - text, try std.fmt.parseInt(usize, declaration[length..length_end], 10));
             try out.appendSlice(allocator, document[at .. tag + length]);
             try out.append(allocator, '#');
@@ -297,10 +312,10 @@ fn encoderIndependent(allocator: std.mem.Allocator, document: []const u8) ![]u8 
             try std.testing.expectEqualSlices(u8, plain.buffered(), try mzml.zlib.decompress(&decoded, wire[0..counts.decoded_bytes]));
             for (plain.buffered()) |byte| try out.print(allocator, "{x:0>2}", .{byte});
             at = text_end;
-        } else if (sizeDependentValue(rest)) |prefix| {
+        } else if (try sizeDependentValue(rest)) |prefix| {
             try out.appendSlice(allocator, document[at .. tag + prefix]);
             try out.append(allocator, '#');
-            at = std.mem.indexOfScalarPos(u8, document, tag + prefix, '<').?;
+            at = std.mem.indexOfScalarPos(u8, document, tag + prefix, '<') orelse return error.TestUnexpectedResult;
         } else {
             try out.appendSlice(allocator, document[at .. tag + 1]);
             at = tag + 1;
@@ -310,11 +325,11 @@ fn encoderIndependent(allocator: std.mem.Allocator, document: []const u8) ![]u8 
     return out.toOwnedSlice(allocator);
 }
 
-fn sizeDependentValue(tag: []const u8) ?usize {
+fn sizeDependentValue(tag: []const u8) !?usize {
     inline for (.{ "<indexListOffset>", "<fileChecksum>" }) |open| {
         if (std.mem.startsWith(u8, tag, open)) return open.len;
     }
-    if (std.mem.startsWith(u8, tag, "<offset ")) return std.mem.indexOfScalar(u8, tag, '>').? + 1;
+    if (std.mem.startsWith(u8, tag, "<offset ")) return (std.mem.indexOfScalar(u8, tag, '>') orelse return error.TestUnexpectedResult) + 1;
     return null;
 }
 

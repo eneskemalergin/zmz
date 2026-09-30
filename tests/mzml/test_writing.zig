@@ -898,7 +898,7 @@ test "[failure] - [mzML mixed writing]: checks supplied bytes and keeps failures
                     aliased.* = choices;
                     supplied = aliased;
                 },
-                // Indexed output reaches the sink in 64 KiB chunks, so only plain output fails here.
+                // Indexed output reaches the sink in buffered chunks, so only plain output fails here.
                 7 => if (indexed) continue else {
                     sink.buffer = sink.buffer[0 .. sink.end + 1];
                 },
@@ -941,7 +941,7 @@ test "[integration] - [mzML prepared writing]: rejects mismatches and keeps sink
                     writer.limits.text_bytes = 11;
                     try std.testing.expectError(error.LimitExceeded, writer.writeRecordWithArrays(record.node, &.{ &bytes, &bytes }));
                 },
-                // Indexed output reaches the sink in 64 KiB chunks, so only plain output fails here.
+                // Indexed output reaches the sink in buffered chunks, so only plain output fails here.
                 4 => if (indexed) continue else {
                     sink.buffer = sink.buffer[0 .. sink.end + 1];
                     try std.testing.expectError(error.WriteFailed, writer.writeRecordWithArrays(record.node, &.{ &bytes, &bytes }));
@@ -1220,7 +1220,7 @@ test "[integration] - [mzML file writer]: patches counts without changing record
                     try std.testing.expectEqualStrings(entry.id, found.value.id);
                     try std.testing.expectEqualStrings("AAAAAAAA8D8=", found.value.binaryArrays()[0].child(.binary).?.text.?);
                 }
-                const checksum_start = std.mem.indexOf(u8, bytes, "<fileChecksum>").? + "<fileChecksum>".len;
+                const checksum_start = try support.checksumStart(bytes);
                 var digest: [20]u8 = undefined;
                 std.crypto.hash.Sha1.hash(bytes[0..checksum_start], &digest, .{});
                 try std.testing.expectEqualStrings(&std.fmt.bytesToHex(digest, .lower), bytes[checksum_start .. checksum_start + 40]);

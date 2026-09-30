@@ -64,8 +64,9 @@ pub fn initIndexed(allocator: std.mem.Allocator, sink: *std.Io.Writer, limits: L
     try schema.checkLimits(limits);
     const state = try allocator.create(IndexState);
     errdefer allocator.destroy(state);
-    state.* = .{ .allocator = allocator, .hashed = undefined, .arena = .init(allocator), .limits = index_limits };
-    state.hashed = .init(sink, &state.hashed_buffer);
+    const chunk = try allocator.alloc(u8, CHUNK_BYTES);
+    errdefer allocator.free(chunk);
+    state.* = .{ .allocator = allocator, .hashed = .init(sink, chunk), .arena = .init(allocator), .limits = index_limits };
     return .{ .engine = try xml.Writer.init(allocator, &state.hashed.writer, .{}), .allocator = allocator, .limits = limits, .index_state = state };
 }
 
@@ -352,8 +353,9 @@ pub fn endList(self: *Writer) Error!void {
     self.phase = .run;
 }
 
-/// Closes the run and document. Indexed file output flushes and reads the checksum
-/// prefix, but the caller must flush the final bytes. Can succeed only once.
+/// Closes the run and document. Indexed stream output flushes the writer's chunk buffer
+/// into the sink; indexed file output flushes and reads the checksum prefix. The caller
+/// must still flush its own sink. Can succeed only once.
 pub fn finish(self: *Writer) Error!void {
     if (self.failure != null) return error.FailedState;
     errdefer |err| self.fail(err, .finish);
@@ -420,7 +422,8 @@ fn writeIndex(self: *Writer, state: *IndexState) Error!void {
         sink.interface.flush() catch |err| return try self.ioFailure(err);
         const end = self.engine.byteOffset() orelse return error.LimitExceeded;
         var hasher: Sha1 = .{};
-        var buffer: [64 * 1024]u8 = undefined;
+        // File output bypasses the hashed writer, so its idle buffer holds each read.
+        const buffer = state.hashed.writer.buffer;
         var position: u64 = 0;
         while (position < end) {
             const capacity: usize = @intCast(@min(buffer.len, end - position));
@@ -646,11 +649,14 @@ fn optionalAttribute(self: *Writer, name: []const u8, value: ?[]const u8) Error!
 
 const IndexEntry = struct { id: []const u8, offset: u64 };
 
+/// Indexed stream output is hashed and forwarded, and file output reread, in chunks of this
+/// size. Rewrite time was flat from 8 to 256 KiB; 16 KiB kept peak RSS at the unhashed level.
+const CHUNK_BYTES = 16 * 1024;
+
 const IndexState = struct {
     allocator: std.mem.Allocator,
     /// Hashes and forwards streamed output in whole chunks; file output rereads the file instead.
     hashed: std.Io.Writer.Hashed(Sha1),
-    hashed_buffer: [64 * 1024]u8 = undefined,
     arena: std.heap.ArenaAllocator,
     limits: IndexLimits,
     entries: std.ArrayList(IndexEntry) = .empty,
@@ -666,6 +672,7 @@ const IndexState = struct {
         self.historical_ids.deinit(self.allocator);
         for (&self.ids) |*ids| ids.deinit(self.allocator);
         self.arena.deinit();
+        self.allocator.free(self.hashed.writer.buffer);
         self.allocator.destroy(self);
     }
 
