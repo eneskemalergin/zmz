@@ -58,7 +58,7 @@ zig-out/bin/mzml-indexed example-indexed.mzML 'scan=1'
 
 [write.zig](write.zig) constructs a small example spectrum with `f64` m/z and `f32` intensity arrays, compressed with zlib. Its header labels the data as example values, not an acquisition. Replace that metadata and those numbers with your own acquisition information.
 
-`Builder.prepareArray` creates metadata and wire bytes without retaining a Base64 copy. Each array has a separate compressed destination that remains unchanged until `writeRecordWithArrays` returns. `arrays.wireBound` excludes zlib overhead, so the example retries `OutputTooSmall` with bounded growth, capped at 1 MiB per buffer. The temporary precompression buffer can be released after zlib finishes; the compressed destination cannot. For uncompressed prepared arrays, wire can instead borrow the original numeric values or endian-conversion scratch.
+`Builder.prepareArray` creates metadata and wire bytes without retaining a Base64 copy. An `arrays.Encoder` owns the scratch, the compressor, and each array's wire, which stays valid until the encoder is reset, so both arrays remain available to `writeRecordWithArrays`. For uncompressed primitive arrays on little-endian targets, wire borrows the original numeric values.
 
 Builder reset releases its metadata. The example resets only after the header or record has been written. `Writer.finish` closes the document and emits the optional index; the caller must then flush the sink. `deinit` does neither. Output creation refuses an existing path, and a failed write removes its newly created partial output.
 

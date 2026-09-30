@@ -404,6 +404,22 @@ test "[property] - [zlib]: reuses compression storage after success and capacity
     }
 }
 
+test "[property] - [zlib]: incompressible input fits the compression bound" {
+    var random = std.Random.DefaultPrng.init(std.testing.random_seed);
+    const source = try std.testing.allocator.alloc(u8, 200_000);
+    defer std.testing.allocator.free(source);
+    random.random().bytes(source);
+    const output = try std.testing.allocator.alloc(u8, zlib.compressBound(source.len));
+    defer std.testing.allocator.free(output);
+    inline for (.{ zlib.Preset.fast, .even, .dense }) |preset| {
+        var compressor = try zlib.Compressor.init(std.testing.allocator, preset);
+        defer compressor.deinit();
+        for ([_]usize{ 0, 1, 31, 32767, 32768, 32769, 65535, 65536, 65537, 131073, source.len }) |len| {
+            _ = try compressor.compress(output[0..zlib.compressBound(len)], source[0..len]);
+        }
+    }
+}
+
 test "[failure] - [zlib]: releases partially allocated compression storage" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, allocateCompressor, .{});
 }
@@ -686,6 +702,63 @@ test "[failure] - [zlib arrays]: returns OutputTooSmall when a stream outgrows i
     try std.testing.expectError(error.OutputTooSmall, arrays.decodeWire(f64, output[0..1], transport[0..counts.decoded_bytes], .zlib, &.{}, .{}));
     // Three SLOF values exceed the wire bound of one.
     try std.testing.expectError(error.OutputTooSmall, arrays.decode(f64, output[0..1], "eJxzWO/AAAFXuSpUARP4Aqw=", .slof_zlib, scratch, .{}));
+}
+
+test "[integration] - [array encoder]: keeps every wire until reset for all pipelines" {
+    var encoder = arrays.Encoder.init(std.testing.allocator, .even);
+    defer encoder.deinit();
+    const values = [_]f64{ 0, 1.25, 10.5, 100.125 };
+    var wires: [std.meta.tags(arrays.Pipeline).len][]const u8 = undefined;
+    inline for (std.meta.tags(arrays.Pipeline), 0..) |pipeline, i| {
+        const fixed_point: ?f64 = switch (pipeline) {
+            .linear, .linear_zlib => 1000,
+            .slof, .slof_zlib => 10000,
+            else => null,
+        };
+        wires[i] = try encoder.encode(f64, &values, .{ .pipeline = pipeline, .fixed_point = fixed_point });
+    }
+    var transformed: [512]u8 = undefined;
+    inline for (std.meta.tags(arrays.Pipeline), 0..) |pipeline, i| {
+        var output: [values.len]f64 = undefined;
+        try arrays.decodeWire(f64, &output, wires[i], pipeline, &transformed, .{});
+        if (pipeline == .none or pipeline == .zlib) try std.testing.expectEqualSlices(f64, &values, &output);
+        if (pipeline == .pic or pipeline == .pic_zlib) try std.testing.expectEqualSlices(f64, &.{ 0, 1, 11, 100 }, &output);
+    }
+    if (@import("builtin").cpu.arch.endian() == .little)
+        try std.testing.expectEqual(@intFromPtr(&values), @intFromPtr(wires[0].ptr));
+    encoder.reset();
+    inline for (.{ f32, i32, i64 }) |T| {
+        const typed = [_]T{ 1, 2, 3 };
+        var output: [3]T = undefined;
+        try arrays.decodeWire(T, &output, try encoder.encode(T, &typed, .{ .pipeline = .zlib }), .zlib, &.{}, .{});
+        try std.testing.expectEqualSlices(T, &typed, &output);
+    }
+}
+
+test "[property] - [array encoder]: compresses incompressible arrays without retries" {
+    var encoder = arrays.Encoder.init(std.testing.allocator, .dense);
+    defer encoder.deinit();
+    const values = try std.testing.allocator.alloc(u64, 12_500);
+    defer std.testing.allocator.free(values);
+    var random = std.Random.DefaultPrng.init(std.testing.random_seed);
+    random.random().bytes(std.mem.sliceAsBytes(values));
+    const numbers: []const i64 = @ptrCast(values);
+    const wire = try encoder.encode(i64, numbers, .{ .pipeline = .zlib });
+    const output = try std.testing.allocator.alloc(i64, numbers.len);
+    defer std.testing.allocator.free(output);
+    try arrays.decodeWire(i64, output, wire, .zlib, &.{}, .{});
+    try std.testing.expectEqualSlices(i64, numbers, output);
+}
+
+fn encodeAllocated(allocator: std.mem.Allocator) !void {
+    var encoder = arrays.Encoder.init(allocator, .fast);
+    defer encoder.deinit();
+    _ = try encoder.encode(f64, &.{ 1, 2, 3 }, .{ .pipeline = .slof_zlib, .fixed_point = 10000 });
+    _ = try encoder.encode(f64, &.{ 1, 2, 3 }, .{ .pipeline = .linear, .fixed_point = 1000 });
+}
+
+test "[failure] - [array encoder]: releases storage after allocation failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, encodeAllocated, .{});
 }
 
 test "[integration] - [uncompressed arrays]: reports the first decode error without rescanning" {

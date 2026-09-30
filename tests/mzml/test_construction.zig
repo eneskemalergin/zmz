@@ -12,12 +12,13 @@ test "[integration] - [mzML extensions]: array replacement retains XML and late 
     const original = (try reader.nextRecord()).?;
     var builder = mzml.Builder.init(std.testing.allocator, .{});
     defer builder.deinit();
+    var encoder = mzml.arrays.Encoder.init(std.testing.allocator, .fast);
+    defer encoder.deinit();
     const values = [_]f64{ 5, 6 };
     const second = [_]f64{ 3, 4 };
-    const scratch: mzml.arrays.Scratch = .{ .transport = &.{}, .transformed = &.{} };
-    const first = try builder.prepareArrayFrom(f64, &values, original.binaryArrays()[0], header.groups, .{}, scratch, null);
+    const first = try builder.prepareArrayFrom(f64, &values, original.binaryArrays()[0], header.groups, .{}, &encoder);
     try std.testing.expectEqualDeep(original.binaryArrays()[0].params[0], first.array.node.params[0]);
-    const other = try builder.prepareArrayFrom(f64, &second, original.binaryArrays()[1], header.groups, .{}, scratch, null);
+    const other = try builder.prepareArrayFrom(f64, &second, original.binaryArrays()[1], header.groups, .{}, &encoder);
     var array_list = original.node.child(.binary_data_array_list).?;
     array_list.children = &.{ first.array.node, other.array.node };
     var record = original.node;
@@ -57,6 +58,8 @@ fn reencodeReferenceAllocated(allocator: std.mem.Allocator) !void {
     const source = (try reader.nextRecord()).?;
     var header_builder = mzml.Builder.init(allocator, .{});
     defer header_builder.deinit();
+    var encoder = mzml.arrays.Encoder.init(allocator, .fast);
+    defer encoder.deinit();
     const target: mzml.model.Encoding = .{ .primitive = .float32, .pipeline = .zlib };
     const prepared_header = try header_builder.reencoding(header.*, &.{ target, target });
     try std.testing.expectEqual(@as(usize, 2), prepared_header.header.groups.len);
@@ -66,13 +69,10 @@ fn reencodeReferenceAllocated(allocator: std.mem.Allocator) !void {
     defer builder.deinit();
     var compressor = try mzml.zlib.Compressor.init(allocator, .fast);
     defer compressor.deinit();
-    var wire: [128]u8 = undefined;
-    var transformed: [128]u8 = undefined;
-    const scratch: mzml.arrays.Scratch = .{ .transport = &wire, .transformed = &transformed };
     const values = [_]f32{ 5, 6 };
     const first_source = source.binaryArrays()[0];
-    try std.testing.expectError(error.GroupRewriteRequired, builder.prepareArrayFrom(f32, &values, first_source, header.groups, .{ .pipeline = .zlib }, scratch, &compressor));
-    const first = try prepared_header.prepareArray(&builder, f32, &values, first_source, .{ .pipeline = .zlib }, scratch, &compressor);
+    try std.testing.expectError(error.GroupRewriteRequired, builder.prepareArrayFrom(f32, &values, first_source, header.groups, .{ .pipeline = .zlib }, &encoder));
+    const first = try prepared_header.prepareArray(&builder, f32, &values, first_source, .{ .pipeline = .zlib }, &encoder);
     try std.testing.expectEqualDeep(first_source.params[0].group_ref.xml, first.array.node.params[0].group_ref.xml);
     try std.testing.expectEqualStrings(prepared_header.header.groups[1].id, first.array.node.params[0].group_ref.ref.?);
     try std.testing.expectEqualStrings("encoding", source.binaryArrays()[1].params[0].group_ref.ref.?);
@@ -125,6 +125,8 @@ test "[integration] - [parameter namespaces]: reencoding keeps reference and mem
                 "</binaryDataArray></binaryDataArrayList></spectrum></spectrumList></run></mzML>";
             var header_builder = mzml.Builder.init(allocator, .{});
             defer header_builder.deinit();
+            var encoder = mzml.arrays.Encoder.init(allocator, .fast);
+            defer encoder.deinit();
             var builder = mzml.Builder.init(allocator, .{});
             defer builder.deinit();
             const values = [_]f32{3};
@@ -135,7 +137,7 @@ test "[integration] - [parameter namespaces]: reencoding keeps reference and mem
                 const header = try reader.readHeader();
                 const record = (try reader.nextRecord()).?;
                 const rewritten = try header_builder.reencoding(header.*, &.{.{ .primitive = .float32, .pipeline = .none }});
-                const array = try rewritten.prepareArray(&builder, f32, &values, record.binaryArrays()[0], .{}, .{ .transport = &.{}, .transformed = &.{} }, null);
+                const array = try rewritten.prepareArray(&builder, f32, &values, record.binaryArrays()[0], .{}, &encoder);
                 const copied = try builder.preparedRecord(.spectrum, record.id, 0, 1, &.{}, &.{}, &.{array.array});
                 break :blk .{ .header = rewritten.header, .record = copied, .wire = array.wire };
             };
@@ -188,14 +190,15 @@ test "[integration] - [mzML containers]: prepared writing preserves extra contai
             const record = (try reader.nextRecord()).?;
             var header_builder = mzml.Builder.init(allocator, .{});
             defer header_builder.deinit();
+            var encoder = mzml.arrays.Encoder.init(allocator, .fast);
+            defer encoder.deinit();
             const prepared_header = try header_builder.reencoding(header.*, &.{.{ .primitive = .float32, .pipeline = .none }});
             try std.testing.expectEqual(@as(usize, 2), prepared_header.header.groups.len);
             try std.testing.expectEqualStrings("zmz-reencoded-1", prepared_header.header.groups[1].id);
             var builder = mzml.Builder.init(allocator, .{});
             defer builder.deinit();
-            const scratch: mzml.arrays.Scratch = .{ .transport = &.{}, .transformed = &.{} };
-            const first = try prepared_header.prepareArray(&builder, f32, &.{1}, record.binaryArrays()[0], .{}, scratch, null);
-            const second = try prepared_header.prepareArray(&builder, f32, &.{2}, record.binaryArrays()[1], .{}, scratch, null);
+            const first = try prepared_header.prepareArray(&builder, f32, &.{1}, record.binaryArrays()[0], .{}, &encoder);
+            const second = try prepared_header.prepareArray(&builder, f32, &.{2}, record.binaryArrays()[1], .{}, &encoder);
             const children = try allocator.dupe(mzml.model.Node, record.node.children);
             defer allocator.free(children);
             for (children) |*child| if (child.kind == .binary_data_array_list) {
@@ -240,6 +243,8 @@ test "[integration] - [group reencoding]: handles partial groups, ID collisions,
     const header: mzml.model.Header = .{ .document = .{ .kind = .mzml, .children = &.{list} }, .run = .{ .kind = .run }, .groups = &.{} };
     var owner = mzml.Builder.init(std.testing.allocator, .{});
     defer owner.deinit();
+    var encoder = mzml.arrays.Encoder.init(std.testing.allocator, .fast);
+    defer encoder.deinit();
     const prepared = try owner.reencoding(header, &.{ .{ .primitive = .float32, .pipeline = .zlib }, .{ .primitive = .float64, .pipeline = .zlib }, .{ .primitive = .float32, .pipeline = .zlib } });
     try std.testing.expectEqual(@as(usize, 5), prepared.header.groups.len);
     try std.testing.expectEqualStrings("zmz-reencoded-1", prepared.header.groups[3].id);
@@ -255,14 +260,12 @@ test "[integration] - [group reencoding]: handles partial groups, ID collisions,
     const array: mzml.model.Node = .{ .kind = .binary_data_array, .params = &.{ .{ .group_ref = .{ .ref = "zmz-reencoded-0", .xml = &xml } }, .{ .group_ref = .{ .ref = " codec ", .xml = &xml } } }, .children = &.{.{ .kind = .binary }} };
     var compressor = try mzml.zlib.Compressor.init(std.testing.allocator, .fast);
     defer compressor.deinit();
-    var wire: [128]u8 = undefined;
-    var transformed: [128]u8 = undefined;
-    const result = try prepared.prepareArray(&builder, f32, &.{ 1, 2 }, array, .{ .pipeline = .zlib }, .{ .transport = &wire, .transformed = &transformed }, &compressor);
+    const result = try prepared.prepareArray(&builder, f32, &.{ 1, 2 }, array, .{ .pipeline = .zlib }, &encoder);
     try std.testing.expectEqualStrings("zmz-reencoded-1", result.array.node.params[0].group_ref.ref.?);
     try std.testing.expectEqualStrings("zmz-reencoded-2", result.array.node.params[1].group_ref.ref.?);
     try std.testing.expectEqualDeep(&xml, result.array.node.params[0].group_ref.xml.?);
     try std.testing.expectEqualDeep(&xml, result.array.node.params[1].group_ref.xml.?);
-    try std.testing.expectError(error.GroupRewriteRequired, prepared.prepareArray(&builder, i32, &.{1}, array, .{ .pipeline = .zlib }, .{ .transport = &wire, .transformed = &transformed }, &compressor));
+    try std.testing.expectError(error.GroupRewriteRequired, prepared.prepareArray(&builder, i32, &.{1}, array, .{ .pipeline = .zlib }, &encoder));
     var limited = mzml.Builder.init(std.testing.allocator, .{ .bytes = 1 });
     defer limited.deinit();
     try std.testing.expectError(error.LimitExceeded, limited.reencoding(header, &.{.{ .primitive = .float32, .pipeline = .zlib }}));
@@ -289,21 +292,15 @@ fn replaceArrayAllocated(allocator: std.mem.Allocator) !void {
     };
     var builder = mzml.Builder.init(allocator, .{ .bytes = 4096 });
     defer builder.deinit();
+    var encoder = mzml.arrays.Encoder.init(allocator, .fast);
+    defer encoder.deinit();
     var compressor = try mzml.zlib.Compressor.init(allocator, .fast);
     defer compressor.deinit();
-    try std.testing.expectError(error.MissingCompressor, builder.prepareArrayFrom(f32, &.{1}, source, &groups, .{ .pipeline = .zlib }, .{ .transport = &.{}, .transformed = &.{} }, null));
-    var retry_scratch: [16]u8 = undefined;
-    for (0..2) |_| try std.testing.expectError(error.OutputTooSmall, builder.prepareArrayFrom(f32, &.{1}, source, &groups, .{ .pipeline = .zlib }, .{ .transport = &.{}, .transformed = &retry_scratch }, &compressor));
     for ([_]mzml.arrays.Pipeline{ .none, .zlib }) |pipeline| {
         for ([_]usize{ 0, 2 }) |length| {
             builder.reset();
             const values = [_]f32{ 2, 4 };
-            var wire: [128]u8 = undefined;
-            var scratch: [128]u8 = undefined;
-            const result = try builder.prepareArrayFrom(f32, values[0..length], source, &groups, .{ .pipeline = pipeline }, .{
-                .transport = &wire,
-                .transformed = &scratch,
-            }, &compressor);
+            const result = try builder.prepareArrayFrom(f32, values[0..length], source, &groups, .{ .pipeline = pipeline }, &encoder);
             var copied = mzml.Builder.init(allocator, .{});
             defer copied.deinit();
             _ = try copied.node(result.array.node);
@@ -340,10 +337,11 @@ test "[integration] - [array replacement]: preserves source metadata while chang
 test "[regression] - [array replacement]: charges only final metadata and outlives the source" {
     var builder = mzml.Builder.init(std.testing.allocator, .{ .depth = 2 });
     defer builder.deinit();
+    var encoder = mzml.arrays.Encoder.init(std.testing.allocator, .fast);
+    defer encoder.deinit();
     var copied = mzml.Builder.init(std.testing.allocator, .{});
     defer copied.deinit();
     const values = [_]f64{ 5, 6 };
-    const scratch: mzml.arrays.Scratch = .{ .transport = &.{}, .transformed = &.{} };
     const nodes = blk: {
         var input = std.Io.Reader.fixed(support.EXTENSIONS);
         var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
@@ -359,18 +357,18 @@ test "[regression] - [array replacement]: charges only final metadata and outliv
         for ([_]mzml.owned.Limits{ .{ .bytes = bytes - 1 }, .{ .depth = 1 } }) |limits| {
             var limited = mzml.Builder.init(std.testing.allocator, limits);
             defer limited.deinit();
-            try std.testing.expectError(error.LimitExceeded, limited.prepareArrayFrom(f64, &values, source, header.groups, .{}, scratch, null));
+            try std.testing.expectError(error.LimitExceeded, limited.prepareArrayFrom(f64, &values, source, header.groups, .{}, &encoder));
         }
         var exact = mzml.Builder.init(std.testing.allocator, .{ .bytes = bytes, .depth = 2 });
         defer exact.deinit();
-        const bounded = try exact.prepareArrayFrom(f64, &values, source, header.groups, .{}, scratch, null);
+        const bounded = try exact.prepareArrayFrom(f64, &values, source, header.groups, .{}, &encoder);
         try std.testing.expectEqual(@as(usize, 0), exact.remaining);
         try std.testing.expectEqualDeep(expected, bounded.array.node);
-        try std.testing.expectError(error.LimitExceeded, exact.prepareArrayFrom(f64, &values, source, header.groups, .{}, scratch, null));
+        try std.testing.expectError(error.LimitExceeded, exact.prepareArrayFrom(f64, &values, source, header.groups, .{}, &encoder));
         exact.reset();
-        const retried = try exact.prepareArrayFrom(f64, &values, source, header.groups, .{}, scratch, null);
+        const retried = try exact.prepareArrayFrom(f64, &values, source, header.groups, .{}, &encoder);
         try std.testing.expectEqualDeep(expected, retried.array.node);
-        const result = try builder.prepareArrayFrom(f64, &values, source, header.groups, .{}, scratch, null);
+        const result = try builder.prepareArrayFrom(f64, &values, source, header.groups, .{}, &encoder);
         break :blk .{ expected, result.array.node };
     };
     try std.testing.expectEqualDeep(nodes[0], nodes[1]);
@@ -388,14 +386,15 @@ test "[integration] - [array replacement]: returns metadata and allocation error
     const source = (try reader.nextRecord()).?.binaryArrays()[0];
     var builder = mzml.Builder.init(std.testing.allocator, .{});
     defer builder.deinit();
-    const scratch: mzml.arrays.Scratch = .{ .transport = &.{}, .transformed = &.{} };
-    try std.testing.expectError(error.MissingGroup, builder.prepareArrayFrom(f64, &.{1}, source, &.{}, .{}, scratch, null));
+    var encoder = mzml.arrays.Encoder.init(std.testing.allocator, .fast);
+    defer encoder.deinit();
+    try std.testing.expectError(error.MissingGroup, builder.prepareArrayFrom(f64, &.{1}, source, &.{}, .{}, &encoder));
     var extra_child = source;
     extra_child.children = &.{ source.children[0], .{ .kind = .binary } };
-    try std.testing.expectError(error.InvalidStructure, builder.prepareArrayFrom(f64, &.{1}, extra_child, header.groups, .{}, scratch, null));
+    try std.testing.expectError(error.InvalidStructure, builder.prepareArrayFrom(f64, &.{1}, extra_child, header.groups, .{}, &encoder));
     var limited = mzml.Builder.init(std.testing.allocator, .{ .bytes = 1 });
     defer limited.deinit();
-    try std.testing.expectError(error.LimitExceeded, limited.prepareArrayFrom(f64, &.{1}, source, header.groups, .{}, scratch, null));
+    try std.testing.expectError(error.LimitExceeded, limited.prepareArrayFrom(f64, &.{1}, source, header.groups, .{}, &encoder));
 }
 
 test "[integration] - [record editing]: changes values and length while retaining source references" {
@@ -418,14 +417,11 @@ test "[integration] - [record editing]: changes values and length while retainin
     const old_array = original.binaryArrays()[0];
     var builder = mzml.Builder.init(std.testing.allocator, .{});
     defer builder.deinit();
+    var encoder = mzml.arrays.Encoder.init(std.testing.allocator, .fast);
+    defer encoder.deinit();
     var compressor = try mzml.zlib.Compressor.init(std.testing.allocator, .fast);
     defer compressor.deinit();
-    var wire_storage: [128]u8 = undefined;
-    var transformed: [16]u8 = undefined;
-    const prepared = try builder.prepareArrayFrom(f64, &values, old_array, header.groups, .{ .pipeline = .zlib }, .{
-        .transport = &wire_storage,
-        .transformed = &transformed,
-    }, &compressor);
+    const prepared = try builder.prepareArrayFrom(f64, &values, old_array, header.groups, .{ .pipeline = .zlib }, &encoder);
     try std.testing.expectEqual(null, prepared.array.node.attribute("arrayLength"));
     try std.testing.expectError(error.InvalidArrayLength, builder.preparedRecord(.spectrum, original.id, 0, 1, &.{}, &.{}, &.{prepared.array}));
     var attributes: [6]mzml.model.Attribute = undefined;
@@ -465,6 +461,8 @@ test "[integration] - [record editing]: changes values and length while retainin
 test "[integration] - [prepared construction]: retains metadata and borrows primitive wire" {
     var builder = mzml.Builder.init(std.testing.allocator, .{});
     defer builder.deinit();
+    var encoder = mzml.arrays.Encoder.init(std.testing.allocator, .fast);
+    defer encoder.deinit();
     var compressor = try mzml.zlib.Compressor.init(std.testing.allocator, .fast);
     defer compressor.deinit();
     inline for (.{ f32, f64, i32, i64 }) |T| {
@@ -475,13 +473,11 @@ test "[integration] - [prepared construction]: retains metadata and borrows prim
         for ([_]mzml.arrays.Pipeline{ .none, .zlib }) |pipeline| {
             for ([_]usize{ 0, 1, values.len }) |length| {
                 builder.reset();
-                var transport: [512]u8 = undefined;
-                var transformed: [512]u8 = undefined;
                 const result = try builder.prepareArray(T, values[0..length], .{
                     .cv_ref = "MS",
                     .role = .{ .cv_ref = "MS", .accession = .{ .raw = "X:auxiliary" }, .name = "auxiliary" },
                     .encoding = .{ .pipeline = pipeline },
-                }, .{ .transport = &transport, .transformed = &transformed }, &compressor);
+                }, &encoder);
                 try std.testing.expectEqual(@as(?[]const u8, null), result.array.node.child(.binary).?.text);
                 try std.testing.expectEqual(try mzml.base64.encodedSize(result.wire.len), try mzml.cv.parseInteger(usize, result.array.node.attribute("encodedLength")));
                 try std.testing.expectEqual(length, result.array.length);
@@ -498,15 +494,16 @@ test "[integration] - [prepared construction]: retains metadata and borrows prim
 test "[integration] - [prepared construction]: keeps builder and writer failure checks" {
     var builder = mzml.Builder.init(std.testing.allocator, .{});
     defer builder.deinit();
+    var encoder = mzml.arrays.Encoder.init(std.testing.allocator, .fast);
+    defer encoder.deinit();
     var other = mzml.Builder.init(std.testing.allocator, .{});
     defer other.deinit();
     const options: mzml.Builder.ArrayOptions = .{ .cv_ref = "MS", .role = .{ .cv_ref = "MS", .accession = mzml.model.Terms.MZ_ARRAY, .name = "m/z array" } };
-    const scratch: mzml.arrays.Scratch = .{ .transport = &.{}, .transformed = &.{} };
     var intensity_options = options;
     intensity_options.role.accession = mzml.model.Terms.INTENSITY_ARRAY;
     intensity_options.role.name = "intensity array";
-    const a = try builder.prepareArray(f64, &.{1}, options, scratch, null);
-    const b = try builder.prepareArray(f64, &.{2}, intensity_options, scratch, null);
+    const a = try builder.prepareArray(f64, &.{1}, options, &encoder);
+    const b = try builder.prepareArray(f64, &.{2}, intensity_options, &encoder);
     try std.testing.expectError(error.PayloadNotRetained, builder.record(.spectrum, "scan=1", 0, 1, &.{}, &.{}, &.{ a.array, b.array }));
     try std.testing.expectError(error.InvalidRecord, other.preparedRecord(.spectrum, "scan=1", 0, 1, &.{}, &.{}, &.{ a.array, b.array }));
     try std.testing.expectError(error.InvalidArrayLength, builder.preparedRecord(.spectrum, "scan=1", 0, 2, &.{}, &.{}, &.{ a.array, b.array }));
@@ -514,17 +511,18 @@ test "[integration] - [prepared construction]: keeps builder and writer failure 
     try std.testing.expectEqual(@as(usize, 1), single.binaryArrays().len);
     var bad = options;
     bad.role.unit.cv_ref = "UO";
-    const partial = try builder.prepareArray(f64, &.{1}, bad, scratch, null);
+    const partial = try builder.prepareArray(f64, &.{1}, bad, &encoder);
     try std.testing.expectEqualDeep(bad.role.unit, partial.array.node.params[0].cv.unit);
     bad = options;
     bad.encoding.pipeline = .zlib;
-    try std.testing.expectError(error.MissingCompressor, builder.prepareArray(f64, &.{1}, bad, scratch, null));
+    // The encoder supplies its own compressor for zlib pipelines.
+    try std.testing.expect((try builder.prepareArray(f64, &.{1}, bad, &encoder)).wire.len != 0);
     bad.encoding.pipeline = .linear;
-    try std.testing.expectError(error.MissingFixedPoint, builder.prepareArray(f64, &.{1}, bad, scratch, null));
-    try std.testing.expectError(error.TypeMismatch, builder.prepareArray(f32, &.{1}, bad, scratch, null));
+    try std.testing.expectError(error.MissingFixedPoint, builder.prepareArray(f64, &.{1}, bad, &encoder));
+    try std.testing.expectError(error.TypeMismatch, builder.prepareArray(f32, &.{1}, bad, &encoder));
     var limited = mzml.Builder.init(std.testing.allocator, .{ .bytes = 1 });
     defer limited.deinit();
-    try std.testing.expectError(error.LimitExceeded, limited.prepareArray(f64, &.{1}, options, scratch, null));
+    try std.testing.expectError(error.LimitExceeded, limited.prepareArray(f64, &.{1}, options, &encoder));
     const record = try builder.preparedRecord(.spectrum, "scan=1", 0, 1, &.{}, &.{}, &.{ a.array, b.array });
     var input = std.Io.Reader.fixed(support.DOCUMENT);
     var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
@@ -650,13 +648,15 @@ test "[failure] - [mzML construction]: rejects depth options before copying or e
         var empty = std.heap.FixedBufferAllocator.init(&.{});
         var builder = mzml.Builder.init(empty.allocator(), .{ .depth = depth });
         defer builder.deinit();
+        var encoder = mzml.arrays.Encoder.init(empty.allocator(), .fast);
+        defer encoder.deinit();
         try std.testing.expectError(error.LimitExceeded, builder.record(.spectrum, "one", 0, 0, &.{}, &.{}, &.{}));
-        try std.testing.expectError(error.LimitExceeded, builder.prepareArrayFrom(f64, &.{1}, .{ .kind = .binary_data_array }, &.{}, .{}, .{ .transport = &.{}, .transformed = &.{} }, null));
+        try std.testing.expectError(error.LimitExceeded, builder.prepareArrayFrom(f64, &.{1}, .{ .kind = .binary_data_array }, &.{}, .{}, &encoder));
         try std.testing.expectError(error.LimitExceeded, builder.preparedRecord(.spectrum, "one", 0, 0, &.{}, &.{}, &.{}));
         const options: mzml.Builder.ArrayOptions = .{ .cv_ref = "MS", .role = .{ .cv_ref = "MS", .accession = mzml.model.Terms.MZ_ARRAY, .name = "m/z" } };
         const scratch: mzml.arrays.Scratch = .{ .transport = &.{}, .transformed = &.{} };
         try std.testing.expectError(error.LimitExceeded, builder.binaryArray(f64, &.{1}, options, &.{}, scratch, null));
-        try std.testing.expectError(error.LimitExceeded, builder.prepareArray(f64, &.{1}, options, scratch, null));
+        try std.testing.expectError(error.LimitExceeded, builder.prepareArray(f64, &.{1}, options, &encoder));
     }
 }
 

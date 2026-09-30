@@ -51,6 +51,13 @@ pub fn decompress(output: []u8, source: []const u8) Error![]u8 {
     return output[0..length];
 }
 
+/// Largest stream compress can write for source_len bytes. zipir emits a stored block
+/// whenever compression would not be smaller, so output never exceeds the source plus
+/// block headers, the zlib header, and the Adler-32 trailer.
+pub fn compressBound(source_len: usize) usize {
+    return source_len +| source_len / 2048 +| 32;
+}
+
 /// Reusable compression storage with one owner. Do not copy a live instance.
 /// Calls are independent streams; a failed call does not prevent reuse.
 pub const Compressor = struct {

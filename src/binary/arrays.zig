@@ -187,6 +187,66 @@ pub fn encodeWire(
     return wire;
 }
 
+/// Encoder failures: composition errors or failed allocation of its storage.
+pub const EncodeError = Error || std.mem.Allocator.Error;
+
+/// Encodes arrays with storage it owns: scratch, the zlib compressor (allocated on first
+/// use), and one output buffer per array encoded since the last reset. Callers size and
+/// retry nothing. Do not copy an initialized encoder.
+pub const Encoder = struct {
+    allocator: std.mem.Allocator,
+    preset: zlib.Preset,
+    compressor: ?zlib.Compressor = null,
+    transformed: std.ArrayList(u8) = .empty,
+    outputs: std.ArrayList(std.ArrayList(u8)) = .empty,
+    used: usize = 0,
+
+    pub fn init(allocator: std.mem.Allocator, preset: zlib.Preset) Encoder {
+        return .{ .allocator = allocator, .preset = preset };
+    }
+
+    pub fn deinit(self: *Encoder) void {
+        if (self.compressor) |*compressor| compressor.deinit();
+        for (self.outputs.items) |*output| output.deinit(self.allocator);
+        self.outputs.deinit(self.allocator);
+        self.transformed.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    /// Invalidates every wire returned since the last reset; capacity is kept for reuse.
+    pub fn reset(self: *Encoder) void {
+        self.used = 0;
+    }
+
+    /// Encodes values into wire bytes (primitive or Numpress, then optional zlib), valid
+    /// until reset or deinit. Little-endian primitives without zlib borrow values instead.
+    pub fn encode(self: *Encoder, comptime T: type, values: []const T, options: EncodeOptions) EncodeError![]const u8 {
+        const bound = try wireBound(T, values.len, options.pipeline);
+        const transformed = options.pipeline.transform() != .none or
+            @import("builtin").cpu.arch.endian() == .big;
+        if (!options.pipeline.hasZlib()) {
+            if (!transformed) return encodeWire(T, values, options, .{ .transport = &.{}, .transformed = &.{} }, null);
+            const output = try self.nextOutput(bound);
+            return encodeWire(T, values, options, .{ .transport = &.{}, .transformed = output }, null);
+        }
+        if (self.compressor == null) self.compressor = try zlib.Compressor.init(self.allocator, self.preset);
+        if (transformed) try self.transformed.resize(self.allocator, bound);
+        const output = try self.nextOutput(zlib.compressBound(bound));
+        return encodeWire(T, values, options, .{
+            .transport = output,
+            .transformed = if (transformed) self.transformed.items else &.{},
+        }, &self.compressor.?);
+    }
+
+    fn nextOutput(self: *Encoder, size: usize) std.mem.Allocator.Error![]u8 {
+        if (self.used == self.outputs.items.len) try self.outputs.append(self.allocator, .empty);
+        const output = &self.outputs.items[self.used];
+        try output.resize(self.allocator, size);
+        self.used += 1;
+        return output.items;
+    }
+};
+
 /// Returns the primitive or Numpress wire capacity before optional zlib compression.
 /// This is not a bound for the zlib stream or its Base64 representation.
 pub fn wireBound(comptime T: type, count: usize, pipeline: Pipeline) Error!usize {

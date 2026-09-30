@@ -58,8 +58,8 @@ pub const Reencoding = struct {
 
     /// Keeps array references and their XML, selecting prepared group definitions as needed.
     /// Array metadata belongs to builder; wire follows prepareArrayFrom's lifetime rules.
-    pub fn prepareArray(self: Reencoding, builder: *Builder, comptime T: type, values: []const T, source: model.Node, options: arrays.EncodeOptions, scratch: arrays.Scratch, compressor: ?*zlib.Compressor) Error!PreparedArray {
-        return builder.prepareArrayFromInner(T, values, source, self.source_groups, options, scratch, compressor, self.replacements);
+    pub fn prepareArray(self: Reencoding, builder: *Builder, comptime T: type, values: []const T, source: model.Node, options: arrays.EncodeOptions, encoder: *arrays.Encoder) Error!PreparedArray {
+        return builder.prepareArrayFromInner(T, values, source, self.source_groups, options, encoder, self.replacements);
     }
 };
 
@@ -140,12 +140,17 @@ pub fn binaryArray(
     scratch: arrays.Scratch,
     compressor: ?*zlib.Compressor,
 ) Error!Array {
-    return (try self.buildArray(T, values, options, output, scratch, compressor, false)).array;
+    try self.checkArrayOptions(options);
+    const text = try arrays.encode(T, output, values, options.encoding, scratch, compressor);
+    return self.arrayMetadata(T, values.len, options, text.len, text);
 }
 
-/// Encodes wire once and constructs metadata without retaining Base64.
-pub fn prepareArray(self: *Builder, comptime T: type, values: []const T, options: ArrayOptions, scratch: arrays.Scratch, compressor: ?*zlib.Compressor) Error!PreparedArray {
-    return self.buildArray(T, values, options, &.{}, scratch, compressor, true);
+/// Encodes wire once with encoder and constructs metadata without retaining Base64.
+/// The wire lasts until the encoder is reset.
+pub fn prepareArray(self: *Builder, comptime T: type, values: []const T, options: ArrayOptions, encoder: *arrays.Encoder) Error!PreparedArray {
+    try self.checkArrayOptions(options);
+    const wire = try encoder.encode(T, values, options.encoding);
+    return .{ .array = try self.arrayMetadata(T, values.len, options, try base64.encodedSize(wire.len), null), .wire = wire };
 }
 
 /// Reencodes values using copied source metadata, without copying the old payload.
@@ -154,7 +159,7 @@ pub fn prepareArray(self: *Builder, comptime T: type, values: []const T, options
 /// otherwise returns GroupRewriteRequired rather than discarding its XML.
 /// Replaces primitive/codec terms and lengths, preserving other fields and parameter order.
 /// If a default array omits arrayLength, the caller must update the enclosing record's
-/// defaultArrayLength when changing its length. Wire borrows values or caller scratch.
+/// defaultArrayLength when changing its length. Wire lasts until the encoder is reset.
 pub fn prepareArrayFrom(
     self: *Builder,
     comptime T: type,
@@ -162,19 +167,18 @@ pub fn prepareArrayFrom(
     source: model.Node,
     groups: []const cv.Group,
     options: arrays.EncodeOptions,
-    scratch: arrays.Scratch,
-    compressor: ?*zlib.Compressor,
+    encoder: *arrays.Encoder,
 ) Error!PreparedArray {
-    return self.prepareArrayFromInner(T, values, source, groups, options, scratch, compressor, null);
+    return self.prepareArrayFromInner(T, values, source, groups, options, encoder, null);
 }
 
-fn prepareArrayFromInner(self: *Builder, comptime T: type, values: []const T, source: model.Node, groups: []const cv.Group, options: arrays.EncodeOptions, scratch: arrays.Scratch, compressor: ?*zlib.Compressor, replacements: ?[]const GroupReplacement) Error!PreparedArray {
+fn prepareArrayFromInner(self: *Builder, comptime T: type, values: []const T, source: model.Node, groups: []const cv.Group, options: arrays.EncodeOptions, encoder: *arrays.Encoder, replacements: ?[]const GroupReplacement) Error!PreparedArray {
     if (self.limits.depth < 2 or self.limits.depth > schema.MAX_DEPTH) return error.LimitExceeded;
     _ = try model.arrayEncoding(source, groups);
     if (source.children.len != 1 or source.children[0].kind != .binary) return error.InvalidStructure;
     const target: model.Encoding = .{ .primitive = encoding.Primitive.of(T), .pipeline = options.pipeline };
     const counted = try reencodedParams(null, source.params, groups, target, replacements, self.remaining / @sizeOf(cv.Entry));
-    const wire = try arrays.encodeWire(T, values, options, scratch, compressor);
+    const wire = try encoder.encode(T, values, options);
     var copier = self.makeCopier();
     defer self.remaining = copier.remaining;
     const params = try copier.alloc(cv.Entry, counted.count);
@@ -448,21 +452,22 @@ fn reencodedParams(output: ?[]cv.Entry, params: []const cv.Entry, groups: []cons
     return result;
 }
 
-fn buildArray(self: *Builder, comptime T: type, values: []const T, options: ArrayOptions, output: []u8, scratch: arrays.Scratch, compressor: ?*zlib.Compressor, comptime prepared: bool) Error!PreparedArray {
+fn checkArrayOptions(self: *const Builder, options: ArrayOptions) Error!void {
     if (self.limits.depth < 2 or self.limits.depth > schema.MAX_DEPTH) return error.LimitExceeded;
     if (options.cv_ref.len == 0 or options.role.cv_ref == null or options.role.accession == null or
         options.role.name == null) return error.InvalidDeclaration;
+}
+
+/// Copies array metadata for encoded values; text is null for prepared wire.
+fn arrayMetadata(self: *Builder, comptime T: type, value_count: usize, options: ArrayOptions, encoded_length: usize, text: ?[]const u8) Error!Array {
     const is_default = isDefaultRole(options.role.accession.?);
     const primitive = encoding.primitiveTerm(encoding.Primitive.of(T));
     const codec = encoding.codecTerm(options.encoding.pipeline);
-    const wire = if (prepared) try arrays.encodeWire(T, values, options.encoding, scratch, compressor) else &.{};
-    const encoded: ?[]const u8 = if (prepared) null else try arrays.encode(T, output, values, options.encoding, scratch, compressor);
-    const encoded_length = if (prepared) try base64.encodedSize(wire.len) else encoded.?.len;
     var length: [32]u8 = undefined;
     var count: [32]u8 = undefined;
     var attrs = [_]model.Attribute{
         .{ .name = "encodedLength", .value = length[0..std.fmt.printInt(&length, encoded_length, 10, .lower, .{})] },
-        .{ .name = "arrayLength", .value = count[0..std.fmt.printInt(&count, values.len, 10, .lower, .{})] },
+        .{ .name = "arrayLength", .value = count[0..std.fmt.printInt(&count, value_count, 10, .lower, .{})] },
         .{ .name = "dataProcessingRef", .value = options.data_processing_ref orelse "" },
     };
     var attribute_count: usize = if (is_default) 1 else 2;
@@ -479,11 +484,10 @@ fn buildArray(self: *Builder, comptime T: type, values: []const T, options: Arra
         .kind = .binary_data_array,
         .attributes = attrs[0..attribute_count],
         .params = &params,
-        .children = &.{.{ .kind = .binary, .text = encoded }},
+        .children = &.{.{ .kind = .binary, .text = text }},
     };
     _ = try model.arrayEncoding(result, &.{});
-    const copied = try self.node(result);
-    return .{ .array = .{ .node = copied, .length = values.len, .is_default = is_default, .owner = self }, .wire = wire };
+    return .{ .node = try self.node(result), .length = value_count, .is_default = is_default, .owner = self };
 }
 
 /// Creates a spectrum or chromatogram with generated numeric attributes and copied children.

@@ -1,5 +1,5 @@
 //! Constructs one example spectrum from numeric values and writes plain or indexed mzML.
-//! Each compressed array keeps its own scratch until writeRecordWithArrays returns.
+//! The encoder keeps each array's wire bytes until writeRecordWithArrays returns.
 //! Output creation is exclusive; failed writes remove only the new partial file.
 
 const std = @import("std");
@@ -28,22 +28,18 @@ pub fn main(init: std.process.Init) !void {
     try writer.writeHeader(try makeHeader(&builder));
     builder.reset();
 
-    var compressor = try mzml.zlib.Compressor.init(init.gpa, .fast);
-    defer compressor.deinit();
-    var mz_storage: std.ArrayList(u8) = .empty;
-    defer mz_storage.deinit(init.gpa);
-    var intensity_storage: std.ArrayList(u8) = .empty;
-    defer intensity_storage.deinit(init.gpa);
-    const mz = try prepare(f64, init.gpa, &builder, &compressor, &mz_storage, &.{ 100, 200, 300 }, .{
+    var encoder = mzml.arrays.Encoder.init(init.gpa, .fast);
+    defer encoder.deinit();
+    const mz = try builder.prepareArray(f64, &.{ 100, 200, 300 }, .{
         .cv_ref = "MS",
-        .accession = mzml.model.Terms.MZ_ARRAY,
-        .name = "m/z array",
-    });
-    const intensity = try prepare(f32, init.gpa, &builder, &compressor, &intensity_storage, &.{ 10, 20, 30 }, .{
+        .role = .{ .cv_ref = "MS", .accession = mzml.model.Terms.MZ_ARRAY, .name = "m/z array" },
+        .encoding = .{ .pipeline = .zlib },
+    }, &encoder);
+    const intensity = try builder.prepareArray(f32, &.{ 10, 20, 30 }, .{
         .cv_ref = "MS",
-        .accession = mzml.model.Terms.INTENSITY_ARRAY,
-        .name = "intensity array",
-    });
+        .role = .{ .cv_ref = "MS", .accession = mzml.model.Terms.INTENSITY_ARRAY, .name = "intensity array" },
+        .encoding = .{ .pipeline = .zlib },
+    }, &encoder);
     const record = try builder.preparedRecord(.spectrum, "scan=1", 0, 3, &.{.{ .cv = .{
         .cv_ref = "MS",
         .accession = mzml.model.Terms.MS_LEVEL,
@@ -56,37 +52,6 @@ pub fn main(init: std.process.Init) !void {
     try writer.endList();
     try writer.finish();
     try output.interface.flush();
-}
-
-fn prepare(
-    comptime T: type,
-    allocator: std.mem.Allocator,
-    builder: *mzml.Builder,
-    compressor: *mzml.zlib.Compressor,
-    storage: *std.ArrayList(u8),
-    values: []const T,
-    role: mzml.cv.Param,
-) !mzml.Builder.PreparedArray {
-    const byte_limit = 1024 * 1024;
-    const bound = try mzml.arrays.wireBound(T, values.len, .zlib);
-    if (bound > byte_limit) return error.LimitExceeded;
-    const transformed = try allocator.alloc(u8, bound);
-    defer allocator.free(transformed);
-    try storage.resize(allocator, @max(bound, 1));
-    while (true) {
-        return builder.prepareArray(T, values, .{ .cv_ref = "MS", .role = role, .encoding = .{ .pipeline = .zlib } }, .{
-            .transport = storage.items,
-            .transformed = transformed,
-        }, compressor) catch |err| switch (err) {
-            error.OutputTooSmall => {
-                // wireBound excludes zlib overhead, so incompressible input may need more space.
-                if (storage.items.len == byte_limit) return error.LimitExceeded;
-                try storage.resize(allocator, @min(storage.items.len * 2, byte_limit));
-                continue;
-            },
-            else => return err,
-        };
-    }
 }
 
 fn makeHeader(builder: *mzml.Builder) !mzml.model.Header {

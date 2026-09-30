@@ -127,6 +127,8 @@ pub fn constructFixture(allocator: std.mem.Allocator, sink: *std.Io.Writer, inde
     defer reader.deinit();
     var metadata = mzml.Builder.init(allocator, .{});
     defer metadata.deinit();
+    var encoder = mzml.arrays.Encoder.init(allocator, .fast);
+    defer encoder.deinit();
     var source_header = (try reader.readHeader()).*;
     var metadata_nodes: [8]mzml.model.Node = undefined;
     @memcpy(metadata_nodes[0..source_header.document.children.len], source_header.document.children);
@@ -158,8 +160,6 @@ pub fn constructFixture(allocator: std.mem.Allocator, sink: *std.Io.Writer, inde
             } };
             var nodes: [2]mzml.Builder.Array = undefined;
             var wires: [2][]const u8 = undefined;
-            var prepared_transport: [2][512]u8 = undefined;
-            var prepared_transformed: [2][512]u8 = undefined;
             inline for (0..2) |i| {
                 const array_options: mzml.Builder.ArrayOptions = .{
                     .cv_ref = "MS",
@@ -171,7 +171,7 @@ pub fn constructFixture(allocator: std.mem.Allocator, sink: *std.Io.Writer, inde
                     },
                 };
                 if (prepared) {
-                    const built = try builder.prepareArray(f64, &.{ 1, 2, 3 }, array_options, .{ .transport = &prepared_transport[i], .transformed = &prepared_transformed[i] }, &compressor);
+                    const built = try builder.prepareArray(f64, &.{ 1, 2, 3 }, array_options, &encoder);
                     nodes[i] = built.array;
                     wires[i] = built.wire;
                 } else nodes[i] = try builder.binaryArray(f64, &.{ 1, 2, 3 }, array_options, &encoded, .{ .transport = &transport, .transformed = &transformed }, &compressor);
