@@ -1588,12 +1588,16 @@ test "[integration] - [mzML indexed writer]: preserves bytes and checksum throug
         chunk: usize,
         writer: std.Io.Writer = .{ .vtable = &.{ .drain = drain }, .buffer = &.{} },
 
+        // Accepts at most one chunk of the first nonempty slice per call.
         fn drain(writer: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
-            std.debug.assert(data.len == 1 and splat == 1);
             const self: *@This() = @alignCast(@fieldParentPtr("writer", writer));
-            const length = @min(data[0].len, self.chunk);
-            try self.out.writeAll(data[0][0..length]);
-            return length;
+            for (data, 0..) |bytes, i| {
+                if (bytes.len == 0 or (i == data.len - 1 and splat == 0)) continue;
+                const length = @min(bytes.len, self.chunk);
+                try self.out.writeAll(bytes[0..length]);
+                return length;
+            }
+            return 0;
         }
     };
     var whole_bytes: [16384]u8 = undefined;
@@ -1630,8 +1634,11 @@ test "[failure] - [mzML indexed writer]: keeps record-limit and sink failures st
     var full = std.Io.Writer.fixed(&.{});
     var failed = try mzml.Writer.initIndexed(std.testing.allocator, &full, .{}, .{});
     defer failed.deinit();
-    try std.testing.expectError(error.WriteFailed, failed.writeHeader(header.*));
+    // Indexed output reaches the sink in 64 KiB chunks; this one fails when finish flushes it.
+    try failed.writeHeader(header.*);
+    try std.testing.expectError(error.WriteFailed, failed.finish());
     try std.testing.expectEqual(.write_failed, failed.diagnostic().?.id);
+    try std.testing.expectEqual(.finish, failed.diagnostic().?.operation);
     try std.testing.expectEqual(null, failed.diagnostic().?.location);
     try std.testing.expectError(error.FailedState, failed.finish());
 }

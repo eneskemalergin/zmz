@@ -1,19 +1,30 @@
-//! Shared by the binary codecs: cached CPU and OS support for their AVX2 paths,
-//! and the check that caller buffers do not overlap. Codec build options and
+//! Shared by the binary codecs: cached CPU and OS support for their AVX2 and SHA
+//! extension paths, and the check that caller buffers do not overlap. Codec build options and
 //! compiler restrictions stay with their callers.
 
 const std = @import("std");
 const builtin = @import("builtin");
 
 const AVX_STATE: u32 = (1 << 26) | (1 << 27) | (1 << 28);
+// Zero until detected, then 1 for absent and 2 for present; tests store 1 to force fallbacks.
 var avx2_cached = std.atomic.Value(u8).init(0);
+pub var sha_cached = std.atomic.Value(u8).init(0);
 
 pub fn hasAvx2() bool {
+    return cached(&avx2_cached, detectAvx2);
+}
+
+/// SHA extensions with the SSSE3 byte shuffle their message loads need.
+pub fn hasSha() bool {
+    return cached(&sha_cached, detectSha);
+}
+
+fn cached(cache: *std.atomic.Value(u8), comptime detect: fn () bool) bool {
     if (comptime builtin.cpu.arch != .x86_64) return false;
-    const saved = avx2_cached.load(.monotonic);
+    const saved = cache.load(.monotonic);
     if (saved != 0) return saved == 2;
-    const available = detectAvx2();
-    avx2_cached.store(if (available) 2 else 1, .monotonic);
+    const available = detect();
+    cache.store(if (available) 2 else 1, .monotonic);
     return available;
 }
 
@@ -37,6 +48,11 @@ fn detectAvx2() bool {
         : [_] "{ecx}" (@as(u32, 0)),
         : .{ .edx = true });
     return avx2Usable(leaf1, leaf7, xcr0);
+}
+
+fn detectSha() bool {
+    if (cpuid(0, 0).eax < 7) return false;
+    return cpuid(1, 0).ecx & (1 << 9) != 0 and cpuid(7, 0).ebx & (1 << 29) != 0;
 }
 
 fn avx2Usable(leaf1: u32, leaf7: u32, xcr0: u32) bool {
@@ -73,6 +89,15 @@ test "[unit] - [AVX2 detection]: agrees with host detection on repeated calls" {
         false;
     try std.testing.expectEqual(expected, hasAvx2());
     try std.testing.expectEqual(expected, hasAvx2());
+}
+
+test "[unit] - [SHA detection]: agrees with host detection on repeated calls" {
+    const expected = if (comptime builtin.cpu.arch == .x86_64) cpu: {
+        const host = (try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_model = .native })).cpu;
+        break :cpu host.has(.x86, .sha) and host.has(.x86, .ssse3);
+    } else false;
+    try std.testing.expectEqual(expected, hasSha());
+    try std.testing.expectEqual(expected, hasSha());
 }
 
 test "[property] - [base64 dispatch]: cached scalar fallback preserves both directions" {

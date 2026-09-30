@@ -878,7 +878,7 @@ test "[failure] - [mzML mixed writing]: checks supplied bytes and keeps failures
             defer writer.deinit();
             try writer.writeHeader(header.*);
             try writer.beginList(.spectrum_list, 1, "dp");
-            const before = sink.buffered().len;
+            const before = writer.engine.byteOffset();
             var choices = [_]?[]const u8{ null, &wire };
             var supplied: []const ?[]const u8 = &choices;
             var arrays = [_]mzml.model.Node{ record.binaryArrays()[0], record.binaryArrays()[1] };
@@ -898,11 +898,14 @@ test "[failure] - [mzML mixed writing]: checks supplied bytes and keeps failures
                     aliased.* = choices;
                     supplied = aliased;
                 },
-                7 => sink.buffer = sink.buffer[0 .. sink.end + 1],
+                // Indexed output reaches the sink in 64 KiB chunks, so only plain output fails here.
+                7 => if (indexed) continue else {
+                    sink.buffer = sink.buffer[0 .. sink.end + 1];
+                },
                 else => unreachable,
             }
             try std.testing.expectError(expected_error, writer.writeRecordWithSelectedArrays(node, supplied));
-            if (case != 4 and case != 7) try std.testing.expectEqual(before, sink.buffered().len);
+            if (case != 4 and case != 7) try std.testing.expectEqual(before, writer.engine.byteOffset());
             const report = writer.diagnostic().?;
             try std.testing.expectEqual(.write_record, report.operation);
             if (case >= 1 and case <= 5)
@@ -929,7 +932,7 @@ test "[integration] - [mzML prepared writing]: rejects mismatches and keeps sink
             defer writer.deinit();
             try writer.writeHeader(header.*);
             try writer.beginList(.spectrum_list, 1, "dp");
-            const before = sink.buffered().len;
+            const before = writer.engine.byteOffset().?;
             switch (failure) {
                 0 => try std.testing.expectError(error.CountMismatch, writer.writeRecordWithArrays(record.node, &.{})),
                 1 => try std.testing.expectError(error.EncodedLengthMismatch, writer.writeRecordWithArrays(record.node, &.{ &bytes, bytes[0..1] })),
@@ -938,7 +941,8 @@ test "[integration] - [mzML prepared writing]: rejects mismatches and keeps sink
                     writer.limits.text_bytes = 11;
                     try std.testing.expectError(error.LimitExceeded, writer.writeRecordWithArrays(record.node, &.{ &bytes, &bytes }));
                 },
-                4 => {
+                // Indexed output reaches the sink in 64 KiB chunks, so only plain output fails here.
+                4 => if (indexed) continue else {
                     sink.buffer = sink.buffer[0 .. sink.end + 1];
                     try std.testing.expectError(error.WriteFailed, writer.writeRecordWithArrays(record.node, &.{ &bytes, &bytes }));
                 },
@@ -959,11 +963,11 @@ test "[integration] - [mzML prepared writing]: rejects mismatches and keeps sink
                     const list = changed.child(.binary_data_array_list).?;
                     changed.children = &.{ list, list };
                     try std.testing.expectError(error.InvalidStructure, writer.writeRecordWithArrays(changed, &.{ &bytes, &bytes }));
-                    try std.testing.expect(sink.buffered().len > before);
+                    try std.testing.expect(writer.engine.byteOffset().? > before);
                 },
                 else => unreachable,
             }
-            if (failure != 4 and failure != 8) try std.testing.expectEqual(before, sink.buffered().len);
+            if (failure != 4 and failure != 8) try std.testing.expectEqual(before, writer.engine.byteOffset().?);
             const report = writer.diagnostic().?;
             try std.testing.expectEqual(.write_record, report.operation);
             try std.testing.expectEqual(@as(usize, 0), report.record.?.ordinal);

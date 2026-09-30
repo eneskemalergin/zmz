@@ -9,6 +9,7 @@ const schema = @import("schema.zig");
 const xml = @import("../xml/mzml_adapter.zig");
 const base64 = @import("../binary/base64.zig");
 const overlaps = @import("../binary/core.zig").overlaps;
+const Sha1 = @import("../binary/sha1.zig").Sha1;
 const Diagnostic = @import("diagnostic.zig");
 const Ids = @import("internal/id_index.zig").IdIndex(IndexEntry);
 
@@ -63,7 +64,8 @@ pub fn initIndexed(allocator: std.mem.Allocator, sink: *std.Io.Writer, limits: L
     try schema.checkLimits(limits);
     const state = try allocator.create(IndexState);
     errdefer allocator.destroy(state);
-    state.* = .{ .allocator = allocator, .hashed = .{ .out = sink }, .arena = .init(allocator), .limits = index_limits };
+    state.* = .{ .allocator = allocator, .hashed = undefined, .arena = .init(allocator), .limits = index_limits };
+    state.hashed = .init(sink, &state.hashed_buffer);
     return .{ .engine = try xml.Writer.init(allocator, &state.hashed.writer, .{}), .allocator = allocator, .limits = limits, .index_state = state };
 }
 
@@ -272,8 +274,7 @@ fn writeRecordInner(self: *Writer, node: model.Node, comptime replace_arrays: bo
         const list = node.child(.binary_data_array_list);
         const arrays = if (list) |value| value.children else &.{};
         if (arrays.len != wire_arrays.len) return try self.sizeError(error.CountMismatch, arrays.len, wire_arrays.len, .arrays);
-        const sink = if (self.index_state) |state| state.hashed.out else self.engine.sink;
-        if (overlaps(sink.buffer, std.mem.sliceAsBytes(wire_arrays))) return error.OverlappingBuffers;
+        if (self.overlapsOutput(std.mem.sliceAsBytes(wire_arrays))) return error.OverlappingBuffers;
         for (arrays, wire_arrays, 0..) |array, supplied, position| {
             const wire = @as(?[]const u8, supplied) orelse continue;
             errdefer |err| {
@@ -283,7 +284,7 @@ fn writeRecordInner(self: *Writer, node: model.Node, comptime replace_arrays: bo
             }
             if (array.kind != .binary_data_array or array.children.len != 1 or
                 array.children[0].kind != .binary) return error.InvalidStructure;
-            if (overlaps(sink.buffer, wire)) return error.OverlappingBuffers;
+            if (self.overlapsOutput(wire)) return error.OverlappingBuffers;
             const length = try base64.encodedSize(wire.len);
             if (length > self.limits.text_bytes) return try self.limitError(.text_bytes, self.limits.text_bytes, length);
             const declared = try self.number(array, .encoded_length);
@@ -361,7 +362,24 @@ pub fn finish(self: *Writer) Error!void {
     try self.engine.endElement();
     if (self.index_state) |state| try self.writeIndex(state);
     try self.engine.endDocument();
+    if (self.index_state != null and self.file_sink == null) try self.flushHashed(self.index_state.?);
     self.phase = .done;
+}
+
+// Wire is read while encoding, so it must not share any buffer that output passes through.
+fn overlapsOutput(self: *const Writer, bytes: []const u8) bool {
+    if (overlaps(self.engine.sink.buffer, bytes)) return true;
+    const state = self.index_state orelse return false;
+    return self.file_sink == null and overlaps(state.hashed.out.buffer, bytes);
+}
+
+// Buffered bytes that fail to reach the sink have no accepted output position.
+fn flushHashed(self: *Writer, state: *IndexState) Error!void {
+    state.hashed.writer.flush() catch {
+        self.capture(error.WriteFailed, .output, .none);
+        self.failure.?.location = null;
+        return error.WriteFailed;
+    };
 }
 
 fn writeIndex(self: *Writer, state: *IndexState) Error!void {
@@ -401,7 +419,7 @@ fn writeIndex(self: *Writer, state: *IndexState) Error!void {
     const digest = if (self.file_sink) |sink| digest: {
         sink.interface.flush() catch |err| return try self.ioFailure(err);
         const end = self.engine.byteOffset() orelse return error.LimitExceeded;
-        var hasher = std.crypto.hash.Sha1.init(.{});
+        var hasher: Sha1 = .{};
         var buffer: [64 * 1024]u8 = undefined;
         var position: u64 = 0;
         while (position < end) {
@@ -412,7 +430,10 @@ fn writeIndex(self: *Writer, state: *IndexState) Error!void {
             position += length;
         }
         break :digest hasher.finalResult();
-    } else state.hashed.hasher.finalResult();
+    } else digest: {
+        try self.flushHashed(state);
+        break :digest state.hashed.hasher.finalResult();
+    };
     const checksum = std.fmt.bytesToHex(digest, .lower);
     try self.engine.text(&checksum);
     try self.engine.endElement();
@@ -627,7 +648,9 @@ const IndexEntry = struct { id: []const u8, offset: u64 };
 
 const IndexState = struct {
     allocator: std.mem.Allocator,
-    hashed: ChecksumWriter,
+    /// Hashes and forwards streamed output in whole chunks; file output rereads the file instead.
+    hashed: std.Io.Writer.Hashed(Sha1),
+    hashed_buffer: [64 * 1024]u8 = undefined,
     arena: std.heap.ArenaAllocator,
     limits: IndexLimits,
     entries: std.ArrayList(IndexEntry) = .empty,
@@ -651,20 +674,5 @@ const IndexState = struct {
         const result = try self.arena.allocator().dupe(u8, text);
         self.id_bytes += text.len;
         return result;
-    }
-};
-
-const ChecksumWriter = struct {
-    out: *std.Io.Writer,
-    hasher: std.crypto.hash.Sha1 = .init(.{}),
-    writer: std.Io.Writer = .{ .vtable = &.{ .drain = drain }, .buffer = &.{} },
-
-    fn drain(writer: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
-        // The XML writer submits one slice per write, without buffering or splats.
-        std.debug.assert(writer.end == 0 and data.len == 1 and splat == 1);
-        const self: *ChecksumWriter = @alignCast(@fieldParentPtr("writer", writer));
-        const written = try self.out.write(data[0]);
-        if (written != 0) self.hasher.update(data[0][0..written]);
-        return written;
     }
 };
