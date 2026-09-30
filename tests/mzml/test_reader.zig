@@ -1175,14 +1175,12 @@ test "[failure] - [mzML decoded reading]: bounds storage and releases failed all
     try std.testing.checkAllAllocationFailures(std.testing.allocator, readDecoded, .{ compressed.buffered(), mzml.arrays.Limits{} });
     for ([_]mzml.arrays.Limits{
         .{ .array_bytes = 7 },
-        .{ .base64_text = .{ .text_bytes = 11 } },
-        .{ .base64_text = .{ .significant_bytes = 11 } },
-        .{ .base64_text = .{ .decoded_bytes = 7 } },
+        .{ .text_bytes = 11 },
     }) |limit| try std.testing.expectError(error.LimitExceeded, readDecoded(std.testing.allocator, support.DOCUMENT, limit));
     const text = "!" ++ "A" ** 70000;
     const source = try decodedDocument(std.testing.allocator, text, text.len, 1, "MS:1000576");
     defer std.testing.allocator.free(source);
-    try std.testing.expectError(error.InvalidCharacter, readDecoded(std.testing.allocator, source, .{ .base64_text = .{ .text_bytes = 65536 } }));
+    try std.testing.expectError(error.InvalidCharacter, readDecoded(std.testing.allocator, source, .{ .text_bytes = 65536 }));
 }
 
 test "[integration] - [mzML decoded reading]: preserves encoded length hints without using them" {
@@ -1243,17 +1241,15 @@ test "[integration] - [mzML decoded reading]: grows wire storage across fragment
     try compareDecoded(source, 7);
     const limits: mzml.arrays.Limits = .{
         .array_bytes = @sizeOf(@TypeOf(values)),
-        .base64_text = .{ .text_bytes = text.len, .significant_bytes = text.len, .decoded_bytes = wire.len },
+        .text_bytes = text.len,
     };
     // EOF can attempt optional arena consolidation, whose allocation failure is recoverable.
     try std.testing.checkAllAllocationFailures(std.testing.allocator, readDecodedRecord, .{ source, limits });
-    for (0..4) |limit| {
+    for (0..2) |limit| {
         var too_small = limits;
         switch (limit) {
             0 => too_small.array_bytes -= 1,
-            1 => too_small.base64_text.text_bytes -= 1,
-            2 => too_small.base64_text.significant_bytes -= 1,
-            3 => too_small.base64_text.decoded_bytes -= 1,
+            1 => too_small.text_bytes -= 1,
             else => unreachable,
         }
         var input = std.Io.Reader.fixed(source);
@@ -1262,7 +1258,7 @@ test "[integration] - [mzML decoded reading]: grows wire storage across fragment
         var output = mzml.StreamReader.DecodedArrays.init(std.testing.allocator, too_small);
         defer output.deinit();
         try std.testing.expectError(error.LimitExceeded, reader.nextDecodedRecord(&output));
-        const names = [_]mzml.Diagnostic.Limit{ .array_bytes, .base64_text_bytes, .base64_significant_bytes, .base64_decoded_bytes };
+        const names = [_]mzml.Diagnostic.Limit{ .array_bytes, .base64_text_bytes };
         try std.testing.expectEqual(names[limit], reader.diagnostic().?.detail.limit.name);
     }
 }
@@ -1369,7 +1365,7 @@ test "[regression] - [mzML array decoding]: reads empty producer arrays with zli
     var typed_arrays = record.arrays(&.{});
     const typed_array = (try typed_arrays.next()).?;
     try typed_array.decode(f64, &.{}, .{ .transport = &scratch, .transformed = &.{} }, .{});
-    try std.testing.expectError(error.LimitExceeded, mzml.model.decodeArray(f64, &.{}, node, 0, &.{}, .{ .transport = &scratch, .transformed = &.{} }, .{ .base64_text = .{ .text_bytes = 0 } }));
+    try std.testing.expectError(error.LimitExceeded, mzml.model.decodeArray(f64, &.{}, node, 0, &.{}, .{ .transport = &scratch, .transformed = &.{} }, .{ .text_bytes = 0 }));
     var one: [1]f64 = undefined;
     var nonempty = node;
     nonempty.attributes = &.{.{ .name = "encodedLength", .value = "0" }};

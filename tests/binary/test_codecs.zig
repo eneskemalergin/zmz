@@ -32,7 +32,7 @@ fn expectSlofBound(expected: []const f64, actual: []const f64, fixed_point: f64)
 /// Decodes text in one call: the reference for split updates.
 fn decodeWhole(text: []const u8) base64.Error!base64.Counts {
     var output: [1536]u8 = undefined;
-    return base64.decode(&output, text, .{});
+    return base64.decode(&output, text);
 }
 
 test "[property] - [base64]: encoding matches independent bytes around vector blocks" {
@@ -60,7 +60,7 @@ test "[property] - [base64]: exact unaligned slices match independent encoding a
             const expected = std.base64.standard.Encoder.encode(&reference, input);
             const text = try base64.encode(encoded[offset..][0..expected.len], input);
             try std.testing.expectEqualSlices(u8, expected, text);
-            const counts = try base64.decode(decoded[offset..][0..length], text, .{});
+            const counts = try base64.decode(decoded[offset..][0..length], text);
             try std.testing.expectEqual(length, counts.decoded_bytes);
             try std.testing.expectEqualSlices(u8, input, decoded[offset..][0..length]);
             try std.testing.expect(std.mem.allEqual(u8, encoded[0..offset], 0xa5));
@@ -76,7 +76,7 @@ test "[property] - [base64]: every byte in vector blocks follows XML decoding ru
         for (0..256) |value| {
             var text = [_]u8{'A'} ** 132;
             text[position] = @intCast(value);
-            try compareBase64Updates(&text, .{}, 99);
+            try compareBase64Updates(&text, 99);
         }
     }
 }
@@ -103,7 +103,7 @@ test "[property] - [base64]: matches RFC 4648 vectors across every text split" {
         }
         for (0..len + 1) |split| {
             var output: [32]u8 = undefined;
-            var decoder = base64.Decoder.init(&output, .{});
+            var decoder = base64.Decoder.init(&output, std.math.maxInt(usize));
             try decoder.update(spaced[0..split]);
             try decoder.update(spaced[split..len]);
             const counts = try decoder.finish();
@@ -132,7 +132,7 @@ test "[failure] - [base64]: rejects malformed tails and remains failed" {
         try std.testing.expectError(case[1], decodeWhole(case[0]));
         for (0..case[0].len + 1) |split| {
             var output: [32]u8 = undefined;
-            var decoder = base64.Decoder.init(&output, .{});
+            var decoder = base64.Decoder.init(&output, std.math.maxInt(usize));
             const result = blk: {
                 decoder.update(case[0][0..split]) catch |err| break :blk err;
                 decoder.update(case[0][split..]) catch |err| break :blk err;
@@ -145,35 +145,24 @@ test "[failure] - [base64]: rejects malformed tails and remains failed" {
     }
 }
 
-test "[edge] - [base64]: enforces independent bounds and destination ownership" {
+test "[edge] - [base64]: enforces the text limit, output capacity, and destination ownership" {
     var output: [4]u8 = undefined;
-    _ = try base64.decode(output[0..1], " Zg== ", .{
-        .text_bytes = 6,
-        .significant_bytes = 4,
-        .decoded_bytes = 1,
-    });
-    try std.testing.expectError(
-        error.LimitExceeded,
-        base64.decode(&output, " Zg== ", .{ .text_bytes = 5 }),
-    );
-    try std.testing.expectError(
-        error.LimitExceeded,
-        base64.decode(&output, "Zg==", .{ .significant_bytes = 3 }),
-    );
-    try std.testing.expectError(
-        error.LimitExceeded,
-        base64.decode(&output, "Zg==", .{ .decoded_bytes = 0 }),
-    );
-    try std.testing.expectError(error.OutputTooSmall, base64.decode(output[0..0], "Zg==", .{}));
+    _ = try base64.decode(output[0..1], " Zg== ");
+    var exact = base64.Decoder.init(&output, 6);
+    try exact.update(" Zg== ");
+    _ = try exact.finish();
+    var short = base64.Decoder.init(&output, 5);
+    try std.testing.expectError(error.LimitExceeded, short.update(" Zg== "));
+    try std.testing.expectError(error.OutputTooSmall, base64.decode(output[0..0], "Zg=="));
     try std.testing.expectError(error.OutputTooSmall, base64.encode(output[0..3], "f"));
     try std.testing.expectError(error.OverlappingBuffers, base64.encode(&output, output[0..1]));
-    try std.testing.expectError(error.OverlappingBuffers, base64.decode(&output, &output, .{}));
+    try std.testing.expectError(error.OverlappingBuffers, base64.decode(&output, &output));
     try std.testing.expectError(error.LengthOverflow, base64.encodedSize(std.math.maxInt(usize)));
 }
 
 test "[failure] - [base64]: rejects reuse after finish" {
     var output: [4]u8 = undefined;
-    var decoder = base64.Decoder.init(&output, .{});
+    var decoder = base64.Decoder.init(&output, std.math.maxInt(usize));
     _ = try decoder.finish();
     try std.testing.expectError(error.AlreadyFinished, decoder.finish());
     try std.testing.expectError(error.AlreadyFinished, decoder.update(""));
@@ -186,13 +175,13 @@ test "[property] - [base64]: preserves all one-byte and two-byte inputs" {
     for (0..65536) |number| {
         std.mem.writeInt(u16, &input, @intCast(number), .little);
         const text = try base64.encode(&encoded, &input);
-        var decoder = base64.Decoder.init(&decoded, .{});
+        var decoder = base64.Decoder.init(&decoded, std.math.maxInt(usize));
         for (text) |byte| try decoder.update(&.{byte});
         const counts = try decoder.finish();
         try std.testing.expectEqualSlices(u8, &input, decoded[0..counts.decoded_bytes]);
         if (number < 256) {
             const short = try base64.encode(&encoded, input[0..1]);
-            const short_counts = try base64.decode(&decoded, short, .{});
+            const short_counts = try base64.decode(&decoded, short);
             try std.testing.expectEqualSlices(
                 u8,
                 input[0..1],
@@ -202,7 +191,7 @@ test "[property] - [base64]: preserves all one-byte and two-byte inputs" {
     }
 }
 
-test "[property] - [base64]: bulk input matches quartet decoding at errors limits and fragment splits" {
+test "[property] - [base64]: bulk input matches quartet decoding at errors capacities and fragment splits" {
     var source: [384]u8 = undefined;
     var random = std.Random.DefaultPrng.init(std.testing.random_seed);
     random.random().bytes(&source);
@@ -214,7 +203,7 @@ test "[property] - [base64]: bulk input matches quartet decoding at errors limit
         for ([_]usize{ 0, 1, 3, 31, 32, 33, 255, 256, 257, short.len }) |split| {
             if (split > short.len) continue;
             var output: [384]u8 = undefined;
-            var decoder = base64.Decoder.init(&output, .{});
+            var decoder = base64.Decoder.init(&output, std.math.maxInt(usize));
             try decoder.update(short[0..split]);
             try decoder.update(short[split..]);
             const counts = try decoder.finish();
@@ -226,13 +215,9 @@ test "[property] - [base64]: bulk input matches quartet decoding at errors limit
         for ([_]u8{ '=', ' ', '\t', '\r', '\n', '!', 0x80 }) |replacement| {
             var changed = encoded;
             changed[position] = replacement;
-            try compareBase64Updates(&changed, .{}, source.len);
+            try compareBase64Updates(&changed, source.len);
         }
-        try compareBase64Updates(text, .{ .significant_bytes = position }, source.len);
-        if (position <= source.len) {
-            try compareBase64Updates(text, .{ .decoded_bytes = position }, source.len);
-            try compareBase64Updates(text, .{}, position);
-        }
+        if (position <= source.len) try compareBase64Updates(text, position);
     }
     for ([_]usize{ 1, 3, 4, 7, 31, 32, 63, 64, 65, 75, 76, 77, 255, 256, 257 }) |width| {
         for ([_][]const u8{ "\n", "\r\n", " \t" }) |whitespace| {
@@ -246,11 +231,11 @@ test "[property] - [base64]: bulk input matches quartet decoding at errors limit
                 wrapped[used] = byte;
                 used += 1;
             }
-            try compareBase64Updates(wrapped[0..used], .{}, source.len);
+            try compareBase64Updates(wrapped[0..used], source.len);
             for ([_]usize{ 1, width - 1, width, width + 1, 31, 32, 33, 255, 256, 257, used }) |split| {
                 if (split > used) continue;
                 var output: [384]u8 = undefined;
-                var decoder = base64.Decoder.init(&output, .{});
+                var decoder = base64.Decoder.init(&output, std.math.maxInt(usize));
                 try decoder.update(wrapped[0..split]);
                 try decoder.update(wrapped[split..used]);
                 const counts = try decoder.finish();
@@ -261,23 +246,21 @@ test "[property] - [base64]: bulk input matches quartet decoding at errors limit
                 for ([_]u8{ '=', '!', 0x80 }) |replacement| {
                     var changed = wrapped;
                     changed[position] = replacement;
-                    try compareBase64Updates(changed[0..used], .{}, source.len);
+                    try compareBase64Updates(changed[0..used], source.len);
                 }
             }
-            for ([_]usize{ 0, 1, 3, 31, 32, 33, 191, 192, 193, 383, 384 }) |limit| {
-                try compareBase64Updates(wrapped[0..used], .{ .significant_bytes = limit }, source.len);
-                try compareBase64Updates(wrapped[0..used], .{ .decoded_bytes = limit }, source.len);
-                try compareBase64Updates(wrapped[0..used], .{}, limit);
+            for ([_]usize{ 0, 1, 3, 31, 32, 33, 191, 192, 193, 383, 384 }) |capacity| {
+                try compareBase64Updates(wrapped[0..used], capacity);
             }
         }
     }
 }
 
-fn compareBase64Updates(text: []const u8, limits: base64.Limits, capacity: usize) !void {
+fn compareBase64Updates(text: []const u8, capacity: usize) !void {
     var bulk_output: [384]u8 = undefined;
     var scalar_output: [384]u8 = undefined;
-    var bulk = base64.Decoder.init(bulk_output[0..capacity], limits);
-    var scalar = base64.Decoder.init(scalar_output[0..capacity], limits);
+    var bulk = base64.Decoder.init(bulk_output[0..capacity], std.math.maxInt(usize));
+    var scalar = base64.Decoder.init(scalar_output[0..capacity], std.math.maxInt(usize));
     const bulk_error: ?base64.Error = result: {
         bulk.update(text) catch |err| break :result err;
         _ = bulk.finish() catch |err| break :result err;
@@ -543,7 +526,7 @@ test "[failure] - [wire decoding]: rejects overlap type size and limit errors" {
     const bytes = std.mem.sliceAsBytes(&output);
     const source = [_]u8{ 4, 3, 2, 1 };
     var values: [1]i32 = undefined;
-    try arrays.decodeWire(i32, &values, &source, .none, &.{}, .{ .base64_text = .{ .text_bytes = 0, .significant_bytes = 0 } });
+    try arrays.decodeWire(i32, &values, &source, .none, &.{}, .{ .text_bytes = 8 });
     try std.testing.expectEqual(@as(i32, 0x01020304), values[0]);
     try std.testing.expectError(error.OverlappingBuffers, arrays.decodeWire(i64, std.mem.bytesAsSlice(i64, bytes)[0..1], bytes[1..9], .none, &.{}, .{}));
     try std.testing.expectError(error.OverlappingBuffers, arrays.decodeWire(i64, std.mem.bytesAsSlice(i64, bytes)[0..1], bytes[0..8], .zlib, &.{}, .{}));
@@ -551,7 +534,7 @@ test "[failure] - [wire decoding]: rejects overlap type size and limit errors" {
     try std.testing.expectError(error.DecodedSizeMismatch, arrays.decodeWire(i32, &values, source[0..3], .none, &.{}, .{}));
     try std.testing.expectError(error.TypeMismatch, arrays.decodeWire(i32, &values, &source, .pic, &.{}, .{}));
     try std.testing.expectError(error.LimitExceeded, arrays.decodeWire(i32, &values, &source, .none, &.{}, .{ .array_bytes = 3 }));
-    try std.testing.expectError(error.LimitExceeded, arrays.decodeWire(i32, &values, &source, .none, &.{}, .{ .base64_text = .{ .decoded_bytes = 3 } }));
+    try std.testing.expectError(error.LimitExceeded, arrays.decodeWire(i32, &values, &source, .none, &.{}, .{ .text_bytes = 4 }));
 }
 
 test "[integration] - [SLOF pipeline]: decodes a frozen zlib envelope" {
@@ -698,7 +681,7 @@ test "[failure] - [zlib arrays]: returns OutputTooSmall when a stream outgrows i
     try std.testing.expectEqualSlices(f64, &.{ 1, 2 }, output[0..2]);
     try std.testing.expectError(error.OutputTooSmall, arrays.decode(f64, output[0..1], two, .zlib, scratch, .{}));
     try std.testing.expectError(error.DecodedSizeMismatch, arrays.decode(f64, &output, two, .zlib, scratch, .{}));
-    const counts = try base64.decode(&transport, two, .{});
+    const counts = try base64.decode(&transport, two);
     try std.testing.expectError(error.OutputTooSmall, arrays.decodeWire(f64, output[0..1], transport[0..counts.decoded_bytes], .zlib, &.{}, .{}));
     // Three SLOF values exceed the wire bound of one.
     try std.testing.expectError(error.OutputTooSmall, arrays.decode(f64, output[0..1], "eJxzWO/AAAFXuSpUARP4Aqw=", .slof_zlib, scratch, .{}));
@@ -776,7 +759,7 @@ test "[integration] - [uncompressed arrays]: reports the first decode error with
     try std.testing.expectError(error.InvalidCharacter, arrays.decode(i32, output[0..1], "!AMCAQAAAAAA", .none, scratch, .{}));
     try std.testing.expectError(error.TruncatedInput, arrays.decode(i32, output[0..1], "BAM", .none, scratch, .{}));
     try std.testing.expectError(error.NonCanonicalTail, arrays.decode(i32, output[0..1], "BR==", .none, scratch, .{}));
-    try std.testing.expectError(error.LimitExceeded, arrays.decode(i32, output[0..1], "BAMCAQAAAAAA", .none, scratch, .{ .base64_text = .{ .decoded_bytes = 5 } }));
+    try std.testing.expectError(error.LimitExceeded, arrays.decode(i32, output[0..1], "BAMCAQAAAAAA", .none, scratch, .{ .text_bytes = 11 }));
     try std.testing.expectError(error.OverlappingBuffers, arrays.decode(i32, &output, std.mem.sliceAsBytes(&output), .none, scratch, .{}));
     try std.testing.expectError(error.OverlappingBuffers, arrays.decode(i32, &output, "BAMCAQ==", .none, .{ .transport = std.mem.sliceAsBytes(&output), .transformed = &.{} }, .{}));
 }

@@ -87,7 +87,7 @@ test "[property] - [base64 dispatch]: cached scalar fallback preserves both dire
     var decoded: [257]u8 = undefined;
     const text = try base64.encode(&encoded, &source);
     try std.testing.expectEqualSlices(u8, std.base64.standard.Encoder.encode(&expected, &source), text);
-    const counts = try base64.decode(&decoded, text, .{});
+    const counts = try base64.decode(&decoded, text);
     try std.testing.expectEqualSlices(u8, &source, decoded[0..counts.decoded_bytes]);
 }
 

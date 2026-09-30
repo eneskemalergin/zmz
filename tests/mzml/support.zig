@@ -279,7 +279,7 @@ fn encoderIndependent(allocator: std.mem.Allocator, document: []const u8) ![]u8 
             try out.append(allocator, '#');
             try out.appendSlice(allocator, document[tag + length_end .. text]);
             var wire: [512]u8 = undefined;
-            const counts = try mzml.base64.decode(&wire, document[text..text_end], .{});
+            const counts = try mzml.base64.decode(&wire, document[text..text_end]);
             var reference: [512]u8 = undefined;
             var input = std.Io.Reader.fixed(wire[0..counts.decoded_bytes]);
             var plain = std.Io.Writer.fixed(&reference);

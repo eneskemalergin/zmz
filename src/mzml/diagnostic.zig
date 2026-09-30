@@ -134,8 +134,6 @@ pub const Limit = enum {
     binary_text_bytes,
     array_bytes,
     base64_text_bytes,
-    base64_significant_bytes,
-    base64_decoded_bytes,
     index_bytes,
     record_span_bytes,
     records,

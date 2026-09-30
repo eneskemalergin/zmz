@@ -27,14 +27,6 @@ pub const Error = error{
     FailedState,
 };
 
-/// Independent bounds on logical XML text, significant Base64 characters, and output.
-/// Physical XML byte limits belong to the XML reader, before entity expansion.
-pub const Limits = struct {
-    text_bytes: usize = 256 * 1024 * 1024,
-    significant_bytes: usize = 256 * 1024 * 1024,
-    decoded_bytes: usize = 192 * 1024 * 1024,
-};
-
 /// Successful input and output counts; significant bytes include padding.
 pub const Counts = struct {
     text_bytes: usize = 0,
@@ -58,19 +50,21 @@ pub fn encode(output: []u8, source: []const u8) Error![]u8 {
 }
 
 /// Decodes logical XML text, accepting only XML whitespace between Base64 characters.
-/// No allocation or complete whitespace-stripped copy is made.
-pub fn decode(output: []u8, source: []const u8, limits: Limits) Error!Counts {
-    var decoder = Decoder.init(output, limits);
+/// The output bounds the decoded bytes. No allocation or whitespace-stripped copy is made.
+pub fn decode(output: []u8, source: []const u8) Error!Counts {
+    var decoder = Decoder.init(output, std.math.maxInt(usize));
     try decoder.update(source);
     return decoder.finish();
 }
 
-/// A bounded decoder borrowing its destination until finish or abandonment.
+/// A decoder borrowing its destination until finish or abandonment, bounded by its output
+/// and by text_limit bytes of logical text (whitespace included); physical XML byte
+/// limits belong to the XML reader, before entity expansion.
 /// Input slices need remain alive only during update and must not overlap the destination.
 /// Failures are sticky; counters and partially written output are not a successful result.
 pub const Decoder = struct {
     output: []u8,
-    limits: Limits,
+    text_limit: usize,
     counts: Counts = .{},
     quartet: [4]u8 = undefined,
     quartet_len: u3 = 0,
@@ -81,8 +75,8 @@ pub const Decoder = struct {
     error_offset: ?usize = null,
 
     /// Borrows the destination without allocating or writing it.
-    pub fn init(output: []u8, limits: Limits) Decoder {
-        return .{ .output = output, .limits = limits };
+    pub fn init(output: []u8, text_limit: usize) Decoder {
+        return .{ .output = output, .text_limit = text_limit };
     }
 
     /// Consumes one text fragment. Empty fragments are valid before finish.
@@ -93,7 +87,7 @@ pub const Decoder = struct {
         if (overlaps(self.output, text)) return error.OverlappingBuffers;
         const total = std.math.add(usize, self.counts.text_bytes, text.len) catch
             return error.LengthOverflow;
-        if (total > self.limits.text_bytes) return error.LimitExceeded;
+        if (total > self.text_limit) return error.LimitExceeded;
         return self.updateParts(text);
     }
 
@@ -113,8 +107,6 @@ pub const Decoder = struct {
             self.error_offset = offset;
             if (self.padded) return error.InvalidPadding;
             if (byte != '=' and alphabet(byte) == null) return error.InvalidCharacter;
-            if (self.counts.significant_bytes == self.limits.significant_bytes)
-                return error.LimitExceeded;
             self.counts.significant_bytes += 1;
             self.quartet[self.quartet_len] = byte;
             self.quartet_len += 1;
@@ -126,8 +118,8 @@ pub const Decoder = struct {
     fn decodeRun(self: *Decoder, text: []const u8) usize {
         if (self.quartet_len != 0 or self.padded or text.len < 4) return 0;
         const output = self.output[self.counts.decoded_bytes..];
-        const capacity = @min(output.len, self.limits.decoded_bytes -| self.counts.decoded_bytes);
-        const input = text[0..@min(text.len, self.limits.significant_bytes -| self.counts.significant_bytes)];
+        const capacity = output.len;
+        const input = text;
         const has_tail = input.len >= 4 and input.len % 4 == 0 and input[input.len - 1] == '=';
         const plain_length = input.len - @as(usize, if (has_tail) 4 else 0);
         var length = decodePrefix(output[0..capacity], input[0..plain_length]);
@@ -165,7 +157,6 @@ pub const Decoder = struct {
         const group = try decodeQuartet(self.quartet);
         const end = std.math.add(usize, self.counts.decoded_bytes, group.len) catch
             return error.LengthOverflow;
-        if (end > self.limits.decoded_bytes) return error.LimitExceeded;
         if (end > self.output.len) return error.OutputTooSmall;
         inline for (0..3) |i| {
             if (i < group.len) self.output[self.counts.decoded_bytes + i] = group.bytes[i];

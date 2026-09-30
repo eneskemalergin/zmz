@@ -120,21 +120,14 @@ pub fn text(self: *DecodedArrays, bytes: []const u8) Error!void {
     const compressed = self.outputs.items[self.count - 1].encoding.pipeline != .none;
     if (compressed) {
         const total = std.math.add(usize, self.decoder.counts.text_bytes, bytes.len) catch return error.LengthOverflow;
-        if (total > self.limits.base64_text.text_bytes) return try self.limitError(.base64_text_bytes, self.limits.base64_text.text_bytes, total);
-        const incoming = @min(bytes.len, self.limits.base64_text.significant_bytes -| self.decoder.counts.significant_bytes);
-        const pending = std.math.add(usize, incoming, self.decoder.quartet_len) catch return error.LengthOverflow;
+        if (total > self.limits.text_bytes) return try self.limitError(.base64_text_bytes, self.limits.text_bytes, total);
+        const pending = std.math.add(usize, bytes.len, self.decoder.quartet_len) catch return error.LengthOverflow;
         const needed = std.math.add(usize, self.decoder.counts.decoded_bytes, pending / 4 * 3) catch return error.LengthOverflow;
-        try self.wire.resize(self.allocator, @min(needed, self.limits.base64_text.decoded_bytes));
+        try self.wire.resize(self.allocator, needed);
         self.decoder.output = self.wire.items;
     }
     self.decoder.update(bytes) catch |err| {
-        if (err == error.LimitExceeded) {
-            if (self.decoder.quartet_len == 4)
-                return try self.limitError(.base64_decoded_bytes, self.limits.base64_text.decoded_bytes, null);
-            if (self.decoder.error_offset != null)
-                return try self.limitError(.base64_significant_bytes, self.limits.base64_text.significant_bytes, null);
-            return try self.limitError(.base64_text_bytes, self.limits.base64_text.text_bytes, null);
-        }
+        if (err == error.LimitExceeded) return try self.limitError(.base64_text_bytes, self.limits.text_bytes, null);
         return if (err == error.OutputTooSmall and !compressed) error.DecodedSizeMismatch else err;
     };
 }
@@ -170,7 +163,7 @@ pub fn beginArray(self: *DecodedArrays, node: model.Node, groups: []const cv.Gro
         else => 0,
     });
     const destination = if (array.encoding.pipeline == .none) std.mem.sliceAsBytes(output.words.items)[0..bytes] else self.wire.items;
-    self.decoder = base64.Decoder.init(destination, self.limits.base64_text);
+    self.decoder = base64.Decoder.init(destination, self.limits.text_bytes);
 }
 
 pub fn finishArray(self: *DecodedArrays) Error!void {

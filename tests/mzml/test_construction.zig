@@ -569,7 +569,7 @@ test "[integration] - [mzML construction]: writes and decodes every declared pip
             try array.decode(f64, &output, .{ .transport = &transport, .transformed = &transformed }, .{});
             for (output, [_]f64{ 1, 2, 3 }) |value, expected| try std.testing.expectApproxEqAbs(expected, value, 0.001);
             if (encoding.pipeline == .pic or encoding.pipeline == .pic_zlib) {
-                const counts = try mzml.base64.decode(&transport, array.node.child(.binary).?.text.?, .{});
+                const counts = try mzml.base64.decode(&transport, array.node.child(.binary).?.text.?);
                 const wire = if (encoding.pipeline == .pic_zlib)
                     try mzml.zlib.decompress(&transformed, transport[0..counts.decoded_bytes])
                 else
