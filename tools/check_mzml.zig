@@ -62,10 +62,8 @@ fn checkFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Totals
         reportReaderFailure(&reader, err);
         return err;
     };
-    const cv_nodes = if (header.document.child(.cv_list)) |list| list.children else &.{};
-    const declarations = try allocator.alloc(mzml.cv.Declaration, cv_nodes.len);
+    const declarations = try header.cvDeclarations(allocator);
     defer allocator.free(declarations);
-    for (declarations, cv_nodes) |*declaration, node| declaration.* = try node.cvDeclaration();
     const resolver = mzml.cv.Resolver.init(declarations);
     const count = index.entries.items.len;
     var totals: Totals = .{};

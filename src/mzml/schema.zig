@@ -94,7 +94,7 @@ pub const CHILD_KINDS = blk: {
 };
 
 /// Deepest element nesting any reader, writer, copy, or builder supports, counting the root.
-pub const MAX_DEPTH = 64;
+pub const MAX_DEPTH = @import("../xml/mzml_adapter.zig").MAX_DEPTH;
 
 pub const Limits = struct { nodes: usize = 100_000, text_bytes: usize = 256 * 1024 * 1024 };
 pub const Error = error{

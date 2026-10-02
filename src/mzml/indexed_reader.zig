@@ -141,23 +141,34 @@ fn buildInner(allocator: std.mem.Allocator, source: Source, options: Options, fa
             self.failure.?.location = .{ .input_event = record.node.start_offset };
             self.failure.?.element = record.node.kind;
         }
-        if (self.entries.items.len == options.max_records) return try self.limitError(.records, options.max_records, null);
         const k = kindIndex(record.node.kind);
         if (record.node.start_offset >= record.node.end_offset or record.node.end_offset > self.size)
             return error.InvalidIndex;
         if (self.contexts[k] == null) self.contexts[k] = try self.captureAncestors(&reader, k);
-        try self.charge(@sizeOf(Entry) + @sizeOf(usize) * 4);
-        const id = try self.copy(record.id);
-        const entry = try self.ids[k].getOrPutContextAdapted(allocator, id, Ids.Query{ .entries = self.entries.items }, .{ .entries = self.entries.items });
-        if (entry.found_existing) return error.DuplicateId;
-        entry.key_ptr.* = self.entries.items.len;
-        try self.entries.ensureUnusedCapacity(allocator, 1);
-        self.entries.appendAssumeCapacity(.{ .kind = record.node.kind, .id = id, .index = self.counts[k], .start = record.node.start_offset, .end = record.node.end_offset });
-        self.counts[k] += 1;
+        try self.addEntry(record.node.kind, try self.entryId(record.id), record.node.start_offset, record.node.end_offset);
     }
     self.metadata = owned.Header.init(allocator, source_header.*, .{ .bytes = options.reader.limits.header_bytes }) catch |err| return try self.headerCopyError(err);
     try self.checkSource();
     return self;
+}
+
+// Copies the next entry's ID, within max_records and the index bytes.
+fn entryId(self: *IndexedReader, id: []const u8) Error![]const u8 {
+    if (self.entries.items.len == self.options.max_records) return try self.limitError(.records, self.options.max_records, null);
+    try self.charge(@sizeOf(Entry) + @sizeOf(usize) * 4);
+    return self.copy(id);
+}
+
+// Adds an entry whose ID entryId copied, unique within its kind. Capacity comes first, so a
+// failure leaves no ID without its entry.
+fn addEntry(self: *IndexedReader, kind: model.Kind, copied: []const u8, start: u64, end: u64) Error!void {
+    try self.entries.ensureUnusedCapacity(self.allocator, 1);
+    const k = kindIndex(kind);
+    const entry = try self.ids[k].getOrPutContextAdapted(self.allocator, copied, Ids.Query{ .entries = self.entries.items }, .{ .entries = self.entries.items });
+    if (entry.found_existing) return error.DuplicateId;
+    entry.key_ptr.* = self.entries.items.len;
+    self.entries.appendAssumeCapacity(.{ .kind = kind, .id = copied, .index = self.counts[k], .start = start, .end = end });
+    self.counts[k] += 1;
 }
 
 /// Leaves the source and returned records alive.
@@ -186,39 +197,39 @@ pub fn diagnostic(self: *const IndexedReader) ?Diagnostic {
 /// Returns AmbiguousId when both a spectrum and a chromatogram use this ID.
 /// Lookups reuse parser storage and must not run concurrently on this reader.
 pub fn byId(self: *IndexedReader, allocator: std.mem.Allocator, id: []const u8) Error!?owned.Record {
-    self.failure = null;
-    errdefer |err| self.capture(err, .index, .none);
-    const position = try self.idPosition(id) orelse return null;
-    return try self.readEntry(allocator, self.entries.items[position], null);
+    return self.lookup(allocator, .{ .id = id }, null);
 }
 
 /// Looks up a zero-based ordinal within spectra or chromatograms; other kinds fail.
 pub fn at(self: *IndexedReader, allocator: std.mem.Allocator, kind: model.Kind, ordinal: usize) Error!?owned.Record {
-    self.failure = null;
-    errdefer |err| self.capture(err, .index, .none);
-    const position = try self.ordinalPosition(kind, ordinal) orelse return null;
-    return try self.readEntry(allocator, self.entries.items[position], null);
+    return self.lookup(allocator, .{ .ordinal = .{ .kind = kind, .ordinal = ordinal } }, null);
 }
 
 /// Like byId, decoding the selected arrays into output as StreamReader.nextDecodedRecord does,
 /// without their binary text. An absent ID or a failure leaves output empty.
 pub fn byIdDecoded(self: *IndexedReader, allocator: std.mem.Allocator, id: []const u8, output: *DecodedArrays) Error!?owned.Record {
-    self.failure = null;
-    errdefer |err| self.capture(err, .index, .none);
-    output.reset();
-    errdefer output.reset();
-    const position = try self.idPosition(id) orelse return null;
-    return try self.readDecodedEntry(allocator, self.entries.items[position], output);
+    return self.lookup(allocator, .{ .id = id }, output);
 }
 
 /// Uses byIdDecoded's storage and failure rules for a zero-based spectrum or chromatogram ordinal.
 pub fn atDecoded(self: *IndexedReader, allocator: std.mem.Allocator, kind: model.Kind, ordinal: usize, output: *DecodedArrays) Error!?owned.Record {
+    return self.lookup(allocator, .{ .ordinal = .{ .kind = kind, .ordinal = ordinal } }, output);
+}
+
+const Target = union(enum) { id: []const u8, ordinal: struct { kind: model.Kind, ordinal: usize } };
+
+// Every lookup: clears the last failure and, with output, earlier decoded results.
+fn lookup(self: *IndexedReader, allocator: std.mem.Allocator, target: Target, output: ?*DecodedArrays) Error!?owned.Record {
     self.failure = null;
     errdefer |err| self.capture(err, .index, .none);
-    output.reset();
-    errdefer output.reset();
-    const position = try self.ordinalPosition(kind, ordinal) orelse return null;
-    return try self.readDecodedEntry(allocator, self.entries.items[position], output);
+    if (output) |decoded| decoded.reset();
+    errdefer if (output) |decoded| decoded.reset();
+    const position = try switch (target) {
+        .id => |id| self.idPosition(id),
+        .ordinal => |ordinal| self.ordinalPosition(ordinal.kind, ordinal.ordinal),
+    } orelse return null;
+    const entry = self.entries.items[position];
+    return try if (output) |decoded| self.readDecodedEntry(allocator, entry, decoded) else self.readEntry(allocator, entry, null);
 }
 
 fn idPosition(self: *IndexedReader, id: []const u8) Error!?usize {
@@ -485,7 +496,7 @@ fn openEmbedded(self: *IndexedReader, reader: *StreamReader) Error!void {
 
 fn readEmbeddedEntries(self: *IndexedReader, input: *std.Io.Reader, index_start: u64, prefix_length: usize, minimum: u64, endian: ?std.builtin.Endian) Error!void {
     const limits = self.options.reader.limits;
-    var cursor = try xml.Cursor.init(self.allocator, input, schema.MAX_DEPTH, limits.attributes, limits.attribute_bytes);
+    var cursor = try xml.Cursor.init(self.allocator, input, limits.attributes, limits.attribute_bytes);
     defer cursor.deinit();
     errdefer |err| {
         self.capture(err, if (cursor.failure != null) .xml else .index, Diagnostic.xmlDetail(&cursor));
@@ -516,19 +527,13 @@ fn readEmbeddedEntries(self: *IndexedReader, input: *std.Io.Reader, index_start:
                 self.failure.?.element = .offset;
                 self.failure.?.record = Diagnostic.RecordPosition.of(kind, self.counts[k]);
             }
-            const id_ref = (offset.attribute(null, "idRef") orelse return try self.attributeError(.id_ref)).value;
-            if (self.entries.items.len == self.options.max_records) return try self.limitError(.records, self.options.max_records, null);
-            try self.charge(@sizeOf(Entry) + @sizeOf(usize) * 4);
-            const id = try self.copy(id_ref);
+            // The attribute is borrowed from the cursor, so it is copied before reading on.
+            const id = try self.entryId((offset.attribute(null, "idRef") orelse return try self.attributeError(.id_ref)).value);
             const target = try cv.parseInteger(u64, try self.indexText(&cursor, &text, .offset));
             if (target <= previous or target >= index_start or target < minimum or
                 (endian != null and target % 2 != 0) or target > std.math.maxInt(i64)) return error.InvalidIndex;
             previous = target;
-            const entry = try self.ids[k].getOrPutContextAdapted(self.allocator, id, Ids.Query{ .entries = self.entries.items }, .{ .entries = self.entries.items });
-            if (entry.found_existing) return error.DuplicateId;
-            entry.key_ptr.* = self.entries.items.len;
-            try self.entries.append(self.allocator, .{ .kind = kind, .id = id, .index = self.counts[k], .start = target, .end = index_start });
-            self.counts[k] += 1;
+            try self.addEntry(kind, id, target, index_start);
         }
         try indexEnd(&cursor, .index);
     }

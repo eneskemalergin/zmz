@@ -4,7 +4,7 @@ const std = @import("std");
 const cv = @import("../../cv/source.zig");
 const model = @import("../model.zig");
 
-pub const Error = std.mem.Allocator.Error || error{LimitExceeded};
+pub const Error = std.mem.Allocator.Error || error{ LimitExceeded, MissingAttribute };
 
 pub const Copier = struct {
     allocator: std.mem.Allocator,
@@ -98,25 +98,51 @@ pub const Copier = struct {
         result.attributes = try self.attributes(source.attributes);
         result.params = try self.entries(source.params);
         result.text = try self.optionalText(source.text);
-        if (source.content) |content| {
-            const copied = &(try self.alloc(model.Content, 1))[0];
-            const items = try self.alloc(model.Content.Item, content.items.len);
-            for (content.items, items) |item, *copy| copy.* = switch (item) {
-                .xml => |bytes| .{ .xml = try self.text(bytes) },
-                else => item,
-            };
-            copied.* = .{ .items = items };
-            result.content = copied;
-        }
+        if (source.content) |content| result.content = try self.contentOf(try self.contentItems(content.items));
         const children = try self.alloc(model.Node, source.children.len);
         for (source.children, children) |child, *copy| copy.* = try self.node(child, depth - 1);
         result.children = children;
         return result;
     }
 
+    /// Copies content items; the copy may still be edited.
+    pub fn contentItems(self: *Copier, source: []const model.Content.Item) Error![]model.Content.Item {
+        const items = try self.alloc(model.Content.Item, source.len);
+        for (source, items) |item, *copy| copy.* = switch (item) {
+            .xml => |bytes| .{ .xml = try self.text(bytes) },
+            else => item,
+        };
+        return items;
+    }
+
+    pub fn contentOf(self: *Copier, items: []const model.Content.Item) Error!*const model.Content {
+        const content = &(try self.alloc(model.Content, 1))[0];
+        content.* = .{ .items = items };
+        return content;
+    }
+
     pub fn list(self: *Copier, source: ?model.RecordList) Error!?model.RecordList {
         var result = source orelse return null;
         result.attributes = try self.attributes(result.attributes);
+        return result;
+    }
+
+    /// Copies a header. Groups are derived from the copied group definitions, as the reader
+    /// derives them, so their entries are stored once; source.groups is not read.
+    pub fn header(self: *Copier, source: model.Header, depth: usize) Error!model.Header {
+        var result = source;
+        result.namespace_uri = try self.text(source.namespace_uri);
+        result.document = try self.node(source.document, depth);
+        result.run = try self.node(source.run, depth);
+        const group_nodes = if (result.document.child(.referenceable_param_group_list)) |groups| groups.children else &.{};
+        const groups = try self.alloc(cv.Group, group_nodes.len);
+        for (group_nodes, groups) |group, *destination| destination.* = .{
+            .id = group.attribute("id") orelse return error.MissingAttribute,
+            .entries = group.params,
+        };
+        result.groups = groups;
+        result.spectrum_list = try self.list(source.spectrum_list);
+        result.chromatogram_list = try self.list(source.chromatogram_list);
         return result;
     }
 };

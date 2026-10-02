@@ -156,10 +156,8 @@ fn scan(allocator: std.mem.Allocator, io: std.Io, path: []const u8, output: *std
     var reader = try mzml.StreamReader.init(allocator, &input.interface, .{ .payload = .skip });
     defer reader.deinit();
     const header = try reader.readHeader();
-    const nodes = if (header.document.child(.cv_list)) |list| list.children else &.{};
-    const declarations = try allocator.alloc(mzml.cv.Declaration, nodes.len);
+    const declarations = try header.cvDeclarations(allocator);
     defer allocator.free(declarations);
-    for (declarations, nodes) |*declaration, node| declaration.* = try node.cvDeclaration();
     const resolver = mzml.cv.Resolver.init(declarations);
     for (declarations) |declaration| {
         const found = try resolver.resolve(.{ .cv_ref = declaration.id });

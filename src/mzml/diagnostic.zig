@@ -194,7 +194,7 @@ pub fn xmlDetail(cursor: *const xml.Cursor) Detail {
             .declaration_bytes => .xml_declaration_bytes,
         },
         .maximum = switch (limit) {
-            .depth => cursor.max_depth,
+            .depth => xml.MAX_DEPTH,
             .attributes => cursor.max_attributes,
             .attribute_bytes => cursor.max_attribute_bytes,
             .nodes => 0,

@@ -271,6 +271,15 @@ pub const Header = struct {
     /// List descriptors become available when their opening tag is reached.
     spectrum_list: ?RecordList = null,
     chromatogram_list: ?RecordList = null,
+
+    /// The cvList declarations in order, for cv.Resolver.init. The caller frees the slice.
+    pub fn cvDeclarations(self: Header, allocator: std.mem.Allocator) (std.mem.Allocator.Error || error{UnexpectedElement})![]cv.Declaration {
+        const nodes = if (self.document.child(.cv_list)) |list| list.children else &.{};
+        const declarations = try allocator.alloc(cv.Declaration, nodes.len);
+        errdefer allocator.free(declarations);
+        for (declarations, nodes) |*declaration, node| declaration.* = try node.cvDeclaration();
+        return declarations;
+    }
 };
 
 /// declared_count is the source count attribute (null when absent); observed_count counts the

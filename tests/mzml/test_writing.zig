@@ -1374,7 +1374,8 @@ test "[failure] - [mzML file writer]: flush, count patch, and checksum read fail
         vtable.fileWritePositional = Sink.write;
         vtable.fileReadPositional = Sink.read;
         const io: std.Io = .{ .userdata = &injected, .vtable = &vtable };
-        var buffer: [8192]u8 = undefined;
+        // A buffer smaller than a record, so the count has left it before endList patches it.
+        var buffer: [64]u8 = undefined;
         var sink = file.writer(io, &buffer);
         var writer = try mzml.Writer.initFile(std.testing.allocator, &sink, .{}, .{});
         defer writer.deinit();
@@ -1508,11 +1509,11 @@ test "[property] - [mzML streamed writing]: every pipeline round trips through s
                 const indexed = output_kind % 2 == 1;
                 const options = struct {
                     fn of(p: mzml.arrays.Pipeline, values: anytype) !mzml.arrays.EncodeOptions {
-                        return .{ .pipeline = p, .fixed_point = switch (p.transform()) {
+                        return .{ .pipeline = p, .fixed_point = if (p.transform()) |transform| switch (transform) {
                             .linear => try mzml.numpress.optimalLinearFixedPoint(values),
                             .slof => try mzml.numpress.optimalSlofFixedPoint(values),
-                            else => null,
-                        } };
+                            .pic => null,
+                        } else null };
                     }
                 };
                 const mz_options = try options.of(pipeline, mz[0..count]);

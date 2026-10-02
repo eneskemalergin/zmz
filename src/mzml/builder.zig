@@ -23,7 +23,6 @@ pub const Error = owned.Error || schema.Error || arrays.Error || model.EncodingE
     InvalidRecord,
     InvalidArrayLength,
     GroupRewriteRequired,
-    MissingAttribute,
 };
 
 /// The caller chooses the role, its unit, and the encoding; none is inferred.
@@ -192,23 +191,19 @@ fn prepareArrayFromInner(self: *Builder, comptime T: type, values: []const T, so
     result.children = children;
     result.text = if (source.text) |text| try copier.text(text) else null;
     if (source.content) |content| {
-        const copied = &(try copier.alloc(model.Content, 1))[0];
-        const items = try copier.alloc(model.Content.Item, content.items.len);
+        // Parameter runs keep their place; each takes its reencoded count.
+        const items = try copier.contentItems(content.items);
         var position: usize = 0;
-        for (content.items, items) |item, *destination| {
-            destination.* = switch (item) {
-                .xml => |bytes| .{ .xml = try copier.text(bytes) },
-                else => item,
-            };
-            if (item != .params) continue;
-            if (item.params > source.params.len - position) return error.InvalidStructure;
-            const run = try reencodedParams(null, source.params[position..][0..item.params], groups, target, replacements, params.len);
-            destination.* = .{ .params = run.count };
-            position += item.params;
+        for (items) |*item| {
+            if (item.* != .params) continue;
+            const count = item.params;
+            if (count > source.params.len - position) return error.InvalidStructure;
+            const run = try reencodedParams(null, source.params[position..][0..count], groups, target, replacements, params.len);
+            item.* = .{ .params = run.count };
+            position += count;
         }
         if (position != source.params.len) return error.InvalidStructure;
-        copied.* = .{ .items = items };
-        result.content = copied;
+        result.content = try copier.contentOf(items);
     }
     return .{ .array = .{
         .node = result,
@@ -314,7 +309,7 @@ fn extraGroupIdUsed(allocator: std.mem.Allocator, header_value: model.Header, id
     for (content.items) |item| {
         if (item != .xml) continue;
         var input = std.Io.Reader.fixed(item.xml);
-        var cursor = try xml.Cursor.init(allocator, &input, schema.MAX_DEPTH, @max(1, item.xml.len / 4), item.xml.len);
+        var cursor = try xml.Cursor.init(allocator, &input, @max(1, item.xml.len / 4), item.xml.len);
         defer cursor.deinit();
         try cursor.advanceFragment(false);
         const root = cursor.current orelse return error.InvalidXml;
@@ -502,15 +497,8 @@ pub fn header(self: *Builder, source: model.Header) Error!model.Header {
     try schema.checkHeader(source);
     var copier = self.makeCopier();
     defer self.remaining = copier.remaining;
-    const document = try copier.node(source.document, schema.MAX_DEPTH);
-    const run = try copier.node(source.run, schema.MAX_DEPTH);
-    const group_nodes = if (document.child(.referenceable_param_group_list)) |groups| groups.children else &.{};
-    const groups = try copier.alloc(cv.Group, group_nodes.len);
-    for (group_nodes, groups) |group, *destination| destination.* = .{
-        .id = group.attribute("id") orelse return error.MissingAttribute,
-        .entries = group.params,
-    };
-    return .{ .document = document, .run = run, .namespace_uri = try copier.text(source.namespace_uri), .groups = groups };
+    // Only the metadata: list descriptors and the index flag are reader state.
+    return copier.header(.{ .document = source.document, .run = source.run, .namespace_uri = source.namespace_uri }, schema.MAX_DEPTH);
 }
 
 fn makeCopier(self: *Builder) copy.Copier {

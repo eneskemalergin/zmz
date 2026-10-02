@@ -121,7 +121,7 @@ pub fn init(allocator: std.mem.Allocator, input: *std.Io.Reader, options: Option
         return error.InvalidOptions;
     return .{
         .allocator = allocator,
-        .cursor = try xml.Cursor.init(allocator, input, schema.MAX_DEPTH, options.limits.attributes, options.limits.attribute_bytes),
+        .cursor = try xml.Cursor.init(allocator, input, options.limits.attributes, options.limits.attribute_bytes),
         .options = options,
         .header_store = Storage.init(allocator, options.limits.header_bytes),
         .record_store = Storage.init(allocator, options.limits.record_bytes),
@@ -177,27 +177,38 @@ fn nextItemFor(self: *StreamReader, comptime retention: Retention, comptime reta
 }
 
 pub fn nextDecodedItem(self: *StreamReader, output: *DecodedArrays) Error!?model.Item {
-    output.reset();
-    errdefer output.reset();
-    self.decoded_arrays = output;
-    defer self.decoded_arrays = null;
-    const item = try self.nextItem() orelse return null;
-    if (item == .record) output.complete();
-    return item;
+    return self.nextDecoded(model.Item, nextItem, output);
 }
 
 pub fn nextDecodedRecord(self: *StreamReader, output: *DecodedArrays) Error!?model.Record {
+    return self.nextDecoded(model.Record, nextRecord, output);
+}
+
+// Reads the next item or record, decoding its arrays into output; results become visible
+// only once the record completes.
+fn nextDecoded(self: *StreamReader, comptime T: type, comptime next: fn (*StreamReader) Error!?T, output: *DecodedArrays) Error!?T {
     output.reset();
     errdefer output.reset();
     self.decoded_arrays = output;
     defer self.decoded_arrays = null;
-    const record = try self.nextRecord() orelse return null;
-    output.complete();
-    return record;
+    const value = try next(self) orelse return null;
+    const is_record = if (T == model.Item) value == .record else true;
+    if (is_record) output.complete();
+    return value;
 }
 
 pub fn diagnostic(self: *const StreamReader) ?Diagnostic {
     return self.failure;
+}
+
+// A parsed spectrum or chromatogram node, whose id the parser has checked.
+fn recordOf(self: *StreamReader, node: model.Node) Error!model.Record {
+    return .{
+        .node = node,
+        .id = node.attribute("id").?,
+        .index = try self.number(node, .index),
+        .default_array_length = try self.number(node, .default_array_length),
+    };
 }
 
 fn captureScope(self: *StreamReader) Error!Scope {
@@ -251,12 +262,7 @@ pub fn readFragment(self: *StreamReader, allocator: std.mem.Allocator, input: *s
         if (self.cursor.current != null) return error.InvalidStructure;
     }
     try shiftOffsets(&node, physical_start - prefix_length);
-    const record: model.Record = .{
-        .node = node,
-        .id = node.attribute("id").?,
-        .index = try self.number(node, .index),
-        .default_array_length = try self.number(node, .default_array_length),
-    };
+    const record = try self.recordOf(node);
     const arena = self.record_store.arena;
     self.record_store.arena = .init(allocator);
     return .{ .arena = arena, .value = record };
@@ -302,7 +308,7 @@ pub fn parseFooter(allocator: std.mem.Allocator, bytes: []const u8, options: Opt
 pub fn resumeFollowingList(self: *StreamReader, input: *std.Io.Reader, ancestors: usize, physical_start: u64, prefix_length: usize) Error!void {
     if (self.active_list != .spectrum_list or
         ancestors != self.scope_count + 1 or physical_start < prefix_length) return error.InvalidOptions;
-    const replacement = try xml.Cursor.init(self.allocator, input, schema.MAX_DEPTH, self.options.limits.attributes, self.options.limits.attribute_bytes);
+    const replacement = try xml.Cursor.init(self.allocator, input, self.options.limits.attributes, self.options.limits.attribute_bytes);
     self.cursor.deinit();
     self.cursor = replacement;
     errdefer |err| self.fail(err, .open_index);
@@ -539,12 +545,7 @@ fn nextItemInner(self: *StreamReader, comptime retention: Retention, comptime re
             }
             const node = try self.parseNodeFor(&self.record_store, 1, false, self.options.payload, retention);
             list.observed_count = std.math.add(usize, list.observed_count, 1) catch return error.LimitExceeded;
-            return .{ .record = .{
-                .node = node,
-                .id = node.attribute("id").?,
-                .index = try self.number(node, .index),
-                .default_array_length = try self.number(node, .default_array_length),
-            } };
+            return .{ .record = try self.recordOf(node) };
         },
         .run => {
             try self.cursor.advance(false);

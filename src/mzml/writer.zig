@@ -20,7 +20,9 @@ const Diagnostic = @import("diagnostic.zig");
 const Ids = @import("internal/id_index.zig").IdIndex(IndexEntry);
 
 const Writer = @This();
-const COUNT_PLACEHOLDER = "0" ** std.fmt.comptimePrint("{d}", .{std.math.maxInt(usize)}).len;
+// Zeros as wide as the longest usize: a count or encodedLength written before it is known,
+// then patched with patchDigits.
+const PLACEHOLDER = "0" ** std.fmt.comptimePrint("{d}", .{std.math.maxInt(usize)}).len;
 
 pub const Limits = schema.Limits;
 
@@ -223,11 +225,11 @@ pub fn beginListWithAttributes(self: *Writer, kind: model.Kind, count: ?usize, a
     if (self.list_kind == kind or self.list_kind == .chromatogram_list) return error.InvalidStructure;
     if (count == null and self.file_sink == null) return error.InvalidOptions;
     var buffer: [32]u8 = undefined;
-    const text = if (count) |value| buffer[0..std.fmt.printInt(&buffer, value, 10, .lower, .{})] else COUNT_PLACEHOLDER;
+    const text = if (count) |value| buffer[0..std.fmt.printInt(&buffer, value, 10, .lower, .{})] else PLACEHOLDER;
     try self.startKnown(kind.xmlName(), attributes, false);
     try self.engine.attribute("count", text);
     self.count_offset = if (count == null)
-        (self.engine.byteOffset() orelse return error.LimitExceeded) - 1 - COUNT_PLACEHOLDER.len
+        (self.engine.byteOffset() orelse return error.LimitExceeded) - 1 - PLACEHOLDER.len
     else
         null;
     for (attributes) |attribute| {
@@ -454,14 +456,14 @@ const Base64Out = struct {
     }
 };
 
-// Writes the encodedLength of a streamed source over its placeholder: in the sink's buffer
-// when the placeholder is still there, otherwise at its file position.
-fn patchLength(self: *Writer, offset: u64, length: usize, width: usize) Error!void {
+// Writes value over its placeholder of width digits, zero-padded: in the sink's buffer when
+// the placeholder is still there, otherwise at its file position.
+fn patchDigits(self: *Writer, offset: u64, value: usize, width: usize) Error!void {
     var buffer: [32]u8 = undefined;
-    const text = buffer[0..std.fmt.printInt(&buffer, length, 10, .lower, .{})];
+    const text = buffer[0..std.fmt.printInt(&buffer, value, 10, .lower, .{})];
     // Only an undercounted bound could overflow the placeholder.
     if (text.len > width) return error.InvalidState;
-    var padded = COUNT_PLACEHOLDER.*;
+    var padded = PLACEHOLDER.*;
     const digits = padded[0..width];
     @memcpy(digits[width - text.len ..], text);
     const sink = self.engine.sink;
@@ -496,7 +498,7 @@ fn writeArrayAttributes(self: *Writer, attrs: []const model.Attribute, text_leng
 
 fn writeEncodedLength(self: *Writer, text_length: ?usize, width: usize) Error!?u64 {
     var buffer: [32]u8 = undefined;
-    const value = if (text_length) |length| buffer[0..std.fmt.printInt(&buffer, length, 10, .lower, .{})] else COUNT_PLACEHOLDER[0..width];
+    const value = if (text_length) |length| buffer[0..std.fmt.printInt(&buffer, length, 10, .lower, .{})] else PLACEHOLDER[0..width];
     try self.engine.attribute("encodedLength", value);
     if (text_length != null) return null;
     return (self.engine.byteOffset() orelse return error.LimitExceeded) - 1 - width;
@@ -514,15 +516,7 @@ pub fn endList(self: *Writer) Error!void {
     if (self.count_offset == null and self.written_count != self.expected_count)
         return try self.sizeError(error.CountMismatch, self.expected_count, self.written_count, .records);
     try self.engine.endElement();
-    if (self.count_offset) |offset| {
-        const sink = self.file_sink.?;
-        sink.interface.flush() catch |err| return try self.ioFailure(err);
-        var buffer: [32]u8 = undefined;
-        const text = buffer[0..std.fmt.printInt(&buffer, self.written_count, 10, .lower, .{})];
-        var count = COUNT_PLACEHOLDER.*;
-        @memcpy(count[count.len - text.len ..], text);
-        sink.file.writePositionalAll(sink.io, &count, offset) catch |err| return try self.ioFailure(err);
-    }
+    if (self.count_offset) |offset| try self.patchDigits(offset, self.written_count, PLACEHOLDER.len);
     self.phase = .run;
 }
 
@@ -652,7 +646,7 @@ fn writeNode(self: *Writer, node: model.Node, comptime replace_arrays: bool, rem
     if (replace_arrays and node.kind == .binary_data_array) {
         if (remaining.len == 0) return error.CountMismatch;
         remaining.* = remaining.*[1..];
-        if (placeholder) |offset| try self.patchLength(offset, self.source_text_length, plan.source.width);
+        if (placeholder) |offset| try self.patchDigits(offset, self.source_text_length, plan.source.width);
         // A counted length is already in the output, so the text must have matched it.
         if (plan == .source) if (plan.source.text_length) |length| if (length != self.source_text_length) return error.InvalidState;
     }
@@ -706,7 +700,7 @@ fn writeChild(self: *Writer, parent: model.Node, child: model.Node, position: us
 noinline fn writeXml(self: *Writer, bytes: []const u8, budget: *usize) Error!void {
     if (bytes.len > self.limits.text_bytes) return try self.limitError(.text_bytes, self.limits.text_bytes, bytes.len);
     var input = std.Io.Reader.fixed(bytes);
-    var cursor = try xml.Cursor.init(self.allocator, &input, schema.MAX_DEPTH, @max(1, bytes.len / 4), self.limits.text_bytes);
+    var cursor = try xml.Cursor.init(self.allocator, &input, @max(1, bytes.len / 4), self.limits.text_bytes);
     defer cursor.deinit();
     errdefer |err| {
         var detail = Diagnostic.xmlDetail(&cursor);

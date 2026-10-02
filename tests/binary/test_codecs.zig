@@ -797,11 +797,11 @@ test "[property] - [array encoder]: f32 Numpress input matches its f64 copy and 
     }
     var transformed: [16 + 9 * narrow.len / 2 + 16]u8 = undefined;
     for ([_]arrays.Pipeline{ .linear, .pic, .slof, .linear_zlib, .pic_zlib, .slof_zlib }) |pipeline| {
-        const fixed_point: ?f64 = switch (pipeline.transform()) {
+        const fixed_point: ?f64 = if (pipeline.transform()) |transform| switch (transform) {
             .linear => try mzml.numpress.optimalLinearFixedPoint(&narrow),
             .slof => try mzml.numpress.optimalSlofFixedPoint(&narrow),
-            else => null,
-        };
+            .pic => null,
+        } else null;
         encoder.reset();
         const options: arrays.EncodeOptions = .{ .pipeline = pipeline, .fixed_point = fixed_point };
         const from_narrow = try encoder.encode(f32, &narrow, options);

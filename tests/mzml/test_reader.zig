@@ -2596,11 +2596,11 @@ test "[property] - [decoded arrays]: streamed decoding matches whole-payload dec
             const pipeline, const accession = entry;
             if (T != f64 and pipeline.isNumpress()) continue;
             for ([_]usize{ 0, 1, 3, 600, 9_000, 20_000 }) |count| {
-                const fixed_point: ?f64 = switch (pipeline.transform()) {
+                const fixed_point: ?f64 = if (pipeline.transform()) |transform| switch (transform) {
                     .linear => try mzml.numpress.optimalLinearFixedPoint(values[0..count]),
                     .slof => try mzml.numpress.optimalSlofFixedPoint(values[0..count]),
-                    else => null,
-                };
+                    .pic => null,
+                } else null;
                 encoder.reset();
                 const wire = try encoder.encode(T, typed[0..count], .{ .pipeline = pipeline, .fixed_point = fixed_point });
                 const damaged = try allocator.dupe(u8, wire);

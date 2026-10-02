@@ -53,8 +53,7 @@ pub const Curie = struct {
     pub fn numericLocal(self: Curie, comptime T: type) error{Overflow}!?T {
         if (@typeInfo(T) != .int or @typeInfo(T).int.signedness != .unsigned)
             @compileError("numericLocal requires an unsigned integer type");
-        if (self.local.len == 0) return null;
-        for (self.local) |byte| if (byte < '0' or byte > '9') return null;
+        if (!allDigits(self.local)) return null;
         return std.fmt.parseInt(T, self.local, 10) catch return error.Overflow;
     }
 };
@@ -212,12 +211,18 @@ pub fn parseBoolean(value: ?[]const u8) ValueError!bool {
     return error.InvalidValue;
 }
 
+// Whether bytes is a nonempty run of ASCII decimal digits.
+fn allDigits(bytes: []const u8) bool {
+    if (bytes.len == 0) return false;
+    for (bytes) |byte| if (!std.ascii.isDigit(byte)) return false;
+    return true;
+}
+
 /// Parses a decimal integer; out of range is Overflow.
 pub fn parseInteger(comptime T: type, value: ?[]const u8) ValueError!T {
     const bytes = try lexical(value);
     const digits = if (bytes[0] == '+' or bytes[0] == '-') bytes[1..] else bytes;
-    if (digits.len == 0) return error.InvalidValue;
-    for (digits) |byte| if (byte < '0' or byte > '9') return error.InvalidValue;
+    if (!allDigits(digits)) return error.InvalidValue;
     return std.fmt.parseInt(T, bytes, 10) catch |failure| switch (failure) {
         error.Overflow => error.Overflow,
         error.InvalidCharacter => error.InvalidValue,

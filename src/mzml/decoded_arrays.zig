@@ -25,12 +25,7 @@ const Diagnostic = @import("diagnostic.zig");
 const DecodedArrays = @This();
 
 pub const Error = model.EncodingError || cv.ValueError || arrays.Error || std.mem.Allocator.Error || error{LimitExceeded};
-pub const Values = union(model.Primitive) {
-    float32: []const f32,
-    float64: []const f64,
-    int32: []const i32,
-    int64: []const i64,
-};
+pub const Values = arrays.Values;
 pub const Array = struct { source_position: usize, encoding: model.Encoding, values: Values };
 
 /// Bounds each array's decoded typed bytes, allocated from its declared length. The reader's
@@ -86,10 +81,7 @@ pub fn get(self: *const DecodedArrays, position: usize) ?Array {
         .source_position = output.source_position,
         .encoding = output.encoding,
         .values = switch (output.primitive()) {
-            .float32 => .{ .float32 = output.values(f32) },
-            .float64 => .{ .float64 = output.values(f64) },
-            .int32 => .{ .int32 = output.values(i32) },
-            .int64 => .{ .int64 = output.values(i64) },
+            inline else => |kind| .of(kind.Type(), output.values(kind.Type())),
         },
     };
 }
@@ -200,25 +192,17 @@ pub fn beginArray(self: *DecodedArrays, node: model.Node, groups: []const cv.Gro
     output.source_position = source_position;
     output.encoding = array.encoding;
     output.length = array.length;
-    const width: usize = switch (output.primitive()) {
-        .float32, .int32 => 4,
-        .float64, .int64 => 8,
-    };
-    const bytes = std.math.mul(usize, array.length, width) catch return error.LengthOverflow;
+    output.bytes = 0;
+    const bytes = std.math.mul(usize, array.length, output.primitive().size()) catch return error.LengthOverflow;
     if (bytes > self.limits.array_bytes) {
         self.failure = .{ .stage = .array, .detail = .{ .limit = .{ .name = .array_bytes, .maximum = self.limits.array_bytes, .needed = bytes } } };
         return error.LimitExceeded;
     }
     try output.words.resize(self.allocator, bytes / 8 + @intFromBool(bytes % 8 != 0));
+    output.bytes = bytes;
     const pipeline = array.encoding.pipeline;
     if (pipeline != .none) try self.window.resize(self.allocator, WINDOW);
-    if (pipeline.isNumpress()) {
-        const transform: numpress.Transform = switch (pipeline.transform()) {
-            .linear => .linear,
-            .pic => .pic,
-            .slof => .slof,
-            .none => unreachable,
-        };
+    if (pipeline.transform()) |transform| {
         self.values = numpress.Decoder.initExact(transform, output.values(f64));
         self.deferred = null;
     }
@@ -234,10 +218,10 @@ fn finishArray(self: *DecodedArrays) Error!void {
     errdefer |err| {
         self.failure = .{ .stage = .array };
         if (err == error.DecodedSizeMismatch and output.encoding.pipeline == .none)
-            self.failure.?.detail = .{ .size = .{ .expected = output.byteLength(), .actual = counts.decoded_bytes, .unit = .bytes } };
+            self.failure.?.detail = .{ .size = .{ .expected = output.bytes, .actual = counts.decoded_bytes, .unit = .bytes } };
     }
     if (output.encoding.pipeline.isNumpress()) return self.finishNumpress();
-    if (counts.decoded_bytes != output.byteLength()) return error.DecodedSizeMismatch;
+    if (counts.decoded_bytes != output.bytes) return error.DecodedSizeMismatch;
     output.toNative();
 }
 
@@ -281,15 +265,7 @@ fn decompressWhole(self: *DecodedArrays, output: *Output, wire: []const u8, coun
     errdefer self.failure = .{ .stage = .array };
     const pipeline = output.encoding.payloadPipeline(output.length, counts.significant_bytes == 0);
     switch (output.primitive()) {
-        inline else => |kind| {
-            const T = switch (kind) {
-                .float32 => f32,
-                .float64 => f64,
-                .int32 => i32,
-                .int64 => i64,
-            };
-            try arrays.decodeWire(T, output.values(T), wire, pipeline, &.{});
-        },
+        inline else => |kind| try arrays.decodeWire(kind.Type(), output.values(kind.Type()), wire, pipeline, &.{}),
     }
 }
 
@@ -307,7 +283,7 @@ fn decompressInto(self: *DecodedArrays, decompressor: *zlib.Decompressor, output
             self.feed(piece);
         }
     }
-    const bytes = std.mem.sliceAsBytes(output.words.items)[0..output.byteLength()];
+    const bytes = std.mem.sliceAsBytes(output.words.items)[0..output.bytes];
     if ((try decompressor.read(bytes)).len != bytes.len) return error.DecodedSizeMismatch;
     var extra: [1]u8 = undefined;
     if ((try decompressor.read(&extra)).len != 0) return error.DecodedSizeMismatch;
@@ -413,6 +389,8 @@ const Output = struct {
     source_position: usize = 0,
     encoding: model.Encoding = undefined,
     length: usize = 0,
+    // length times the primitive's size, set once its words are allocated.
+    bytes: usize = 0,
 
     fn primitive(self: *const Output) model.Primitive {
         return self.encoding.decodedPrimitive();
@@ -423,23 +401,11 @@ const Output = struct {
         if (comptime @import("builtin").cpu.arch.endian() == .little) return;
         switch (self.primitive()) {
             inline else => |kind| {
-                const T = switch (kind) {
-                    .float32 => f32,
-                    .float64 => f64,
-                    .int32 => i32,
-                    .int64 => i64,
-                };
+                const T = kind.Type();
                 const Bits = @Int(.unsigned, @bitSizeOf(T));
                 for (std.mem.bytesAsSlice(Bits, std.mem.sliceAsBytes(self.values(T)))) |*bits| bits.* = @byteSwap(bits.*);
             },
         }
-    }
-
-    fn byteLength(self: *const Output) usize {
-        return switch (self.primitive()) {
-            .float32, .int32 => self.length * 4,
-            .float64, .int64 => self.length * 8,
-        };
     }
 
     fn values(self: *const Output, comptime T: type) []T {
