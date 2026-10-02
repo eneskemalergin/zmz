@@ -1160,6 +1160,10 @@ test "[failure] - [mzML decoded reading]: stops at the first error and clears fa
         try std.testing.expect(reader.diagnostic() != null);
         const diagnostic = reader.diagnostic().?;
         try std.testing.expectEqual(case[4], diagnostic.code);
+        try std.testing.expectEqual(@as(mzml.Diagnostic.Stage, switch (@as(anyerror, case[4])) {
+            error.DecodedSizeMismatch, error.MissingCompression => .array,
+            else => .base64,
+        }), diagnostic.stage);
         try std.testing.expectError(error.FailedState, reader.nextDecodedRecord(&output));
         try std.testing.expectError(error.FailedState, reader.nextRecord());
         try std.testing.expectEqualDeep(diagnostic, reader.diagnostic().?);

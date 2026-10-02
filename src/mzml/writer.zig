@@ -31,11 +31,13 @@ pub const ArrayPayload = union(enum) {
     wire: []const u8,
     /// Values encoded while they are written. File output streams every source, writing a
     /// placeholder encodedLength as wide as the longest possible text and patching it after
-    /// the text, so it may carry leading zeros. Other output streams sources whose length is known without encoding (primitives
-    /// without zlib) or after a counting pass (Numpress without zlib), and encodes zlib
-    /// sources into the source's encoder first, so a failing source writes nothing there. On
-    /// file output a Numpress value error can stop a record midway; the writer then fails as
-    /// for an output error.
+    /// the text, so it may carry leading zeros. Other output streams sources whose length is
+    /// known without encoding (primitives without zlib) or after a counting pass (Numpress
+    /// without zlib), and encodes zlib sources into the source's encoder first, so a failing
+    /// source writes nothing there. On file output, a source whose length is not known
+    /// before encoding can stop a record midway: on a Numpress value error, or when its text
+    /// turns out longer than `Limits.text_bytes`. The writer then fails as for an output
+    /// error.
     source: arrays.Source,
 };
 
@@ -457,6 +459,8 @@ const Base64Out = struct {
 fn patchLength(self: *Writer, offset: u64, length: usize, width: usize) Error!void {
     var buffer: [32]u8 = undefined;
     const text = buffer[0..std.fmt.printInt(&buffer, length, 10, .lower, .{})];
+    // Only an undercounted bound could overflow the placeholder.
+    if (text.len > width) return error.InvalidState;
     var padded = COUNT_PLACEHOLDER.*;
     const digits = padded[0..width];
     @memcpy(digits[width - text.len ..], text);
@@ -649,6 +653,8 @@ fn writeNode(self: *Writer, node: model.Node, comptime replace_arrays: bool, rem
         if (remaining.len == 0) return error.CountMismatch;
         remaining.* = remaining.*[1..];
         if (placeholder) |offset| try self.patchLength(offset, self.source_text_length, plan.source.width);
+        // A counted length is already in the output, so the text must have matched it.
+        if (plan == .source) if (plan.source.text_length) |length| if (length != self.source_text_length) return error.InvalidState;
     }
 }
 

@@ -1642,3 +1642,50 @@ test "[failure] - [mzML streamed writing]: Numpress value errors write nothing t
         encoder.reset();
     }
 }
+
+test "[failure] - [mzML streamed writing]: the text limit stops streams first and files after the text" {
+    const allocator = std.testing.allocator;
+    var input = std.Io.Reader.fixed(support.DOCUMENT);
+    var source_reader = try mzml.StreamReader.init(allocator, &input, .{});
+    defer source_reader.deinit();
+    const header = try source_reader.readHeader();
+    var encoder = mzml.arrays.Encoder.init(allocator, .fast);
+    defer encoder.deinit();
+    var builder = mzml.Builder.init(allocator, .{});
+    defer builder.deinit();
+    const values = [_]f64{ 1, 2, 3, 4 };
+    const prepared = try builder.prepareArray(f64, &values, .{
+        .cv_ref = "MS",
+        .encoding = .{ .pipeline = .pic },
+        .role = .{ .cv_ref = "MS", .accession = mzml.model.Terms.INTENSITY_ARRAY, .name = "intensity array" },
+    }, &encoder);
+    const record = try builder.record(.spectrum, "scan=1", 0, values.len, &.{}, &.{}, &.{prepared.array});
+    const limits: mzml.Writer.Limits = .{ .text_bytes = 3 };
+
+    var stream: std.Io.Writer.Allocating = .init(allocator);
+    defer stream.deinit();
+    var writer = try mzml.Writer.init(allocator, &stream.writer, limits);
+    defer writer.deinit();
+    try writer.writeHeader(header.*);
+    try writer.beginList(.spectrum_list, 1, "dp");
+    const before = writer.engine.byteOffset();
+    try std.testing.expectError(error.LimitExceeded, writer.writeRecordWithArrays(record.node, &.{prepared.payload}));
+    try std.testing.expectEqual(before, writer.engine.byteOffset());
+    try std.testing.expectEqual(.text_bytes, writer.diagnostic().?.detail.limit.name);
+
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    const file = try dir.dir.createFile(std.testing.io, "limited.mzML", .{ .read = true });
+    defer file.close(std.testing.io);
+    var buffer: [4096]u8 = undefined;
+    var sink = file.writer(std.testing.io, &buffer);
+    var file_writer = try mzml.Writer.initFile(allocator, &sink, limits, null);
+    defer file_writer.deinit();
+    try file_writer.writeHeader(header.*);
+    try file_writer.beginList(.spectrum_list, 1, "dp");
+    const file_before = file_writer.engine.byteOffset().?;
+    try std.testing.expectError(error.LimitExceeded, file_writer.writeRecordWithArrays(record.node, &.{prepared.payload}));
+    try std.testing.expect(file_writer.engine.byteOffset().? > file_before);
+    try std.testing.expectEqual(.text_bytes, file_writer.diagnostic().?.detail.limit.name);
+    try std.testing.expectError(error.FailedState, file_writer.finish());
+}

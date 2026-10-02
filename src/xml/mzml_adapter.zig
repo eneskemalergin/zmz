@@ -332,7 +332,7 @@ const Source = struct {
             const unit = try self.readUtf16Unit();
             if (unit >= 0xD800 and unit <= 0xDBFF) {
                 const next = self.readUtf16Unit() catch |err| return switch (err) {
-                    error.InvalidEncoding => error.InvalidEncoding,
+                    error.EndOfStream => error.InvalidEncoding,
                     else => err,
                 };
                 if (next < 0xDC00 or next > 0xDFFF) return error.InvalidEncoding;
@@ -1019,7 +1019,7 @@ pub const Cursor = struct {
             if (value.value == quote) break;
             if (value.value == '<') return error.InvalidXml;
             if (value.value == '&') {
-                try self.readEntity(&self.event_bytes, self.max_attribute_bytes);
+                try self.appendCodepoint(try self.readEntity());
                 continue;
             }
             if (value.value == '\r' or value.value == '\n' or value.value == '\t') {
@@ -1040,39 +1040,45 @@ pub const Cursor = struct {
         return .{ .start = start, .len = self.event_bytes.items.len - start };
     }
 
-    fn readEntity(self: *Cursor, destination: *std.ArrayList(u8), limit: usize) Error!void {
-        var name: [32]u8 = undefined;
-        var length: usize = 0;
-        while (true) {
-            const value = self.requiredCodepoint() catch |err| return err;
-            if (value.value == ';') break;
-            if (value.value > 0x7F or length == name.len) return error.InvalidXml;
-            name[length] = @intCast(value.value);
-            length += 1;
+    /// Reads an entity or character reference after '&' through its ';'.
+    /// Digits stream, so any number of leading zeros is accepted.
+    fn readEntity(self: *Cursor) Error!u21 {
+        const first = (try self.requiredCodepoint()).value;
+        if (first != '#') {
+            var name: [4]u8 = undefined;
+            var length: usize = 0;
+            var value = first;
+            while (value != ';') : (value = (try self.requiredCodepoint()).value) {
+                if (value > 0x7F or length == name.len) return error.InvalidXml;
+                name[length] = @intCast(value);
+                length += 1;
+            }
+            const entities = [_]struct { []const u8, u21 }{
+                .{ "amp", '&' }, .{ "lt", '<' }, .{ "gt", '>' }, .{ "apos", '\'' }, .{ "quot", '"' },
+            };
+            for (entities) |entity| {
+                if (std.mem.eql(u8, name[0..length], entity[0])) return entity[1];
+            }
+            return error.InvalidXml;
         }
-        if (length == 0) return error.InvalidXml;
-        if (std.mem.eql(u8, name[0..length], "amp")) return appendTo(destination, self.allocator, '&', limit);
-        if (std.mem.eql(u8, name[0..length], "lt")) return appendTo(destination, self.allocator, '<', limit);
-        if (std.mem.eql(u8, name[0..length], "gt")) return appendTo(destination, self.allocator, '>', limit);
-        if (std.mem.eql(u8, name[0..length], "apos")) return appendTo(destination, self.allocator, '\'', limit);
-        if (std.mem.eql(u8, name[0..length], "quot")) return appendTo(destination, self.allocator, '"', limit);
 
-        if (name[0] != '#') return error.InvalidXml;
+        var value = (try self.requiredCodepoint()).value;
         var base: u32 = 10;
-        var index: usize = 1;
-        if (index < length and (name[index] == 'x' or name[index] == 'X')) {
+        if (value == 'x') {
             base = 16;
-            index += 1;
+            value = (try self.requiredCodepoint()).value;
         }
-        if (index == length) return error.InvalidXml;
         var number: u32 = 0;
-        while (index < length) : (index += 1) {
-            const digit = digitValue(name[index], base) orelse return error.InvalidXml;
-            number = std.math.mul(u32, number, base) catch return error.InvalidXml;
-            number = std.math.add(u32, number, digit) catch return error.InvalidXml;
+        var digits: usize = 0;
+        while (value != ';') : (value = (try self.requiredCodepoint()).value) {
+            if (value > 0x7F) return error.InvalidXml;
+            const digit = digitValue(@intCast(value), base) orelse return error.InvalidXml;
+            number = number * base + digit;
+            if (number > 0x10FFFF) return error.InvalidXml;
+            digits += 1;
         }
-        if (number > 0x10FFFF or !isXmlChar(@intCast(number))) return error.InvalidXml;
-        return appendToCodepoint(destination, self.allocator, @intCast(number), limit);
+        if (digits == 0 or !isXmlChar(@intCast(number))) return error.InvalidXml;
+        return @intCast(number);
     }
 
     fn bufferedName(self: *Cursor, bytes: []const u8, position: *usize, used: *usize) ?NameRange {
@@ -1412,7 +1418,7 @@ pub const Cursor = struct {
             if (value.value == '&') {
                 if (self.text_bytes.items.len != 0) break;
                 _ = try self.requiredCodepoint();
-                try self.readEntity(&self.text_bytes, TEXT_CHUNK_BYTES);
+                try self.appendTextCodepoint(try self.readEntity(), false);
                 self.normal_text_brackets = 0;
                 continue;
             }
@@ -1643,19 +1649,6 @@ fn digitValue(value: u8, base: u32) ?u32 {
     return digit;
 }
 
-fn appendTo(destination: *std.ArrayList(u8), allocator: std.mem.Allocator, value: u8, limit: usize) Error!void {
-    if (destination.items.len >= limit) return error.LimitExceeded;
-    try destination.append(allocator, value);
-}
-
-fn appendToCodepoint(destination: *std.ArrayList(u8), allocator: std.mem.Allocator, value: u21, limit: usize) Error!void {
-    var encoded: [4]u8 = undefined;
-    const len = std.unicode.utf8Encode(value, &encoded) catch return error.InvalidXml;
-    const next_length = std.math.add(usize, destination.items.len, len) catch return error.LimitExceeded;
-    if (next_length > limit) return error.LimitExceeded;
-    try destination.appendSlice(allocator, encoded[0..len]);
-}
-
 /// Writer construction failures caused by invalid options.
 pub const WriterInitError = error{InvalidOptions};
 /// Writer state, namespace, character, sink, and bound failures.
@@ -1736,7 +1729,7 @@ pub const Writer = struct {
 
     /// Opens an element; any prefix must have a declaration before its content is written.
     pub fn startElement(self: *Writer, name: []const u8) WriterError!void {
-        try self.checkAny();
+        try self.checkContent();
         if (self.state == .epilog and self.root_written) return self.fail(error.InvalidState);
         if (self.state != .epilog and self.state != .content and self.state != .start_tag) return self.fail(error.InvalidState);
         validateQName(name) catch |err| return self.fail(err);
@@ -1830,7 +1823,7 @@ pub const Writer = struct {
 
     /// Writes XML text with character and delimiter-safe escaping.
     pub fn text(self: *Writer, value: []const u8) WriterError!void {
-        try self.checkAny();
+        try self.checkContent();
         if (self.state != .start_tag and self.state != .content) return self.fail(error.InvalidState);
         if (self.state == .start_tag) {
             try self.checkOpeningName();
@@ -1847,6 +1840,7 @@ pub const Writer = struct {
 
     /// Writes binary content as Base64 one piece at a time; binaryEnd closes it. Up to two
     /// bytes carry over between pieces, so any split gives the text binary gives for the whole.
+    /// While bytes carry, startElement, text and endElement fail with InvalidState.
     pub fn binaryPart(self: *Writer, wire: []const u8) WriterError!void {
         try self.checkAny();
         if (self.state != .start_tag and self.state != .content) return self.fail(error.InvalidState);
@@ -1906,7 +1900,7 @@ pub const Writer = struct {
 
     /// Closes the current element.
     pub fn endElement(self: *Writer) WriterError!void {
-        try self.checkAny();
+        try self.checkContent();
         if (self.state != .start_tag and self.state != .content) return self.fail(error.InvalidState);
         if (self.frame_count == 0) return self.fail(error.InvalidState);
         const frame = self.frames[self.frame_count - 1];
@@ -1944,6 +1938,12 @@ pub const Writer = struct {
     fn checkAny(self: *Writer) WriterError!void {
         if (self.failure) |failure| return failure;
         if (self.state == .failed) return error.WriteFailed;
+    }
+
+    // Other content would split a Base64 group that binaryPart left open.
+    fn checkContent(self: *Writer) WriterError!void {
+        try self.checkAny();
+        if (self.binary_carry_len != 0) return self.fail(error.InvalidState);
     }
 
     pub fn namespaceUri(self: *const Writer, prefix: []const u8) ?[]const u8 {
@@ -2785,4 +2785,81 @@ test "[unit] - [mzML XML writer]: rejects undeclared namespace names" {
         try writer.startElement("p:child");
         try std.testing.expectError(error.InvalidNamespace, writer.endElement());
     }
+}
+
+test "[failure] - [mzML XML cursor]: rejects a lone UTF-16 surrogate after the root" {
+    const document = "<mzML xmlns='" ++ NAMESPACE ++ "'/>";
+    for ([_]std.builtin.Endian{ .little, .big }) |endian| {
+        var bytes: [2 + document.len * 2 + 2]u8 = undefined;
+        std.mem.writeInt(u16, bytes[0..2], 0xfeff, endian);
+        for (document, 0..) |byte, i| std.mem.writeInt(u16, bytes[2 + i * 2 ..][0..2], byte, endian);
+        std.mem.writeInt(u16, bytes[bytes.len - 2 ..][0..2], 0xd800, endian);
+        var input = std.Io.Reader.fixed(&bytes);
+        var cursor = try Cursor.init(std.testing.allocator, &input, 64, 64, 1024);
+        defer cursor.deinit();
+        const result: Error!void = while (true) {
+            cursor.advance(false) catch |err| break err;
+            if (cursor.current == null) break;
+        };
+        try std.testing.expectError(error.InvalidEncoding, result);
+    }
+}
+
+test "[failure] - [mzML XML cursor]: reports the attribute limit when an entity overflows it" {
+    // Names count against the same limit, so every limit size is tried to land on an entity.
+    for ([_][]const u8{ "<mzML a='&amp;&amp;&amp;'/>", "<mzML a='&#65;&#x42;&#67;'/>" }) |source| {
+        for (1..12) |limit| {
+            var input = std.Io.Reader.fixed(source);
+            var cursor = try Cursor.init(std.testing.allocator, &input, 64, 64, limit);
+            defer cursor.deinit();
+            // A limit that fits the attribute reaches the missing namespace instead.
+            cursor.advance(false) catch |err| switch (err) {
+                error.LimitExceeded => try std.testing.expectEqual(@as(@TypeOf(cursor.limit_failure), .attribute_bytes), cursor.limit_failure),
+                error.WrongNamespace => {},
+                else => return err,
+            };
+        }
+    }
+}
+
+test "[edge] - [mzML XML cursor]: decodes character references with many leading zeros" {
+    const zeros = "0" ** 40;
+    var input = std.Io.Reader.fixed("<mzML a='&#" ++ zeros ++ "65;&#x" ++ zeros ++ "42;' xmlns='" ++ NAMESPACE ++ "'>&#" ++ zeros ++ "67;</mzML>");
+    var cursor = try Cursor.init(std.testing.allocator, &input, 64, 64, 1024);
+    defer cursor.deinit();
+    try cursor.advance(true);
+    try std.testing.expectEqualStrings("AB", cursor.current.?.data.start_element.attributes[0].value);
+    try cursor.advance(true);
+    try std.testing.expectEqualStrings("C", cursor.current.?.data.text.bytes);
+}
+
+test "[property] - [mzML XML writer]: Base64 in pieces equals Base64 of the whole, and needs its end" {
+    var wire: [64]u8 = undefined;
+    for (&wire, 0..) |*byte, i| byte.* = @truncate(i * 37 + 11);
+    var whole_bytes: [256]u8 = undefined;
+    var whole_sink = std.Io.Writer.fixed(&whole_bytes);
+    var whole = try Writer.init(std.testing.allocator, &whole_sink, .{ .fragment = true });
+    defer whole.deinit();
+    try whole.startElement("binary");
+    try whole.binary(&wire);
+    try whole.endElement();
+    for (1..8) |piece| {
+        var bytes: [256]u8 = undefined;
+        var sink = std.Io.Writer.fixed(&bytes);
+        var writer = try Writer.init(std.testing.allocator, &sink, .{ .fragment = true });
+        defer writer.deinit();
+        try writer.startElement("binary");
+        var at: usize = 0;
+        while (at < wire.len) : (at += piece) try writer.binaryPart(wire[at..@min(wire.len, at + piece)]);
+        try writer.binaryEnd();
+        try writer.endElement();
+        try std.testing.expectEqualStrings(whole_sink.buffered(), sink.buffered());
+    }
+    var bytes: [256]u8 = undefined;
+    var sink = std.Io.Writer.fixed(&bytes);
+    var writer = try Writer.init(std.testing.allocator, &sink, .{ .fragment = true });
+    defer writer.deinit();
+    try writer.startElement("binary");
+    try writer.binaryPart(wire[0..4]);
+    try std.testing.expectError(error.InvalidState, writer.endElement());
 }

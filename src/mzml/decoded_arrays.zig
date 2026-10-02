@@ -155,8 +155,12 @@ fn text(self: *DecodedArrays, bytes: []const u8) Error!void {
     };
     const pipeline = self.outputs.items[self.count - 1].encoding.pipeline;
     if (pipeline.isNumpress()) return self.numpressText(bytes);
-    self.decoder.update(bytes) catch |err|
-        return if (err == error.OutputTooSmall) error.DecodedSizeMismatch else err;
+    self.decoder.update(bytes) catch |err| {
+        if (err != error.OutputTooSmall) return err;
+        // An overlong array is an array error, as a short one is in finishArray.
+        self.failure = .{ .stage = .array };
+        return error.DecodedSizeMismatch;
+    };
 }
 
 // Decodes Base64 in pieces whose bytes always fit the window and hands them to Numpress.
