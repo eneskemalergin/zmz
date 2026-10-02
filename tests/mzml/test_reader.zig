@@ -2576,7 +2576,8 @@ test "[property] - [decoded arrays]: streamed decoding matches whole-payload dec
     defer encoder.deinit();
     var decoded = mzml.StreamReader.DecodedArrays.init(allocator, .{});
     defer decoded.deinit();
-    const values = try allocator.alloc(f64, 9_000);
+    // 20,000 values compress past the 64 KiB window, so zlib arrays take both routes.
+    const values = try allocator.alloc(f64, 20_000);
     defer allocator.free(values);
     var current: f64 = 100;
     for (values) |*value| {
@@ -2590,7 +2591,7 @@ test "[property] - [decoded arrays]: streamed decoding matches whole-payload dec
         for (compressions) |entry| {
             const pipeline, const accession = entry;
             if (T != f64 and pipeline.isNumpress()) continue;
-            for ([_]usize{ 0, 1, 3, 600, 9_000 }) |count| {
+            for ([_]usize{ 0, 1, 3, 600, 9_000, 20_000 }) |count| {
                 const fixed_point: ?f64 = switch (pipeline.transform()) {
                     .linear => try mzml.numpress.optimalLinearFixedPoint(values[0..count]),
                     .slof => try mzml.numpress.optimalSlofFixedPoint(values[0..count]),

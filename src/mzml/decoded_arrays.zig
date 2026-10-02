@@ -37,8 +37,9 @@ pub const Array = struct { source_position: usize, encoding: model.Encoding, val
 /// binary_text_bytes bounds the Base64 text.
 pub const Limits = struct { array_bytes: usize = 192 * 1024 * 1024 };
 
-// Bytes decoded per step: Numpress input from Base64, or Base64 output for the inflater.
-const WINDOW = 16 * 1024;
+// Bytes decoded per step: Numpress input from Base64, or Base64 output for the inflater. A
+// zlib payload that fits whole (most spectra) is decoded in one call, straight into its values.
+const WINDOW = 64 * 1024;
 
 allocator: std.mem.Allocator,
 limits: Limits,
@@ -248,6 +249,10 @@ fn finishNumpress(self: *DecodedArrays) Error!void {
 fn inflateText(self: *DecodedArrays, source: anytype) !void {
     const output = &self.outputs.items[self.count - 1];
     var input = Base64Input(@TypeOf(source)).init(source, self.window.items);
+    if (!output.encoding.pipeline.isNumpress()) {
+        input.fill();
+        if (input.ended and input.failure == null) return self.inflateWhole(output, input.reader.buffered(), input.decoder.counts);
+    }
     if (self.inflater == null) self.inflater = try zlib.Inflater.init(self.allocator);
     const inflater = &self.inflater.?;
     inflater.startReader(&input.reader);
@@ -264,6 +269,24 @@ fn inflateText(self: *DecodedArrays, source: anytype) !void {
     if (output.encoding.pipeline.isNumpress()) {
         errdefer self.failure = .{ .stage = .array };
         return self.finishNumpress();
+    }
+}
+
+// A primitive zlib payload that fit the window whole: the slice decoder writes straight into
+// the values, with the same checks and errors as decoding a retained payload.
+fn inflateWhole(self: *DecodedArrays, output: *Output, wire: []const u8, counts: base64.Counts) Error!void {
+    errdefer self.failure = .{ .stage = .array };
+    const pipeline = output.encoding.payloadPipeline(output.length, counts.significant_bytes == 0);
+    switch (output.primitive()) {
+        inline else => |kind| {
+            const T = switch (kind) {
+                .float32 => f32,
+                .float64 => f64,
+                .int32 => i32,
+                .int64 => i64,
+            };
+            try arrays.decodeWire(T, output.values(T), wire, pipeline, &.{});
+        },
     }
 }
 
@@ -357,6 +380,12 @@ fn Base64Input(comptime Source: type) type {
             self.failure = err;
             self.base64_failed = from_base64;
             return error.ReadFailed;
+        }
+
+        // Decodes until the window is full, the text ends, or an error is kept.
+        fn fill(self: *Self) void {
+            const r = &self.reader;
+            while (!self.ended and self.failure == null and r.buffer.len - r.end >= 6) self.produce() catch return;
         }
 
         // Reads and checks the rest of the text, discarding its bytes.
