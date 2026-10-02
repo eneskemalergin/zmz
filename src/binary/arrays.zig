@@ -106,7 +106,7 @@ fn decodeWireInner(comptime T: type, output: []T, source: []const u8, pipeline: 
 }
 
 /// Encodes values as Base64 into output and returns the written prefix. compressor is needed
-/// only for zlib pipelines.
+/// only for zlib pipelines. Numpress takes f32 or f64 values and always decodes to f64.
 pub fn encode(
     comptime T: type,
     output: []u8,
@@ -154,15 +154,15 @@ pub fn encodeWire(
             }
             break :blk required;
         },
-        .linear => if (T == f64)
+        .linear => if (T == f64 or T == f32)
             try numpress.encodeLinear(values, options.fixed_point.?, scratch.transformed)
         else
             unreachable,
-        .pic => if (T == f64)
+        .pic => if (T == f64 or T == f32)
             try numpress.encodePic(values, scratch.transformed)
         else
             unreachable,
-        .slof => if (T == f64)
+        .slof => if (T == f64 or T == f32)
             try numpress.encodeSlof(values, options.fixed_point.?, scratch.transformed)
         else
             unreachable,
@@ -178,13 +178,13 @@ fn writeWire(comptime T: type, values: []const T, options: EncodeOptions, writer
             const Bits = @Int(.unsigned, @bitSizeOf(T));
             for (values) |value| try writer.writeInt(Bits, @bitCast(value), .little);
         },
-        .linear => if (T == f64) {
+        .linear => if (T == f64 or T == f32) {
             _ = try numpress.encodeLinearTo(values, options.fixed_point.?, writer);
         } else unreachable,
-        .pic => if (T == f64) {
+        .pic => if (T == f64 or T == f32) {
             _ = try numpress.encodePicTo(values, writer);
         } else unreachable,
-        .slof => if (T == f64) {
+        .slof => if (T == f64 or T == f32) {
             _ = try numpress.encodeSlofTo(values, options.fixed_point.?, writer);
         } else unreachable,
     }
@@ -192,7 +192,7 @@ fn writeWire(comptime T: type, values: []const T, options: EncodeOptions, writer
 
 fn checkOptions(comptime T: type, options: EncodeOptions, has_compressor: bool) Error!void {
     const selected = options.pipeline.transform();
-    if (selected != .none and T != f64) return error.TypeMismatch;
+    if (selected != .none and T != f64 and T != f32) return error.TypeMismatch;
     if (options.pipeline.hasZlib() and !has_compressor) return error.MissingCompressor;
     if (selected == .linear or selected == .slof) {
         if (options.fixed_point == null) return error.MissingFixedPoint;
@@ -257,7 +257,7 @@ pub const Encoder = struct {
 /// This is not a bound for the zlib stream or its Base64 representation.
 pub fn wireBound(comptime T: type, count: usize, pipeline: Pipeline) Error!usize {
     _ = encoding.Primitive.of(T);
-    if (pipeline.transform() != .none and T != f64) return error.TypeMismatch;
+    if (pipeline.transform() != .none and T != f64 and T != f32) return error.TypeMismatch;
     return switch (pipeline.transform()) {
         .none => std.math.mul(usize, count, @sizeOf(T)) catch error.LengthOverflow,
         .linear => numpress.linearMaxEncodedLen(count),

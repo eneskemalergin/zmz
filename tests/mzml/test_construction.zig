@@ -516,7 +516,8 @@ test "[integration] - [prepared construction]: keeps builder and writer failure 
     try std.testing.expect((try builder.prepareArray(f64, &.{1}, bad, &encoder)).wire.len != 0);
     bad.encoding.pipeline = .linear;
     try std.testing.expectError(error.MissingFixedPoint, builder.prepareArray(f64, &.{1}, bad, &encoder));
-    try std.testing.expectError(error.TypeMismatch, builder.prepareArray(f32, &.{1}, bad, &encoder));
+    try std.testing.expectError(error.MissingFixedPoint, builder.prepareArray(f32, &.{1}, bad, &encoder));
+    try std.testing.expectError(error.TypeMismatch, builder.prepareArray(i32, &.{1}, bad, &encoder));
     var limited = mzml.Builder.init(std.testing.allocator, .{ .bytes = 1 });
     defer limited.deinit();
     try std.testing.expectError(error.LimitExceeded, limited.prepareArray(f64, &.{1}, options, &encoder));
@@ -635,7 +636,10 @@ test "[integration] - [mzML construction]: cleans failed allocations and preserv
     try std.testing.expectEqual(null, processing.node.attribute("arrayLength"));
     bad = options;
     bad.encoding.pipeline = .pic;
-    try std.testing.expectError(error.TypeMismatch, builder.prepareArray(f32, &.{1}, bad, &encoder));
+    try std.testing.expectError(error.TypeMismatch, builder.prepareArray(i64, &.{1}, bad, &encoder));
+    // f32 Numpress input keeps its declared 32-bit float term; reading decodes it to f64.
+    const narrow = (try builder.prepareArray(f32, &.{1}, bad, &encoder)).array;
+    try std.testing.expectEqualStrings("MS:1000521", narrow.node.params[1].cv.accession.?.raw);
 }
 
 test "[failure] - [mzML construction]: rejects nodes nested past the depth ceiling" {

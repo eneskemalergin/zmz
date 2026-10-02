@@ -66,13 +66,14 @@ fn maxNibbleBytes(value_count: usize) Error!usize {
 ///
 /// This matches the reference selector for nondegenerate input. For an all-zero
 /// maximum it returns the largest signed 32-bit integer instead of infinity.
-pub fn optimalLinearFixedPoint(values: []const f64) Error!f64 {
+pub fn optimalLinearFixedPoint(input: anytype) Error!f64 {
+    const values = slice(input);
     if (values.len == 0) return 0;
     for (values) |value| try validateNonnegative(value);
 
-    if (values.len == 1) return fixedPointForMaximum(values[0]);
+    if (values.len == 1) return fixedPointForMaximum(valueAt(values, 0));
 
-    var maximum = @max(values[0], values[1]);
+    var maximum = @max(valueAt(values, 0), valueAt(values, 1));
     var index: usize = 2;
     if (values.len >= 64) {
         maximum = try linearMaximumVector(values, index, maximum, &index);
@@ -81,7 +82,7 @@ pub fn optimalLinearFixedPoint(values: []const f64) Error!f64 {
 }
 
 fn linearMaximumVector(
-    values: []const f64,
+    values: anytype,
     start: usize,
     initial_maximum: f64,
     end: *usize,
@@ -91,9 +92,9 @@ fn linearMaximumVector(
     var maximum = initial_maximum;
     var index = start;
     while (values.len - index >= LANES) : (index += LANES) {
-        const current: F64s = values[index..][0..LANES].*;
-        const previous_1: F64s = values[index - 1 ..][0..LANES].*;
-        const previous_2: F64s = values[index - 2 ..][0..LANES].*;
+        const current = load(LANES, values, index);
+        const previous_1 = load(LANES, values, index - 1);
+        const previous_2 = load(LANES, values, index - 2);
         const extrapolated = previous_1 + (previous_1 - previous_2);
         if (!@reduce(.And, @abs(extrapolated) <= finite_limit)) {
             return error.ValueOutOfRange;
@@ -106,24 +107,25 @@ fn linearMaximumVector(
 }
 
 fn linearMaximumScalar(
-    values: []const f64,
+    values: anytype,
     start: usize,
     initial_maximum: f64,
 ) Error!f64 {
     var maximum = initial_maximum;
-    for (values[start..], start..) |value, index| {
-        const extrapolated = values[index - 1] + (values[index - 1] - values[index - 2]);
+    for (start..values.len) |index| {
+        const extrapolated = valueAt(values, index - 1) + (valueAt(values, index - 1) - valueAt(values, index - 2));
         if (!std.math.isFinite(extrapolated)) return error.ValueOutOfRange;
-        maximum = @max(maximum, @ceil(@abs(value - extrapolated) + 1.0));
+        maximum = @max(maximum, @ceil(@abs(valueAt(values, index) - extrapolated) + 1.0));
     }
     return maximum;
 }
 
 /// Selects a Linear fixed point that bounds rounding error by `max_abs_error`.
 pub fn linearFixedPointForAbsoluteError(
-    values: []const f64,
+    input: anytype,
     max_abs_error: f64,
 ) Error!f64 {
+    const values = slice(input);
     if (!std.math.isFinite(max_abs_error) or max_abs_error <= 0) {
         return error.InvalidValue;
     }
@@ -139,11 +141,13 @@ pub fn linearFixedPointForAbsoluteError(
 }
 
 /// Selects the reference-compatible SLOF fixed point for valid nonnegative data.
-pub fn optimalSlofFixedPoint(values: []const f64) Error!f64 {
+pub fn optimalSlofFixedPoint(input: anytype) Error!f64 {
+    const values = slice(input);
     if (values.len == 0) return 0;
 
     var maximum: f64 = 1;
-    for (values) |value| {
+    for (0..values.len) |index| {
+        const value = valueAt(values, index);
         try validateNonnegative(value);
         maximum = @max(maximum, logLibm(value + 1.0));
     }
@@ -169,6 +173,41 @@ const BLOCK = 128;
 const BLOCK_BYTES = 9 * BLOCK / 2 + 16;
 
 const LANES = std.simd.suggestVectorLength(f64) orelse 1;
+
+// Encoders and selectors take f32 or f64 values. f32 widens to f64 exactly, and every step
+// computes in f64 after widening, so f32 input encodes as its f64 copy would, without the copy.
+fn Input(comptime Values: type) type {
+    const T = std.meta.Elem(Values);
+    if (T != f64 and T != f32) @compileError("Numpress encodes f32 or f64 values, not " ++ @typeName(T));
+    return T;
+}
+
+inline fn valueAt(values: anytype, index: usize) f64 {
+    _ = Input(@TypeOf(values));
+    return values[index];
+}
+
+// The input as a slice: f32 slices and arrays stay f32; everything else (f64 slices, arrays,
+// and literals such as &.{ 1, 2 }) coerces to []const f64.
+fn Slice(comptime Values: type) type {
+    const info = @typeInfo(Values);
+    if (info == .pointer) {
+        const child = info.pointer.child;
+        if (info.pointer.size == .slice and child == f32) return []const f32;
+        if (info.pointer.size == .one and @typeInfo(child) == .array and @typeInfo(child).array.child == f32) return []const f32;
+    }
+    return []const f64;
+}
+
+inline fn slice(values: anytype) Slice(@TypeOf(values)) {
+    return values;
+}
+
+inline fn load(comptime N: usize, values: anytype, index: usize) @Vector(N, f64) {
+    const T = Input(@TypeOf(values));
+    const v: @Vector(N, T) = values[index..][0..N].*;
+    return if (T == f64) v else @floatCast(v);
+}
 const F64s = @Vector(LANES, f64);
 const I64s = @Vector(LANES, i64);
 const U32s = @Vector(LANES, u32);
@@ -176,7 +215,8 @@ const U64s = @Vector(LANES, u64);
 
 /// Encodes finite doubles from zero through `maxInt(u32)` by rounding to the nearest integer
 /// and applying the Numpress integer code.
-pub noinline fn encodePic(values: []const f64, output: []u8) Error!usize {
+pub noinline fn encodePic(input: anytype, output: []u8) Error!usize {
+    const values = slice(input);
     // The sink writes only filled bytes, so the worst-case bound is enough room; a smaller
     // output takes the checked encoder, which reports OutputTooSmall only when it is needed.
     const bound = picMaxEncodedLen(values.len) catch return encodePicChecked(values, output);
@@ -198,7 +238,8 @@ pub noinline fn encodePic(values: []const f64, output: []u8) Error!usize {
 }
 
 /// Encodes nonnegative doubles with MS-Numpress linear prediction.
-pub noinline fn encodeLinear(values: []const f64, fixed_point: f64, output: []u8) Error!usize {
+pub noinline fn encodeLinear(input: anytype, fixed_point: f64, output: []u8) Error!usize {
+    const values = slice(input);
     const bound = linearMaxEncodedLen(values.len) catch
         return encodeLinearChecked(values, fixed_point, output);
     if (values.len < 3 or !(fixed_point > 0 and fixed_point <= std.math.floatMax(f64)) or
@@ -235,7 +276,8 @@ pub noinline fn encodeLinear(values: []const f64, fixed_point: f64, output: []u8
 }
 
 /// Encodes nonnegative doubles with the MS-Numpress short logged float transform.
-pub noinline fn encodeSlof(values: []const f64, fixed_point: f64, output: []u8) Error!usize {
+pub noinline fn encodeSlof(input: anytype, fixed_point: f64, output: []u8) Error!usize {
+    const values = slice(input);
     const encoded_len = slofEncodedLen(values.len) catch
         return encodeSlofChecked(values, fixed_point, output);
     if (!(fixed_point > 0 and fixed_point <= std.math.floatMax(f64)) or output.len < encoded_len)
@@ -258,7 +300,8 @@ pub noinline fn encodeSlof(values: []const f64, fixed_point: f64, output: []u8) 
 
 /// Writes the PIC encoding of `values` to `writer` and returns the bytes written. Errors match
 /// `encodePic`; after one, the writer holds an unspecified prefix.
-pub fn encodePicTo(values: []const f64, writer: *std.Io.Writer) WriteError!usize {
+pub fn encodePicTo(input: anytype, writer: *std.Io.Writer) WriteError!usize {
+    const values = slice(input);
     var block: [BLOCK_BYTES]u8 = undefined;
     var sink = RawSink{ .out = &block };
     var codes: [BLOCK]u32 = undefined;
@@ -285,7 +328,8 @@ pub fn encodePicTo(values: []const f64, writer: *std.Io.Writer) WriteError!usize
 
 /// Writes the Linear encoding of `values` to `writer` and returns the bytes written. Errors
 /// match `encodeLinear`; after one, the writer holds an unspecified prefix.
-pub fn encodeLinearTo(values: []const f64, fixed_point: f64, writer: *std.Io.Writer) WriteError!usize {
+pub fn encodeLinearTo(input: anytype, fixed_point: f64, writer: *std.Io.Writer) WriteError!usize {
+    const values = slice(input);
     try validateFixedPoint(fixed_point, values.len == 0);
     var header: [16]u8 = undefined;
     writeFixedPoint(header[0..8], fixed_point);
@@ -331,7 +375,8 @@ pub fn encodeLinearTo(values: []const f64, fixed_point: f64, writer: *std.Io.Wri
 
 /// Writes the SLOF encoding of `values` to `writer` and returns the bytes written. Errors
 /// match `encodeSlof`; after one, the writer holds an unspecified prefix.
-pub fn encodeSlofTo(values: []const f64, fixed_point: f64, writer: *std.Io.Writer) WriteError!usize {
+pub fn encodeSlofTo(input: anytype, fixed_point: f64, writer: *std.Io.Writer) WriteError!usize {
+    const values = slice(input);
     try validateFixedPoint(fixed_point, values.len == 0);
     var header: [8]u8 = undefined;
     writeFixedPoint(&header, fixed_point);
@@ -361,13 +406,13 @@ pub fn encodeSlofTo(values: []const f64, fixed_point: f64, writer: *std.Io.Write
 // The checked encoders: one value at a time, every check in the reference order. The block
 // encoders fall back to them for invalid input or an output below the worst-case bound, so
 // errors and short-output behavior come from one place.
-noinline fn encodePicChecked(values: []const f64, output: []u8) Error!usize {
+noinline fn encodePicChecked(values: anytype, output: []u8) Error!usize {
     var writer = NibbleWriter.init(output);
     for (values) |value| try writer.writeInt(try roundedPic(value));
     return writer.finish();
 }
 
-noinline fn encodeLinearChecked(values: []const f64, fixed_point: f64, output: []u8) Error!usize {
+noinline fn encodeLinearChecked(values: anytype, fixed_point: f64, output: []u8) Error!usize {
     try validateFixedPoint(fixed_point, values.len == 0);
     if (output.len < 8) return error.OutputTooSmall;
     writeFixedPoint(output[0..8], fixed_point);
@@ -392,7 +437,7 @@ noinline fn encodeLinearChecked(values: []const f64, fixed_point: f64, output: [
     return 16 + writer.finish();
 }
 
-noinline fn encodeSlofChecked(values: []const f64, fixed_point: f64, output: []u8) Error!usize {
+noinline fn encodeSlofChecked(values: anytype, fixed_point: f64, output: []u8) Error!usize {
     try validateFixedPoint(fixed_point, values.len == 0);
     const encoded_len = try slofEncodedLen(values.len);
     if (output.len < encoded_len) return error.OutputTooSmall;
@@ -410,7 +455,7 @@ noinline fn encodeSlofChecked(values: []const f64, fixed_point: f64, output: []u
 // needs the general word builder; `.invalid` means a value needs the checked path.
 const Rounded = enum { simple, wide, invalid };
 
-fn roundPicBlock(values: []const f64, codes: []u32, leading: []u32) Rounded {
+fn roundPicBlock(values: anytype, codes: []u32, leading: []u32) Rounded {
     const regular_maximum = @as(f64, @floatFromInt(std.math.maxInt(u32))) - 0.5;
     const filled_minimum = 0xf000_0000 - 0.5;
     const limit: F64s = @splat(regular_maximum);
@@ -419,7 +464,7 @@ fn roundPicBlock(values: []const f64, codes: []u32, leading: []u32) Rounded {
     var any_filled = false;
     var i: usize = 0;
     while (values.len - i >= LANES) : (i += LANES) {
-        const v: F64s = values[i..][0..LANES].*;
+        const v = load(LANES, values, i);
         if (!@reduce(.And, (v >= zero) & (v < limit))) return .invalid;
         any_filled = any_filled or @reduce(.Or, v >= filled);
         const shifted = v + @as(F64s, @splat(0.5));
@@ -428,7 +473,7 @@ fn roundPicBlock(values: []const f64, codes: []u32, leading: []u32) Rounded {
         leading[i..][0..LANES].* = @as(U32s, @truncate((@as(U64s, @splat(1054)) - exponent) >> @splat(2)));
     }
     while (i < values.len) : (i += 1) {
-        const v = values[i];
+        const v = valueAt(values, i);
         if (!(v >= 0 and v < regular_maximum)) return .invalid;
         any_filled = any_filled or v >= filled_minimum;
         const shifted = v + 0.5;
@@ -441,21 +486,22 @@ fn roundPicBlock(values: []const f64, codes: []u32, leading: []u32) Rounded {
 // Scales a Linear block to i64 with the checked encoder's rounding; false when a value needs
 // the checked path (negative, non-finite, or not below 2^62 after scaling, where the second
 // difference stops being exact in i64).
-fn scaleLinearBlock(values: []const f64, fixed_point: f64, out: []i64) bool {
+fn scaleLinearBlock(values: anytype, fixed_point: f64, out: []i64) bool {
     const fp: F64s = @splat(fixed_point);
     const half: F64s = @splat(0.5);
     const limit: F64s = @splat(0x1p62);
     const zero: F64s = @splat(0);
     var i: usize = 0;
     while (values.len - i >= LANES) : (i += LANES) {
-        const v: F64s = values[i..][0..LANES].*;
+        const v = load(LANES, values, i);
         const scaled = v * fp + half;
         if (!@reduce(.And, (v >= zero) & (scaled < limit))) return false;
         out[i..][0..LANES].* = @as(I64s, @intFromFloat(scaled));
     }
     while (i < values.len) : (i += 1) {
-        const scaled = values[i] * fixed_point + 0.5;
-        if (!(values[i] >= 0 and scaled < 0x1p62)) return false;
+        const value = valueAt(values, i);
+        const scaled = value * fixed_point + 0.5;
+        if (!(value >= 0 and scaled < 0x1p62)) return false;
         out[i] = @intFromFloat(scaled);
     }
     return true;
@@ -495,8 +541,8 @@ const SlofCodes = @Vector(SLOF_LANES, u16);
 // The codes of a SLOF block, or null when a value needs the checked path. Codes whose scaled
 // logarithm lies within `guard` of a rounding boundary are recomputed with the glibc-exact
 // scalar log, so every code matches C++.
-inline fn slofBlock(values: *const [SLOF_LANES]f64, fixed_point: f64, guard: f64) ?SlofCodes {
-    const v: SlofF64s = values.*;
+inline fn slofBlock(values: anytype, fixed_point: f64, guard: f64) ?SlofCodes {
+    const v = load(SLOF_LANES, values, 0);
     const valid = (v >= @as(SlofF64s, @splat(0))) & (v <= @as(SlofF64s, @splat(std.math.floatMax(f64))));
     if (!@reduce(.And, valid)) return null;
     const scaled = logAtLeastOne(SLOF_LANES, v + @as(SlofF64s, @splat(1.0))) * @as(SlofF64s, @splat(fixed_point));
@@ -509,7 +555,7 @@ inline fn slofBlock(values: *const [SLOF_LANES]f64, fixed_point: f64, guard: f64
     var codes: SlofCodes = @intCast(truncated);
     if (!@reduce(.And, stable)) {
         inline for (0..SLOF_LANES) |lane| {
-            if (!stable[lane]) codes[lane] = @intFromFloat(logLibm(values[lane] + 1.0) * fixed_point + 0.5);
+            if (!stable[lane]) codes[lane] = @intFromFloat(logLibm(valueAt(values, lane) + 1.0) * fixed_point + 0.5);
         }
     }
     return codes;

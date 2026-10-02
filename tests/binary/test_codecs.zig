@@ -784,6 +784,37 @@ test "[property] - [array encoder]: streamed zlib matches encoding whole then co
     }
 }
 
+test "[property] - [array encoder]: f32 Numpress input matches its f64 copy and decodes to f64" {
+    var encoder = arrays.Encoder.init(std.testing.allocator, .even);
+    defer encoder.deinit();
+    var narrow: [3_000]f32 = undefined;
+    var wide: [narrow.len]f64 = undefined;
+    var current: f32 = 100;
+    var random = std.Random.DefaultPrng.init(0x6633_3220_6172_7279);
+    for (&narrow, &wide) |*n, *w| {
+        current += random.random().float(f32) * 2;
+        n.* = current;
+        w.* = current;
+    }
+    var transformed: [16 + 9 * narrow.len / 2 + 16]u8 = undefined;
+    for ([_]arrays.Pipeline{ .linear, .pic, .slof, .linear_zlib, .pic_zlib, .slof_zlib }) |pipeline| {
+        const fixed_point: ?f64 = switch (pipeline.transform()) {
+            .linear => try mzml.numpress.optimalLinearFixedPoint(&narrow),
+            .slof => try mzml.numpress.optimalSlofFixedPoint(&narrow),
+            else => null,
+        };
+        encoder.reset();
+        const options: arrays.EncodeOptions = .{ .pipeline = pipeline, .fixed_point = fixed_point };
+        const from_narrow = try encoder.encode(f32, &narrow, options);
+        const from_wide = try encoder.encode(f64, &wide, options);
+        try std.testing.expectEqualSlices(u8, from_wide, from_narrow);
+        var decoded: [narrow.len]f64 = undefined;
+        try arrays.decodeWire(f64, &decoded, from_narrow, pipeline, &transformed);
+        var narrow_output: [narrow.len]f32 = undefined;
+        try std.testing.expectError(error.TypeMismatch, arrays.decodeWire(f32, &narrow_output, from_narrow, pipeline, &transformed));
+    }
+}
+
 test "[property] - [array encoder]: compresses incompressible arrays without retries" {
     var encoder = arrays.Encoder.init(std.testing.allocator, .dense);
     defer encoder.deinit();
