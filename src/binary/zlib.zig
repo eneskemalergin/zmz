@@ -81,8 +81,29 @@ pub const Inflater = struct {
         self.state.init(&self.input, .{});
     }
 
-    /// Fills window with the next decoded bytes and returns them; an empty result means the
-    /// stream ended and its checksum and trailing bytes were checked.
+    /// Starts decoding a stream pulled from input, which stays borrowed until the stream ends
+    /// or fails. A failed read of input is InvalidData here; its owner keeps the cause.
+    pub fn startReader(self: *Inflater, input: *std.Io.Reader) void {
+        self.empty = false;
+        self.state.init(input, .{});
+    }
+
+    /// Returns up to limit next decoded bytes from the inflater's own buffer, valid until the
+    /// next call; an empty result means the stream ended and was checked.
+    pub fn next(self: *Inflater, limit: usize) Error![]const u8 {
+        if (self.empty) return error.TruncatedInput;
+        const reader = &self.state.reader;
+        const available = reader.peekGreedy(1) catch |err| switch (err) {
+            error.EndOfStream => return &.{},
+            error.ReadFailed => return mapped(self.state.err orelse error.ReadFailed),
+        };
+        const length = @min(available.len, limit);
+        reader.toss(length);
+        return available[0..length];
+    }
+
+    /// Fills window with the next decoded bytes and returns them, short only at the end; an
+    /// empty result means the stream ended and its checksum and trailing bytes were checked.
     pub fn read(self: *Inflater, window: []u8) Error![]u8 {
         if (self.empty) return error.TruncatedInput;
         const length = self.state.reader.readSliceShort(window) catch
