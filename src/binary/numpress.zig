@@ -303,20 +303,25 @@ pub fn encodeLinearTo(input: anytype, fixed_point: f64, writer: *std.Io.Writer) 
     var blocks: Blocks = .{ .writer = writer, .written = 16 };
     var sink: RawSink = .{ .out = &.{} };
     var residuals: [BLOCK]u32 = undefined;
+    var heads: [BLOCK]u32 = undefined;
+    var leading: [BLOCK]u32 = undefined;
     var i: usize = 2;
     while (i < values.len) {
         const n: usize = @min(BLOCK, values.len - i);
         // scaled[0..2] carries the previous two values into the block.
-        if (!scaleLinearBlock(values[i..][0..n], fixed_point, scaled[2..][0..n]) or
-            !linearResiduals(scaled[0 .. n + 2], residuals[0..n]))
+        if (scaleLinearBlock(values[i..][0..n], fixed_point, scaled[2..][0..n]) and
+            linearResiduals(scaled[0 .. n + 2], residuals[0..n], heads[0..n], leading[0..n]))
         {
+            try blocks.start(&sink, n);
+            if (comptime FAST_CLZ) sink.putAll(residuals[0..n]) else sink.putAllHeads(residuals[0..n], heads[0..n], leading[0..n]);
+        } else {
             for (0..n) |j| {
                 scaled[j + 2] = try scaleLinear(values[i + j], fixed_point);
                 residuals[j] = @bitCast(try linearResidual(scaled[j + 2], scaled[j], scaled[j + 1]));
             }
+            try blocks.start(&sink, n);
+            sink.putAll(residuals[0..n]);
         }
-        try blocks.start(&sink, n);
-        sink.putAll(residuals[0..n]);
         try blocks.commit(&sink);
         scaled[0] = scaled[n];
         scaled[1] = scaled[n + 1];
@@ -508,9 +513,19 @@ fn scaleLinearBlock(values: anytype, fixed_point: f64, out: []i64) bool {
     return true;
 }
 
+// Whether the CPU counts leading zeros in one instruction. Without that (x86-64 before LZCNT),
+// Linear residual heads come from the vector pass: 4% to 5% fewer cycles on baseline encode;
+// with it, the packing loop's own count is 2% faster.
+const FAST_CLZ = switch (builtin.cpu.arch) {
+    .x86_64 => std.Target.x86.featureSetHas(builtin.cpu.features, .lzcnt),
+    else => true,
+};
+
 // Second differences of a scaled block (two carried values first) as i32 bits; false when one
-// does not fit in i32.
-fn linearResiduals(scaled: []const i64, out: []u32) bool {
+// does not fit in i32. Without FAST_CLZ it also gives each residual's head nibble and leading
+// nibbles, read from the exponent of t + 0.5 as for PIC, where t is the residual, or its
+// complement when its top nibble is F (counted as leading F nibbles, at most 7).
+fn linearResiduals(scaled: []const i64, out: []u32, heads: []u32, leading: []u32) bool {
     const n = out.len;
     const bias: U64s = @splat(1 << 31);
     var wide: U64s = @splat(0);
@@ -522,13 +537,27 @@ fn linearResiduals(scaled: []const i64, out: []u32) bool {
         const r: U64s = @bitCast(c - (b + b - a));
         // In range exactly when r + 2^31 fits in 32 bits.
         wide |= (r +% bias) >> @splat(32);
-        out[j..][0..LANES].* = @as(U32s, @truncate(r));
+        const v: U32s = @truncate(r);
+        out[j..][0..LANES].* = v;
+        if (comptime FAST_CLZ) continue;
+        const filled = (v >> @splat(28)) == @as(U32s, @splat(0xf));
+        const t = @select(u32, filled, ~v, v);
+        const shifted = @as(F64s, @floatFromInt(t)) + @as(F64s, @splat(0.5));
+        const exponent = @as(U64s, @bitCast(shifted)) >> @splat(52);
+        const count: U32s = @truncate((@as(U64s, @splat(1054)) - exponent) >> @splat(2));
+        const lead = @select(u32, filled, @min(count, @as(U32s, @splat(7))), count);
+        leading[j..][0..LANES].* = lead;
+        heads[j..][0..LANES].* = lead + (@as(U32s, @intFromBool(filled)) << @splat(3));
     }
     var tail_wide: u64 = 0;
     while (j < n) : (j += 1) {
         const r: u64 = @bitCast(scaled[j + 2] - (scaled[j + 1] + scaled[j + 1] - scaled[j]));
         tail_wide |= (r +% (1 << 31)) >> 32;
         out[j] = @truncate(r);
+        if (comptime FAST_CLZ) continue;
+        const w = nibbleWord(out[j]);
+        leading[j] = @intCast(9 - w.nibbles);
+        heads[j] = @intCast(w.word & 0xf);
     }
     return @reduce(.Or, wide) | tail_wide == 0;
 }
@@ -1068,6 +1097,15 @@ const RawSink = struct {
         self.swapFinished();
     }
 
+    // Like putAll with each value's head nibble and leading nibbles given: the word is the head
+    // and the body above it, the code with its leading nibbles masked off.
+    inline fn putAllHeads(self: *RawSink, codes: []const u32, heads: []const u32, leading: []const u32) void {
+        const fit = self.fitting(codes.len);
+        for (codes[0..fit], heads[0..fit], leading[0..fit]) |c, h, l| self.put(h | (c & BODY_BITS[l]) << 4, 9 - @as(u64, l));
+        for (codes[fit..], heads[fit..], leading[fit..]) |c, h, l| self.putChecked(h | (c & BODY_BITS[l]) << 4, 9 - @as(u64, l));
+        self.swapFinished();
+    }
+
     fn swapFinished(self: *RawSink) void {
         const V = 16;
         var i = self.swapped;
@@ -1087,6 +1125,13 @@ const RawSink = struct {
         }
         return self.pos;
     }
+};
+
+// The value bits below each count of leading nibbles.
+const BODY_BITS: [9]u64 = blk: {
+    var masks: [9]u64 = undefined;
+    for (&masks, 0..) |*m, l| m.* = @as(u64, 0xffff_ffff) >> (4 * l);
+    break :blk masks;
 };
 
 // Body length and fill bits for each head nibble.
