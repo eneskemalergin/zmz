@@ -163,6 +163,33 @@ test "[failure] - [base64]: rejects reuse after finish" {
     try std.testing.expectError(error.AlreadyFinished, decoder.update(""));
 }
 
+test "[property] - [base64]: pieces of pieceFor characters always fit a retargeted window" {
+    var source: [300]u8 = undefined;
+    var random = std.Random.DefaultPrng.init(std.testing.random_seed);
+    random.random().bytes(&source);
+    var encoded: [400]u8 = undefined;
+    const text = try base64.encode(&encoded, &source);
+    for (3..40) |size| {
+        var window: [40]u8 = undefined;
+        var decoded: [300]u8 = undefined;
+        var length: usize = 0;
+        var decoder = base64.Decoder.init(&.{});
+        var rest: []const u8 = text;
+        while (rest.len != 0) {
+            // Shorter pieces leave a partial quartet for the next one.
+            const piece = @min(rest.len, 1 + random.random().uintLessThan(usize, base64.Decoder.pieceFor(size)));
+            decoder.retarget(window[0..size]);
+            try decoder.update(rest[0..piece]);
+            const bytes = decoder.take();
+            @memcpy(decoded[length..][0..bytes.len], bytes);
+            length += bytes.len;
+            rest = rest[piece..];
+        }
+        _ = try decoder.finish();
+        try std.testing.expectEqualSlices(u8, &source, decoded[0..length]);
+    }
+}
+
 test "[property] - [base64]: preserves all one-byte and two-byte inputs" {
     var input: [2]u8 = undefined;
     var encoded: [4]u8 = undefined;

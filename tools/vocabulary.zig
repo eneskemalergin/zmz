@@ -63,7 +63,7 @@ fn run(init: std.process.Init) !void {
         try stdout.interface.flush();
         return;
     }
-    const baseline = mzml.cv.Resolver.init(&.{}).resources;
+    const baseline = mzml.cv.Resolver.BUNDLED;
     const blocked = try review(&stdout.interface, baseline, &resources);
     try stdout.interface.flush();
     if (blocked) return error.UnreviewedUpdate;
@@ -978,7 +978,7 @@ test "[unit] - [vocabulary update]: reports each metadata change without changin
 }
 
 test "[failure] - [vocabulary update]: blocks removals kernel changes and new family terms" {
-    const baseline = mzml.cv.Resolver.init(&.{}).resources;
+    const baseline = mzml.cv.Resolver.BUNDLED;
     var next = [_]Vocabulary{ baseline[0], baseline[1] };
     const terms = try std.testing.allocator.dupe(Vocabulary.Term, baseline[0].terms);
     defer std.testing.allocator.free(terms);
@@ -1015,7 +1015,7 @@ test "[failure] - [vocabulary update]: blocks removals kernel changes and new fa
 }
 
 test "[property] - [vocabulary coverage]: every active monitored term has one reviewed disposition" {
-    const resources = mzml.cv.Resolver.init(&.{}).resources;
+    const resources = mzml.cv.Resolver.BUNDLED;
     var counts = [_]usize{ 0, 0, 0 };
     for (resources[0].terms) |term| {
         const families = try monitored(resources[0], term);
@@ -1034,7 +1034,7 @@ test "[property] - [vocabulary coverage]: every active monitored term has one re
 }
 
 test "[property] - [vocabulary manifest]: matches pinned identities and rejects invalid metadata" {
-    const resources = mzml.cv.Resolver.init(&.{}).resources;
+    const resources = mzml.cv.Resolver.BUNDLED;
     const pinned = try std.json.parseFromSlice(Manifest, std.testing.allocator, @embedFile("pinned_manifest"), .{});
     defer pinned.deinit();
     try checkManifest(pinned.value);

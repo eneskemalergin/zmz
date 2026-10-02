@@ -54,7 +54,7 @@ pub const Issues = struct {
 };
 
 /// The selected declaration and table entry, with the accession actually looked up.
-pub const Term = struct {
+pub const Resolution = struct {
     declaration: ?*const cv.Declaration = null,
     resource: ?*const Vocabulary = null,
     match: ?Vocabulary.Match = null,
@@ -65,8 +65,8 @@ pub const Term = struct {
 /// Source metadata and independent parameter/unit interpretation.
 pub const Parameter = struct {
     source: cv.Param,
-    term: Term,
-    unit: Term,
+    term: Resolution,
+    unit: Resolution,
     unit_fields: enum { absent, partial, complete },
     /// `not_declared` means no direct has_units relation, not a unit prohibition.
     unit_allowed: enum { unresolved, not_declared, allowed, disallowed },
@@ -83,11 +83,13 @@ pub fn Quantity(comptime T: type) type {
 /// Ambiguity is an error; no first match is chosen.
 pub const Error = error{ LimitExceeded, DuplicateDeclaration, InvalidBinding, AmbiguousResource, ConflictingVersion };
 
-/// Resolves against the bundled current vocabulary snapshots; `declarations` must outlive every
-/// resolution. Historical snapshots are not bundled.
+/// The bundled current vocabulary snapshots. Historical snapshots are not bundled.
+pub const BUNDLED: []const Vocabulary = @import("generated_data.zig").RESOURCES;
+
+/// Resolves against BUNDLED; `declarations` must outlive every resolution.
 pub fn init(declarations: []const cv.Declaration) Resolver {
     return .{
-        .resources = @import("generated_data.zig").RESOURCES,
+        .resources = BUNDLED,
         .declarations = declarations,
         .known_versions = &.{.{ .resource_key = "psi-ms", .version = "4.1.248", .relationship = .historical }},
     };
@@ -98,7 +100,7 @@ pub fn init(declarations: []const cv.Declaration) Resolver {
 pub fn resolve(self: Resolver, parameter: cv.Param) Error!Parameter {
     var remaining = self.max_work;
     const term = try self.find(parameter.cv_ref, parameter.accession, parameter.name, &remaining);
-    const unit = if (parameter.unit.isAbsent()) Term{} else try self.find(parameter.unit.cv_ref, parameter.unit.accession, parameter.unit.name, &remaining);
+    const unit = if (parameter.unit.isAbsent()) Resolution{} else try self.find(parameter.unit.cv_ref, parameter.unit.accession, parameter.unit.name, &remaining);
     var result: Parameter = .{
         .source = parameter,
         .term = term,
@@ -141,8 +143,8 @@ fn find(
     accession: ?cv.Accession,
     name: ?[]const u8,
     remaining: *usize,
-) Error!Term {
-    var result: Term = .{};
+) Error!Resolution {
+    var result: Resolution = .{};
     result.issues.missing_accession = accession == null;
     const ref = reference orelse {
         result.issues.missing_reference = true;

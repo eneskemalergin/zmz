@@ -89,12 +89,12 @@ pub const Decompressor = struct {
     }
 
     /// Returns up to limit next decoded bytes from the decompressor's own buffer, valid until the
-    /// next call; an empty result means the stream ended and was checked.
-    pub fn next(self: *Decompressor, limit: usize) Error![]const u8 {
+    /// next call, or null once the stream ended and was checked.
+    pub fn next(self: *Decompressor, limit: usize) Error!?[]const u8 {
         if (self.empty) return error.TruncatedInput;
         const reader = &self.state.reader;
         const available = reader.peekGreedy(1) catch |err| switch (err) {
-            error.EndOfStream => return &.{},
+            error.EndOfStream => return null,
             error.ReadFailed => return mapped(self.state.err orelse error.ReadFailed),
         };
         const length = @min(available.len, limit);

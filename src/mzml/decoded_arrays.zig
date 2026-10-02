@@ -5,13 +5,14 @@
 //! buffers grow as needed and are reused between records. Every array decodes as its text
 //! arrives: Base64 goes straight into typed output, into a fixed window for Numpress, or, with
 //! zlib, through a window that the decompressor pulls from. No buffer holds a payload whole.
-//! Selected results stay in source order; source_position indexes record.binaryArrays().
+//! Selected results stay in source order; source_position indexes record.binaryArrays(),
+//! and is 0 for decodeArray.
 //! Results become visible only after the complete record succeeds. Returned slices last
 //! until the next decoded read using this owner, reset, or deinit; ordinary reads do not
 //! invalidate them. No source metadata is borrowed by this owner.
 //!
-//! startRecord, beginArray, decodeText, and complete are the reader engine's entry points
-//! while it parses a record; callers use the reads and decode functions.
+//! beginArray, decodeText, and complete are internal: the reader engine calls them while it
+//! parses a record. Callers use the reads and the decode functions.
 
 const std = @import("std");
 const model = @import("model.zig");
@@ -43,7 +44,6 @@ window: std.ArrayList(u8) = .empty,
 decompressor: ?zlib.Decompressor = null,
 count: usize = 0,
 ready: bool = false,
-default_length: ?usize = null,
 decoder: base64.Decoder = undefined,
 values: numpress.Decoder = undefined,
 // The first Numpress error of the current array. It is reported only after the Base64 and
@@ -92,8 +92,7 @@ pub fn get(self: *const DecodedArrays, position: usize) ?Array {
 pub fn decodeRecord(self: *DecodedArrays, record: model.Record, groups: []const cv.Group) Error!void {
     self.reset();
     errdefer self.reset();
-    try self.startRecord(record.node);
-    for (record.binaryArrays(), 0..) |node, position| try self.decodeRetained(node, groups, position);
+    for (record.binaryArrays(), 0..) |node, position| try self.decodeRetained(node, record.default_array_length, groups, position);
     self.complete();
 }
 
@@ -102,14 +101,13 @@ pub fn decodeRecord(self: *DecodedArrays, record: model.Record, groups: []const 
 pub fn decodeArray(self: *DecodedArrays, node: model.Node, default_length: ?usize, groups: []const cv.Group) Error!Values {
     self.reset();
     errdefer self.reset();
-    self.default_length = default_length;
-    try self.decodeRetained(node, groups, 0);
+    try self.decodeRetained(node, default_length, groups, 0);
     self.complete();
     return self.get(0).?.values;
 }
 
-fn decodeRetained(self: *DecodedArrays, node: model.Node, groups: []const cv.Group, source_position: usize) Error!void {
-    try self.beginArray(node, groups, source_position);
+fn decodeRetained(self: *DecodedArrays, node: model.Node, default_length: ?usize, groups: []const cv.Group, source_position: usize) Error!void {
+    try self.beginArray(node, default_length, groups, source_position);
     const binary = node.child(.binary) orelse return error.PayloadNotRetained;
     var source = RetainedText{ .text = binary.text orelse return error.PayloadNotRetained };
     try self.decodeText(&source);
@@ -125,10 +123,6 @@ const RetainedText = struct {
 };
 
 // --- Reader engine entry points ---
-
-pub fn startRecord(self: *DecodedArrays, node: model.Node) Error!void {
-    self.default_length = if (node.attribute("defaultArrayLength")) |value| try cv.parseInteger(usize, value) else null;
-}
 
 /// Decodes the current array's binary text, pulled from source until its next() returns null.
 /// source.next() returns the next logical text fragment, valid until the following call; its
@@ -178,14 +172,14 @@ pub fn complete(self: *DecodedArrays) void {
     self.ready = true;
 }
 
-pub fn beginArray(self: *DecodedArrays, node: model.Node, groups: []const cv.Group, source_position: usize) Error!void {
+pub fn beginArray(self: *DecodedArrays, node: model.Node, default_length: ?usize, groups: []const cv.Group, source_position: usize) Error!void {
     errdefer |err| if (self.failure == null) {
         self.failure = .{ .stage = .array, .detail = switch (@as(anyerror, err)) {
             error.MissingValue, error.EmptyValue, error.InvalidValue, error.Overflow => .{ .attribute = .array_length },
             else => .none,
         } };
     };
-    const array = try model.BinaryArray.init(node, self.default_length, groups);
+    const array = try model.BinaryArray.init(node, default_length, groups);
     if (self.count == self.outputs.items.len) try self.outputs.append(self.allocator, .{});
     const output = &self.outputs.items[self.count];
     self.count += 1;
@@ -276,8 +270,7 @@ fn decompressInto(self: *DecodedArrays, decompressor: *zlib.Decompressor, output
         const bound = try arrays.wireBound(f64, output.length, output.encoding.pipeline);
         var total: usize = 0;
         while (true) {
-            const piece = try decompressor.next(bound - total + 1);
-            if (piece.len == 0) return;
+            const piece = try decompressor.next(bound - total + 1) orelse return;
             total += piece.len;
             if (total > bound) return error.DecodedSizeMismatch;
             self.feed(piece);
@@ -347,8 +340,7 @@ fn Base64Input(comptime Source: type) type {
                 const room = r.buffer.len - r.end;
                 if (room < 6) return;
                 const part = self.pending[0..@min(self.pending.len, base64.Decoder.pieceFor(room))];
-                self.decoder.output = r.buffer[r.end..];
-                self.decoder.taken = self.decoder.counts.decoded_bytes;
+                self.decoder.retarget(r.buffer[r.end..]);
                 self.decoder.update(part) catch |err| return self.stop(err, true);
                 r.end += self.decoder.take().len;
                 self.pending = self.pending[part.len..];

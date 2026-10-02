@@ -42,6 +42,7 @@ pub const Limits = struct {
     record_bytes: usize = 256 * 1024 * 1024,
     nodes: usize = 100_000,
     list_entries: usize = 100_000,
+    /// Also bounds the text of the index's offset, indexListOffset, and fileChecksum elements.
     binary_text_bytes: usize = 256 * 1024 * 1024,
 };
 
@@ -109,6 +110,8 @@ list_scopes: [2]?Scope = .{ null, null },
 child_scratch: std.ArrayList(model.Node) = .empty,
 param_scratch: std.ArrayList(cv.Entry) = .empty,
 decoded_arrays: ?*DecodedArrays = null,
+// The decoded record's defaultArrayLength, for its arrays.
+record_default_length: ?usize = null,
 decode_binary: bool = false,
 fragment_ancestors: ?xml.Ancestors = null,
 
@@ -633,10 +636,7 @@ fn startNodeFor(self: *StreamReader, storage: *Storage, kind_value: model.Kind, 
     const attributes = try self.copyAttributes(
         storage,
         event.data.start_element,
-        switch (kind_value) {
-            .referenceable_param_group, .spectrum, .chromatogram => "id",
-            else => "",
-        },
+        kind_value == .referenceable_param_group or kind_value == .spectrum or kind_value == .chromatogram,
         retain,
     );
     return .{
@@ -704,8 +704,8 @@ fn parseNodeFor(self: *StreamReader, storage: *Storage, depth: usize, advance_af
     node = try self.startNodeFor(storage, kind_value, retention != .none);
     var child_payload = payload;
     if (storage == &self.record_store and depth == 1) {
-        if (self.decoded_arrays) |output| {
-            output.startRecord(node) catch |err| return try self.attributeError(err, .default_array_length);
+        if (self.decoded_arrays != null) {
+            self.record_default_length = try self.number(node, .default_array_length);
             child_payload = .retain;
         }
     }
@@ -752,7 +752,7 @@ fn parseNodeFor(self: *StreamReader, storage: *Storage, depth: usize, advance_af
             }
             if (self.decoded_arrays) |output| {
                 decode_array = child_payload == .retain;
-                if (decode_array) output.beginArray(node, self.header.groups, position) catch |err| {
+                if (decode_array) output.beginArray(node, self.record_default_length, self.header.groups, position) catch |err| {
                     self.capture(err, .array, .none);
                     self.failure.?.element = .binary_data_array;
                     return @as(Error!model.Node, err);
@@ -789,6 +789,7 @@ fn parseNodeFor(self: *StreamReader, storage: *Storage, depth: usize, advance_af
                     // Late declarations must agree with the bytes already decoded.
                     _ = model.arrayEncoding(node, self.header.groups) catch |err| {
                         self.capture(err, .array, .none);
+                        self.failure.?.element = .binary_data_array;
                         return @as(Error!model.Node, err);
                     };
                 }
@@ -957,14 +958,10 @@ fn copyAttributes(
     self: *StreamReader,
     storage: *Storage,
     start: xml.StartElement,
-    required: []const u8,
+    requires_id: bool,
     comptime retain: bool,
 ) Error![]const model.Attribute {
-    var names = std.mem.tokenizeScalar(u8, required, ' ');
-    while (names.next()) |name| {
-        const attribute = start.attribute(null, name);
-        if (attribute == null) return try self.attributeError(error.MissingAttribute, .id);
-    }
+    if (requires_id and start.attribute(null, "id") == null) return try self.attributeError(error.MissingAttribute, .id);
     if (retain and self.cursor.hasAdditionalNamespaces()) return self.copyForeignAttributes(storage, start, null);
     var byte_count: usize = 0;
     var attribute_count: usize = 0;

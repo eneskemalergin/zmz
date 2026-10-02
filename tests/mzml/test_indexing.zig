@@ -1879,3 +1879,18 @@ test "[integration] - [mzML indexed writer]: streams multi-chunk output through 
     try std.testing.expectEqual(null, report.location);
     try std.testing.expectError(error.FailedState, writer.finish());
 }
+
+test "[failure] - [mzML index]: bounds embedded offset text by binary_text_bytes and reports the need" {
+    // Padding inside the index keeps every offset valid; open_embedded does not check the checksum.
+    const source = try std.mem.replaceOwned(u8, std.testing.allocator, @embedFile("data/writer_indexed.mzML"), ">1242</offset>", ">" ++ " " ** 100 ++ "1242</offset>");
+    defer std.testing.allocator.free(source);
+    var failure: ?mzml.Diagnostic = null;
+    try std.testing.expectError(error.LimitExceeded, mzml.IndexedReader.buildWithDiagnostic(std.testing.allocator, .{ .bytes = source }, .{
+        .policy = .open_embedded,
+        .reader = .{ .limits = .{ .binary_text_bytes = 64 } },
+    }, &failure));
+    const limit = failure.?.detail.limit;
+    try std.testing.expectEqual(.binary_text_bytes, limit.name);
+    try std.testing.expectEqual(@as(u64, 64), limit.maximum);
+    try std.testing.expectEqual(@as(?u64, 104), limit.needed);
+}

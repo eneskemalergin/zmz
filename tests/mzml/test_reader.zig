@@ -876,6 +876,13 @@ test "[integration] - [mzML parameters]: retains late array declarations without
         defer std.testing.allocator.free(conflicting);
         try support.readAll(std.testing.allocator, conflicting, .{});
         try std.testing.expectError(case[1], readDecoded(std.testing.allocator, conflicting, .{}));
+        var conflicting_input = std.Io.Reader.fixed(conflicting);
+        var conflicting_reader = try mzml.StreamReader.init(std.testing.allocator, &conflicting_input, .{});
+        defer conflicting_reader.deinit();
+        try std.testing.expectError(case[1], conflicting_reader.nextDecodedRecord(&output));
+        const report = conflicting_reader.diagnostic().?;
+        try std.testing.expectEqual(.binary_data_array, report.element.?);
+        try std.testing.expectEqual(@as(usize, 0), report.array_position.?);
     }
 }
 
@@ -2666,9 +2673,8 @@ fn expectStreamedMatchesWhole(
 
     // The reader hands text over in fragments of any size.
     decoded.reset();
-    decoded.default_length = length;
     const actual = streamed: {
-        decoded.beginArray(node, &.{}, 0) catch |err| break :streamed err;
+        decoded.beginArray(node, length, &.{}, 0) catch |err| break :streamed err;
         var fragments: Fragments = .{ .rest = text, .source = source };
         decoded.decodeText(&fragments) catch |err| break :streamed err;
         decoded.complete();

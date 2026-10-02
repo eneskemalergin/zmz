@@ -9,9 +9,9 @@ const model = @import("model.zig");
 const cv = @import("../cv/source.zig");
 const owned = @import("owned.zig");
 const schema = @import("schema.zig");
-const PublicStreamReader = @import("stream_reader.zig").StreamReader;
-const DecodedArrays = PublicStreamReader.DecodedArrays;
-const StreamReader = @import("internal/reader_engine.zig");
+const StreamReader = @import("stream_reader.zig").StreamReader;
+const DecodedArrays = StreamReader.DecodedArrays;
+const Engine = @import("internal/reader_engine.zig");
 const xml = @import("../xml/mzml_adapter.zig");
 const Diagnostic = @import("diagnostic.zig");
 const Ids = @import("internal/id_index.zig").IdIndex(Entry);
@@ -36,7 +36,7 @@ pub const Options = struct {
     /// Bounded backward search for indexListOffset when opening an embedded index.
     tail_bytes: usize = 64 * 1024,
     /// Applies to headers and returned records; index building skips payload text.
-    reader: PublicStreamReader.Options = .{},
+    reader: StreamReader.Options = .{},
 };
 
 /// Physical span and ID, borrowed from this index. Index is the zero-based lookup
@@ -44,7 +44,7 @@ pub const Options = struct {
 /// start may precede XML whitespace and end bounds the span at the next target or trailer.
 pub const Entry = struct { kind: model.Kind, id: []const u8, index: usize, start: u64, end: u64 };
 
-pub const Error = PublicStreamReader.Error || owned.Error || std.Io.File.StatError || std.Io.File.ReadPositionalError || error{
+pub const Error = StreamReader.Error || owned.Error || std.Io.File.StatError || std.Io.File.ReadPositionalError || error{
     MissingIndex,
     InvalidIndex,
     DuplicateId,
@@ -66,7 +66,7 @@ ids: [2]Ids.Map = .{ .empty, .empty },
 metadata: ?owned.Header = null,
 contexts: [2]?FragmentAncestors = .{ null, null },
 counts: [2]usize = .{ 0, 0 },
-lookup_reader: ?StreamReader = null,
+lookup_reader: ?Engine = null,
 lookup_kind: ?model.Kind = null,
 failure: ?Diagnostic = null,
 
@@ -121,7 +121,7 @@ fn buildInner(allocator: std.mem.Allocator, source: Source, options: Options, fa
     var reader_options = options.reader;
     reader_options.payload = .skip;
     reader_options.retain_index = false;
-    var reader = try StreamReader.init(allocator, input, reader_options);
+    var reader = try Engine.init(allocator, input, reader_options);
     defer reader.deinit();
     errdefer if (self.failure == null) {
         self.failure = reader.diagnostic();
@@ -270,7 +270,7 @@ fn readEntry(self: *IndexedReader, allocator: std.mem.Allocator, entry: Entry, o
     var input = FragmentInput.init(self, if (reuse_ancestors) &.{} else context.prefix, entry.start, length, context.suffix, buffer[0..@max(4, @min(buffer.len, total))]);
     if (self.lookup_reader == null) {
         var empty_input = std.Io.Reader.fixed(&.{});
-        self.lookup_reader = try StreamReader.init(self.allocator, &empty_input, self.options.reader);
+        self.lookup_reader = try Engine.init(self.allocator, &empty_input, self.options.reader);
         self.lookup_reader.?.cursor.resetEmpty();
     }
     var record = readFragment(&self.lookup_reader.?, allocator, &input.interface, context.ancestors, entry.start, context.prefix.len, self.options.policy != .open_embedded, self.header().groups, output, reuse_ancestors, .{ .kind = entry.kind, .id = entry.id }) catch |err| {
@@ -289,7 +289,7 @@ fn readEntry(self: *IndexedReader, allocator: std.mem.Allocator, entry: Entry, o
 
 // Lends the index's groups and the decoded output to the lookup reader for one fragment only.
 fn readFragment(
-    reader: *StreamReader,
+    reader: *Engine,
     allocator: std.mem.Allocator,
     input: *std.Io.Reader,
     ancestors: usize,
@@ -299,7 +299,7 @@ fn readFragment(
     groups: []const cv.Group,
     output: ?*DecodedArrays,
     reuse_ancestors: bool,
-    expected: StreamReader.FragmentTarget,
+    expected: Engine.FragmentTarget,
 ) Error!owned.Record {
     reader.header.groups = groups;
     reader.decoded_arrays = output;
@@ -400,7 +400,7 @@ const FragmentInput = struct {
     }
 };
 
-fn trailerLimits(self: *const IndexedReader) PublicStreamReader.Limits {
+fn trailerLimits(self: *const IndexedReader) StreamReader.Limits {
     var limits = self.options.reader.limits;
     limits.header_bytes = self.options.index_bytes;
     limits.list_entries = @max(2, self.options.max_records);
@@ -408,7 +408,7 @@ fn trailerLimits(self: *const IndexedReader) PublicStreamReader.Limits {
     return limits;
 }
 
-fn openEmbedded(self: *IndexedReader, reader: *StreamReader) Error!void {
+fn openEmbedded(self: *IndexedReader, reader: *Engine) Error!void {
     const scopes = reader.scopes[0..reader.scope_count];
     const prefix_len = std.math.cast(usize, scopes[0].end) orelse return error.LimitExceeded;
     if (prefix_len > self.options.reader.limits.header_bytes) return try self.limitError(.header_bytes, self.options.reader.limits.header_bytes, prefix_len);
@@ -435,7 +435,7 @@ fn openEmbedded(self: *IndexedReader, reader: *StreamReader) Error!void {
         @memcpy(bytes[0..prefix_len], prefix);
         @memcpy(bytes[prefix_len..], tail[start..]);
         var footer_failure: ?Diagnostic = null;
-        var parsed = StreamReader.parseFooter(self.allocator, bytes, trailer_options, physical_start, prefix_len, &footer_failure) catch |err| switch (err) {
+        var parsed = Engine.parseFooter(self.allocator, bytes, trailer_options, physical_start, prefix_len, &footer_failure) catch |err| switch (err) {
             error.OutOfMemory, error.LimitExceeded => {
                 self.failure = footer_failure;
                 if (self.failure) |*report| if (report.detail == .limit and report.detail.limit.name == .header_bytes) {
@@ -573,7 +573,8 @@ fn indexText(self: *IndexedReader, cursor: *xml.Cursor, text: *std.ArrayList(u8)
     while (cursor.current) |event| {
         if (event.data != .text) break;
         const fragment = event.data.text.bytes;
-        if (fragment.len > self.options.reader.limits.binary_text_bytes -| text.items.len) return try self.limitError(.binary_text_bytes, self.options.reader.limits.binary_text_bytes, null);
+        const maximum = self.options.reader.limits.binary_text_bytes;
+        if (fragment.len > maximum -| text.items.len) return try self.limitError(.binary_text_bytes, maximum, text.items.len +| fragment.len);
         try text.appendSlice(self.allocator, fragment);
         try cursor.advance(true);
     }
@@ -618,9 +619,9 @@ fn encoding(self: *const IndexedReader) Error!?std.builtin.Endian {
     return if (signature[0] == 0xff or (signature[0] == '<' and signature[1] == 0)) .little else if (signature[0] == 0xfe or (signature[0] == 0 and signature[1] == '<')) .big else null;
 }
 
-fn captureAncestors(self: *IndexedReader, reader: *StreamReader, k: usize) Error!FragmentAncestors {
+fn captureAncestors(self: *IndexedReader, reader: *Engine, k: usize) Error!FragmentAncestors {
     const current_scopes = reader.scopes[0..reader.scope_count];
-    var scopes: [4]StreamReader.Scope = undefined;
+    var scopes: [4]Engine.Scope = undefined;
     @memcpy(scopes[0..current_scopes.len], current_scopes);
     scopes[0].start = 0;
     scopes[current_scopes.len] = reader.list_scopes[k].?;

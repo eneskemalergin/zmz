@@ -137,10 +137,16 @@ pub const Decoder = struct {
         return self.output[0..n];
     }
 
-    /// Text characters per update that always fit a window of `window` bytes with take: 3
-    /// bytes per 4 characters, plus the bytes of a quartet left from the previous update.
+    /// Decodes later updates into output, from its start, as take does.
+    pub fn retarget(self: *Decoder, output: []u8) void {
+        self.output = output;
+        self.taken = self.counts.decoded_bytes;
+    }
+
+    /// Text characters per update that always fit a window of `window` bytes with take: a
+    /// quartet left from the previous update has at most 3 characters, so 4 per 3 bytes fit.
     pub fn pieceFor(window: usize) usize {
-        return (window - 3) / 3 * 4;
+        return window / 3 * 4;
     }
 
     /// Checks the final quartet and returns the counts; call it once.
