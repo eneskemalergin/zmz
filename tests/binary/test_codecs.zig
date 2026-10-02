@@ -750,7 +750,7 @@ test "[integration] - [array encoder]: keeps every wire until reset for all pipe
     }
 }
 
-test "[property] - [array encoder]: streams the same bytes and errors as encodeWire" {
+test "[property] - [array encoder]: streamed zlib matches encoding whole then compressing" {
     var encoder = arrays.Encoder.init(std.testing.allocator, .even);
     defer encoder.deinit();
     var compressor = try zlib.Compressor.init(std.testing.allocator, .even);
@@ -766,16 +766,18 @@ test "[property] - [array encoder]: streams the same bytes and errors as encodeW
     defer std.testing.allocator.free(transformed);
     const transport = try std.testing.allocator.alloc(u8, zlib.compressBound(transformed.len));
     defer std.testing.allocator.free(transport);
+    const pairs = [_][2]arrays.Pipeline{
+        .{ .zlib, .none }, .{ .linear_zlib, .linear }, .{ .pic_zlib, .pic }, .{ .slof_zlib, .slof },
+    };
     for ([_]?f64{ null, -1 }) |invalid| {
         if (invalid) |bad| values[values.len / 2] = bad;
-        inline for (std.meta.tags(arrays.Pipeline)) |pipeline| {
+        for (pairs) |pair| {
             for ([_]?f64{ null, 1000 }) |fixed_point| {
-                const options: arrays.EncodeOptions = .{ .pipeline = pipeline, .fixed_point = fixed_point };
                 encoder.reset();
-                const actual = encoder.encode(f64, &values, options);
-                const expected = arrays.encodeWire(f64, &values, options, .{ .transport = transport, .transformed = transformed }, &compressor);
-                if (expected) |bytes| {
-                    try std.testing.expectEqualSlices(u8, bytes, try actual);
+                const actual = encoder.encode(f64, &values, .{ .pipeline = pair[0], .fixed_point = fixed_point });
+                const plain = arrays.encodeWire(f64, &values, .{ .pipeline = pair[1], .fixed_point = fixed_point }, .{ .transport = &.{}, .transformed = transformed }, null);
+                if (plain) |bytes| {
+                    try std.testing.expectEqualSlices(u8, try compressor.compress(transport, bytes), try actual);
                 } else |err| try std.testing.expectError(err, actual);
             }
         }

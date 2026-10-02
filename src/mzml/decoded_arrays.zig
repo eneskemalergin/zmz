@@ -136,7 +136,7 @@ pub fn text(self: *DecodedArrays, bytes: []const u8) Error!void {
     };
     const pipeline = self.outputs.items[self.count - 1].encoding.pipeline;
     if (pipeline.isNumpress() and !pipeline.hasZlib()) return self.numpressText(bytes);
-    const compressed = pipeline != .none;
+    const compressed = pipeline.hasZlib();
     if (compressed) {
         const pending = std.math.add(usize, bytes.len, self.decoder.quartet_len) catch return error.LengthOverflow;
         const needed = std.math.add(usize, self.decoder.counts.decoded_bytes, pending / 4 * 3) catch return error.LengthOverflow;
