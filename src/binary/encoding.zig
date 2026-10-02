@@ -118,9 +118,6 @@ pub const Error = cv.ExpansionError || error{
     ConflictingPrimitive,
     ConflictingCompression,
     UnsupportedEncoding,
-    NotBinaryArray,
-    PayloadNotRetained,
-    TypeMismatch,
 };
 
 /// Classifies the reviewed primitive and compression terms. A missing term is an error, and

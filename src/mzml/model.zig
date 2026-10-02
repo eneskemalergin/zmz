@@ -365,7 +365,8 @@ pub const Record = struct {
 
 pub const Primitive = encoding.Primitive;
 pub const Encoding = encoding.Descriptor;
-pub const EncodingError = encoding.Error;
+/// encoding.Error, and the failures of reading a modeled array node.
+pub const EncodingError = encoding.Error || error{ NotBinaryArray, PayloadNotRetained, TypeMismatch };
 
 /// A binary array node with its classified encoding and value count.
 pub const BinaryArray = struct {

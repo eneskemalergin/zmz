@@ -11,7 +11,6 @@ const model = @import("model.zig");
 const owned = @import("owned.zig");
 const copy = @import("internal/owned_copy.zig");
 const arrays = @import("../binary/arrays.zig");
-const base64 = @import("../binary/base64.zig");
 const encoding = @import("../binary/encoding.zig");
 const schema = @import("schema.zig");
 const xml = @import("../xml/mzml_adapter.zig");
@@ -24,6 +23,7 @@ pub const Error = owned.Error || schema.Error || arrays.Error || model.EncodingE
     InvalidRecord,
     InvalidArrayLength,
     GroupRewriteRequired,
+    MissingAttribute,
 };
 
 /// The caller chooses the role, its unit, and the encoding; none is inferred.
@@ -126,22 +126,23 @@ pub fn number(self: *Builder, parameter: cv.Param, value: f64) Error!cv.Param {
 /// Builds array metadata with its primitive and codec terms, and a payload that the writer
 /// encodes while writing (with encoder's compressor or buffer when needed). Options are
 /// checked here; Numpress value errors surface when the record is written. Default arrays
-/// (m/z, intensity, time) omit arrayLength; others carry it.
+/// (m/z, intensity, time) omit arrayLength; others carry it. The metadata has no
+/// encodedLength: the writer writes it first, from the text it writes.
 pub fn prepareArray(self: *Builder, comptime T: type, values: []const T, options: ArrayOptions, encoder: *arrays.Encoder) Error!PreparedArray {
     try checkArrayOptions(options);
     const source = arrays.Source.of(T, values, options.encoding, encoder);
     try source.check();
-    const encoded_length = if (source.wireLength()) |length| try base64.encodedSize(length) else 0;
     return .{
-        .array = try self.arrayMetadata(T, values.len, options, encoded_length),
+        .array = try self.arrayMetadata(T, values.len, options),
         .payload = .{ .source = source },
     };
 }
 
 /// Prepares values under a copy of the source array's metadata, like prepareArray, replacing
-/// its primitive, codec, and length terms and keeping other fields in order. Bare group references
-/// become local parameters; changing an annotated group's encoding needs a Reencoding header
-/// and otherwise returns GroupRewriteRequired. If a default array omits arrayLength, update
+/// its primitive, codec, and arrayLength and keeping other fields in order; the writer
+/// replaces encodedLength. Bare group references become local parameters; changing an
+/// annotated group's encoding needs a Reencoding header and otherwise returns
+/// GroupRewriteRequired. If a default array omits arrayLength, update
 /// the record's defaultArrayLength when the length changes.
 pub fn prepareArrayFrom(
     self: *Builder,
@@ -168,33 +169,18 @@ fn prepareArrayFromInner(self: *Builder, comptime T: type, values: []const T, so
     _ = try reencodedParams(params, source.params, groups, target, replacements, params.len);
     for (params) |*entry| entry.* = try copier.entry(entry.*);
     const is_default = counted.is_default;
-    var encoded_length: [32]u8 = undefined;
     var array_length: [32]u8 = undefined;
-    const known_length = if (prepared.wireLength()) |length| try base64.encodedSize(length) else 0;
-    const encoded_text = encoded_length[0..std.fmt.printInt(&encoded_length, known_length, 10, .lower, .{})];
     const length_text = array_length[0..std.fmt.printInt(&array_length, values.len, 10, .lower, .{})];
-    const add_encoded_length = source.attribute("encodedLength") == null;
     const add_array_length = !is_default and source.attribute("arrayLength") == null;
-    const added = @as(usize, @intFromBool(add_encoded_length)) + @intFromBool(add_array_length);
+    const added: usize = @intFromBool(add_array_length);
     const attributes = try copier.alloc(model.Attribute, std.math.add(usize, source.attributes.len, added) catch return error.LimitExceeded);
     for (source.attributes, attributes[0..source.attributes.len]) |attribute, *destination| {
         var changed = attribute;
-        if (attribute.namespace_uri == null) {
-            if (std.mem.eql(u8, attribute.name, "encodedLength")) {
-                changed.value = encoded_text;
-            } else if (std.mem.eql(u8, attribute.name, "arrayLength")) {
-                changed.value = length_text;
-            }
-        }
+        if (attribute.namespace_uri == null and std.mem.eql(u8, attribute.name, "arrayLength")) changed.value = length_text;
         destination.* = try copier.attribute(changed);
     }
-    var attribute_count = source.attributes.len;
-    if (add_encoded_length) {
-        attributes[attribute_count] = try copier.attribute(.{ .name = "encodedLength", .value = encoded_text });
-        attribute_count += 1;
-    }
     if (add_array_length) {
-        attributes[attribute_count] = try copier.attribute(.{ .name = "arrayLength", .value = length_text });
+        attributes[source.attributes.len] = try copier.attribute(.{ .name = "arrayLength", .value = length_text });
     }
     var binary = source.children[0];
     binary.text = null;
@@ -440,20 +426,18 @@ fn checkArrayOptions(options: ArrayOptions) Error!void {
         options.role.name == null) return error.InvalidDeclaration;
 }
 
-fn arrayMetadata(self: *Builder, comptime T: type, value_count: usize, options: ArrayOptions, encoded_length: usize) Error!Array {
+fn arrayMetadata(self: *Builder, comptime T: type, value_count: usize, options: ArrayOptions) Error!Array {
     const is_default = isDefaultRole(options.role.accession.?);
     const primitive = encoding.primitiveTerm(encoding.Primitive.of(T));
     const codec = encoding.codecTerm(options.encoding.pipeline);
-    var length: [32]u8 = undefined;
     var count: [32]u8 = undefined;
     var attrs = [_]model.Attribute{
-        .{ .name = "encodedLength", .value = length[0..std.fmt.printInt(&length, encoded_length, 10, .lower, .{})] },
         .{ .name = "arrayLength", .value = count[0..std.fmt.printInt(&count, value_count, 10, .lower, .{})] },
         .{ .name = "dataProcessingRef", .value = options.data_processing_ref orelse "" },
     };
-    var attribute_count: usize = if (is_default) 1 else 2;
+    var attribute_count: usize = if (is_default) 0 else 1;
     if (options.data_processing_ref != null) {
-        attrs[attribute_count] = attrs[2];
+        attrs[attribute_count] = attrs[1];
         attribute_count += 1;
     }
     const params = [_]cv.Entry{

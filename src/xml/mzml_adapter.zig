@@ -35,12 +35,6 @@ pub const Error = ReadError || InitError || std.mem.Allocator.Error || error{
 };
 const ParserError = Error;
 
-/// XML declaration version recognized before the mzML layer applies its policy.
-pub const XmlVersion = enum {
-    xml10,
-    xml11,
-};
-
 const Encoding = enum {
     utf8,
     latin1,
@@ -84,12 +78,6 @@ pub const Name = struct {
     }
 };
 
-pub const Start = StartElement;
-
-pub fn localName(name: Name) []const u8 {
-    return name.expanded.local;
-}
-
 /// A parsed non-namespace attribute borrowed until the next cursor event.
 pub const Attribute = struct {
     name: Name,
@@ -129,7 +117,7 @@ pub const Text = struct {
 
 /// Events exposed to the mzML reader and indexed-reader bridge.
 pub const EventData = union(enum) {
-    document_start: struct { version: XmlVersion },
+    document_start,
     start_element: StartElement,
     end_element: EndElement,
     text: Text,
@@ -434,7 +422,6 @@ pub const Ancestors = struct {
     namespace_bytes: usize,
     bindings: usize,
     encoding: Encoding,
-    version: XmlVersion,
     mzml_namespace: []const u8,
     pending_empty: bool,
 };
@@ -456,7 +443,6 @@ pub const Cursor = struct {
     in_cdata: bool = false,
     cdata_brackets: u2 = 0,
     normal_text_brackets: u2 = 0,
-    effective_version: XmlVersion = .xml10,
     mzml_namespace: []const u8 = NAMESPACE,
     frames: [MAX_XML_DEPTH]Frame = undefined,
     pending_empty: bool = false,
@@ -471,7 +457,7 @@ pub const Cursor = struct {
     namespace_bindings: std.ArrayList(NamespaceBinding) = .empty,
     additional_namespaces: ?bool = null,
     failure: ?Error = null,
-    limit_failure: ?enum { depth, attributes, attribute_bytes, nodes, declaration_bytes, text_bytes } = null,
+    limit_failure: ?enum { depth, attributes, attribute_bytes, nodes, declaration_bytes } = null,
 
     /// Initializes a cursor without consuming the input.
     pub fn init(
@@ -508,7 +494,7 @@ pub const Cursor = struct {
     }
 
     /// Reuses the cursor with a new input stream and clears parser state.
-    pub fn reset(self: *Cursor, input: *std.Io.Reader) Error!void {
+    pub fn reset(self: *Cursor, input: *std.Io.Reader) void {
         self.source.reset(input);
         self.resetState(false);
     }
@@ -531,7 +517,6 @@ pub const Cursor = struct {
             .namespace_bytes = self.namespace_bytes.items.len,
             .bindings = self.namespace_bindings.items.len,
             .encoding = self.source.encoding,
-            .version = self.effective_version,
             .mzml_namespace = self.mzml_namespace,
             .pending_empty = self.pending_empty,
         };
@@ -552,7 +537,6 @@ pub const Cursor = struct {
         self.open_names.items = self.open_names.allocatedSlice()[0..saved.names];
         self.namespace_bytes.items = self.namespace_bytes.allocatedSlice()[0..saved.namespace_bytes];
         self.namespace_bindings.items = self.namespace_bindings.allocatedSlice()[0..saved.bindings];
-        self.effective_version = saved.version;
         self.mzml_namespace = saved.mzml_namespace;
         self.pending_empty = saved.pending_empty;
     }
@@ -570,7 +554,6 @@ pub const Cursor = struct {
         self.in_cdata = false;
         self.cdata_brackets = 0;
         self.normal_text_brackets = 0;
-        self.effective_version = .xml10;
         self.mzml_namespace = NAMESPACE;
         self.additional_namespaces = null;
         self.pending_empty = false;
@@ -614,9 +597,7 @@ pub const Cursor = struct {
             };
             self.offset = event.span.start;
             switch (event.data) {
-                .document_start => |document| {
-                    if (document.version != .xml10) return error.UnsupportedVersion;
-                },
+                .document_start => {},
                 .start_element => |start| {
                     if (self.depth == 1 and optionalSliceEql(start.name.expanded.namespace_uri, NAMESPACE_1_0))
                         self.mzml_namespace = NAMESPACE_1_0;
@@ -789,7 +770,7 @@ pub const Cursor = struct {
             self.document_started = true;
             return .{
                 .span = .{ .start = 0, .end = self.source.currentOffset() },
-                .data = .{ .document_start = .{ .version = self.effective_version } },
+                .data = .document_start,
             };
         }
 
@@ -826,7 +807,7 @@ pub const Cursor = struct {
 
             const opening = try self.requiredCodepoint();
             if (try self.readBufferedStartElement(opening.start)) |event| return event;
-            const marker = self.requiredCodepoint() catch |err| return err;
+            const marker = try self.requiredCodepoint();
             switch (marker.value) {
                 '/' => return try self.readEndElement(opening.start),
                 '?' => {
@@ -834,9 +815,9 @@ pub const Cursor = struct {
                     continue;
                 },
                 '!' => {
-                    const declaration_marker = self.requiredCodepoint() catch |err| return err;
+                    const declaration_marker = try self.requiredCodepoint();
                     if (declaration_marker.value == '-') {
-                        const second_dash = self.requiredCodepoint() catch |err| return err;
+                        const second_dash = try self.requiredCodepoint();
                         if (second_dash.value != '-') return error.InvalidXml;
                         try self.readComment();
                         continue;
@@ -862,7 +843,7 @@ pub const Cursor = struct {
         };
         if (first.value != '<') return;
 
-        const opening = self.requiredCodepoint() catch |err| return err;
+        const opening = try self.requiredCodepoint();
         const marker = self.source.peekCodepoint() catch |err| switch (err) {
             error.EndOfStream => {
                 try self.source.unread(opening);
@@ -910,13 +891,12 @@ pub const Cursor = struct {
         try self.appendEventSlice(encoded[0..len]);
     }
 
-    fn appendTextCodepoint(self: *Cursor, value: u21, normalize_cr: bool) Error!void {
+    // Callers check the chunk has room first, so text ends a chunk instead of failing.
+    fn appendTextCodepoint(self: *Cursor, value: u21) Error!void {
         if (!isXmlChar(value)) return error.InvalidXml;
-        const actual = if (normalize_cr and value == '\r') '\n' else value;
         var encoded: [4]u8 = undefined;
-        const len = std.unicode.utf8Encode(actual, &encoded) catch return error.InvalidXml;
-        const next_length = std.math.add(usize, self.text_bytes.items.len, len) catch return error.LimitExceeded;
-        if (next_length > TEXT_CHUNK_BYTES) return self.limitError(.text_bytes);
+        const len = std.unicode.utf8Encode(value, &encoded) catch return error.InvalidXml;
+        std.debug.assert(len <= TEXT_CHUNK_BYTES - self.text_bytes.items.len);
         try self.text_bytes.appendSlice(self.allocator, encoded[0..len]);
     }
 
@@ -962,7 +942,7 @@ pub const Cursor = struct {
                     if (length != 0) continue;
                 }
             }
-            const value = self.requiredCodepoint() catch |err| return err;
+            const value = try self.requiredCodepoint();
             if (value.value > 0x7F) return error.InvalidXml;
             const byte: u8 = @intCast(value.value);
             if (!have_character) {
@@ -1015,7 +995,7 @@ pub const Cursor = struct {
                     continue;
                 }
             }
-            const value = self.requiredCodepoint() catch |err| return err;
+            const value = try self.requiredCodepoint();
             if (value.value == quote) break;
             if (value.value == '<') return error.InvalidXml;
             if (value.value == '&') {
@@ -1178,7 +1158,7 @@ pub const Cursor = struct {
 
         while (true) {
             try self.skipWhitespace();
-            const marker = self.requiredCodepoint() catch |err| return err;
+            const marker = try self.requiredCodepoint();
             if (marker.value == '>') break;
             if (marker.value == '/') {
                 const close = try self.requiredCodepoint();
@@ -1238,7 +1218,7 @@ pub const Cursor = struct {
 
         const binding_start = self.namespace_bindings.items.len;
         const namespace_bytes_start = self.namespace_bytes.items.len;
-        try self.installNamespaces(binding_start);
+        try self.installNamespaces();
         const element_name = try self.makeName(bytes, name_range);
 
         const frame_name_start = self.open_names.items.len;
@@ -1277,15 +1257,12 @@ pub const Cursor = struct {
         };
     }
 
-    fn installNamespaces(self: *Cursor, binding_start: usize) Error!void {
+    // Raw attribute names are unique, so each prefix is declared once per element.
+    fn installNamespaces(self: *Cursor) Error!void {
         if (self.namespace_declarations.items.len != 0) self.additional_namespaces = null;
         for (self.namespace_declarations.items) |declaration| {
             const prefix = self.event_bytes.items[declaration.prefix.start..][0..declaration.prefix.len];
             const uri = self.event_bytes.items[declaration.uri.start..][0..declaration.uri.len];
-            for (self.namespace_bindings.items[binding_start..]) |previous| {
-                const previous_prefix = self.namespace_bytes.items[previous.prefix_start..][0..previous.prefix_len];
-                if (std.mem.eql(u8, previous_prefix, prefix)) return error.InvalidXml;
-            }
             if (std.mem.eql(u8, prefix, "xmlns")) return error.InvalidXml;
             if (std.mem.eql(u8, prefix, "xml")) {
                 if (!std.mem.eql(u8, uri, XML_NAMESPACE)) return error.InvalidXml;
@@ -1418,16 +1395,16 @@ pub const Cursor = struct {
             if (value.value == '&') {
                 if (self.text_bytes.items.len != 0) break;
                 _ = try self.requiredCodepoint();
-                try self.appendTextCodepoint(try self.readEntity(), false);
+                try self.appendTextCodepoint(try self.readEntity());
                 self.normal_text_brackets = 0;
                 continue;
             }
             const encoded_len = std.unicode.utf8CodepointSequenceLength(value.value) catch return error.InvalidXml;
-            if (value.value != '\r' and encoded_len > TEXT_CHUNK_BYTES - self.text_bytes.items.len) break;
+            if (encoded_len > TEXT_CHUNK_BYTES - self.text_bytes.items.len) break;
             _ = try self.requiredCodepoint();
             if (value.value == ']') {
                 if (self.normal_text_brackets < 2) self.normal_text_brackets += 1;
-                try self.appendTextCodepoint(value.value, false);
+                try self.appendTextCodepoint(value.value);
             } else if (value.value == '>' and self.normal_text_brackets == 2) {
                 return error.InvalidXml;
             } else if (value.value == '\r') {
@@ -1439,10 +1416,10 @@ pub const Cursor = struct {
                 if (next) |following| {
                     if (following.value == '\n') _ = try self.requiredCodepoint();
                 }
-                try self.appendTextCodepoint('\n', false);
+                try self.appendTextCodepoint('\n');
             } else {
                 self.normal_text_brackets = 0;
-                try self.appendTextCodepoint(value.value, false);
+                try self.appendTextCodepoint(value.value);
             }
         }
         if (self.text_bytes.items.len == 0) return error.NoText;
@@ -1482,18 +1459,17 @@ pub const Cursor = struct {
                 if (self.cdata_brackets < 2) {
                     self.cdata_brackets += 1;
                 } else {
-                    try self.appendTextCodepoint(']', false);
+                    try self.appendTextCodepoint(']');
                 }
                 continue;
             }
             if (value.value == '>' and self.cdata_brackets == 2) {
                 self.cdata_brackets = 0;
                 self.in_cdata = false;
-                if (self.text_bytes.items.len == 0) return error.NoText;
                 break;
             }
             while (self.cdata_brackets != 0) : (self.cdata_brackets -= 1) {
-                try self.appendTextCodepoint(']', false);
+                try self.appendTextCodepoint(']');
             }
             if (value.value == '\r') {
                 const next = self.source.peekCodepoint() catch |err| switch (err) {
@@ -1503,9 +1479,9 @@ pub const Cursor = struct {
                 if (next) |following| {
                     if (following.value == '\n') _ = try self.requiredCodepoint();
                 }
-                try self.appendTextCodepoint('\n', false);
+                try self.appendTextCodepoint('\n');
             } else {
-                try self.appendTextCodepoint(value.value, false);
+                try self.appendTextCodepoint(value.value);
             }
         }
         if (self.text_bytes.items.len == 0) return error.NoText;
@@ -1620,13 +1596,7 @@ pub const Cursor = struct {
             while (position < self.declaration_bytes.items.len and isXmlWhitespace(self.declaration_bytes.items[position])) position += 1;
         }
         const version_value = version orelse return error.InvalidXml;
-        if (std.mem.eql(u8, version_value, "1.0")) {
-            self.effective_version = .xml10;
-        } else if (std.mem.eql(u8, version_value, "1.1")) {
-            self.effective_version = .xml11;
-        } else {
-            return error.UnsupportedVersion;
-        }
+        if (!std.mem.eql(u8, version_value, "1.0")) return error.UnsupportedVersion;
         if (encoding) |value| {
             if (std.ascii.eqlIgnoreCase(value, "UTF-8")) {
                 if (self.source.encoding != .utf8) return error.InvalidEncoding;
@@ -2283,7 +2253,7 @@ test "[property] - [mzML XML cursor]: preserves qualified names and namespace re
                 try std.testing.expectEqual(item.opening, event.data == .start_element);
                 const name = if (item.opening) event.data.start_element.name else event.data.end_element.name;
                 try std.testing.expectEqualStrings(item.raw, name.raw);
-                try std.testing.expectEqualStrings(item.local, localName(name));
+                try std.testing.expectEqualStrings(item.local, name.expanded.local);
                 try std.testing.expectEqualDeep(item.prefix, name.expanded.prefix);
                 try std.testing.expectEqualStrings(NAMESPACE, name.expanded.namespace_uri.?);
                 try std.testing.expectEqual(offset, event.span.start);

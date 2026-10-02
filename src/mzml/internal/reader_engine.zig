@@ -215,7 +215,7 @@ pub fn readFragment(self: *StreamReader, allocator: std.mem.Allocator, input: *s
         try self.cursor.resetToAncestors(input, self.fragment_ancestors.?, prefix_length);
     } else {
         self.fragment_ancestors = null;
-        try self.cursor.reset(input);
+        self.cursor.reset(input);
     }
     defer self.cursor.detachFragment();
     self.record_store.arena.deinit();
@@ -593,7 +593,7 @@ fn nextItemInner(self: *StreamReader, comptime retention: Retention, comptime re
 fn consumeEnd(self: *StreamReader, kind_value: model.Kind, advance: bool) Error!void {
     const event = self.cursor.current orelse return error.UnexpectedEnd;
     if (event.data != .end_element or
-        !std.mem.eql(u8, xml.localName(event.data.end_element.name), kind_value.xmlName()))
+        !std.mem.eql(u8, event.data.end_element.name.expanded.local, kind_value.xmlName()))
         return error.InvalidStructure;
     if (kind_value == .run) self.header.run.end_offset = event.span.end;
     if (kind_value == .mzml) self.header.document.end_offset = event.span.end;
@@ -834,9 +834,9 @@ fn parseNodeFor(self: *StreamReader, storage: *Storage, depth: usize, advance_af
     return node;
 }
 
-fn paramKind(self: *const StreamReader, start: xml.Start) ?u2 {
+fn paramKind(self: *const StreamReader, start: xml.StartElement) ?u2 {
     if (!std.mem.eql(u8, start.name.expanded.namespace_uri orelse "", self.cursor.mzml_namespace)) return null;
-    const local = xml.localName(start.name);
+    const local = start.name.expanded.local;
     if (std.mem.eql(u8, local, "referenceableParamGroupRef")) return 0;
     if (std.mem.eql(u8, local, "cvParam")) return 1;
     if (std.mem.eql(u8, local, "userParam")) return 2;
@@ -922,7 +922,7 @@ fn parseParams(self: *StreamReader, storage: *Storage, comptime retain: bool, co
     }
 }
 
-fn copyParamAttributes(storage: *Storage, start: xml.Start, selected: u2, comptime retain: bool, has_extra: *bool) Error!ParamAttributes {
+fn copyParamAttributes(storage: *Storage, start: xml.StartElement, selected: u2, comptime retain: bool, has_extra: *bool) Error!ParamAttributes {
     var result: ParamAttributes = .{};
     for (start.attributes) |attribute| {
         const name = attribute.name.expanded;
@@ -955,7 +955,7 @@ fn copyParamAttributes(storage: *Storage, start: xml.Start, selected: u2, compti
 fn copyAttributes(
     self: *StreamReader,
     storage: *Storage,
-    start: xml.Start,
+    start: xml.StartElement,
     required: []const u8,
     comptime retain: bool,
 ) Error![]const model.Attribute {
@@ -1014,7 +1014,7 @@ fn parameterAttribute(name: xml.ExpandedName, selected: u2) ?std.meta.FieldEnum(
     };
 }
 
-fn copyParamExtra(self: *StreamReader, storage: *Storage, start: xml.Start, selected: u2) Error!*cv.ParameterXml {
+fn copyParamExtra(self: *StreamReader, storage: *Storage, start: xml.StartElement, selected: u2) Error!*cv.ParameterXml {
     const result = &(try storage.alloc(cv.ParameterXml, 1))[0];
     result.* = .{ .attributes = try self.copyForeignAttributes(storage, start, selected) };
     return result;
@@ -1085,7 +1085,7 @@ const FragmentBuffer = struct {
     }
 };
 
-fn copyForeignAttributes(self: *StreamReader, storage: *Storage, start: xml.Start, parameter: ?u2) Error![]const model.Attribute {
+fn copyForeignAttributes(self: *StreamReader, storage: *Storage, start: xml.StartElement, parameter: ?u2) Error![]const model.Attribute {
     var count: usize = 0;
     var position: usize = 0;
     var has_default = false;

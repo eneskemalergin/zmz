@@ -313,9 +313,8 @@ fn replaceArrayAllocated(allocator: std.mem.Allocator) !void {
             try std.testing.expect(source.attribute("dataProcessingRef").?.ptr != result.array.node.attribute("dataProcessingRef").?.ptr);
             try std.testing.expectEqualStrings("keep", result.array.node.attribute("extra").?);
             try std.testing.expectEqual(length, try mzml.cv.parseInteger(usize, result.array.node.attribute("arrayLength")));
-            // Only lengths known without encoding are filled in; the writer sets the others.
-            const known = if (result.payload.source.wireLength()) |wire_length| try mzml.base64.encodedSize(wire_length) else 0;
-            try std.testing.expectEqual(known, try mzml.cv.parseInteger(usize, result.array.node.attribute("encodedLength")));
+            // The source's encodedLength is kept; the writer replaces it.
+            try std.testing.expectEqualDeep(source.attribute("encodedLength"), result.array.node.attribute("encodedLength"));
             try std.testing.expectEqualDeep(mzml.model.Encoding{ .primitive = .float32, .pipeline = pipeline }, try mzml.model.arrayEncoding(result.array.node, &.{}));
             try std.testing.expectEqual(@as(usize, 8), result.array.node.params.len);
             try std.testing.expectEqualDeep(params[0], result.array.node.params[0]);
@@ -479,9 +478,8 @@ test "[integration] - [prepared construction]: retains metadata and borrows prim
                     .encoding = .{ .pipeline = pipeline },
                 }, &encoder);
                 try std.testing.expectEqual(@as(?[]const u8, null), result.array.node.child(.binary).?.text);
-                // Only lengths known without encoding are filled in; the writer sets the others.
-                const known = if (result.payload.source.wireLength()) |wire_length| try mzml.base64.encodedSize(wire_length) else 0;
-                try std.testing.expectEqual(known, try mzml.cv.parseInteger(usize, result.array.node.attribute("encodedLength")));
+                // The writer writes encodedLength from the text it writes.
+                try std.testing.expectEqual(null, result.array.node.attribute("encodedLength"));
                 try std.testing.expectEqual(length, result.array.length);
                 // The payload borrows the values; nothing is encoded until the record is written.
                 try std.testing.expectEqual(std.mem.sliceAsBytes(values[0..length]).ptr, std.mem.sliceAsBytes(@field(result.payload.source.values, @tagName(mzml.model.Primitive.of(T)))).ptr);

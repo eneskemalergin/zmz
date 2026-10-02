@@ -729,11 +729,10 @@ test "[integration] - [mzML prepared writing]: preserves primitive bytes across 
                     binaries[i] = node.children[0];
                     binaries[i].text = encoded_text;
                     node.children = binaries[i..][0..1];
-                    for (node.attributes, attributes[i][0..node.attributes.len]) |attribute, *copy| {
-                        copy.* = attribute;
-                        if (std.mem.eql(u8, attribute.name, "encodedLength")) copy.value = length;
-                    }
-                    node.attributes = attributes[i][0..node.attributes.len];
+                    // The writer writes the missing encodedLength first.
+                    attributes[i][0] = .{ .name = "encodedLength", .value = length };
+                    @memcpy(attributes[i][1..][0..node.attributes.len], node.attributes);
+                    node.attributes = attributes[i][0 .. node.attributes.len + 1];
                 }
                 var list = metadata.child(.binary_data_array_list).?;
                 list.children = &nodes;

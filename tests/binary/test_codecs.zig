@@ -268,7 +268,6 @@ fn compareBase64Updates(text: []const u8, capacity: usize) !void {
     };
     try std.testing.expectEqual(scalar_error, bulk_error);
     try std.testing.expectEqualDeep(scalar.counts, bulk.counts);
-    try std.testing.expectEqual(scalar.error_offset, bulk.error_offset);
     if (bulk_error == null) try std.testing.expectEqualSlices(u8, scalar_output[0..scalar.counts.decoded_bytes], bulk_output[0..bulk.counts.decoded_bytes]);
 }
 

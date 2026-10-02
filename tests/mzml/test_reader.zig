@@ -147,8 +147,8 @@ test "[failure] - [mzML diagnostics]: does not assign the next opening error to 
 }
 
 test "[unit] - [mzML diagnostics]: distinguishes unknown offsets and maps only source fragment bytes" {
-    const locations = [_]?mzml.Diagnostic.Location{ null, .{ .input_event = 0 }, .{ .input_byte = 17 }, .{ .output_byte = 17 } };
-    const suffixes = [_][]const u8{ "", "; input_event=0", "; input_byte=17", "; output_byte=17" };
+    const locations = [_]?mzml.Diagnostic.Location{ null, .{ .input_event = 0 }, .{ .output_byte = 17 } };
+    const suffixes = [_][]const u8{ "", "; input_event=0", "; output_byte=17" };
     for (locations, suffixes) |location, suffix| {
         var report = mzml.Diagnostic.init(error.OutOfMemory, .write_record, .metadata, .none);
         report.location = location;

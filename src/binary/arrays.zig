@@ -39,12 +39,6 @@ pub const Values = union(encoding.Primitive) {
     pub fn of(comptime T: type, values: []const T) Values {
         return @unionInit(Values, @tagName(encoding.Primitive.of(T)), values);
     }
-
-    pub fn len(self: Values) usize {
-        return switch (self) {
-            inline else => |values| values.len,
-        };
-    }
 };
 
 /// Borrowed values and how to encode them, for encoding while they are written instead of

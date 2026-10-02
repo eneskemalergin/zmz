@@ -644,10 +644,6 @@ fn isKernel(id: []const u8) bool {
     inline for (comptime std.meta.declarations(mzml.model.Terms)) |declaration| {
         if (std.mem.eql(u8, id, @field(mzml.model.Terms, declaration.name).raw)) return true;
     }
-    for ([_][]const u8{
-        "MS:1000519", "MS:1000521", "MS:1000522", "MS:1000523", "MS:1000574", "MS:1000576",
-        "MS:1002312", "MS:1002313", "MS:1002314", "MS:1002746", "MS:1002747", "MS:1002748",
-    }) |known| if (std.mem.eql(u8, id, known)) return true;
     for (DISPOSITIONS) |entry| {
         if (entry.family == 1) continue;
         for (entry.terms) |known| if (std.mem.eql(u8, id, known)) return true;

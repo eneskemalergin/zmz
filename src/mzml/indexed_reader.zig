@@ -550,7 +550,7 @@ fn readEmbeddedEntries(self: *IndexedReader, input: *std.Io.Reader, index_start:
     }
 }
 
-fn indexStart(cursor: *const xml.Cursor, kind: model.Kind) Error!xml.Start {
+fn indexStart(cursor: *const xml.Cursor, kind: model.Kind) Error!xml.StartElement {
     const event = cursor.current orelse return error.UnexpectedEnd;
     if (event.data != .start_element or !event.data.start_element.name.eql(cursor.mzml_namespace, kind.xmlName())) return error.InvalidStructure;
     return event.data.start_element;

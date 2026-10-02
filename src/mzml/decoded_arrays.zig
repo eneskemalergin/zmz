@@ -255,7 +255,8 @@ fn decompressText(self: *DecodedArrays, source: anytype) !void {
     var input = Base64Input(@TypeOf(source)).init(source, self.window.items);
     if (!output.encoding.pipeline.isNumpress()) {
         input.fill();
-        if (input.ended and input.failure == null) return self.decompressWhole(output, input.reader.buffered(), input.decoder.counts);
+        if (input.failure) |err| return input.fail(self, err);
+        if (input.ended) return self.decompressWhole(output, input.reader.buffered(), input.decoder.counts);
     }
     if (self.decompressor == null) self.decompressor = try zlib.Decompressor.init(self.allocator);
     const decompressor = &self.decompressor.?;
@@ -263,10 +264,8 @@ fn decompressText(self: *DecodedArrays, source: anytype) !void {
     const inflated = self.decompressInto(decompressor, output);
     if (input.failure) |err| return input.fail(self, err);
     input.drain() catch |err| return input.fail(self, err);
-    const counts = input.decoder.counts;
+    // An empty plain zlib array has no text and was decoded whole above.
     inflated catch |err| {
-        // An empty zlib array with no text is valid, as for decoding the payload whole.
-        if (output.encoding.payloadPipeline(output.length, counts.significant_bytes == 0) == .none) return;
         self.failure = .{ .stage = .array };
         return err;
     };

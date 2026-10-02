@@ -52,6 +52,7 @@ pub const Id = enum(u16) {
     io_failed = 27,
     canceled = 28,
     count_mismatch = 29,
+    // 30 (encodedLength differs from the written text) is retired: the writer now sets it.
 
     pub fn description(self: Id) []const u8 {
         return switch (self) {
@@ -90,7 +91,7 @@ pub const Id = enum(u16) {
 
 pub const Operation = enum { read_header, read_record, read_item, open_index, rebuild_index, lookup_record, write_header, open_list, write_record, write_item, close_list, finish };
 pub const Stage = enum { xml, metadata, base64, array, index, output };
-pub const Location = union(enum) { input_event: u64, input_byte: u64, output_byte: u64 };
+pub const Location = union(enum) { input_event: u64, output_byte: u64 };
 pub const RecordPosition = struct {
     kind: enum { spectrum, chromatogram },
     ordinal: usize,
@@ -106,8 +107,6 @@ pub const Attribute = enum {
     count,
     default_array_length,
     array_length,
-    encoded_length,
-    ref,
     name,
     id_ref,
 
@@ -115,7 +114,6 @@ pub const Attribute = enum {
         return switch (self) {
             .default_array_length => "defaultArrayLength",
             .array_length => "arrayLength",
-            .encoded_length => "encodedLength",
             .id_ref => "idRef",
             else => @tagName(self),
         };
@@ -137,7 +135,6 @@ pub const Limit = enum {
     id_bytes,
     text_bytes,
     xml_declaration_bytes,
-    xml_text_bytes,
 };
 pub const Detail = union(enum) {
     none,
@@ -145,7 +142,7 @@ pub const Detail = union(enum) {
     limit: struct { name: Limit, maximum: u64, needed: ?u64 = null },
     size: struct { expected: u64, actual: u64, unit: SizeUnit },
 };
-pub const SizeUnit = enum { bytes, values, records, arrays, index };
+pub const SizeUnit = enum { bytes, records, arrays, index };
 
 /// Maps a typed operation error using its capture stage and any known limit.
 /// New errors must be assigned deliberately; generic I/O errors are listed explicitly.
@@ -195,7 +192,6 @@ pub fn xmlDetail(cursor: *const xml.Cursor) Detail {
             .attribute_bytes => .attribute_bytes,
             .nodes => .nodes,
             .declaration_bytes => .xml_declaration_bytes,
-            .text_bytes => .xml_text_bytes,
         },
         .maximum = switch (limit) {
             .depth => cursor.max_depth,
@@ -203,7 +199,6 @@ pub fn xmlDetail(cursor: *const xml.Cursor) Detail {
             .attribute_bytes => cursor.max_attribute_bytes,
             .nodes => 0,
             .declaration_bytes => 4096,
-            .text_bytes => 64 * 1024,
         },
     } };
 }
