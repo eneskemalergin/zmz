@@ -128,6 +128,9 @@ pub const ExpansionError = error{
     ExpansionLimit,
 };
 
+/// The work budget of one parameter expansion, which ExpansionLimit reports as exhausted.
+pub const EXPANSION_WORK = 1_000_000;
+
 /// Yields local parameters with each group reference replaced by its group's parameters,
 /// keeping every repeat. Keep the inputs alive and unchanged while iterating. Group IDs match
 /// after collapsing surrounding XML whitespace.
@@ -135,7 +138,7 @@ pub const EffectiveIterator = struct {
     entries: []const Entry,
     groups: []const Group,
     /// Bounds entry visits and group comparisons, including repeated references.
-    remaining_work: usize = 1_000_000,
+    remaining_work: usize = EXPANSION_WORK,
     position: usize = 0,
     expanded: []const Entry = &.{},
     expanded_position: usize = 0,

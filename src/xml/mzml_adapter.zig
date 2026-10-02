@@ -13,6 +13,8 @@ pub const XMLNS_NAMESPACE = "http://www.w3.org/2000/xmlns/";
 const TEXT_CHUNK_BYTES = 64 * 1024;
 /// Deepest element nesting the cursor and writer support, counting the root.
 pub const MAX_DEPTH = 64;
+/// Longest XML declaration the cursor reads.
+pub const MAX_DECLARATION_BYTES = 4096;
 
 /// XML cursor failures, including malformed input and bounded-storage failures.
 pub const ReadError = error{
@@ -449,6 +451,8 @@ pub const Cursor = struct {
     additional_namespaces: ?bool = null,
     failure: ?Error = null,
     limit_failure: ?enum { depth, attributes, attribute_bytes, nodes, declaration_bytes } = null,
+    // The bytes an over-limit attribute value needed, when known.
+    limit_needed: ?usize = null,
 
     /// Initializes a cursor without consuming the input.
     pub fn init(
@@ -533,6 +537,7 @@ pub const Cursor = struct {
     fn resetState(self: *Cursor, keep_ancestors: bool) void {
         self.failure = null;
         self.limit_failure = null;
+        self.limit_needed = null;
         self.current = null;
         self.offset = 0;
         self.document_started = false;
@@ -867,7 +872,10 @@ pub const Cursor = struct {
 
     fn appendEventSlice(self: *Cursor, value: []const u8) Error!void {
         const next_length = std.math.add(usize, self.event_bytes.items.len, value.len) catch return error.LimitExceeded;
-        if (next_length > self.max_attribute_bytes) return self.limitError(.attribute_bytes);
+        if (next_length > self.max_attribute_bytes) {
+            self.limit_needed = next_length;
+            return self.limitError(.attribute_bytes);
+        }
         try self.event_bytes.appendSlice(self.allocator, value);
     }
 
@@ -1508,7 +1516,7 @@ pub const Cursor = struct {
     }
 
     fn appendDeclarationByte(self: *Cursor, value: u8) Error!void {
-        if (self.declaration_bytes.items.len == 4096) return self.limitError(.declaration_bytes);
+        if (self.declaration_bytes.items.len == MAX_DECLARATION_BYTES) return self.limitError(.declaration_bytes);
         try self.declaration_bytes.append(self.allocator, value);
     }
 
@@ -1600,7 +1608,7 @@ pub const WriterError = error{
     InvalidCharacter,
     InvalidNamespace,
     DuplicateAttribute,
-    WriterLimit,
+    LimitExceeded,
     WriteFailed,
     OutOfMemory,
 };
@@ -1693,7 +1701,7 @@ pub const Writer = struct {
         if (self.state == .epilog and self.root_written) return self.fail(error.InvalidState);
         if (self.state != .epilog and self.state != .content and self.state != .start_tag) return self.fail(error.InvalidState);
         validateQName(name) catch |err| return self.fail(err);
-        if (self.frame_count == MAX_DEPTH) return self.fail(error.WriterLimit);
+        if (self.frame_count == MAX_DEPTH) return self.fail(error.LimitExceeded);
         if (self.state == .start_tag) {
             try self.checkOpeningName();
             try self.writeByte('>');
@@ -1847,9 +1855,9 @@ pub const Writer = struct {
             const available = self.sink.unusedCapacitySlice();
             const direct_length = @min(wire.len - offset, available.len / 4 * 3);
             if (direct_length != 0) {
-                const required = base64.encodedSize(direct_length) catch return self.fail(error.WriterLimit);
-                const next = std.math.add(u64, self.logical_offset, @intCast(required)) catch return self.fail(error.WriterLimit);
-                const value = base64.encode(available, wire[offset..][0..direct_length]) catch return self.fail(error.WriterLimit);
+                const required = base64.encodedSize(direct_length) catch return self.fail(error.LimitExceeded);
+                const next = std.math.add(u64, self.logical_offset, @intCast(required)) catch return self.fail(error.LimitExceeded);
+                const value = base64.encode(available, wire[offset..][0..direct_length]) catch return self.fail(error.LimitExceeded);
                 self.sink.advance(value.len);
                 self.logical_offset = next;
                 offset += direct_length;
@@ -1857,7 +1865,7 @@ pub const Writer = struct {
             }
             const length = @min(wire.len - offset, encoded.len / 4 * 3);
             // The encoder emits ASCII without XML metacharacters.
-            const value = base64.encode(&encoded, wire[offset..][0..length]) catch return self.fail(error.WriterLimit);
+            const value = base64.encode(&encoded, wire[offset..][0..length]) catch return self.fail(error.LimitExceeded);
             try self.writeBytes(value);
             offset += length;
         }
@@ -1948,7 +1956,7 @@ pub const Writer = struct {
     }
 
     fn writeBytes(self: *Writer, bytes: []const u8) WriterError!void {
-        const next = std.math.add(u64, self.logical_offset, @intCast(bytes.len)) catch return self.fail(error.WriterLimit);
+        const next = std.math.add(u64, self.logical_offset, @intCast(bytes.len)) catch return self.fail(error.LimitExceeded);
         self.sink.writeAll(bytes) catch return self.fail(error.WriteFailed);
         self.logical_offset = next;
     }

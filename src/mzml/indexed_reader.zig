@@ -201,7 +201,8 @@ pub fn byId(self: *IndexedReader, allocator: std.mem.Allocator, id: []const u8) 
     return self.lookup(allocator, .{ .id = id }, null);
 }
 
-/// Looks up a zero-based ordinal within spectra or chromatograms; other kinds fail.
+/// Looks up a zero-based ordinal within spectra or chromatograms; other kinds are
+/// InvalidOptions.
 pub fn at(self: *IndexedReader, allocator: std.mem.Allocator, kind: model.Kind, ordinal: usize) Error!?owned.Record {
     return self.lookup(allocator, .{ .ordinal = .{ .kind = kind, .ordinal = ordinal } }, null);
 }
@@ -253,7 +254,7 @@ fn idPosition(self: *IndexedReader, id: []const u8) Error!?usize {
 }
 
 fn ordinalPosition(self: *IndexedReader, kind: model.Kind, ordinal: usize) Error!?usize {
-    if (kind != .spectrum and kind != .chromatogram) return error.InvalidIndex;
+    if (kind != .spectrum and kind != .chromatogram) return error.InvalidOptions;
     try self.checkSource();
     if (ordinal >= self.counts[kindIndex(kind)]) return null;
     return ordinal + if (kind == .spectrum) @as(usize, 0) else self.counts[0];
@@ -477,6 +478,8 @@ fn openEmbedded(self: *IndexedReader, reader: *Engine) Error!void {
     if (reader.list_scopes[0] != null) self.contexts[0] = try self.captureAncestors(reader, 0);
     if (reader.list_scopes[1] != null) self.contexts[1] = try self.captureAncestors(reader, 1);
     if (self.counts[1] != 0 and self.contexts[1] == null) {
+        // Chromatograms listed in the index must follow an open spectrum list.
+        if (reader.active_list != .spectrum_list) return error.InvalidIndex;
         if (self.counts[0] == 0) {
             try reader.finishEmptySpectrumList();
         } else {
@@ -672,7 +675,7 @@ fn readAt(self: *const IndexedReader, output: []u8, offset: u64) Error!void {
 }
 
 fn charge(self: *IndexedReader, bytes: usize) Error!void {
-    if (bytes > self.remaining) return try self.limitError(.index_bytes, self.options.index_bytes, null);
+    if (bytes > self.remaining) return try self.limitError(.index_bytes, self.options.index_bytes, self.options.index_bytes - self.remaining +| bytes);
     self.remaining -= bytes;
 }
 

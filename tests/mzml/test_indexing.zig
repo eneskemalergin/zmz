@@ -204,7 +204,7 @@ fn expectDecodedRecord(record: mzml.model.Record, groups: []const mzml.cv.Group,
                 defer std.testing.allocator.free(transport);
                 const transformed = try std.testing.allocator.alloc(u8, try mzml.arrays.wireBound(T, array.length, array.encoding.pipeline));
                 defer std.testing.allocator.free(transformed);
-                try array.decode(T, expected, .{ .transport = transport, .transformed = transformed });
+                _ = try array.decode(T, expected, .{ .transport = transport, .transformed = transformed });
                 try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(expected), std.mem.sliceAsBytes(values));
             },
         }
@@ -329,7 +329,7 @@ test "[integration] - [mzML indexed decoding]: selects arrays and records withou
                     var values: [3]f64 = undefined;
                     var transport: [128]u8 = undefined;
                     var transformed: [128]u8 = undefined;
-                    try array.decode(f64, &values, .{ .transport = &transport, .transformed = &transformed });
+                    _ = try array.decode(f64, &values, .{ .transport = &transport, .transformed = &transformed });
                     try std.testing.expectEqualDeep(array.encoding, decoded.encoding);
                     try std.testing.expectEqualSlices(f64, &values, decoded.values.float64);
                 }
@@ -581,8 +581,10 @@ test "[failure] - [mzML indexed decoding]: clears results and recovers after dec
     try std.testing.expectEqual(null, try index.byIdDecoded(allocator, "absent", &output));
     try std.testing.expectEqual(@as(usize, 0), output.len());
     try std.testing.expectEqual(null, try index.atDecoded(allocator, .spectrum, 8, &output));
-    try std.testing.expectError(error.InvalidIndex, index.atDecoded(allocator, .run, 0, &output));
-    try std.testing.expectEqual(error.InvalidIndex, index.diagnostic().?.code);
+    // A wrong kind is the caller's argument, not a damaged index.
+    try std.testing.expectError(error.InvalidOptions, index.atDecoded(allocator, .run, 0, &output));
+    try std.testing.expectEqual(error.InvalidOptions, index.diagnostic().?.code);
+    try std.testing.expectEqual(mzml.Diagnostic.Id.invalid_options, index.diagnostic().?.id);
     var limited = mzml.StreamReader.DecodedArrays.init(allocator, .{ .array_bytes = 1 });
     defer limited.deinit();
     try std.testing.expectError(error.LimitExceeded, index.atDecoded(allocator, .spectrum, 0, &limited));
@@ -919,7 +921,7 @@ test "[integration] - [mzML indexed lookup]: crosses file refills with UTF-16 an
                         try expectDecodedRecord(record.value, index.header().groups, decoded.value, &output);
                         var arrays = record.value.arrays(index.header().groups);
                         var value: [1]f64 = undefined;
-                        try (try arrays.next()).?.decode(f64, &value, .{ .transport = &.{}, .transformed = &.{} });
+                        _ = try (try arrays.next()).?.decode(f64, &value, .{ .transport = &.{}, .transformed = &.{} });
                         try std.testing.expectEqual(@as(f64, 1), value[0]);
                     }
                 }
@@ -1502,7 +1504,7 @@ test "[integration] - [mzML index]: builds plain files explicitly and rejects ch
     try std.testing.expectError(error.StaleSource, index.byIdDecoded(std.testing.allocator, "absent", &decoded));
     try std.testing.expectError(error.StaleSource, index.atDecoded(std.testing.allocator, .spectrum, 100, &decoded));
     try std.testing.expectEqual(@as(usize, 0), decoded.len());
-    try std.testing.expectError(error.InvalidIndex, index.at(std.testing.allocator, .run, 0));
+    try std.testing.expectError(error.InvalidOptions, index.at(std.testing.allocator, .run, 0));
     try std.testing.expectError(error.LimitExceeded, mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = support.DOCUMENT }, .{ .policy = .rebuild, .max_records = 1 }));
     try std.testing.expectError(error.LimitExceeded, mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = support.DOCUMENT }, .{ .policy = .rebuild, .index_bytes = 1 }));
     const duplicate = support.HEADER ++ "<spectrumList count='2' defaultDataProcessingRef='dp'>" ++
@@ -1893,4 +1895,30 @@ test "[failure] - [mzML index]: bounds embedded offset text by binary_text_bytes
     try std.testing.expectEqual(.binary_text_bytes, limit.name);
     try std.testing.expectEqual(@as(u64, 64), limit.maximum);
     try std.testing.expectEqual(@as(?u64, 104), limit.needed);
+}
+
+test "[failure] - [mzML index]: a failed lookup reports no element from the lookup before it" {
+    // Same length, so every indexed offset stays valid; only scan=zlib's opening tag breaks.
+    const source = try std.mem.replaceOwned(u8, std.testing.allocator, @embedFile("data/writer_indexed.mzML"), "<spectrum id=\"scan=zlib\" index=\"1\"", "<spectrum id=\"scan=zlib\" index=!1\"");
+    defer std.testing.allocator.free(source);
+    var index = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = source }, .{ .policy = .open_embedded });
+    defer index.deinit();
+    var chromatogram = (try index.at(std.testing.allocator, .chromatogram, 0)).?;
+    chromatogram.deinit();
+    try std.testing.expectError(error.InvalidXml, index.at(std.testing.allocator, .spectrum, 1));
+    try std.testing.expectEqual(null, index.diagnostic().?.element);
+}
+
+test "[failure] - [mzML index]: chromatograms listed in the index but missing from the file are an index fault" {
+    const source = try std.testing.allocator.dupe(u8, @embedFile("data/writer_indexed.mzML"));
+    defer std.testing.allocator.free(source);
+    // The run ends where the chromatogram list began; the rest of the old list is blank, so
+    // every indexed offset stays valid but no chromatogram list follows the spectra.
+    const start = std.mem.indexOf(u8, source, "<chromatogramList").?;
+    const end = std.mem.indexOf(u8, source, "</chromatogramList>").? + "</chromatogramList>".len;
+    @memset(source[start..end], ' ');
+    @memcpy(source[start..][0.."</run></mzML>".len], "</run></mzML>");
+    var failure: ?mzml.Diagnostic = null;
+    try std.testing.expectError(error.InvalidIndex, mzml.IndexedReader.buildWithDiagnostic(std.testing.allocator, .{ .bytes = source }, .{ .policy = .open_embedded }, &failure));
+    try std.testing.expectEqual(mzml.Diagnostic.Id.invalid_index, failure.?.id);
 }

@@ -103,15 +103,16 @@ test "[failure] - [mzML diagnostics]: names selected array attributes limits and
 }
 
 test "[failure] - [mzML diagnostics]: identifies configured storage and XML limits" {
-    const Case = struct { limits: mzml.StreamReader.Limits, name: mzml.Diagnostic.Limit, maximum: u64 };
+    // Byte budgets know how much the failed request needed; count limits do not.
+    const Case = struct { limits: mzml.StreamReader.Limits, name: mzml.Diagnostic.Limit, maximum: u64, needed: bool };
     for ([_]Case{
-        .{ .limits = .{ .header_bytes = 0 }, .name = .header_bytes, .maximum = 0 },
-        .{ .limits = .{ .record_bytes = 0 }, .name = .record_bytes, .maximum = 0 },
-        .{ .limits = .{ .attributes = 1 }, .name = .attributes, .maximum = 1 },
-        .{ .limits = .{ .attribute_bytes = 1 }, .name = .attribute_bytes, .maximum = 1 },
-        .{ .limits = .{ .nodes = 1 }, .name = .nodes, .maximum = 1 },
-        .{ .limits = .{ .list_entries = 1 }, .name = .list_entries, .maximum = 1 },
-        .{ .limits = .{ .binary_text_bytes = 1 }, .name = .binary_text_bytes, .maximum = 1 },
+        .{ .limits = .{ .header_bytes = 0 }, .name = .header_bytes, .maximum = 0, .needed = true },
+        .{ .limits = .{ .record_bytes = 0 }, .name = .record_bytes, .maximum = 0, .needed = true },
+        .{ .limits = .{ .attributes = 1 }, .name = .attributes, .maximum = 1, .needed = false },
+        .{ .limits = .{ .attribute_bytes = 1 }, .name = .attribute_bytes, .maximum = 1, .needed = true },
+        .{ .limits = .{ .nodes = 1 }, .name = .nodes, .maximum = 1, .needed = false },
+        .{ .limits = .{ .list_entries = 1 }, .name = .list_entries, .maximum = 1, .needed = false },
+        .{ .limits = .{ .binary_text_bytes = 1 }, .name = .binary_text_bytes, .maximum = 1, .needed = true },
     }) |case| {
         var input = std.Io.Reader.fixed(support.DOCUMENT);
         var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{ .limits = case.limits });
@@ -121,6 +122,8 @@ test "[failure] - [mzML diagnostics]: identifies configured storage and XML limi
         try std.testing.expectEqual(.limit_exceeded, report.id);
         try std.testing.expectEqual(case.name, report.detail.limit.name);
         try std.testing.expectEqual(case.maximum, report.detail.limit.maximum);
+        try std.testing.expectEqual(case.needed, report.detail.limit.needed != null);
+        if (report.detail.limit.needed) |needed| try std.testing.expect(needed > case.maximum);
     }
     var input = std.Io.Reader.fixed("<mzML xmlns='http://psi.hupo.org/ms/mzml'><run><spectrumList><spectrum/></spectrumList></run></mzML>");
     var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
@@ -731,7 +734,7 @@ fn compareDecodedWithSelection(source: []const u8, chunk: usize, selected: bool)
                     defer std.testing.allocator.free(transport);
                     const transformed = try std.testing.allocator.alloc(u8, try mzml.arrays.wireBound(T, values.len, array.encoding.pipeline));
                     defer std.testing.allocator.free(transformed);
-                    try array.decode(T, expected, .{ .transport = transport, .transformed = transformed });
+                    _ = try array.decode(T, expected, .{ .transport = transport, .transformed = transformed });
                     try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(expected), std.mem.sliceAsBytes(values));
                 },
             }
@@ -853,7 +856,7 @@ test "[integration] - [mzML parameters]: retains late array declarations without
     try std.testing.expectEqualStrings("late", (try array.parameter((try reader.readHeader()).groups, .{ .raw = "X:role" })).?.value.?);
     var values: [1]f64 = undefined;
     var scratch: [8]u8 = undefined;
-    try mzml.model.decodeArray(f64, &values, array, 1, (try reader.readHeader()).groups, .{ .transport = &scratch, .transformed = &.{} });
+    _ = try mzml.model.decodeArray(f64, &values, array, 1, (try reader.readHeader()).groups, .{ .transport = &scratch, .transformed = &.{} });
     try std.testing.expectEqual(@as(f64, 1), values[0]);
     try compareDecoded(source, 1);
     var index = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = source }, .{ .policy = .rebuild });
@@ -913,7 +916,7 @@ test "[integration] - [mzML arrays]: retains repeated encoding terms across nume
         while (try reader.nextRecord()) |record| {
             for (record.binaryArrays()) |array| {
                 var value: [1]f64 = undefined;
-                try mzml.model.decodeArray(f64, &value, array, 1, header.groups, .{ .transport = &.{}, .transformed = &.{} });
+                _ = try mzml.model.decodeArray(f64, &value, array, 1, header.groups, .{ .transport = &.{}, .transformed = &.{} });
                 try std.testing.expectEqualSlices(f64, &.{1}, &value);
             }
             var fetched = (try index.byIdDecoded(std.testing.allocator, record.id, &decoded)).?;
@@ -1370,10 +1373,10 @@ test "[regression] - [mzML array decoding]: reads empty producer arrays with zli
     const record = (try reader.nextRecord()).?;
     var scratch: [32]u8 = undefined;
     const node = record.binaryArrays()[0];
-    try mzml.model.decodeArray(f64, &.{}, node, 5, &.{}, .{ .transport = &scratch, .transformed = &.{} });
+    _ = try mzml.model.decodeArray(f64, &.{}, node, 5, &.{}, .{ .transport = &scratch, .transformed = &.{} });
     var typed_arrays = record.arrays(&.{});
     const typed_array = (try typed_arrays.next()).?;
-    try typed_array.decode(f64, &.{}, .{ .transport = &scratch, .transformed = &.{} });
+    _ = try typed_array.decode(f64, &.{}, .{ .transport = &scratch, .transformed = &.{} });
     var one: [1]f64 = undefined;
     var nonempty = node;
     nonempty.attributes = &.{.{ .name = "encodedLength", .value = "0" }};
@@ -1476,7 +1479,7 @@ test "[integration] - [mzML reader]: reuses storage across growing and shrinking
         for (record.binaryArrays()) |array| {
             const text = try mzml.base64.encode(&encoded, zeros[0 .. length * 8]);
             try std.testing.expectEqualStrings(text, array.child(.binary).?.text.?);
-            try mzml.model.decodeArray(f64, output[0..length], array, length, header.groups, .{ .transport = &transport, .transformed = &.{} });
+            _ = try mzml.model.decodeArray(f64, output[0..length], array, length, header.groups, .{ .transport = &transport, .transformed = &.{} });
             try std.testing.expectEqualSlices(u8, zeros[0 .. length * 8], std.mem.sliceAsBytes(output[0..length]));
         }
     }
@@ -1554,8 +1557,7 @@ test "[integration] - [mzML children]: distinguishes missing payloads from repea
             try std.testing.expectError(error.PayloadNotRetained, result);
             try std.testing.expectError(error.PayloadNotRetained, readDecoded(std.testing.allocator, source, .{}));
         } else {
-            try result;
-            try std.testing.expectEqual(@as(f64, 1), values[0]);
+            try std.testing.expectEqualSlices(f64, &.{1}, try result);
             try compareDecoded(source, 1);
         }
     }
@@ -1771,7 +1773,7 @@ test "[integration] - [mzML numeric attributes]: requires a length only for requ
         var value: [1]f64 = undefined;
         const nodes = record.binaryArrays();
         try std.testing.expectError(error.MissingValue, mzml.model.decodeArray(f64, &value, nodes[0], record.default_array_length, header.groups, .{ .transport = &.{}, .transformed = &.{} }));
-        try mzml.model.decodeArray(f64, &value, nodes[1], record.default_array_length, header.groups, .{ .transport = &.{}, .transformed = &.{} });
+        _ = try mzml.model.decodeArray(f64, &value, nodes[1], record.default_array_length, header.groups, .{ .transport = &.{}, .transformed = &.{} });
         try std.testing.expectEqualSlices(f64, &.{1}, &value);
     }
     try std.testing.expectError(error.MissingValue, readDecoded(std.testing.allocator, source, .{}));
@@ -1996,17 +1998,18 @@ test "[integration] - [mzML reader]: retains hierarchy parameters and decodes gr
     var values: [1]f64 = undefined;
     var transport: [32]u8 = undefined;
     var transformed: [32]u8 = undefined;
-    try mzml.model.decodeArray(f64, &values, spectrum.binaryArrays()[0], 1, header.groups, .{
+    _ = try mzml.model.decodeArray(f64, &values, spectrum.binaryArrays()[0], 1, header.groups, .{
         .transport = &transport,
         .transformed = &transformed,
     });
     try std.testing.expectEqual(@as(f64, 1), values[0]);
-    try mzml.model.decodeArray(f64, &values, spectrum.binaryArrays()[1], 2, header.groups, .{
+    _ = try mzml.model.decodeArray(f64, &values, spectrum.binaryArrays()[1], 2, header.groups, .{
         .transport = &transport,
         .transformed = &transformed,
     });
     try std.testing.expectEqual(@as(f64, 1), values[0]);
-    try std.testing.expectError(error.DecodedSizeMismatch, mzml.model.decodeArray(
+    // The buffer is the caller's: short is OutputTooSmall, long decodes into its start.
+    try std.testing.expectError(error.OutputTooSmall, mzml.model.decodeArray(
         f64,
         &values,
         spectrum.binaryArrays()[0],
@@ -2014,13 +2017,15 @@ test "[integration] - [mzML reader]: retains hierarchy parameters and decodes gr
         header.groups,
         .{ .transport = &transport, .transformed = &transformed },
     ));
+    var longer: [3]f64 = undefined;
+    try std.testing.expectEqualSlices(f64, &.{1}, try mzml.model.decodeArray(f64, &longer, spectrum.binaryArrays()[0], 1, header.groups, .{ .transport = &transport, .transformed = &transformed }));
     var typed_arrays = spectrum.arrays(header.groups);
     const typed_array = (try typed_arrays.next()).?;
     try std.testing.expectEqual(spectrum.binaryArrays()[0], typed_array.node);
     try std.testing.expectEqual(mzml.model.Primitive.float64, typed_array.encoding.primitive);
     try std.testing.expectEqual(mzml.arrays.Pipeline.none, typed_array.encoding.pipeline);
     try std.testing.expectEqual(@as(usize, 1), typed_array.length);
-    try typed_array.decode(f64, &values, .{ .transport = &transport, .transformed = &transformed });
+    _ = try typed_array.decode(f64, &values, .{ .transport = &transport, .transformed = &transformed });
     try std.testing.expectEqual(@as(f64, 1), values[0]);
     var wrong_type: [1]i32 = undefined;
     try std.testing.expectError(error.TypeMismatch, typed_array.decode(i32, &wrong_type, .{
@@ -2184,8 +2189,7 @@ test "[integration] - [mzML array selection]: preserves metadata and selected va
                         const descriptor = try mzml.model.BinaryArray.init(array, record.default_array_length, header.groups);
                         const decoded = descriptor.decode(f64, &values, .{ .transport = &transport, .transformed = &.{} });
                         if (keep) {
-                            try decoded;
-                            try std.testing.expectEqual(@as(f64, 1), values[0]);
+                            try std.testing.expectEqualSlices(f64, &.{1}, try decoded);
                         } else try std.testing.expectError(error.PayloadNotRetained, decoded);
                     }
                     try std.testing.expectEqual(selected_count, output.len());
@@ -2288,7 +2292,7 @@ test "[edge] - [mzML array selection]: excludes skipped text from record storage
     try std.testing.expectEqual(null, arrays[0].child(.binary).?.text);
     try std.testing.expectEqualStrings("", arrays[1].child(.binary).?.text.?);
     try std.testing.expectEqual(null, arrays[2].child(.binary).?.text);
-    try mzml.model.decodeArray(f64, &.{}, arrays[1], 0, header.groups, .{ .transport = &.{}, .transformed = &.{} });
+    _ = try mzml.model.decodeArray(f64, &.{}, arrays[1], 0, header.groups, .{ .transport = &.{}, .transformed = &.{} });
     try std.testing.expectEqual(null, try reader.nextRecord());
 }
 
@@ -2824,4 +2828,50 @@ test "[failure] - [mzML decoded arrays]: text in the owner's storage and out-of-
     try std.testing.expectError(error.LimitExceeded, fresh.beginArray(first, 1000, &.{}, 0));
     fresh.complete();
     try std.testing.expectEqual(@as(usize, 0), fresh.get(0).?.values.int32.len);
+}
+
+test "[failure] - [mzML diagnostics]: a valid zlib stream that ends short reports both sizes" {
+    // Whole-window streams and streams past the 64 KiB window take different paths.
+    for ([_]usize{ 1, 10_000 }) |count| {
+        const values = try std.testing.allocator.alloc(f64, count);
+        defer std.testing.allocator.free(values);
+        var random = std.Random.DefaultPrng.init(count);
+        for (values) |*value| value.* = random.random().float(f64);
+        var compressor = try mzml.zlib.Compressor.init(std.testing.allocator, .fast);
+        defer compressor.deinit();
+        const wire = try std.testing.allocator.alloc(u8, mzml.zlib.compressBound(count * 8));
+        defer std.testing.allocator.free(wire);
+        const compressed = try compressor.compress(wire, std.mem.sliceAsBytes(values));
+        const text = try std.testing.allocator.alloc(u8, try mzml.base64.encodedSize(compressed.len));
+        defer std.testing.allocator.free(text);
+        _ = try mzml.base64.encode(text, compressed);
+        const source = try decodedDocument(std.testing.allocator, text, text.len, count + 1, "MS:1000574");
+        defer std.testing.allocator.free(source);
+        var input = std.Io.Reader.fixed(source);
+        var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+        defer reader.deinit();
+        var output = mzml.StreamReader.DecodedArrays.init(std.testing.allocator, .{});
+        defer output.deinit();
+        try std.testing.expectError(error.DecodedSizeMismatch, reader.nextDecodedRecord(&output));
+        const size = reader.diagnostic().?.detail.size;
+        try std.testing.expectEqual(@as(u64, (count + 1) * 8), size.expected);
+        try std.testing.expectEqual(@as(u64, count * 8), size.actual);
+        try std.testing.expectEqual(.bytes, size.unit);
+    }
+}
+
+test "[unit] - [mzML diagnostics]: names option, encoding, and work-cap errors for what they are" {
+    // A fixed point is the caller's option when writing and a payload header when reading.
+    try std.testing.expectEqual(.invalid_options, mzml.Diagnostic.init(error.InvalidFixedPoint, .write_record, .array, .none).id);
+    try std.testing.expectEqual(.array_decode_failed, mzml.Diagnostic.init(error.InvalidFixedPoint, .read_record, .array, .none).id);
+    for ([_]mzml.Diagnostic.Operation{ .write_record, .read_record }) |operation| {
+        inline for (.{ error.MissingCompressor, error.MissingFixedPoint, error.UnexpectedFixedPoint }) |code|
+            try std.testing.expectEqual(.invalid_options, mzml.Diagnostic.init(code, operation, .array, .none).id);
+    }
+    const encode = mzml.Diagnostic.init(error.ValueOutOfRange, .write_record, .array, .none);
+    try std.testing.expectEqualStrings("array bytes cannot be encoded or decoded", encode.id.description());
+    const expansion = mzml.Diagnostic.init(error.ExpansionLimit, .read_record, .metadata, .none);
+    try std.testing.expectEqual(.limit_exceeded, expansion.id);
+    try std.testing.expectEqual(.expansion_work, expansion.detail.limit.name);
+    try std.testing.expectEqual(@as(u64, mzml.cv.EXPANSION_WORK), expansion.detail.limit.maximum);
 }

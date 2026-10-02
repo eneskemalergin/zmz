@@ -146,7 +146,7 @@ fn capture(self: *Writer, err: Error, stage: Diagnostic.Stage, detail: Diagnosti
     var report = Diagnostic.init(err, .write_record, stage, detail);
     if (self.engine.failure != null) {
         report.stage = .output;
-        if (err == error.WriterLimit and self.engine.frame_count == schema.MAX_DEPTH)
+        if (err == error.LimitExceeded and self.engine.frame_count == schema.MAX_DEPTH)
             report = Diagnostic.init(err, .write_record, .output, .{ .limit = .{ .name = .depth, .maximum = schema.MAX_DEPTH } });
     }
     if (self.engine.byteOffset()) |offset| report.location = .{ .output_byte = offset };
@@ -183,7 +183,7 @@ fn ioFailure(self: *Writer, err: Error) Error!noreturn {
 
 fn copyId(self: *Writer, state: *IndexState, id: []const u8) Error![]const u8 {
     return state.copyId(id) catch |err| {
-        self.capture(err, .index, if (err == error.LimitExceeded) .{ .limit = .{ .name = .id_bytes, .maximum = state.limits.id_bytes } } else .none);
+        self.capture(err, .index, if (err == error.LimitExceeded) .{ .limit = .{ .name = .id_bytes, .maximum = state.limits.id_bytes, .needed = state.id_bytes +| id.len } } else .none);
         return @as(Error![]const u8, err);
     };
 }
@@ -676,7 +676,15 @@ fn writeNode(self: *Writer, node: model.Node, comptime replace_arrays: bool, rem
     } else try self.writeAttributes(node.attributes);
     if (node.kind == .binary) switch (plan) {
         .wire => |bytes| try self.engine.binary(bytes),
-        .source => |source| try self.writeSource(source.payload),
+        .source => |source| {
+            errdefer |err| {
+                // As on stream output, where the counting pass finds the error while planning.
+                self.capture(err, .array, .none);
+                self.failure.?.element = .binary_data_array;
+                self.failure.?.array_position = self.plans.items.len - remaining.len;
+            }
+            try self.writeSource(source.payload);
+        },
         .keep => {
             const text = node.text.?;
             if (text.len > self.limits.text_bytes) return try self.limitError(.text_bytes, self.limits.text_bytes, text.len);
@@ -745,8 +753,10 @@ noinline fn writeXml(self: *Writer, bytes: []const u8, budget: *usize) Error!voi
     var cursor = try xml.Cursor.init(self.allocator, &input, @max(1, bytes.len / 4), self.limits.text_bytes);
     defer cursor.deinit();
     errdefer |err| {
-        var detail = Diagnostic.xmlDetail(&cursor);
-        if (detail == .limit and detail.limit.name == .nodes) detail.limit.maximum = self.limits.nodes;
+        const detail: Diagnostic.Detail = if (cursor.limit_failure == .nodes)
+            .{ .limit = .{ .name = .nodes, .maximum = self.limits.nodes } }
+        else
+            Diagnostic.xmlDetail(&cursor);
         self.capture(err, .xml, detail);
         if (self.engine.failure == null) self.failure.?.location = null;
     }

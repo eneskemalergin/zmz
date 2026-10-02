@@ -459,7 +459,7 @@ test "[failure] - [mzML extensions]: rejects incomplete content and bounds fragm
         .{ .items = &.{.{ .params = 1 }}, .err = error.InvalidStructure },
         .{ .items = &.{.{ .children = 1 }}, .err = error.InvalidStructure },
         .{ .items = &.{.{ .xml = "<extra>" }}, .err = error.InvalidXml },
-        .{ .items = &.{.{ .xml = "<extra>" ** mzml.MAX_DEPTH ++ "</extra>" ** mzml.MAX_DEPTH }}, .err = error.WriterLimit },
+        .{ .items = &.{.{ .xml = "<extra>" ** mzml.MAX_DEPTH ++ "</extra>" ** mzml.MAX_DEPTH }}, .err = error.LimitExceeded },
         .{ .items = &.{.{ .xml = "<extra/>" }}, .limits = .{ .nodes = 1 }, .err = error.LimitExceeded },
         .{ .items = &.{.{ .xml = "<extra/>" }}, .limits = .{ .text_bytes = 7 }, .err = error.LimitExceeded },
     };
@@ -671,7 +671,7 @@ test "[integration] - [mzML references]: preserves unresolved and external links
                 try support.expectNode(record.node, found.value.node);
                 for (next.binaryArrays()) |array| {
                     var values: [1]f64 = undefined;
-                    try mzml.model.decodeArray(f64, &values, array, next.default_array_length, rewritten_header.groups, .{ .transport = &.{}, .transformed = &.{} });
+                    _ = try mzml.model.decodeArray(f64, &values, array, next.default_array_length, rewritten_header.groups, .{ .transport = &.{}, .transformed = &.{} });
                     try std.testing.expectEqual(@as(f64, 1), values[0]);
                 }
                 count += 1;
@@ -1624,6 +1624,10 @@ test "[failure] - [mzML streamed writing]: Numpress value errors write nothing t
         const before = writer.engine.byteOffset();
         try std.testing.expectError(error.InvalidValue, writer.writeRecordWithArrays(record.node, &.{prepared.payload}));
         try std.testing.expectEqual(before, writer.engine.byteOffset());
+        const stream_report = writer.diagnostic().?;
+        try std.testing.expectEqual(.array, stream_report.stage);
+        try std.testing.expectEqual(.binary_data_array, stream_report.element.?);
+        try std.testing.expectEqual(@as(usize, 0), stream_report.array_position.?);
         try std.testing.expectError(error.FailedState, writer.finish());
 
         var dir = std.testing.tmpDir(.{});
@@ -1637,6 +1641,11 @@ test "[failure] - [mzML streamed writing]: Numpress value errors write nothing t
         try file_writer.writeHeader(header.*);
         try file_writer.beginList(.spectrum_list, 1, "dp");
         try std.testing.expectError(error.InvalidValue, file_writer.writeRecordWithArrays(record.node, &.{prepared.payload}));
+        // File output finds the error while writing, and reports it as stream output does.
+        const file_report = file_writer.diagnostic().?;
+        try std.testing.expectEqual(stream_report.stage, file_report.stage);
+        try std.testing.expectEqual(stream_report.element, file_report.element);
+        try std.testing.expectEqual(stream_report.array_position, file_report.array_position);
         try std.testing.expectError(error.FailedState, file_writer.finish());
         builder.reset();
         encoder.reset();

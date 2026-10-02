@@ -260,12 +260,13 @@ fn decompressText(self: *DecodedArrays, source: anytype) !void {
     if (self.decompressor == null) self.decompressor = try zlib.Decompressor.init(self.allocator);
     const decompressor = &self.decompressor.?;
     decompressor.startReader(&input.reader);
-    const inflated = self.decompressInto(decompressor, output);
+    var short: ?usize = null;
+    const inflated = self.decompressInto(decompressor, output, &short);
     if (input.failure) |err| return input.fail(self, err);
     input.drain() catch |err| return input.fail(self, err);
     // An empty plain zlib array has no text and was decoded whole above.
     inflated catch |err| {
-        self.failure = .{ .stage = .array };
+        self.failure = .{ .stage = .array, .detail = output.shortDetail(short) };
         return err;
     };
     if (output.encoding.pipeline.isNumpress()) {
@@ -277,14 +278,23 @@ fn decompressText(self: *DecodedArrays, source: anytype) !void {
 // A primitive zlib payload that fit the window whole: the slice decoder writes straight into
 // the values, with the same checks and errors as decoding a retained payload.
 fn decompressWhole(self: *DecodedArrays, output: *Output, wire: []const u8, counts: base64.Counts) Error!void {
-    errdefer self.failure = .{ .stage = .array };
     const pipeline = output.encoding.payloadPipeline(output.length, counts.significant_bytes == 0);
     switch (output.primitive()) {
-        inline else => |kind| try arrays.decodeWire(kind.Type(), output.values(kind.Type()), wire, pipeline, &.{}),
+        inline else => |kind| arrays.decodeWire(kind.Type(), output.values(kind.Type()), wire, pipeline, &.{}) catch |err| {
+            // Only on this error path: inflate again for the length of a stream that ended short.
+            const bytes = std.mem.sliceAsBytes(output.words.items)[0..output.bytes];
+            const short = if (err == error.DecodedSizeMismatch and pipeline == .zlib)
+                if (zlib.decompress(bytes, wire)) |inflated| inflated.len else |_| null
+            else
+                null;
+            self.failure = .{ .stage = .array, .detail = output.shortDetail(short) };
+            return err;
+        },
     }
 }
 
-fn decompressInto(self: *DecodedArrays, decompressor: *zlib.Decompressor, output: *Output) Error!void {
+// short receives the decoded length of a primitive stream that ended before the values did.
+fn decompressInto(self: *DecodedArrays, decompressor: *zlib.Decompressor, output: *Output, short: *?usize) Error!void {
     if (output.encoding.pipeline.isNumpress()) {
         // More than the Numpress bound means the stream holds more than the declared values;
         // never read more than one byte past it, so a zlib error beyond stays unseen.
@@ -298,7 +308,11 @@ fn decompressInto(self: *DecodedArrays, decompressor: *zlib.Decompressor, output
         }
     }
     const bytes = std.mem.sliceAsBytes(output.words.items)[0..output.bytes];
-    if ((try decompressor.read(bytes)).len != bytes.len) return error.DecodedSizeMismatch;
+    const length = (try decompressor.read(bytes)).len;
+    if (length != bytes.len) {
+        short.* = length;
+        return error.DecodedSizeMismatch;
+    }
     var extra: [1]u8 = undefined;
     if ((try decompressor.read(&extra)).len != 0) return error.DecodedSizeMismatch;
     output.toNative();
@@ -404,6 +418,12 @@ const Output = struct {
     length: usize = 0,
     // length times the primitive's size, set once its words are allocated.
     bytes: usize = 0,
+
+    // The size detail of an array whose stream decoded to short bytes, when that is known.
+    fn shortDetail(self: *const Output, short: ?usize) Diagnostic.Detail {
+        const actual = short orelse return .none;
+        return .{ .size = .{ .expected = self.bytes, .actual = actual, .unit = .bytes } };
+    }
 
     fn primitive(self: *const Output) model.Primitive {
         return self.encoding.decodedPrimitive();

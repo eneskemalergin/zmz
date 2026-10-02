@@ -261,6 +261,7 @@ pub fn readFragment(self: *StreamReader, allocator: std.mem.Allocator, input: *s
     try self.enter();
     defer self.active = false;
     self.failure = null;
+    self.current_kind = null;
     if (self.header_ready or ancestors > 4 or physical_start < prefix_length) return error.InvalidOptions;
     errdefer self.fragment_ancestors = null;
     if (reuse_ancestors) {
@@ -358,10 +359,11 @@ pub fn resumeFollowingList(self: *StreamReader, input: *std.Io.Reader, ancestors
         if ((self.cursor.current orelse return error.UnexpectedEnd).data != .start_element) return error.InvalidStructure;
         try self.cursor.advance(false);
     }
-    if (try self.kind() != .spectrum) return error.InvalidStructure;
+    // The index promised a spectrum here and a chromatogram list after the spectra.
+    if (try self.kind() != .spectrum) return error.InvalidIndex;
     try self.cursor.skip();
     try self.finishSpectrumList();
-    if (self.active_list != .chromatogram_list) return error.InvalidStructure;
+    if (self.active_list != .chromatogram_list) return error.InvalidIndex;
     const scope = &self.list_scopes[1].?;
     scope.start = std.math.add(u64, scope.start, physical_start - prefix_length) catch return error.LimitExceeded;
     scope.end = std.math.add(u64, scope.end, physical_start - prefix_length) catch return error.LimitExceeded;
@@ -373,7 +375,7 @@ pub fn finishEmptySpectrumList(self: *StreamReader) Error!void {
     if (self.active_list != .spectrum_list) return error.InvalidOptions;
     try self.cursor.advance(false);
     try self.finishSpectrumList();
-    if (self.active_list != .chromatogram_list) return error.InvalidStructure;
+    if (self.active_list != .chromatogram_list) return error.InvalidIndex;
 }
 
 fn skipExtraXml(self: *StreamReader, parent: model.Kind) Error!void {
@@ -418,6 +420,7 @@ fn capture(self: *StreamReader, err: Error, stage: Diagnostic.Stage, detail: Dia
         report = Diagnostic.init(err, .read_record, .metadata, .{ .limit = .{
             .name = if (record) .record_bytes else .header_bytes,
             .maximum = if (record) self.record_store.limit else self.header_store.limit,
+            .needed = if (record) self.record_store.needed else self.header_store.needed,
         } });
     }
     report.location = .{ .input_event = self.cursor.offset };
@@ -706,7 +709,7 @@ const TextSource = struct {
         if (self.pending) |bytes| {
             self.pending = null;
             if (self.retain) {
-                if (self.size > self.storage.limit -| self.storage.used) return try self.storage.limitError();
+                if (self.size > self.storage.limit -| self.storage.used) return try self.storage.limitError(self.size);
                 try self.text.appendSlice(self.storage.arena.allocator(), bytes);
             }
         }
@@ -935,7 +938,7 @@ fn parseParams(self: *StreamReader, storage: *Storage, comptime retain: bool, co
                             if (text.data != .text) break;
                             if (retain) {
                                 if (text.data.text.bytes.len > storage.limit -| storage.used -| bytes.items.len)
-                                    return try storage.limitError();
+                                    return try storage.limitError(bytes.items.len +| text.data.text.bytes.len);
                                 try bytes.appendSlice(storage.arena.allocator(), text.data.text.bytes);
                             }
                             try self.cursor.advance(true);
@@ -1083,10 +1086,14 @@ fn readXml(self: *StreamReader, storage: *Storage, comptime retain: bool) Error!
     var writer = try xml.Writer.init(self.allocator, &output.writer, .{ .fragment = true });
     defer writer.deinit();
     self.cursor.writeElement(&writer, &remaining) catch |err| return switch (err) {
-        error.WriteFailed => if ((output.failure orelse error.InvalidXml) == error.LimitExceeded) try storage.limitError() else output.failure orelse error.InvalidXml,
+        error.WriteFailed => if ((output.failure orelse error.InvalidXml) == error.LimitExceeded) try storage.limitError(null) else output.failure orelse error.InvalidXml,
         error.InvalidName, error.InvalidCharacter, error.InvalidNamespace, error.DuplicateAttribute => error.InvalidXml,
-        error.WriterLimit => try self.limitError(.depth, schema.MAX_DEPTH, null),
-        error.LimitExceeded => if (self.cursor.limit_failure == .nodes) try self.limitError(.nodes, self.options.limits.nodes, null) else error.LimitExceeded,
+        error.LimitExceeded => if (self.cursor.limit_failure == .nodes)
+            try self.limitError(.nodes, self.options.limits.nodes, null)
+        else if (writer.failure != null)
+            try self.limitError(.depth, schema.MAX_DEPTH, null)
+        else
+            error.LimitExceeded,
         else => |other| other,
     };
     storage.nodes = self.options.limits.nodes - remaining;
@@ -1170,6 +1177,8 @@ const Storage = struct {
     nodes: usize = 0,
     arrays: usize = 0,
     exceeded: bool = false,
+    // The bytes the failed request would have needed, when known.
+    needed: ?usize = null,
 
     fn init(allocator: std.mem.Allocator, limit: usize) Storage {
         return .{ .arena = .init(allocator), .limit = limit };
@@ -1181,16 +1190,18 @@ const Storage = struct {
         self.nodes = 0;
         self.arrays = 0;
         self.exceeded = false;
+        self.needed = null;
     }
 
     fn charge(self: *Storage, comptime T: type, count: usize) Error!void {
         const bytes = std.math.mul(usize, count, @sizeOf(T)) catch return error.LimitExceeded;
-        if (bytes > self.limit -| self.used) return try self.limitError();
+        if (bytes > self.limit -| self.used) return try self.limitError(bytes);
         self.used += bytes;
     }
 
-    fn limitError(self: *Storage) Error!noreturn {
+    fn limitError(self: *Storage, request: ?usize) Error!noreturn {
         self.exceeded = true;
+        self.needed = if (request) |bytes| self.used +| bytes else null;
         return error.LimitExceeded;
     }
 

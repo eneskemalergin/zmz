@@ -109,8 +109,13 @@ pub fn decode(
     if (pipeline.isNumpress() and T != f64) return error.TypeMismatch;
     const destination = if (pipeline == .none) std.mem.sliceAsBytes(output) else scratch.transport;
     const counts = base64.decode(destination, source) catch |err| {
-        if (pipeline != .none or err != error.OutputTooSmall) return err;
-        return error.DecodedSizeMismatch;
+        if (err != error.OutputTooSmall) return err;
+        // Filling output, or Numpress scratch as large as its bound, means the text holds more
+        // than the declared values; shorter scratch is the caller's buffer.
+        if (pipeline == .none) return error.DecodedSizeMismatch;
+        if (pipeline.isNumpress() and !pipeline.hasZlib() and scratch.transport.len >= try wireBound(T, output.len, pipeline))
+            return error.DecodedSizeMismatch;
+        return err;
     };
     try decodeWireInner(T, output, destination[0..counts.decoded_bytes], pipeline, scratch.transformed);
 }

@@ -393,21 +393,24 @@ pub const BinaryArray = struct {
         return initWithEncoding(node, default_length, try arrayEncoding(node, groups));
     }
 
-    /// Decodes the declared values into an exact-size caller-owned typed buffer.
-    /// Ordinary arrays require the declared primitive. Numpress arrays decode into f64 because
-    /// Numpress does not carry a primitive-width wire representation.
+    /// Decodes the declared values into the start of a caller-owned typed buffer and returns
+    /// them; a buffer shorter than length is OutputTooSmall. Ordinary arrays require the
+    /// declared primitive. Numpress arrays decode into f64 because Numpress does not carry a
+    /// primitive-width wire representation.
     pub fn decode(
         self: BinaryArray,
         comptime T: type,
         output: []T,
         scratch: arrays.Scratch,
-    ) (EncodingError || arrays.Error)!void {
+    ) (EncodingError || arrays.Error)![]T {
         if (self.encoding.decodedPrimitive() != Primitive.of(T)) return error.TypeMismatch;
-        if (self.length != output.len) return error.DecodedSizeMismatch;
+        if (output.len < self.length) return error.OutputTooSmall;
+        const values = output[0..self.length];
         const binary = self.node.child(.binary) orelse return error.PayloadNotRetained;
         const text = binary.text orelse return error.PayloadNotRetained;
         const pipeline = self.encoding.payloadPipeline(self.length, std.mem.trim(u8, text, cv.XML_WHITESPACE).len == 0);
-        try arrays.decode(T, output, text, pipeline, scratch);
+        try arrays.decode(T, values, text, pipeline, scratch);
+        return values;
     }
 };
 
@@ -440,7 +443,8 @@ pub fn arrayEncoding(node: Node, groups: []const cv.Group) EncodingError!Encodin
     return encoding.classify(node.params, groups);
 }
 
-/// Decodes one array into an exact-size caller buffer without allocating, whatever its role.
+/// Decodes one array into the start of a caller buffer without allocating, whatever its role,
+/// and returns the values, as BinaryArray.decode does.
 /// Values keep their declared primitive and units.
 pub fn decodeArray(
     comptime T: type,
@@ -449,11 +453,11 @@ pub fn decodeArray(
     default_length: ?usize,
     groups: []const cv.Group,
     scratch: arrays.Scratch,
-) (EncodingError || cv.ValueError || arrays.Error)!void {
+) (EncodingError || cv.ValueError || arrays.Error)![]T {
     const declared_encoding = try arrayEncoding(node, groups);
     if (declared_encoding.decodedPrimitive() != Primitive.of(T)) return error.TypeMismatch;
     const array = try initWithEncoding(node, default_length, declared_encoding);
-    try array.decode(T, output, scratch);
+    return array.decode(T, output, scratch);
 }
 
 fn initWithEncoding(node: Node, default_length: ?usize, descriptor: Encoding) cv.ValueError!BinaryArray {

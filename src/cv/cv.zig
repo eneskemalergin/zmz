@@ -17,6 +17,7 @@ pub const ParameterXml = source.ParameterXml;
 pub const Entry = source.Entry;
 pub const Group = source.Group;
 pub const ExpansionError = source.ExpansionError;
+pub const EXPANSION_WORK = source.EXPANSION_WORK;
 pub const EffectiveIterator = source.EffectiveIterator;
 pub const Match = source.Match;
 pub const ValueError = source.ValueError;

@@ -814,6 +814,21 @@ test "[failure] - [array sources]: values inside the destination's buffer are re
     try std.testing.expectEqual(@as(usize, 0), writer.end);
 }
 
+test "[failure] - [array pipelines]: too many Numpress values are the file's fault at any scratch size" {
+    var encoded: [128]u8 = undefined;
+    var wire: [64]u8 = undefined;
+    const many = [_]f64{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
+    const text = try base64.encode(&encoded, wire[0..try mzml.numpress.encodePic(&many, &wire)]);
+    var output: [1]f64 = undefined;
+    const bound = try arrays.wireBound(f64, output.len, .pic);
+    var transport: [64]u8 = undefined;
+    for ([_]usize{ bound, bound + 1, transport.len }) |size| {
+        try std.testing.expectError(error.DecodedSizeMismatch, arrays.decode(f64, &output, text, .pic, .{ .transport = transport[0..size], .transformed = &.{} }));
+    }
+    // Scratch below the bound is the caller's.
+    try std.testing.expectError(error.OutputTooSmall, arrays.decode(f64, &output, text, .pic, .{ .transport = transport[0 .. bound - 1], .transformed = &.{} }));
+}
+
 test "[integration] - [array encoder]: keeps every wire until reset for all pipelines" {
     var encoder = arrays.Encoder.init(std.testing.allocator, .even);
     defer encoder.deinit();
