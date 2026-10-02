@@ -53,10 +53,11 @@ pub const Source = struct {
         return .{ .values = .of(T, values), .options = options, .encoder = encoder };
     }
 
-    /// Checks the options against the values' type, with the errors encode would return.
+    /// Checks the options against the values, with the errors encode would return: the type,
+    /// the compressor, and the fixed point's presence and value.
     pub fn check(self: Source) Error!void {
         switch (self.values) {
-            inline else => |values| try checkOptions(@typeInfo(@TypeOf(values)).pointer.child, self.options, self.encoder != null),
+            inline else => |values| try checkOptions(@typeInfo(@TypeOf(values)).pointer.child, values.len, self.options, self.encoder != null),
         }
     }
 
@@ -71,6 +72,7 @@ pub const Source = struct {
     /// Writes the wire bytes to writer, through the encoder's compressor for zlib pipelines.
     /// Numpress value errors surface here; after one, writer holds an unspecified prefix.
     pub fn writeTo(self: Source, writer: *std.Io.Writer) WriteError!void {
+        try self.check();
         switch (self.values) {
             inline else => |values| {
                 const T = @typeInfo(@TypeOf(values)).pointer.child;
@@ -182,7 +184,7 @@ pub fn encodeWire(
 ) Error![]const u8 {
     _ = encoding.Primitive.of(T);
     try checkBuffers(&.{}, std.mem.sliceAsBytes(values), scratch);
-    try checkOptions(T, options, compressor != null);
+    try checkOptions(T, values.len, options, compressor != null);
     if (options.pipeline.hasZlib()) {
         const writer = try compressor.?.start(scratch.transport);
         writeWire(T, values, options, writer) catch |err| switch (err) {
@@ -220,12 +222,12 @@ fn writePrimitives(comptime T: type, values: []const T, writer: *std.Io.Writer) 
     for (values) |value| try writer.writeInt(Bits, @bitCast(value), .little);
 }
 
-fn checkOptions(comptime T: type, options: EncodeOptions, has_compressor: bool) Error!void {
+fn checkOptions(comptime T: type, count: usize, options: EncodeOptions, has_compressor: bool) Error!void {
     const selected = options.pipeline.transform();
     if (selected != null and T != f64 and T != f32) return error.TypeMismatch;
     if (options.pipeline.hasZlib() and !has_compressor) return error.MissingCompressor;
     if (selected == .linear or selected == .slof) {
-        if (options.fixed_point == null) return error.MissingFixedPoint;
+        try numpress.validateFixedPoint(options.fixed_point orelse return error.MissingFixedPoint, count == 0);
     } else if (options.fixed_point != null) return error.UnexpectedFixedPoint;
 }
 

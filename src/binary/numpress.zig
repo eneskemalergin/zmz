@@ -358,8 +358,11 @@ pub fn encodeLinearTo(input: anytype, fixed_point: f64, writer: *std.Io.Writer) 
     var i: usize = 2;
     while (i < values.len) {
         const n: usize = @min(BLOCK, values.len - i);
-        // scaled[0..2] carries the previous two values into the block.
-        if (scaleLinearBlock(values[i..][0..n], fixed_point, scaled[2..][0..n]) and
+        // scaled[0..2] carries the previous two values into the block. They come from the
+        // checked path when the previous block did, so they too must stay below 2^62 for the
+        // unchecked residuals.
+        if (scaled[0] < 1 << 62 and scaled[1] < 1 << 62 and
+            scaleLinearBlock(values[i..][0..n], fixed_point, scaled[2..][0..n]) and
             linearResiduals(scaled[0 .. n + 2], residuals[0..n], heads[0..n], leading[0..n]))
         {
             try blocks.start(&sink, n);
@@ -1360,7 +1363,8 @@ fn validateNonnegative(value: f64) Error!void {
     if (value < 0) return error.InvalidValue;
 }
 
-fn validateFixedPoint(fixed_point: f64, allow_zero: bool) Error!void {
+/// The Linear and SLOF rule: a finite, nonnegative fixed point, zero only with no values.
+pub fn validateFixedPoint(fixed_point: f64, allow_zero: bool) Error!void {
     if (!std.math.isFinite(fixed_point) or fixed_point < 0) return error.InvalidFixedPoint;
     if (!allow_zero and fixed_point == 0) return error.InvalidFixedPoint;
 }

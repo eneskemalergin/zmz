@@ -424,6 +424,29 @@ test "[property] - [zlib]: incompressible input fits the compression bound" {
     }
 }
 
+test "[failure] - [zlib]: streaming calls out of order fail with InvalidState" {
+    var decompressor = try zlib.Decompressor.init(std.testing.allocator);
+    defer decompressor.deinit();
+    var window: [16]u8 = undefined;
+    try std.testing.expectError(error.InvalidState, decompressor.next(16));
+    try std.testing.expectError(error.InvalidState, decompressor.read(&window));
+
+    var compressor = try zlib.Compressor.init(std.testing.allocator, .fast);
+    defer compressor.deinit();
+    try std.testing.expectError(error.InvalidState, compressor.finish());
+    try std.testing.expectError(error.InvalidState, compressor.finishWriter());
+    var output: [64]u8 = undefined;
+    _ = try compressor.start(&output);
+    _ = try compressor.finish();
+    try std.testing.expectError(error.InvalidState, compressor.finish());
+    // finish returns start's output, which a startWriter stream does not have.
+    var sink = std.Io.Writer.fixed(&output);
+    _ = try compressor.startWriter(&sink);
+    try std.testing.expectError(error.InvalidState, compressor.finish());
+    try compressor.finishWriter();
+    try std.testing.expectError(error.InvalidState, compressor.finishWriter());
+}
+
 test "[failure] - [zlib]: releases partially allocated compression storage" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, allocateCompressor, .{});
 }
@@ -743,6 +766,22 @@ test "[failure] - [zlib arrays]: returns DecodedSizeMismatch when a stream outgr
         .transport = &transport,
         .transformed = transformed[0..1],
     }));
+}
+
+test "[failure] - [array sources]: writeTo checks options before writing a byte" {
+    var output: [64]u8 = undefined;
+    const cases = .{
+        .{ arrays.Source.of(i32, &.{ 1, 2 }, .{ .pipeline = .pic }, null), error.TypeMismatch },
+        .{ arrays.Source.of(f64, &.{ 1, 2 }, .{ .pipeline = .linear, .fixed_point = 0 }, null), error.InvalidFixedPoint },
+        .{ arrays.Source.of(f64, &.{ 1, 2 }, .{ .pipeline = .slof, .fixed_point = std.math.nan(f64) }, null), error.InvalidFixedPoint },
+        .{ arrays.Source.of(f64, &.{1}, .{ .pipeline = .zlib }, null), error.MissingCompressor },
+    };
+    inline for (cases) |case| {
+        var writer = std.Io.Writer.fixed(&output);
+        try std.testing.expectError(case[1], case[0].check());
+        try std.testing.expectError(case[1], case[0].writeTo(&writer));
+        try std.testing.expectEqual(@as(usize, 0), writer.end);
+    }
 }
 
 test "[integration] - [array encoder]: keeps every wire until reset for all pipelines" {

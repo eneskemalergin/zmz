@@ -333,6 +333,42 @@ test "[property] - [numpress encoders]: block encoding matches the value-by-valu
     }
 }
 
+test "[regression] - [numpress Linear]: values falling below 2^62 at a block boundary encode" {
+    // Second differences of 2^30 fit a residual, but the values peak between 2^62 and 2^63.
+    // The block before the fall takes the checked path; the next one starts below 2^62 with
+    // carried values above it.
+    const allocator = std.testing.allocator;
+    const n: i64 = 80_000;
+    var scaled: std.ArrayList(i64) = .empty;
+    defer scaled.deinit(allocator);
+    var value: i64 = 0;
+    var step: i64 = 0;
+    var fall: ?usize = null;
+    var high = false;
+    var i: i64 = 0;
+    while (fall == null or scaled.items.len < fall.? + 300) : (i += 1) {
+        try scaled.append(allocator, value);
+        const below = @as(f64, @floatFromInt(value)) + 0.5 < 0x1p62;
+        if (high and below and fall == null) fall = scaled.items.len - 1;
+        high = high or !below;
+        step += if (i < n) 1 << 30 else -(1 << 30);
+        value += step;
+    }
+    // Leading zeros move the fall to the first value of a 128-value block, which starts at 2.
+    const zeros = (128 - (fall.? - 2) % 128) % 128;
+    const values = try allocator.alloc(f64, zeros + scaled.items.len);
+    defer allocator.free(values);
+    @memset(values[0..zeros], 0);
+    for (scaled.items, values[zeros..]) |source, *destination| destination.* = @floatFromInt(source);
+    const encoded = try allocator.alloc(u8, try numpress.linearMaxEncodedLen(values.len));
+    defer allocator.free(encoded);
+    const length = try numpress.encodeLinear(values, 1, encoded);
+    const decoded = try allocator.alloc(f64, values.len);
+    defer allocator.free(decoded);
+    try numpress.decodeLinearExact(encoded[0..length], decoded);
+    try std.testing.expectEqualSlices(f64, values, decoded);
+}
+
 test "[property] - [numpress encoders]: f32 input encodes as its f64 copy" {
     var random = std.Random.DefaultPrng.init(0x4e55_4d50_4633_3200);
     const source = random.random();

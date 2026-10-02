@@ -520,6 +520,16 @@ test "[integration] - [prepared construction]: keeps builder and writer failure 
     try std.testing.expectError(error.MissingFixedPoint, builder.prepareArray(f64, &.{1}, bad, &encoder));
     try std.testing.expectError(error.MissingFixedPoint, builder.prepareArray(f32, &.{1}, bad, &encoder));
     try std.testing.expectError(error.TypeMismatch, builder.prepareArray(i32, &.{1}, bad, &encoder));
+    // A bad fixed point fails here, not midway through a written record.
+    for ([_]mzml.arrays.Pipeline{ .linear, .slof_zlib }) |pipeline| {
+        bad.encoding.pipeline = pipeline;
+        for ([_]f64{ 0, -1, std.math.nan(f64), std.math.inf(f64) }) |fixed_point| {
+            bad.encoding.fixed_point = fixed_point;
+            try std.testing.expectError(error.InvalidFixedPoint, builder.prepareArray(f64, &.{1}, bad, &encoder));
+        }
+        bad.encoding.fixed_point = 0;
+        _ = try builder.prepareArray(f64, &.{}, bad, &encoder);
+    }
     var limited = mzml.Builder.init(std.testing.allocator, .{ .bytes = 1 });
     defer limited.deinit();
     try std.testing.expectError(error.LimitExceeded, limited.prepareArray(f64, &.{1}, options, &encoder));
