@@ -151,17 +151,28 @@ pub const Compressor = struct {
     pub fn start(self: *Compressor, output: []u8) Error!*std.Io.Writer {
         self.destination = std.Io.Writer.fixed(output);
         // zipir's only compression error is a full output writer.
-        self.state.init(&self.destination, .{ .preset = switch (self.preset) {
-            .fast => .fast,
-            .even => .even,
-            .dense => .dense,
-        } }) catch return error.OutputTooSmall;
-        return &self.state.writer;
+        return self.startWriter(&self.destination) catch error.OutputTooSmall;
     }
 
     /// Ends the stream begun by start and returns the written prefix of its output.
     pub fn finish(self: *Compressor) Error![]u8 {
-        _ = self.state.finish() catch return error.OutputTooSmall;
+        self.finishWriter() catch return error.OutputTooSmall;
         return self.destination.buffered();
+    }
+
+    /// Starts one zlib stream into destination, which stays borrowed until finishWriter, and
+    /// returns the writer for its source. Write errors are destination's.
+    pub fn startWriter(self: *Compressor, destination: *std.Io.Writer) std.Io.Writer.Error!*std.Io.Writer {
+        try self.state.init(destination, .{ .preset = switch (self.preset) {
+            .fast => .fast,
+            .even => .even,
+            .dense => .dense,
+        } });
+        return &self.state.writer;
+    }
+
+    /// Ends the stream begun by startWriter.
+    pub fn finishWriter(self: *Compressor) std.Io.Writer.Error!void {
+        _ = try self.state.finish();
     }
 };

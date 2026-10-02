@@ -52,7 +52,6 @@ pub const Id = enum(u16) {
     io_failed = 27,
     canceled = 28,
     count_mismatch = 29,
-    encoded_length_mismatch = 30,
 
     pub fn description(self: Id) []const u8 {
         return switch (self) {
@@ -85,7 +84,6 @@ pub const Id = enum(u16) {
             .io_failed => "input or output operation failed",
             .canceled => "operation was canceled",
             .count_mismatch => "count differs from the expected count",
-            .encoded_length_mismatch => "encodedLength differs from the prepared bytes",
         };
     }
 };
@@ -184,7 +182,6 @@ pub fn init(code: Errors, operation: Operation, stage: Stage, detail: Detail) Di
         error.ReadFailed, error.AccessDenied, error.PermissionDenied, error.InputOutput, error.IsDir, error.LockViolation, error.NotOpenForReading, error.Streaming, error.SystemResources, error.Unexpected, error.Unseekable, error.WouldBlock, error.BrokenPipe, error.DeviceBusy, error.DiskQuota, error.FileBusy, error.FileTooBig, error.NoDevice, error.NoSpaceLeft, error.NotOpenForWriting => .io_failed,
         error.Canceled => .canceled,
         error.CountMismatch => .count_mismatch,
-        error.EncodedLengthMismatch => .encoded_length_mismatch,
     };
     return .{ .id = id, .code = code, .operation = operation, .stage = stage, .detail = detail };
 }

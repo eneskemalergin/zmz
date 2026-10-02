@@ -29,7 +29,7 @@ test "[integration] - [mzML extensions]: array replacement retains XML and late 
     defer writer.deinit();
     try writer.writeHeader(header.*);
     try writer.beginListWithAttributes(.spectrum_list, 1, header.spectrum_list.?.attributes);
-    try writer.writeRecordWithArrays(record, &.{ first.wire, other.wire });
+    try writer.writeRecordWithArrays(record, &.{ first.payload, other.payload });
     try writer.endList();
     try writer.finish();
     const bytes = sink.written();
@@ -87,7 +87,7 @@ fn reencodeReferenceAllocated(allocator: std.mem.Allocator) !void {
     defer writer.deinit();
     try writer.writeHeader(prepared_header.header);
     try writer.beginListWithAttributes(.spectrum_list, 1, header.spectrum_list.?.attributes);
-    try writer.writeRecordWithSelectedArrays(record, &.{ first.wire, null });
+    try writer.writeRecordWithSelectedArrays(record, &.{ first.payload, null });
     try writer.endList();
     try writer.finish();
     var index = try mzml.IndexedReader.build(allocator, .{ .bytes = sink.buffered() }, .{});
@@ -139,13 +139,13 @@ test "[integration] - [parameter namespaces]: reencoding keeps reference and mem
                 const rewritten = try header_builder.reencoding(header.*, &.{.{ .primitive = .float32, .pipeline = .none }});
                 const array = try rewritten.prepareArray(&builder, f32, &values, record.binaryArrays()[0], .{}, &encoder);
                 const copied = try builder.record(.spectrum, record.id, 0, 1, &.{}, &.{}, &.{array.array});
-                break :blk .{ .header = rewritten.header, .record = copied, .wire = array.wire };
+                break :blk .{ .header = rewritten.header, .record = copied, .payload = array.payload };
             };
             try std.testing.expectEqual(@as(usize, 2), prepared.header.groups.len);
             for ([_]bool{ false, true }) |indexed| {
                 var buffer: [8192]u8 = undefined;
                 var sink = std.Io.Writer.fixed(&buffer);
-                try support.writeSingleRecord(allocator, &sink, prepared.header, prepared.record.node, indexed, &.{prepared.wire});
+                try support.writeSingleRecord(allocator, &sink, prepared.header, prepared.record.node, indexed, &.{prepared.payload});
                 var lookup = try mzml.IndexedReader.build(allocator, .{ .bytes = sink.buffered() }, .{ .policy = if (indexed) .open_embedded else .rebuild });
                 defer lookup.deinit();
                 var decoded = mzml.StreamReader.DecodedArrays.init(allocator, .{});
@@ -212,7 +212,7 @@ test "[integration] - [mzML containers]: prepared writing preserves extra contai
             defer writer.deinit();
             try writer.writeHeader(prepared_header.header);
             try writer.beginListWithAttributes(.spectrum_list, 1, header.spectrum_list.?.attributes);
-            try writer.writeRecordWithArrays(node, &.{ first.wire, second.wire });
+            try writer.writeRecordWithArrays(node, &.{ first.payload, second.payload });
             try writer.endList();
             try writer.finish();
             var index = try mzml.IndexedReader.build(allocator, .{ .bytes = sink.buffered() }, .{});
@@ -313,7 +313,9 @@ fn replaceArrayAllocated(allocator: std.mem.Allocator) !void {
             try std.testing.expect(source.attribute("dataProcessingRef").?.ptr != result.array.node.attribute("dataProcessingRef").?.ptr);
             try std.testing.expectEqualStrings("keep", result.array.node.attribute("extra").?);
             try std.testing.expectEqual(length, try mzml.cv.parseInteger(usize, result.array.node.attribute("arrayLength")));
-            try std.testing.expectEqual(try mzml.base64.encodedSize(result.wire.len), try mzml.cv.parseInteger(usize, result.array.node.attribute("encodedLength")));
+            // Only lengths known without encoding are filled in; the writer sets the others.
+            const known = if (result.payload.source.wireLength()) |wire_length| try mzml.base64.encodedSize(wire_length) else 0;
+            try std.testing.expectEqual(known, try mzml.cv.parseInteger(usize, result.array.node.attribute("encodedLength")));
             try std.testing.expectEqualDeep(mzml.model.Encoding{ .primitive = .float32, .pipeline = pipeline }, try mzml.model.arrayEncoding(result.array.node, &.{}));
             try std.testing.expectEqual(@as(usize, 8), result.array.node.params.len);
             try std.testing.expectEqualDeep(params[0], result.array.node.params[0]);
@@ -324,7 +326,7 @@ fn replaceArrayAllocated(allocator: std.mem.Allocator) !void {
             try std.testing.expectEqualDeep(result.array.node.params[2], result.array.node.params[7]);
             try std.testing.expectEqualStrings("MS:1000576", groups[0].entries[2].cv.accession.?.raw);
             var decoded: [2]f32 = undefined;
-            try mzml.arrays.decodeWire(f32, decoded[0..length], result.wire, pipeline, &.{});
+            try mzml.arrays.decodeWire(f32, decoded[0..length], try encoder.encodeSource(result.payload.source), pipeline, &.{});
             try std.testing.expectEqualSlices(f32, values[0..length], decoded[0..length]);
         }
     }
@@ -438,7 +440,7 @@ test "[integration] - [record editing]: changes values and length while retainin
     defer writer.deinit();
     try writer.writeHeader(header.*);
     try writer.beginList(.spectrum_list, 1, "dp");
-    try writer.writeRecordWithArrays(changed_record, &.{prepared.wire});
+    try writer.writeRecordWithArrays(changed_record, &.{prepared.payload});
     try writer.endList();
     try writer.finish();
     var index = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = sink.written() }, .{});
@@ -477,12 +479,14 @@ test "[integration] - [prepared construction]: retains metadata and borrows prim
                     .encoding = .{ .pipeline = pipeline },
                 }, &encoder);
                 try std.testing.expectEqual(@as(?[]const u8, null), result.array.node.child(.binary).?.text);
-                try std.testing.expectEqual(try mzml.base64.encodedSize(result.wire.len), try mzml.cv.parseInteger(usize, result.array.node.attribute("encodedLength")));
+                // Only lengths known without encoding are filled in; the writer sets the others.
+                const known = if (result.payload.source.wireLength()) |wire_length| try mzml.base64.encodedSize(wire_length) else 0;
+                try std.testing.expectEqual(known, try mzml.cv.parseInteger(usize, result.array.node.attribute("encodedLength")));
                 try std.testing.expectEqual(length, result.array.length);
-                if (pipeline == .none and @import("builtin").cpu.arch.endian() == .little)
-                    try std.testing.expectEqual(std.mem.sliceAsBytes(values[0..length]).ptr, result.wire.ptr);
+                // The payload borrows the values; nothing is encoded until the record is written.
+                try std.testing.expectEqual(std.mem.sliceAsBytes(values[0..length]).ptr, std.mem.sliceAsBytes(@field(result.payload.source.values, @tagName(mzml.model.Primitive.of(T)))).ptr);
                 var output: [5]T = undefined;
-                try mzml.arrays.decodeWire(T, output[0..length], result.wire, pipeline, &.{});
+                try mzml.arrays.decodeWire(T, output[0..length], try encoder.encodeSource(result.payload.source), pipeline, &.{});
                 try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(values[0..length]), std.mem.sliceAsBytes(output[0..length]));
             }
         }
@@ -512,8 +516,8 @@ test "[integration] - [prepared construction]: keeps builder and writer failure 
     try std.testing.expectEqualDeep(bad.role.unit, partial.array.node.params[0].cv.unit);
     bad = options;
     bad.encoding.pipeline = .zlib;
-    // The encoder supplies its own compressor for zlib pipelines.
-    try std.testing.expect((try builder.prepareArray(f64, &.{1}, bad, &encoder)).wire.len != 0);
+    // The encoder supplies its own compressor for zlib pipelines when the record is written.
+    try std.testing.expect((try builder.prepareArray(f64, &.{1}, bad, &encoder)).payload == .source);
     bad.encoding.pipeline = .linear;
     try std.testing.expectError(error.MissingFixedPoint, builder.prepareArray(f64, &.{1}, bad, &encoder));
     try std.testing.expectError(error.MissingFixedPoint, builder.prepareArray(f32, &.{1}, bad, &encoder));
@@ -532,9 +536,11 @@ test "[integration] - [prepared construction]: keeps builder and writer failure 
     try writer.writeHeader((try reader.readHeader()).*);
     try writer.beginList(.spectrum_list, 1, "dp");
     const before = sink.buffered().len;
-    try std.testing.expectError(error.EncodedLengthMismatch, writer.writeRecordWithArrays(record.node, &.{ a.wire[0..4], b.wire }));
-    try std.testing.expectEqual(before, sink.buffered().len);
-    try std.testing.expectError(error.FailedState, writer.writeRecordWithArrays(record.node, &.{ a.wire, b.wire }));
+    const a_wire = try encoder.encodeSource(a.payload.source);
+    const b_wire = try encoder.encodeSource(b.payload.source);
+    // The writer sets encodedLength from the text it writes, whatever the metadata declares.
+    try writer.writeRecordWithArrays(record.node, &.{ .{ .wire = a_wire[0..4] }, .{ .wire = b_wire } });
+    try std.testing.expect(std.mem.indexOf(u8, sink.buffered()[before..], "encodedLength=\"8\"") != null);
 }
 
 test "[integration] - [mzML prepared writing]: matches frozen plain and indexed output apart from zlib bytes" {
@@ -668,12 +674,12 @@ test "[integration] - [mzML construction]: preserves partial fields and supplied
     var encoder = mzml.arrays.Encoder.init(std.testing.allocator, .fast);
     defer encoder.deinit();
     var arrays: [3]mzml.Builder.Array = undefined;
-    var wires: [3][]const u8 = undefined;
+    var wires: [3]mzml.Writer.ArrayPayload = undefined;
     const values = [_]f64{ 1, 2, 3 };
     for ([_]mzml.cv.Accession{ mzml.model.Terms.INTENSITY_ARRAY, mzml.model.Terms.TIME_ARRAY, mzml.model.Terms.MZ_ARRAY }, &arrays, &wires, 0..) |role, *array, *wire, position| {
         const prepared = try builder.prepareArray(f64, values[position..][0..1], .{ .cv_ref = "MS", .role = .{ .cv_ref = "MS", .accession = role, .name = "caller role" } }, &encoder);
         array.* = prepared.array;
-        wire.* = prepared.wire;
+        wire.* = prepared.payload;
     }
     const record = try builder.record(.spectrum, "one", 0, 1, &.{}, &.{}, &arrays);
     for (arrays, record.binaryArrays()) |array, copied| try support.expectNode(array.node, copied);
@@ -718,7 +724,8 @@ test "[integration] - [mzML construction]: preserves primitive bits through emit
                 const declared = try mzml.model.arrayEncoding(prepared.array.node, &.{});
                 try std.testing.expectEqual(mzml.model.Primitive.of(T), declared.primitive);
                 var decoded: [5]T = undefined;
-                try mzml.arrays.decodeWire(T, decoded[0..length], prepared.wire, declared.pipeline, &.{});
+                const wire = try encoder.encodeSource(prepared.payload.source);
+                try mzml.arrays.decodeWire(T, decoded[0..length], wire, declared.pipeline, &.{});
                 try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(values[0..length]), std.mem.sliceAsBytes(decoded[0..length]));
             }
         }

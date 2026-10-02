@@ -1705,6 +1705,9 @@ pub const Writer = struct {
     default_uri_start: usize = 0,
     default_uri_len: usize = 0,
     text_brackets: u2 = 0,
+    // Binary bytes waiting for a whole Base64 group between binaryPart calls.
+    binary_carry: [3]u8 = undefined,
+    binary_carry_len: usize = 0,
 
     /// Initializes a writer over a caller-owned sink.
     pub fn init(allocator: std.mem.Allocator, sink: *std.Io.Writer, options: struct { fragment: bool = false }) WriterInitError!Writer {
@@ -1838,6 +1841,13 @@ pub const Writer = struct {
     }
 
     pub fn binary(self: *Writer, wire: []const u8) WriterError!void {
+        try self.binaryPart(wire);
+        try self.binaryEnd();
+    }
+
+    /// Writes binary content as Base64 one piece at a time; binaryEnd closes it. Up to two
+    /// bytes carry over between pieces, so any split gives the text binary gives for the whole.
+    pub fn binaryPart(self: *Writer, wire: []const u8) WriterError!void {
         try self.checkAny();
         if (self.state != .start_tag and self.state != .content) return self.fail(error.InvalidState);
         if (self.state == .start_tag) {
@@ -1845,6 +1855,32 @@ pub const Writer = struct {
             try self.writeByte('>');
             self.state = .content;
         }
+        var rest = wire;
+        if (self.binary_carry_len != 0) {
+            const take = @min(3 - self.binary_carry_len, rest.len);
+            @memcpy(self.binary_carry[self.binary_carry_len..][0..take], rest[0..take]);
+            self.binary_carry_len += take;
+            rest = rest[take..];
+            if (self.binary_carry_len < 3) return;
+            try self.encodeBase64(&self.binary_carry);
+            self.binary_carry_len = 0;
+        }
+        const whole = rest.len / 3 * 3;
+        try self.encodeBase64(rest[0..whole]);
+        @memcpy(self.binary_carry[0 .. rest.len - whole], rest[whole..]);
+        self.binary_carry_len = rest.len - whole;
+    }
+
+    /// Writes the padded final group of binary content started with binaryPart.
+    pub fn binaryEnd(self: *Writer) WriterError!void {
+        try self.checkAny();
+        const length = self.binary_carry_len;
+        self.binary_carry_len = 0;
+        try self.encodeBase64(self.binary_carry[0..length]);
+    }
+
+    // Base64 of whole groups, padded only for a final group shorter than three bytes.
+    fn encodeBase64(self: *Writer, wire: []const u8) WriterError!void {
         var encoded: [4096]u8 = undefined;
         var offset: usize = 0;
         while (offset < wire.len) {
