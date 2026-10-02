@@ -28,7 +28,12 @@ pub fn decompress(output: []u8, source: []const u8) Error![]u8 {
     const destination = if (output.len == 0) @constCast(source[0..0]) else output;
     // zipir's decoding workspace lives on the stack; nothing is allocated.
     var decoder: zipir.zlib.SliceDecoder = .{};
-    const length = decoder.decode(source, destination) catch |err| return switch (err) {
+    const length = decoder.decode(source, destination) catch |err| return mapped(err);
+    return output[0..length];
+}
+
+fn mapped(err: zipir.zlib.DecompressError) Error {
+    return switch (err) {
         error.Truncated => error.TruncatedInput,
         error.BadAdler => error.ChecksumMismatch,
         error.TrailingData => error.TrailingInput,
@@ -48,8 +53,43 @@ pub fn decompress(output: []u8, source: []const u8) Error![]u8 {
         error.PeekTooLarge,
         => error.InvalidData,
     };
-    return output[0..length];
 }
+
+/// Reusable streaming decompression storage with one owner. Do not copy a live instance.
+/// Each `start` decodes one zlib stream, with the errors of `decompress`, in caller-sized
+/// pieces, so no buffer for the whole decoded stream is needed.
+pub const Inflater = struct {
+    allocator: std.mem.Allocator,
+    state: *zipir.zlib.Decompressor,
+    input: std.Io.Reader = undefined,
+    empty: bool = false,
+
+    /// Allocates one zipir decompressor.
+    pub fn init(allocator: std.mem.Allocator) std.mem.Allocator.Error!Inflater {
+        return .{ .allocator = allocator, .state = try allocator.create(zipir.zlib.Decompressor) };
+    }
+
+    pub fn deinit(self: *Inflater) void {
+        self.allocator.destroy(self.state);
+        self.* = undefined;
+    }
+
+    /// Starts decoding source, which stays borrowed until the stream ends or fails.
+    pub fn start(self: *Inflater, source: []const u8) void {
+        self.input = std.Io.Reader.fixed(source);
+        self.empty = source.len == 0;
+        self.state.init(&self.input, .{});
+    }
+
+    /// Fills window with the next decoded bytes and returns them; an empty result means the
+    /// stream ended and its checksum and trailing bytes were checked.
+    pub fn read(self: *Inflater, window: []u8) Error![]u8 {
+        if (self.empty) return error.TruncatedInput;
+        const length = self.state.reader.readSliceShort(window) catch
+            return mapped(self.state.err orelse error.ReadFailed);
+        return window[0..length];
+    }
+};
 
 /// Largest stream compress can write for source_len bytes. zipir emits a stored block
 /// whenever compression would not be smaller, so output never exceeds the source plus
@@ -64,6 +104,7 @@ pub const Compressor = struct {
     allocator: std.mem.Allocator,
     state: *zipir.zlib.Compressor,
     preset: Preset,
+    destination: std.Io.Writer = undefined,
 
     /// Allocates one zipir compressor.
     pub fn init(allocator: std.mem.Allocator, preset: Preset) std.mem.Allocator.Error!Compressor {
@@ -78,15 +119,28 @@ pub const Compressor = struct {
     /// Writes one zlib stream without allocating.
     pub fn compress(self: *Compressor, output: []u8, source: []const u8) Error![]u8 {
         if (overlaps(output, source)) return error.OverlappingBuffers;
+        const writer = try self.start(output);
+        writer.writeAll(source) catch return error.OutputTooSmall;
+        return self.finish();
+    }
+
+    /// Starts one zlib stream into output and returns the writer for its source; finish
+    /// ends it. A write error on the writer means output is full. output stays borrowed
+    /// until finish.
+    pub fn start(self: *Compressor, output: []u8) Error!*std.Io.Writer {
+        self.destination = std.Io.Writer.fixed(output);
         // zipir's only compression error is a full output writer.
-        var destination = std.Io.Writer.fixed(output);
-        self.state.init(&destination, .{ .preset = switch (self.preset) {
+        self.state.init(&self.destination, .{ .preset = switch (self.preset) {
             .fast => .fast,
             .even => .even,
             .dense => .dense,
         } }) catch return error.OutputTooSmall;
-        self.state.writer.writeAll(source) catch return error.OutputTooSmall;
+        return &self.state.writer;
+    }
+
+    /// Ends the stream begun by start and returns the written prefix of its output.
+    pub fn finish(self: *Compressor) Error![]u8 {
         _ = self.state.finish() catch return error.OutputTooSmall;
-        return destination.buffered();
+        return self.destination.buffered();
     }
 };

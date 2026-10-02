@@ -2558,3 +2558,109 @@ test "[integration] - [mzML arrays]: classifies explicit encodings without guess
         }
     }
 }
+
+test "[property] - [decoded arrays]: streamed Numpress matches whole-payload decoding" {
+    const allocator = std.testing.allocator;
+    var random = std.Random.DefaultPrng.init(0x4e55_4d50_4152_5259);
+    const source = random.random();
+    const pipelines = [_]struct { mzml.arrays.Pipeline, []const u8 }{
+        .{ .linear, "MS:1002312" },      .{ .pic, "MS:1002313" },      .{ .slof, "MS:1002314" },
+        .{ .linear_zlib, "MS:1002746" }, .{ .pic_zlib, "MS:1002747" }, .{ .slof_zlib, "MS:1002748" },
+    };
+    var encoder = mzml.arrays.Encoder.init(allocator, .fast);
+    defer encoder.deinit();
+    var decoded = mzml.StreamReader.DecodedArrays.init(allocator, .{});
+    defer decoded.deinit();
+    const values = try allocator.alloc(f64, 9_000);
+    defer allocator.free(values);
+    var current: f64 = 100;
+    for (values) |*value| {
+        current += source.float(f64) * 4;
+        value.* = current;
+    }
+    for (pipelines) |entry| {
+        const pipeline, const accession = entry;
+        for ([_]usize{ 0, 1, 3, 600, 9_000 }) |count| {
+            const fixed_point: ?f64 = switch (pipeline.transform()) {
+                .linear => try mzml.numpress.optimalLinearFixedPoint(values[0..count]),
+                .slof => try mzml.numpress.optimalSlofFixedPoint(values[0..count]),
+                else => null,
+            };
+            encoder.reset();
+            const wire = try encoder.encode(f64, values[0..count], .{ .pipeline = pipeline, .fixed_point = fixed_point });
+            const damaged = try allocator.dupe(u8, wire);
+            defer allocator.free(damaged);
+            for (0..12) |variant| {
+                // Variants 1-5 flip a byte, 6-8 cut the payload, 9-11 misstate the length.
+                @memcpy(damaged, wire);
+                var payload: []const u8 = damaged;
+                if (variant >= 1 and variant <= 5 and damaged.len != 0) {
+                    damaged[source.uintLessThan(usize, damaged.len)] ^= @as(u8, 1) << source.int(u3);
+                } else if (variant >= 6 and variant <= 8) {
+                    payload = damaged[0..source.uintLessThan(usize, damaged.len + 1)];
+                }
+                const length = switch (variant) {
+                    9 => count + 1,
+                    10 => count -| 1,
+                    11 => count * 2 + 1,
+                    else => count,
+                };
+                const text = try allocator.alloc(u8, std.base64.standard.Encoder.calcSize(payload.len));
+                defer allocator.free(text);
+                _ = std.base64.standard.Encoder.encode(text, payload);
+                try expectStreamedMatchesWhole(allocator, &decoded, text, accession, length, source);
+            }
+        }
+    }
+}
+
+fn expectStreamedMatchesWhole(
+    allocator: std.mem.Allocator,
+    decoded: *mzml.StreamReader.DecodedArrays,
+    text: []const u8,
+    accession: []const u8,
+    length: usize,
+    source: std.Random,
+) !void {
+    const node: mzml.model.Node = .{
+        .kind = .binary_data_array,
+        .params = &.{
+            .{ .cv = .{ .accession = .{ .raw = "MS:1000523" }, .name = "64-bit float" } },
+            .{ .cv = .{ .accession = .{ .raw = accession }, .name = "compression" } },
+        },
+        .children = &.{.{ .kind = .binary, .text = text }},
+    };
+    const array = try mzml.model.BinaryArray.init(node, length, &.{});
+    const expected_values = try allocator.alloc(f64, length);
+    defer allocator.free(expected_values);
+    const transport = try allocator.alloc(u8, text.len / 4 * 3 + 3);
+    defer allocator.free(transport);
+    const transformed = try allocator.alloc(u8, try mzml.arrays.wireBound(f64, length, array.encoding.pipeline));
+    defer allocator.free(transformed);
+    const expected = array.decode(f64, expected_values, .{ .transport = transport, .transformed = transformed });
+
+    // The reader hands text over in fragments of any size.
+    decoded.reset();
+    decoded.default_length = length;
+    const actual = streamed: {
+        decoded.beginArray(node, &.{}, 0) catch |err| break :streamed err;
+        var rest = text;
+        while (rest.len != 0) {
+            const piece = @min(rest.len, 1 + source.uintLessThan(usize, 40_000));
+            decoded.text(rest[0..piece]) catch |err| break :streamed err;
+            rest = rest[piece..];
+        }
+        decoded.finishArray() catch |err| break :streamed err;
+        decoded.complete();
+    };
+    if (expected) |_| {
+        try actual;
+        try std.testing.expectEqualSlices(
+            u8,
+            std.mem.sliceAsBytes(expected_values),
+            std.mem.sliceAsBytes(decoded.get(0).?.values.float64),
+        );
+    } else |err| {
+        try std.testing.expectError(err, actual);
+    }
+}

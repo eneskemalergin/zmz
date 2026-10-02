@@ -130,12 +130,8 @@ pub fn encodeWire(
 ) Error![]const u8 {
     _ = encoding.Primitive.of(T);
     try checkBuffers(&.{}, std.mem.sliceAsBytes(values), scratch);
+    try checkOptions(T, options, compressor != null);
     const selected = options.pipeline.transform();
-    if (selected != .none and T != f64) return error.TypeMismatch;
-    if (options.pipeline.hasZlib() and compressor == null) return error.MissingCompressor;
-    if (selected == .linear or selected == .slof) {
-        if (options.fixed_point == null) return error.MissingFixedPoint;
-    } else if (options.fixed_point != null) return error.UnexpectedFixedPoint;
 
     if (selected == .none and @import("builtin").cpu.arch.endian() == .little) {
         const wire = std.mem.sliceAsBytes(values);
@@ -171,16 +167,25 @@ pub fn encodeWire(
     return wire;
 }
 
+fn checkOptions(comptime T: type, options: EncodeOptions, has_compressor: bool) Error!void {
+    const selected = options.pipeline.transform();
+    if (selected != .none and T != f64) return error.TypeMismatch;
+    if (options.pipeline.hasZlib() and !has_compressor) return error.MissingCompressor;
+    if (selected == .linear or selected == .slof) {
+        if (options.fixed_point == null) return error.MissingFixedPoint;
+    } else if (options.fixed_point != null) return error.UnexpectedFixedPoint;
+}
+
 pub const EncodeError = Error || std.mem.Allocator.Error;
 
-/// Encodes arrays with storage it owns: scratch, the zlib compressor (allocated on first
-/// use), and one output buffer per array encoded since the last reset. Do not copy an
+/// Encodes arrays with storage it owns: the zlib compressor (allocated on first use) and one
+/// output buffer per array encoded since the last reset. With zlib, primitive or Numpress
+/// bytes go straight into the compressor, so no buffer holds them whole. Do not copy an
 /// initialized encoder.
 pub const Encoder = struct {
     allocator: std.mem.Allocator,
     preset: zlib.Preset,
     compressor: ?zlib.Compressor = null,
-    transformed: std.ArrayList(u8) = .empty,
     outputs: std.ArrayList(std.ArrayList(u8)) = .empty,
     used: usize = 0,
 
@@ -192,7 +197,6 @@ pub const Encoder = struct {
         if (self.compressor) |*compressor| compressor.deinit();
         for (self.outputs.items) |*output| output.deinit(self.allocator);
         self.outputs.deinit(self.allocator);
-        self.transformed.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -212,13 +216,36 @@ pub const Encoder = struct {
             const output = try self.nextOutput(bound);
             return encodeWire(T, values, options, .{ .transport = &.{}, .transformed = output }, null);
         }
+        try checkOptions(T, options, true);
         if (self.compressor == null) self.compressor = try zlib.Compressor.init(self.allocator, self.preset);
-        if (transformed) try self.transformed.resize(self.allocator, bound);
         const output = try self.nextOutput(zlib.compressBound(bound));
-        return encodeWire(T, values, options, .{
-            .transport = output,
-            .transformed = if (transformed) self.transformed.items else &.{},
-        }, &self.compressor.?);
+        if (overlaps(output, std.mem.sliceAsBytes(values))) return error.OverlappingBuffers;
+        const compressor = &self.compressor.?;
+        const writer = try compressor.start(output);
+        writeWire(T, values, options, writer) catch |err| switch (err) {
+            error.WriteFailed => return error.OutputTooSmall,
+            else => |e| return e,
+        };
+        return compressor.finish();
+    }
+
+    fn writeWire(comptime T: type, values: []const T, options: EncodeOptions, writer: *std.Io.Writer) numpress.WriteError!void {
+        switch (options.pipeline.transform()) {
+            .none => {
+                if (@import("builtin").cpu.arch.endian() == .little) return writer.writeAll(std.mem.sliceAsBytes(values));
+                const Bits = @Int(.unsigned, @bitSizeOf(T));
+                for (values) |value| try writer.writeInt(Bits, @bitCast(value), .little);
+            },
+            .linear => if (T == f64) {
+                _ = try numpress.encodeLinearTo(values, options.fixed_point.?, writer);
+            } else unreachable,
+            .pic => if (T == f64) {
+                _ = try numpress.encodePicTo(values, writer);
+            } else unreachable,
+            .slof => if (T == f64) {
+                _ = try numpress.encodeSlofTo(values, options.fixed_point.?, writer);
+            } else unreachable,
+        }
     }
 
     fn nextOutput(self: *Encoder, size: usize) std.mem.Allocator.Error![]u8 {
