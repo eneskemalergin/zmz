@@ -1689,3 +1689,52 @@ test "[failure] - [mzML streamed writing]: the text limit stops streams first an
     try std.testing.expectEqual(.text_bytes, file_writer.diagnostic().?.detail.limit.name);
     try std.testing.expectError(error.FailedState, file_writer.finish());
 }
+
+test "[failure] - [mzML file writer]: refuses to patch after others wrote to the file writer" {
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    for ([_]usize{ 16, 8192 }) |buffer_size| {
+        const file = try dir.dir.createFile(std.testing.io, "out.mzML", .{ .read = true });
+        defer file.close(std.testing.io);
+        var buffer: [8192]u8 = undefined;
+        var sink = file.writer(std.testing.io, buffer[0..buffer_size]);
+        var writer = try mzml.Writer.initFile(std.testing.allocator, &sink, .{}, null);
+        defer writer.deinit();
+        var input = std.Io.Reader.fixed(support.DOCUMENT);
+        var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+        defer reader.deinit();
+        try writer.writeHeader((try reader.readHeader()).*);
+        try writer.beginList(.spectrum_list, null, "dp");
+        try writer.writeRecord((try reader.nextRecord()).?.node);
+        // Against the contract: the count's recorded offset no longer matches the file.
+        try sink.interface.writeAll("<!-- -->");
+        try std.testing.expectError(error.InvalidState, writer.endList());
+        try std.testing.expectError(error.FailedState, writer.finish());
+    }
+}
+
+test "[failure] - [mzML writer]: rejects metadata that shares memory with its output buffers" {
+    var input = std.Io.Reader.fixed(support.DOCUMENT);
+    var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+    defer reader.deinit();
+    const header = try reader.readHeader();
+    const record = (try reader.nextRecord()).?;
+    for ([_]bool{ false, true }) |indexed| {
+        var output: [8192]u8 = undefined;
+        var sink = std.Io.Writer.fixed(&output);
+        var writer = if (indexed) try mzml.Writer.initIndexed(std.testing.allocator, &sink, .{}, .{}) else try mzml.Writer.init(std.testing.allocator, &sink, .{});
+        defer writer.deinit();
+        try writer.writeHeader(header.*);
+        try writer.beginList(.spectrum_list, 1, "dp");
+        // An attribute value inside the caller's sink buffer, ahead of what was written.
+        const aliased = output[output.len - 8 ..];
+        @memcpy(aliased, "aliased!");
+        var attributes: [8]mzml.model.Attribute = undefined;
+        @memcpy(attributes[0..record.node.attributes.len], record.node.attributes);
+        attributes[record.node.attributes.len] = .{ .name = "note", .value = aliased };
+        var node = record.node;
+        node.attributes = attributes[0 .. record.node.attributes.len + 1];
+        try std.testing.expectError(error.InvalidState, writer.writeRecord(node));
+        try std.testing.expectError(error.FailedState, writer.finish());
+    }
+}

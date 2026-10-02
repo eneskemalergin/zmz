@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const base64 = @import("../binary/base64.zig");
+const overlaps = @import("../binary/core.zig").overlaps;
 
 /// Stable mzML namespace used by reader and writer paths.
 pub const NAMESPACE = "http://psi.hupo.org/ms/mzml";
@@ -1626,6 +1627,9 @@ const WriterFrame = struct {
 pub const Writer = struct {
     allocator: std.mem.Allocator,
     sink: *std.Io.Writer,
+    /// A buffer the sink drains into, such as a hashing sink's destination. Written bytes may
+    /// overlap neither it nor the sink's buffer.
+    guard: []const u8 = &.{},
     state: WriterState = .initial,
     failure: ?WriterError = null,
     logical_offset: u64 = 0,
@@ -1655,6 +1659,19 @@ pub const Writer = struct {
         self.namespace_names.deinit(self.allocator);
     }
 
+    /// Whether bytes share memory with the buffers the writer writes into.
+    pub fn overlapsOutput(self: *const Writer, bytes: []const u8) bool {
+        return overlaps(self.sink.buffer, bytes) or overlaps(self.guard, bytes);
+    }
+
+    // Caller bytes are copied into the sink's buffer, so they must not live there.
+    fn checkInput(self: *Writer, bytes: []const u8) WriterError!void {
+        if (self.overlapsOutput(bytes)) {
+            @branchHint(.cold);
+            return self.fail(error.InvalidState);
+        }
+    }
+
     /// Returns the physical bytes accepted by the sink, or null after a write failure.
     pub fn byteOffset(self: *const Writer) ?u64 {
         if (!self.offset_valid) return null;
@@ -1671,6 +1688,7 @@ pub const Writer = struct {
     /// Opens an element; any prefix must have a declaration before its content is written.
     pub fn startElement(self: *Writer, name: []const u8) WriterError!void {
         try self.checkContent();
+        try self.checkInput(name);
         if (self.state == .epilog and self.root_written) return self.fail(error.InvalidState);
         if (self.state != .epilog and self.state != .content and self.state != .start_tag) return self.fail(error.InvalidState);
         validateQName(name) catch |err| return self.fail(err);
@@ -1699,6 +1717,8 @@ pub const Writer = struct {
     /// Writes a namespace declaration on the current opening tag.
     pub fn namespace(self: *Writer, prefix: ?[]const u8, uri: []const u8) WriterError!void {
         try self.check(.start_tag);
+        try self.checkInput(prefix orelse "");
+        try self.checkInput(uri);
         if (prefix) |value| {
             validateQName(value) catch |err| return self.fail(err);
             if (std.mem.indexOfScalar(u8, value, ':') != null or std.mem.eql(u8, value, "xmlns") or uri.len == 0)
@@ -1735,6 +1755,8 @@ pub const Writer = struct {
     /// Writes an attribute with any prefix resolved in the current namespace bindings.
     pub fn attribute(self: *Writer, name: []const u8, value: []const u8) WriterError!void {
         try self.check(.start_tag);
+        try self.checkInput(name);
+        try self.checkInput(value);
         validateQName(name) catch |err| return self.fail(err);
         if (std.mem.eql(u8, name, "xmlns") or std.mem.startsWith(u8, name, "xmlns:"))
             return self.fail(error.InvalidNamespace);
@@ -1765,6 +1787,7 @@ pub const Writer = struct {
     /// Writes XML text with character and delimiter-safe escaping.
     pub fn text(self: *Writer, value: []const u8) WriterError!void {
         try self.checkContent();
+        try self.checkInput(value);
         if (self.state != .start_tag and self.state != .content) return self.fail(error.InvalidState);
         if (self.state == .start_tag) {
             try self.checkOpeningName();
@@ -1784,6 +1807,7 @@ pub const Writer = struct {
     /// While bytes carry, startElement, text and endElement fail with InvalidState.
     pub fn binaryPart(self: *Writer, wire: []const u8) WriterError!void {
         try self.checkAny();
+        try self.checkInput(wire);
         if (self.state != .start_tag and self.state != .content) return self.fail(error.InvalidState);
         if (self.state == .start_tag) {
             try self.checkOpeningName();

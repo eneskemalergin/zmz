@@ -25,7 +25,7 @@ const Diagnostic = @import("diagnostic.zig");
 
 const DecodedArrays = @This();
 
-pub const Error = model.EncodingError || cv.ValueError || arrays.Error || std.mem.Allocator.Error || error{LimitExceeded};
+pub const Error = model.EncodingError || cv.ValueError || arrays.Error || std.mem.Allocator.Error || error{ LimitExceeded, InvalidState };
 pub const Values = arrays.Values;
 pub const Array = struct { source_position: usize, encoding: model.Encoding, values: Values };
 
@@ -50,6 +50,8 @@ values: numpress.Decoder = undefined,
 // zlib layers finish, so their errors come first, as when each layer decodes the whole payload.
 deferred: ?numpress.Error = null,
 failure: ?struct { stage: Diagnostic.Stage, detail: Diagnostic.Detail = .none } = null,
+// A read decodes into this owner; a selection callback must not reset or reuse it meanwhile.
+busy: bool = false,
 
 pub fn init(allocator: std.mem.Allocator, limits: Limits) DecodedArrays {
     return .{ .allocator = allocator, .limits = limits };
@@ -63,8 +65,10 @@ pub fn deinit(self: *DecodedArrays) void {
     self.* = undefined;
 }
 
-/// Invalidates results while retaining allocated capacity.
+/// Invalidates results while retaining allocated capacity. Does nothing while a read decodes
+/// into this owner, as from one of its selection callbacks.
 pub fn reset(self: *DecodedArrays) void {
+    if (self.busy) return;
     self.count = 0;
     self.ready = false;
     self.failure = null;
@@ -90,6 +94,7 @@ pub fn get(self: *const DecodedArrays, position: usize) ?Array {
 /// from nextRecord or an IndexedReader lookup), replacing earlier results. Order, types,
 /// and limits follow nextDecodedRecord; after a failure no results are visible.
 pub fn decodeRecord(self: *DecodedArrays, record: model.Record, groups: []const cv.Group) Error!void {
+    if (self.busy) return error.InvalidState;
     self.reset();
     errdefer self.reset();
     for (record.binaryArrays(), 0..) |node, position| try self.decodeRetained(node, record.default_array_length, groups, position);
@@ -99,6 +104,7 @@ pub fn decodeRecord(self: *DecodedArrays, record: model.Record, groups: []const 
 /// Decodes one binary array node with retained text, replacing earlier results, and returns
 /// its values; get(0) returns the same array. default_length is the record's defaultArrayLength.
 pub fn decodeArray(self: *DecodedArrays, node: model.Node, default_length: ?usize, groups: []const cv.Group) Error!Values {
+    if (self.busy) return error.InvalidState;
     self.reset();
     errdefer self.reset();
     try self.decodeRetained(node, default_length, groups, 0);

@@ -14,7 +14,6 @@ const xml = @import("../xml/mzml_adapter.zig");
 const base64 = @import("../binary/base64.zig");
 const arrays = @import("../binary/arrays.zig");
 const zlib = @import("../binary/zlib.zig");
-const overlaps = @import("../binary/core.zig").overlaps;
 const Sha1 = @import("../binary/sha1.zig").Sha1;
 const Diagnostic = @import("diagnostic.zig");
 const Ids = @import("internal/id_index.zig").IdIndex(IndexEntry);
@@ -100,7 +99,9 @@ pub fn initIndexed(allocator: std.mem.Allocator, sink: *std.Io.Writer, limits: L
     const chunk = try allocator.alloc(u8, CHUNK_BYTES);
     errdefer allocator.free(chunk);
     state.* = .{ .allocator = allocator, .hashed = .init(sink, chunk), .arena = .init(allocator), .limits = index_limits };
-    return .{ .engine = try xml.Writer.init(allocator, &state.hashed.writer, .{}), .allocator = allocator, .limits = limits, .index_state = state };
+    var engine = try xml.Writer.init(allocator, &state.hashed.writer, .{});
+    engine.guard = sink.buffer;
+    return .{ .engine = engine, .allocator = allocator, .limits = limits, .index_state = state };
 }
 
 /// Writes to a positional file writer at offset zero on an empty file; nothing else may write
@@ -305,7 +306,7 @@ fn writeRecordInner(self: *Writer, node: model.Node, comptime replace_arrays: bo
         const list = node.child(.binary_data_array_list);
         const array_nodes = if (list) |value| value.children else &.{};
         if (array_nodes.len != payloads.len) return try self.sizeError(error.CountMismatch, array_nodes.len, payloads.len, .arrays);
-        if (self.overlapsOutput(std.mem.sliceAsBytes(payloads))) return error.OverlappingBuffers;
+        if (self.engine.overlapsOutput(std.mem.sliceAsBytes(payloads))) return error.OverlappingBuffers;
         try self.plans.ensureTotalCapacity(self.allocator, payloads.len);
         for (array_nodes, payloads, 0..) |array, supplied, position| {
             const payload = @as(?ArrayPayload, supplied) orelse {
@@ -321,7 +322,7 @@ fn writeRecordInner(self: *Writer, node: model.Node, comptime replace_arrays: bo
                 array.children[0].kind != .binary) return error.InvalidStructure;
             self.plans.appendAssumeCapacity(switch (payload) {
                 .wire => |wire| plan: {
-                    if (self.overlapsOutput(wire)) return error.OverlappingBuffers;
+                    if (self.engine.overlapsOutput(wire)) return error.OverlappingBuffers;
                     _ = try self.textLength(wire.len);
                     break :plan .{ .wire = wire };
                 },
@@ -377,7 +378,7 @@ fn textLength(self: *Writer, wire_length: usize) Error!usize {
 fn planSource(self: *Writer, source: arrays.Source) Error!Plan {
     try source.check();
     switch (source.values) {
-        inline else => |values| if (self.overlapsOutput(std.mem.sliceAsBytes(values))) return error.OverlappingBuffers,
+        inline else => |values| if (self.engine.overlapsOutput(std.mem.sliceAsBytes(values))) return error.OverlappingBuffers,
     }
     if (source.wireLength()) |length| return .{ .source = .{ .payload = source, .text_length = try self.textLength(length) } };
     if (self.file_sink != null) {
@@ -396,7 +397,7 @@ fn planSource(self: *Writer, source: arrays.Source) Error!Plan {
             error.WriteFailed => unreachable,
             else => |e| return e,
         };
-        return .{ .source = .{ .payload = source, .text_length = try self.textLength(@intCast(counter.fullCount())) } };
+        return .{ .source = .{ .payload = source, .text_length = try self.textLength(std.math.cast(usize, counter.fullCount()) orelse return error.LimitExceeded) } };
     }
     const wire = try source.encoder.?.encodeSource(source);
     _ = try self.textLength(wire.len);
@@ -422,7 +423,7 @@ fn writeSource(self: *Writer, source: arrays.Source) Error!void {
         try self.engine.binaryEnd();
     }
     const end = self.engine.byteOffset() orelse return error.LimitExceeded;
-    self.source_text_length = @intCast(end - start);
+    self.source_text_length = std.math.cast(usize, end - start) orelse return error.LimitExceeded;
     if (self.source_text_length > self.limits.text_bytes)
         return try self.limitError(.text_bytes, self.limits.text_bytes, self.source_text_length);
 }
@@ -466,15 +467,17 @@ fn patchDigits(self: *Writer, offset: u64, value: usize, width: usize) Error!voi
     var padded = PLACEHOLDER.*;
     const digits = padded[0..width];
     @memcpy(digits[width - text.len ..], text);
-    const sink = self.engine.sink;
+    const file = self.file_sink.?;
+    const sink = &file.interface;
     const end = self.engine.byteOffset() orelse return error.LimitExceeded;
+    // Bytes written to the file writer by anyone else would move every recorded offset.
+    if (file.logicalPos() != end) return error.InvalidState;
     const buffered_start = end - sink.end;
     if (offset >= buffered_start) {
         @memcpy(sink.buffer[@intCast(offset - buffered_start)..][0..digits.len], digits);
         return;
     }
-    const file = self.file_sink.?;
-    file.interface.flush() catch |err| return try self.ioFailure(err);
+    sink.flush() catch |err| return try self.ioFailure(err);
     file.file.writePositionalAll(file.io, digits, offset) catch |err| return try self.ioFailure(err);
 }
 
@@ -536,11 +539,6 @@ pub fn finish(self: *Writer) Error!void {
 }
 
 // Wire is read while encoding, so it must not share any buffer that output passes through.
-fn overlapsOutput(self: *const Writer, bytes: []const u8) bool {
-    if (overlaps(self.engine.sink.buffer, bytes)) return true;
-    const state = self.index_state orelse return false;
-    return self.file_sink == null and overlaps(state.hashed.out.buffer, bytes);
-}
 
 // Buffered bytes that fail to reach the sink have no accepted output position.
 fn flushHashed(self: *Writer, state: *IndexState) Error!void {

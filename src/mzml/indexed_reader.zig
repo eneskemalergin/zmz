@@ -220,10 +220,17 @@ const Target = union(enum) { id: []const u8, ordinal: struct { kind: model.Kind,
 
 // Every lookup: clears the last failure and, with output, earlier decoded results.
 fn lookup(self: *IndexedReader, allocator: std.mem.Allocator, target: Target, output: ?*DecodedArrays) Error!?owned.Record {
+    // A selection callback of a lookup in progress must leave it and its output alone.
+    if (self.lookup_reader) |*reader| if (reader.selecting) return error.InvalidState;
+    if (output) |decoded| if (decoded.busy) return error.InvalidState;
     self.failure = null;
     errdefer |err| self.capture(err, .index, .none);
     if (output) |decoded| decoded.reset();
     errdefer if (output) |decoded| decoded.reset();
+    if (output) |decoded| decoded.busy = true;
+    defer if (output) |decoded| {
+        decoded.busy = false;
+    };
     const position = try switch (target) {
         .id => |id| self.idPosition(id),
         .ordinal => |ordinal| self.ordinalPosition(ordinal.kind, ordinal.ordinal),

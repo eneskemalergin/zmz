@@ -2702,3 +2702,68 @@ const Fragments = struct {
         return self.rest[0..piece];
     }
 };
+
+test "[failure] - [mzML selection]: callbacks cannot reenter the reader or reset its output" {
+    const Reentry = struct {
+        reader: ?*mzml.StreamReader = null,
+        index: ?*mzml.IndexedReader = null,
+        output: *mzml.StreamReader.DecodedArrays,
+        calls: usize = 0,
+        refused: usize = 0,
+
+        fn refuse(self: *@This(), result: anytype) void {
+            if (result) |value| {
+                if (@TypeOf(value) == ?mzml.owned.Record) if (value) |record| {
+                    var owned = record;
+                    owned.deinit();
+                };
+            } else |err| {
+                if (err == error.InvalidState) self.refused += 1;
+            }
+        }
+
+        fn select(data: ?*anyopaque, view: mzml.StreamReader.Selection) mzml.model.MetadataError!mzml.StreamReader.Payload {
+            const self: *@This() = @ptrCast(@alignCast(data.?));
+            self.calls += 1;
+            if (self.reader) |reader| {
+                self.refuse(reader.nextRecord());
+                self.refuse(reader.nextDecodedRecord(self.output));
+            }
+            if (self.index) |index| {
+                self.refuse(index.byId(std.testing.allocator, "scan=zlib"));
+                self.refuse(index.atDecoded(std.testing.allocator, .spectrum, 1, self.output));
+            }
+            self.refuse(self.output.decodeArray(view.node, 1, view.groups));
+            // A reset during the read does nothing; the read's arrays stay intact.
+            self.output.reset();
+            return .retain;
+        }
+    };
+    var output = mzml.StreamReader.DecodedArrays.init(std.testing.allocator, .{});
+    defer output.deinit();
+
+    var state: Reentry = .{ .output = &output };
+    var input = std.Io.Reader.fixed(support.DOCUMENT);
+    var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{ .array_selector = .{ .user_data = &state, .select = Reentry.select } });
+    defer reader.deinit();
+    state.reader = &reader;
+    _ = (try reader.nextDecodedRecord(&output)).?;
+    try std.testing.expectEqual(@as(usize, 2), output.len());
+    try std.testing.expectEqualSlices(f64, &.{1}, output.get(0).?.values.float64);
+    try std.testing.expect(state.calls != 0);
+    try std.testing.expectEqual(3 * state.calls, state.refused);
+
+    state = .{ .output = &output };
+    var index = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = @embedFile("data/writer_indexed.mzML") }, .{
+        .policy = .open_embedded,
+        .reader = .{ .array_selector = .{ .user_data = &state, .select = Reentry.select } },
+    });
+    defer index.deinit();
+    state.index = &index;
+    var record = (try index.byIdDecoded(std.testing.allocator, "scan=none", &output)).?;
+    defer record.deinit();
+    try std.testing.expectEqual(@as(usize, 2), output.len());
+    try std.testing.expectEqualSlices(f64, &.{ 1, 2, 3 }, output.get(1).?.values.float64);
+    try std.testing.expect(state.calls != 0);
+    try std.testing.expectEqual(3 * state.calls, state.refused);
+}
