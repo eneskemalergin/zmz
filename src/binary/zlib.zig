@@ -181,6 +181,7 @@ pub const Compressor = struct {
     /// Starts one zlib stream into destination, which stays borrowed until finishWriter, and
     /// returns the writer for its source. Write errors are destination's.
     pub fn startWriter(self: *Compressor, destination: *std.Io.Writer) std.Io.Writer.Error!*std.Io.Writer {
+        self.open = .none;
         try self.state.init(destination, .{ .preset = switch (self.preset) {
             .fast => .fast,
             .even => .even,
@@ -188,6 +189,11 @@ pub const Compressor = struct {
         } });
         self.open = .writer;
         return &self.state.writer;
+    }
+
+    /// Abandons the open stream after its source failed; the next start begins a new one.
+    pub fn cancel(self: *Compressor) void {
+        self.open = .none;
     }
 
     /// Ends the stream begun by startWriter. The stream is closed even when a write fails.

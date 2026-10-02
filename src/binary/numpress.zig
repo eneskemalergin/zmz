@@ -11,6 +11,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const libm = @import("libm_data.zig");
+const overlaps = @import("core.zig").overlaps;
 
 /// Errors returned by checked MS-Numpress operations.
 ///
@@ -27,6 +28,7 @@ pub const Error = error{
     InvalidValue,
     LengthOverflow,
     OutputTooSmall,
+    OverlappingBuffers,
     ToleranceUnattainable,
     ValueOutOfRange,
 };
@@ -306,6 +308,7 @@ pub noinline fn encodeSlof(input: anytype, fixed_point: f64, output: []u8) Error
 /// `encodePic`; after one, the writer holds an unspecified prefix.
 pub fn encodePicTo(input: anytype, writer: *std.Io.Writer) WriteError!usize {
     const values = slice(input);
+    try checkDestination(values, writer);
     var blocks: Blocks = .{ .writer = writer };
     var sink: RawSink = .{ .out = &.{} };
     var codes: [BLOCK]u32 = undefined;
@@ -333,6 +336,7 @@ pub fn encodePicTo(input: anytype, writer: *std.Io.Writer) WriteError!usize {
 /// match `encodeLinear`; after one, the writer holds an unspecified prefix.
 pub fn encodeLinearTo(input: anytype, fixed_point: f64, writer: *std.Io.Writer) WriteError!usize {
     const values = slice(input);
+    try checkDestination(values, writer);
     try validateFixedPoint(fixed_point, values.len == 0);
     var header: [16]u8 = undefined;
     writeFixedPoint(header[0..8], fixed_point);
@@ -388,6 +392,7 @@ pub fn encodeLinearTo(input: anytype, fixed_point: f64, writer: *std.Io.Writer) 
 /// match `encodeSlof`; after one, the writer holds an unspecified prefix.
 pub fn encodeSlofTo(input: anytype, fixed_point: f64, writer: *std.Io.Writer) WriteError!usize {
     const values = slice(input);
+    try checkDestination(values, writer);
     try validateFixedPoint(fixed_point, values.len == 0);
     var header: [8]u8 = undefined;
     writeFixedPoint(&header, fixed_point);
@@ -1357,6 +1362,12 @@ const NibbleWriter = struct {
 };
 
 // --- Value checks ---
+
+// The values are read while the writer's buffer is written, and an allocating writer may
+// move it, so they must not live in it.
+fn checkDestination(values: anytype, writer: *const std.Io.Writer) Error!void {
+    if (overlaps(writer.buffer, std.mem.sliceAsBytes(values))) return error.OverlappingBuffers;
+}
 
 fn validateNonnegative(value: f64) Error!void {
     if (!std.math.isFinite(value)) return error.InvalidValue;

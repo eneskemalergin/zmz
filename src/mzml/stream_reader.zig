@@ -7,7 +7,8 @@ const impl = @import("internal/reader_engine.zig");
 /// Reads header metadata, then records or items, from a forward byte stream it borrows until
 /// deinit; copy neither the input nor the reader. Header metadata lasts until deinit, and each
 /// record or item call invalidates the previous one. The first failure sets diagnostic() and
-/// later reads return FailedState.
+/// later reads return FailedState. A call made while another runs, as from a selection
+/// callback, the input reader, or the allocator, returns InvalidState and leaves it unharmed.
 pub const StreamReader = struct {
     const Reader = @This();
 

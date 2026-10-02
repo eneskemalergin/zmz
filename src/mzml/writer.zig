@@ -4,7 +4,8 @@
 //! Arguments are borrowed only until each call returns. The writer borrows its sink until
 //! deinit, and the caller flushes and closes the sink, including after finish. Failures are
 //! sticky: the first sets diagnostic() and later calls return FailedState, and partial output
-//! is never a complete document.
+//! is never a complete document. A call made while another runs, as from the sink's drain,
+//! returns InvalidState and leaves the running call unharmed.
 
 const std = @import("std");
 const cv = @import("../cv/source.zig");
@@ -81,6 +82,8 @@ namespace_uri: []const u8 = xml.NAMESPACE,
 plans: std.ArrayList(Plan) = .empty,
 // Base64 length of the last streamed source, for its encodedLength patch.
 source_text_length: usize = 0,
+// A call is in progress; the sink's drain runs inside it and must not call the writer.
+active: bool = false,
 
 /// Bounds retained index entries and ID bytes, including historical native/spot IDs.
 pub const IndexLimits = struct { records: usize = 1_000_000, id_bytes: usize = 64 * 1024 * 1024 };
@@ -100,7 +103,7 @@ pub fn initIndexed(allocator: std.mem.Allocator, sink: *std.Io.Writer, limits: L
     errdefer allocator.free(chunk);
     state.* = .{ .allocator = allocator, .hashed = .init(sink, chunk), .arena = .init(allocator), .limits = index_limits };
     var engine = try xml.Writer.init(allocator, &state.hashed.writer, .{});
-    engine.guard = sink.buffer;
+    engine.guard = sink;
     return .{ .engine = engine, .allocator = allocator, .limits = limits, .index_state = state };
 }
 
@@ -117,6 +120,11 @@ pub fn initFile(allocator: std.mem.Allocator, sink: *std.Io.File.Writer, limits:
     writer.engine.sink = &sink.interface;
     writer.file_sink = sink;
     return writer;
+}
+
+fn enter(self: *Writer) Error!void {
+    if (self.active) return error.InvalidState;
+    self.active = true;
 }
 
 /// Neither finishes nor flushes output.
@@ -182,11 +190,15 @@ fn copyId(self: *Writer, state: *IndexState, id: []const u8) Error![]const u8 {
 
 /// Writes the header metadata and opens the run.
 pub fn writeHeader(self: *Writer, header: model.Header) Error!void {
+    try self.enter();
+    defer self.active = false;
     if (self.failure != null) return error.FailedState;
     errdefer |err| self.fail(err, .write_header);
     if (self.phase != .initial) return error.InvalidState;
     try schema.checkHeader(header);
     self.namespace_uri = if (std.mem.eql(u8, header.namespace_uri, xml.NAMESPACE)) xml.NAMESPACE else if (std.mem.eql(u8, header.namespace_uri, xml.NAMESPACE_1_0)) xml.NAMESPACE_1_0 else return error.InvalidNamespace;
+    try self.checkNode(header.document);
+    try self.checkNode(header.run);
     try self.engine.startDocument();
     if (self.index_state) |state| {
         state.historical = std.mem.eql(u8, header.namespace_uri, xml.NAMESPACE_1_0);
@@ -209,18 +221,27 @@ pub fn writeHeader(self: *Writer, header: model.Header) Error!void {
 /// filled in by endList; other writers require an exact count before writing.
 /// Spectra precede chromatograms, and each list can occur at most once.
 pub fn beginList(self: *Writer, kind: model.Kind, count: ?usize, processing_ref: []const u8) Error!void {
-    return self.beginListWithAttributes(kind, count, &.{.{ .name = "defaultDataProcessingRef", .value = processing_ref }});
+    try self.enter();
+    defer self.active = false;
+    return self.openList(kind, count, &.{.{ .name = "defaultDataProcessingRef", .value = processing_ref }});
 }
 
 /// Opens a list with source attributes, writing the supplied count first in place of any
 /// source count; other attributes keep their order and values, and an absent processing
 /// reference stays absent. Count and list order follow beginList.
 pub fn beginListWithAttributes(self: *Writer, kind: model.Kind, count: ?usize, attributes: []const model.Attribute) Error!void {
+    try self.enter();
+    defer self.active = false;
+    return self.openList(kind, count, attributes);
+}
+
+fn openList(self: *Writer, kind: model.Kind, count: ?usize, attributes: []const model.Attribute) Error!void {
     if (self.failure != null) return error.FailedState;
     errdefer |err| {
         self.fail(err, .open_list);
         self.failure.?.element = kind;
     }
+    try self.checkParts(.{attributes});
     if (self.phase != .run) return error.InvalidState;
     if (kind != .spectrum_list and kind != .chromatogram_list) return error.InvalidStructure;
     if (self.list_kind == kind or self.list_kind == .chromatogram_list) return error.InvalidStructure;
@@ -246,6 +267,8 @@ pub fn beginListWithAttributes(self: *Writer, kind: model.Kind, count: ?usize, a
 /// Writes a record with its retained binary text, escaped as XML; the Base64 and encodedLength
 /// are not checked.
 pub fn writeRecord(self: *Writer, node: model.Node) Error!void {
+    try self.enter();
+    defer self.active = false;
     return self.writeRecordInner(node, false, @as([]const ArrayPayload, &.{}));
 }
 
@@ -253,12 +276,14 @@ pub fn writeRecord(self: *Writer, node: model.Node) Error!void {
 /// beginListWithAttributes when filtering changes a count or leaves it unknown. Records from
 /// decoded reads have no binary text; write them with writeRecordWithArrays.
 pub fn writeItem(self: *Writer, item: model.Item) Error!void {
+    try self.enter();
+    defer self.active = false;
     if (self.failure != null) return error.FailedState;
     errdefer |err| self.fail(err, .write_item);
     switch (item) {
-        .list_start => |start| try self.beginListWithAttributes(start.kind, start.list.declared_count, start.list.attributes),
-        .record => |record| try self.writeRecord(record.node),
-        .list_end => try self.endList(),
+        .list_start => |start| try self.openList(start.kind, start.list.declared_count, start.list.attributes),
+        .record => |record| try self.writeRecordInner(record.node, false, @as([]const ArrayPayload, &.{})),
+        .list_end => try self.closeList(),
         .run_end => {
             if (self.phase != .run) return error.InvalidState;
             try self.engine.endElement();
@@ -276,6 +301,8 @@ pub fn writeItem(self: *Writer, item: model.Item) Error!void {
 /// binary text. The array count must match; wire and source values must not share memory
 /// with the output buffers.
 pub fn writeRecordWithArrays(self: *Writer, node: model.Node, payloads: []const ArrayPayload) Error!void {
+    try self.enter();
+    defer self.active = false;
     return self.writeRecordInner(node, true, payloads);
 }
 
@@ -283,6 +310,8 @@ pub fn writeRecordWithArrays(self: *Writer, node: model.Node, payloads: []const 
 /// binary text, and a payload, even an empty one, replaces it. Only supplied payloads are
 /// checked.
 pub fn writeRecordWithSelectedArrays(self: *Writer, node: model.Node, payloads: []const ?ArrayPayload) Error!void {
+    try self.enter();
+    defer self.active = false;
     return self.writeRecordInner(node, true, payloads);
 }
 
@@ -326,7 +355,7 @@ fn writeRecordInner(self: *Writer, node: model.Node, comptime replace_arrays: bo
                     _ = try self.textLength(wire.len);
                     break :plan .{ .wire = wire };
                 },
-                .source => |source| try self.planSource(source),
+                .source => |source| try self.planSource(source, payloads),
             });
         }
     }
@@ -375,7 +404,7 @@ fn textLength(self: *Writer, wire_length: usize) Error!usize {
 
 // Decides how a source is written before any of its record is, so that on output that cannot
 // be patched every length is known and every encoding error found first.
-fn planSource(self: *Writer, source: arrays.Source) Error!Plan {
+fn planSource(self: *Writer, source: arrays.Source, payloads: anytype) Error!Plan {
     try source.check();
     switch (source.values) {
         inline else => |values| if (self.engine.overlapsOutput(std.mem.sliceAsBytes(values))) return error.OverlappingBuffers,
@@ -398,6 +427,12 @@ fn planSource(self: *Writer, source: arrays.Source) Error!Plan {
             else => |e| return e,
         };
         return .{ .source = .{ .payload = source, .text_length = try self.textLength(std.math.cast(usize, counter.fullCount()) orelse return error.LimitExceeded) } };
+    }
+    // A wire of this record left in the slot this encode reuses (the encoder was reset after
+    // making it) would be freed or overwritten before it is written.
+    for (payloads) |supplied| {
+        const other = @as(?ArrayPayload, supplied) orelse continue;
+        if (other == .wire and source.encoder.?.reuses(other.wire)) return error.InvalidState;
     }
     const wire = try source.encoder.?.encodeSource(source);
     _ = try self.textLength(wire.len);
@@ -510,6 +545,12 @@ fn writeEncodedLength(self: *Writer, text_length: ?usize, width: usize) Error!?u
 /// Closes the active list, checking a supplied count or patching an unknown count.
 /// Patching flushes pending file bytes but does not change the output position.
 pub fn endList(self: *Writer) Error!void {
+    try self.enter();
+    defer self.active = false;
+    return self.closeList();
+}
+
+fn closeList(self: *Writer) Error!void {
     if (self.failure != null) return error.FailedState;
     errdefer |err| {
         self.fail(err, .close_list);
@@ -527,6 +568,8 @@ pub fn endList(self: *Writer) Error!void {
 /// into the sink; indexed file output flushes and reads the checksum prefix. The caller
 /// must still flush its own sink. Can succeed only once.
 pub fn finish(self: *Writer) Error!void {
+    try self.enter();
+    defer self.active = false;
     if (self.failure != null) return error.FailedState;
     errdefer |err| self.fail(err, .finish);
     if (self.phase != .run and self.phase != .document) return error.InvalidState;
@@ -615,6 +658,7 @@ fn writeNode(self: *Writer, node: model.Node, comptime replace_arrays: bool, rem
     }
     if (budget.* == 0) return try self.limitError(.nodes, self.limits.nodes, null);
     budget.* -= 1;
+    try self.checkNode(node);
     const plan: Plan = if (replace_arrays and (node.kind == .binary or node.kind == .binary_data_array)) blk: {
         if (remaining.len == 0) return error.CountMismatch;
         break :blk remaining.*[0];
@@ -772,6 +816,19 @@ fn startKnown(self: *Writer, name: []const u8, attrs: []const model.Attribute, r
     };
 }
 
+// A node's arrays are read while its earlier parts are written, so like the strings (checked
+// by the XML writer) they must not live in the output buffers.
+fn checkNode(self: *Writer, node: model.Node) Error!void {
+    try self.checkParts(.{ node.attributes, node.params, node.children });
+    if (node.content) |content| try self.checkParts(.{ std.mem.asBytes(content), content.items });
+}
+
+fn checkParts(self: *Writer, parts: anytype) Error!void {
+    inline for (parts) |part| {
+        if (self.engine.overlapsOutput(std.mem.sliceAsBytes(part))) return error.InvalidState;
+    }
+}
+
 fn writeParams(self: *Writer, params: []const cv.Entry, budget: *usize) Error!void {
     for (params) |entry| {
         const extra = switch (entry) {
@@ -779,6 +836,7 @@ fn writeParams(self: *Writer, params: []const cv.Entry, budget: *usize) Error!vo
             .cv => |param| param.xml,
             .user => |param| param.xml,
         };
+        if (extra) |value| try self.checkParts(.{ std.mem.asBytes(value), value.attributes, value.content });
         const attrs = if (extra) |value| value.attributes else &.{};
         switch (entry) {
             .group_ref => |ref| {

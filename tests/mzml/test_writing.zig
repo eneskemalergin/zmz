@@ -1737,4 +1737,115 @@ test "[failure] - [mzML writer]: rejects metadata that shares memory with its ou
         try std.testing.expectError(error.InvalidState, writer.writeRecord(node));
         try std.testing.expectError(error.FailedState, writer.finish());
     }
+    // A growing caller sink behind the indexed writer's hashing writer is checked as it is now.
+    var grown: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer grown.deinit();
+    var writer = try mzml.Writer.initIndexed(std.testing.allocator, &grown.writer, .{}, .{});
+    defer writer.deinit();
+    try writer.writeHeader(header.*);
+    try writer.beginList(.spectrum_list, 1, "dp");
+    try grown.ensureUnusedCapacity(64);
+    const aliased = grown.writer.buffer[grown.writer.end..][0..8];
+    @memcpy(aliased, "aliased!");
+    var attributes: [8]mzml.model.Attribute = undefined;
+    @memcpy(attributes[0..record.node.attributes.len], record.node.attributes);
+    attributes[record.node.attributes.len] = .{ .name = "note", .value = aliased };
+    var node = record.node;
+    node.attributes = attributes[0 .. record.node.attributes.len + 1];
+    try std.testing.expectError(error.InvalidState, writer.writeRecord(node));
+}
+
+test "[failure] - [mzML writer]: a sink cannot reenter the writer that drains into it" {
+    const Reentrant = struct {
+        interface: std.Io.Writer,
+        out: *std.Io.Writer,
+        target: ?*mzml.Writer = null,
+        refused: usize = 0,
+
+        fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+            const self: *@This() = @alignCast(@fieldParentPtr("interface", w));
+            if (self.target) |target| {
+                if (target.writeItem(.{ .xml = "<extra/>" })) |_| {} else |err| {
+                    if (err == error.InvalidState) self.refused += 1;
+                }
+            }
+            try self.out.writeAll(w.buffered());
+            w.end = 0;
+            var written: usize = 0;
+            for (data[0 .. data.len - 1]) |bytes| {
+                try self.out.writeAll(bytes);
+                written += bytes.len;
+            }
+            for (0..splat) |_| try self.out.writeAll(data[data.len - 1]);
+            return written + data[data.len - 1].len * splat;
+        }
+    };
+    var expected: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer expected.deinit();
+    try support.rewriteFixture(std.testing.allocator, &expected.writer);
+    var actual: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer actual.deinit();
+    var buffer: [16]u8 = undefined;
+    var sink: Reentrant = .{ .interface = .{ .vtable = &.{ .drain = Reentrant.drain }, .buffer = &buffer }, .out = &actual.writer };
+    var input = std.Io.Reader.fixed(support.DOCUMENT);
+    var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+    defer reader.deinit();
+    var writer = try mzml.Writer.init(std.testing.allocator, &sink.interface, .{});
+    defer writer.deinit();
+    sink.target = &writer;
+    try writer.writeHeader((try reader.readHeader()).*);
+    while (try reader.nextItem()) |item| try writer.writeItem(item);
+    try writer.finish();
+    try sink.interface.flush();
+    try std.testing.expectEqualStrings(expected.written(), actual.written());
+    try std.testing.expect(sink.refused != 0);
+}
+
+test "[failure] - [mzML writer]: refuses a wire that a source in the same record would overwrite" {
+    var input = std.Io.Reader.fixed(support.DOCUMENT);
+    var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+    defer reader.deinit();
+    const header = try reader.readHeader();
+    const record = (try reader.nextRecord()).?;
+    var encoder = mzml.arrays.Encoder.init(std.testing.allocator, .fast);
+    defer encoder.deinit();
+    const values = [_]f64{1};
+    const options: mzml.arrays.EncodeOptions = .{ .pipeline = .zlib };
+    const wire = try encoder.encode(f64, &values, options);
+    // Against the contract: the wire is still needed, but its slot is free for reuse.
+    encoder.reset();
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var writer = try mzml.Writer.init(std.testing.allocator, &output.writer, .{});
+    defer writer.deinit();
+    try writer.writeHeader(header.*);
+    try writer.beginList(.spectrum_list, 1, "dp");
+    const before = writer.engine.byteOffset();
+    try std.testing.expectError(error.InvalidState, writer.writeRecordWithArrays(record.node, &.{
+        .{ .wire = wire },
+        .{ .source = mzml.arrays.Source.of(f64, &values, options, &encoder) },
+    }));
+    try std.testing.expectEqual(before, writer.engine.byteOffset());
+}
+
+test "[failure] - [mzML writer]: rejects node arrays that live in its output buffer" {
+    var input = std.Io.Reader.fixed(support.DOCUMENT);
+    var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+    defer reader.deinit();
+    const header = try reader.readHeader();
+    const record = (try reader.nextRecord()).?;
+    var output: [8192]u8 align(@alignOf(mzml.model.Attribute)) = undefined;
+    var sink = std.Io.Writer.fixed(&output);
+    var writer = try mzml.Writer.init(std.testing.allocator, &sink, .{});
+    defer writer.deinit();
+    try writer.writeHeader(header.*);
+    try writer.beginList(.spectrum_list, 1, "dp");
+    // Writing the first attributes would overwrite the structs of the later ones.
+    const aliased: []mzml.model.Attribute = @ptrCast(@alignCast(output[4096..][0 .. record.node.attributes.len * @sizeOf(mzml.model.Attribute)]));
+    @memcpy(aliased, record.node.attributes);
+    var node = record.node;
+    node.attributes = aliased;
+    const before = writer.engine.byteOffset();
+    try std.testing.expectError(error.InvalidState, writer.writeRecord(node));
+    try std.testing.expectEqual(before, writer.engine.byteOffset());
 }

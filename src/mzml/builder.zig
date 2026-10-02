@@ -41,6 +41,7 @@ pub const Array = struct {
     is_default: bool,
     /// Arrays may only be attached to records in this owner, before its next reset.
     owner: *const Builder,
+    generation: usize,
 };
 
 /// Array metadata and the payload the writer encodes while writing it. The values and the
@@ -54,9 +55,13 @@ pub const Reencoding = struct {
     header: model.Header,
     source_groups: []const cv.Group,
     replacements: []const GroupReplacement,
+    owner: *const Builder,
+    generation: usize,
 
     /// Like builder.prepareArrayFrom, moving references to the prepared group definitions.
+    /// InvalidState once the creating builder was reset.
     pub fn prepareArray(self: Reencoding, builder: *Builder, comptime T: type, values: []const T, source: model.Node, options: arrays.EncodeOptions, encoder: *arrays.Encoder) Error!PreparedArray {
+        if (self.owner.generation != self.generation) return error.InvalidState;
         return builder.prepareArrayFromInner(T, values, source, self.source_groups, options, encoder, self.replacements);
     }
 };
@@ -64,6 +69,8 @@ pub const Reencoding = struct {
 arena: std.heap.ArenaAllocator,
 limits: owned.Limits,
 remaining: usize,
+// Counts resets, so arrays and reencodings from before one are refused.
+generation: usize = 0,
 
 pub fn init(allocator: std.mem.Allocator, limits: owned.Limits) Builder {
     return .{ .arena = .init(allocator), .limits = limits, .remaining = limits.bytes };
@@ -78,6 +85,7 @@ pub fn deinit(self: *Builder) void {
 pub fn reset(self: *Builder) void {
     _ = self.arena.reset(.free_all);
     self.remaining = self.limits.bytes;
+    self.generation +%= 1;
 }
 
 /// Copies a node, including any binary text, within the byte limit and MAX_DEPTH.
@@ -210,6 +218,7 @@ fn prepareArrayFromInner(self: *Builder, comptime T: type, values: []const T, so
         .length = values.len,
         .is_default = is_default,
         .owner = self,
+        .generation = self.generation,
     }, .payload = .{ .source = prepared } };
 }
 
@@ -223,7 +232,7 @@ pub fn reencoding(self: *Builder, source: model.Header, targets: []const model.E
         if (groupReplacement(group.entries, targets, i) != null)
             count = std.math.add(usize, count, 1) catch return error.LimitExceeded;
     };
-    if (count == 0) return .{ .header = header_copy, .source_groups = source_groups, .replacements = &.{} };
+    if (count == 0) return .{ .header = header_copy, .source_groups = source_groups, .replacements = &.{}, .owner = self, .generation = self.generation };
     var copier = self.makeCopier();
     defer self.remaining = copier.remaining;
     const replacements = try copier.alloc(GroupReplacement, count);
@@ -297,7 +306,7 @@ pub fn reencoding(self: *Builder, source: model.Header, targets: []const model.E
         break;
     }
     header_copy.groups = groups;
-    return .{ .header = header_copy, .source_groups = source_groups, .replacements = replacements };
+    return .{ .header = header_copy, .source_groups = source_groups, .replacements = replacements, .owner = self, .generation = self.generation };
 }
 
 const GroupEncoding = struct { primitive: ?model.Primitive = null, pipeline: ?arrays.Pipeline = null };
@@ -447,18 +456,19 @@ fn arrayMetadata(self: *Builder, comptime T: type, value_count: usize, options: 
         .children = &.{.{ .kind = .binary }},
     };
     _ = try model.arrayEncoding(result, &.{});
-    return .{ .node = try self.node(result), .length = value_count, .is_default = is_default, .owner = self };
+    return .{ .node = try self.node(result), .length = value_count, .is_default = is_default, .owner = self, .generation = self.generation };
 }
 
 /// Builds a spectrum or chromatogram with new id, index, and defaultArrayLength attributes,
-/// for writeRecordWithArrays with the arrays' wire. Arrays must come from this builder, and
+/// for writeRecordWithArrays with the arrays' wire. Arrays must come from this builder since
+/// its last reset, and
 /// default arrays must match default_length. To keep a source record's attributes, edit a
 /// view of its node instead.
 pub fn record(self: *Builder, kind: model.Kind, id: []const u8, index: usize, default_length: usize, params: []const cv.Entry, children: []const model.Node, binary_arrays: []const Array) Error!model.Record {
     if ((kind != .spectrum and kind != .chromatogram) or id.len == 0) return error.InvalidRecord;
     for (children) |child| if (child.kind == .binary_data_array_list) return error.InvalidRecord;
     for (binary_arrays) |array| {
-        if (array.owner != self) return error.InvalidRecord;
+        if (array.owner != self or array.generation != self.generation) return error.InvalidRecord;
         if (array.is_default and array.length != default_length) return error.InvalidArrayLength;
     }
     const child_count = std.math.add(usize, children.len, @intFromBool(binary_arrays.len != 0)) catch return error.LimitExceeded;

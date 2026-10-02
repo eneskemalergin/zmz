@@ -113,8 +113,9 @@ param_scratch: std.ArrayList(cv.Entry) = .empty,
 decoded_arrays: ?*DecodedArrays = null,
 // The decoded record's defaultArrayLength, for its arrays.
 record_default_length: ?usize = null,
-// A selection callback is running; reentering would reset storage the parse still uses.
-selecting: bool = false,
+// A call is in progress. Caller code runs inside it (selection callbacks, the input reader,
+// the allocator); reentering would reset storage the parse still uses.
+active: bool = false,
 decode_binary: bool = false,
 fragment_ancestors: ?xml.Ancestors = null,
 
@@ -144,6 +145,17 @@ pub fn deinit(self: *StreamReader) void {
 }
 
 pub fn readHeader(self: *StreamReader) Error!*const model.Header {
+    try self.enter();
+    defer self.active = false;
+    return self.ensureHeader();
+}
+
+fn enter(self: *StreamReader) Error!void {
+    if (self.active) return error.InvalidState;
+    self.active = true;
+}
+
+fn ensureHeader(self: *StreamReader) Error!*const model.Header {
     if (self.failure != null) return error.FailedState;
     if (!self.header_ready) self.readHeaderInner() catch |err| {
         self.fail(err, .read_header);
@@ -153,10 +165,14 @@ pub fn readHeader(self: *StreamReader) Error!*const model.Header {
 }
 
 pub fn nextRecord(self: *StreamReader) Error!?model.Record {
+    try self.enter();
+    defer self.active = false;
     return self.nextRecordFor(.tree);
 }
 
 pub fn nextIndexRecord(self: *StreamReader) Error!?model.Record {
+    try self.enter();
+    defer self.active = false;
     return self.nextRecordFor(.entry);
 }
 
@@ -170,31 +186,44 @@ fn nextRecordFor(self: *StreamReader, comptime retention: Retention) Error!?mode
 }
 
 pub fn nextItem(self: *StreamReader) Error!?model.Item {
+    try self.enter();
+    defer self.active = false;
     return self.nextItemFor(.tree, true);
 }
 
 fn nextItemFor(self: *StreamReader, comptime retention: Retention, comptime retain_xml: bool) Error!?model.Item {
-    if (self.selecting) return error.InvalidState;
     if (self.failure != null) return error.FailedState;
     errdefer |err| self.fail(err, if (retain_xml) .read_item else .read_record);
-    _ = try self.readHeader();
+    _ = try self.ensureHeader();
     self.record_store.reset();
     if (self.done) return null;
     return self.nextItemInner(retention, retain_xml);
 }
 
 pub fn nextDecodedItem(self: *StreamReader, output: *DecodedArrays) Error!?model.Item {
-    return self.nextDecoded(model.Item, nextItem, output);
+    try self.enter();
+    defer self.active = false;
+    return self.nextDecoded(model.Item, nextTreeItem, output);
 }
 
 pub fn nextDecodedRecord(self: *StreamReader, output: *DecodedArrays) Error!?model.Record {
-    return self.nextDecoded(model.Record, nextRecord, output);
+    try self.enter();
+    defer self.active = false;
+    return self.nextDecoded(model.Record, nextTreeRecord, output);
+}
+
+fn nextTreeItem(self: *StreamReader) Error!?model.Item {
+    return self.nextItemFor(.tree, true);
+}
+
+fn nextTreeRecord(self: *StreamReader) Error!?model.Record {
+    return self.nextRecordFor(.tree);
 }
 
 // Reads the next item or record, decoding its arrays into output; results become visible
 // only once the record completes.
 fn nextDecoded(self: *StreamReader, comptime T: type, comptime next: fn (*StreamReader) Error!?T, output: *DecodedArrays) Error!?T {
-    if (self.selecting or output.busy) return error.InvalidState;
+    if (output.busy) return error.InvalidState;
     output.reset();
     errdefer output.reset();
     output.busy = true;
@@ -229,7 +258,8 @@ fn captureScope(self: *StreamReader) Error!Scope {
 /// Internal reusable fragment reader. Returned records use the requested allocator;
 /// parser and list scratch remain owned by this reader. No source bytes remain borrowed.
 pub fn readFragment(self: *StreamReader, allocator: std.mem.Allocator, input: *std.Io.Reader, ancestors: usize, physical_start: u64, prefix_length: usize, complete: bool, reuse_ancestors: bool, expected: ?FragmentTarget) Error!owned.Record {
-    if (self.selecting) return error.InvalidState;
+    try self.enter();
+    defer self.active = false;
     self.failure = null;
     if (self.header_ready or ancestors > 4 or physical_start < prefix_length) return error.InvalidOptions;
     errdefer self.fragment_ancestors = null;
@@ -755,11 +785,8 @@ fn parseNodeFor(self: *StreamReader, storage: *Storage, depth: usize, advance_af
             const position = storage.arrays;
             storage.arrays += 1;
             if (child_payload == .retain) {
-                if (self.options.array_selector) |selector| {
-                    self.selecting = true;
-                    defer self.selecting = false;
+                if (self.options.array_selector) |selector|
                     child_payload = try selector.select(selector.user_data, .{ .node = node, .position = position, .groups = self.header.groups });
-                }
             }
             if (self.decoded_arrays) |output| {
                 decode_array = child_payload == .retain;
@@ -821,8 +848,6 @@ fn parseNodeFor(self: *StreamReader, storage: *Storage, depth: usize, advance_af
                     if (selector.select_record) |select| {
                         var view = node;
                         view.params = self.param_scratch.items[params_start..];
-                        self.selecting = true;
-                        defer self.selecting = false;
                         child_payload = try select(selector.user_data, .{ .node = view, .groups = self.header.groups });
                     }
                 }

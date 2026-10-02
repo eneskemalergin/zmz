@@ -2767,3 +2767,61 @@ test "[failure] - [mzML selection]: callbacks cannot reenter the reader or reset
     try std.testing.expect(state.calls != 0);
     try std.testing.expectEqual(3 * state.calls, state.refused);
 }
+
+test "[failure] - [mzML reader]: an input reader cannot reenter the reader it feeds" {
+    const Reentrant = struct {
+        interface: std.Io.Reader,
+        rest: []const u8,
+        target: ?*mzml.StreamReader = null,
+        refused: usize = 0,
+
+        fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+            const self: *@This() = @alignCast(@fieldParentPtr("interface", r));
+            if (self.target) |target| {
+                if (target.nextRecord()) |_| {} else |err| {
+                    if (err == error.InvalidState) self.refused += 1;
+                }
+            }
+            if (self.rest.len == 0) return error.EndOfStream;
+            const length = limit.minInt(@min(self.rest.len, 7));
+            try w.writeAll(self.rest[0..length]);
+            self.rest = self.rest[length..];
+            return length;
+        }
+    };
+    var buffer: [64]u8 = undefined;
+    var input: Reentrant = .{ .interface = .{ .vtable = &.{ .stream = Reentrant.stream }, .buffer = &buffer, .seek = 0, .end = 0 }, .rest = support.DOCUMENT };
+    var reader = try mzml.StreamReader.init(std.testing.allocator, &input.interface, .{});
+    defer reader.deinit();
+    input.target = &reader;
+    var expected_input = std.Io.Reader.fixed(support.DOCUMENT);
+    var expected = try mzml.StreamReader.init(std.testing.allocator, &expected_input, .{});
+    defer expected.deinit();
+    _ = try reader.readHeader();
+    _ = try expected.readHeader();
+    while (try expected.nextRecord()) |record| try support.expectNode(record.node, (try reader.nextRecord()).?.node);
+    try std.testing.expectEqual(null, try reader.nextRecord());
+    try std.testing.expect(input.refused != 0);
+}
+
+test "[failure] - [mzML decoded arrays]: text in the owner's storage and out-of-order engine calls are refused" {
+    const int32 = mzml.cv.Entry{ .cv = .{ .accession = .{ .raw = "MS:1000519" }, .name = "32-bit integer" } };
+    const plain = mzml.cv.Entry{ .cv = .{ .accession = .{ .raw = "MS:1000576" }, .name = "no compression" } };
+    var output = mzml.StreamReader.DecodedArrays.init(std.testing.allocator, .{ .array_bytes = 64 });
+    defer output.deinit();
+    // "QUFB" twice decodes to the int32 values whose bytes spell "AAAAAA" and so on.
+    const first: mzml.model.Node = .{ .kind = .binary_data_array, .params = &.{ int32, plain }, .children = &.{.{ .kind = .binary, .text = "QUFBQUFBQUE=" }} };
+    const values = (try output.decodeArray(first, 2, &.{})).int32;
+    const text = std.mem.sliceAsBytes(values);
+    const aliased: mzml.model.Node = .{ .kind = .binary_data_array, .params = &.{ int32, plain }, .children = &.{.{ .kind = .binary, .text = text }} };
+    try std.testing.expectError(error.OverlappingBuffers, output.decodeArray(aliased, 16, &.{}));
+
+    var fresh = mzml.StreamReader.DecodedArrays.init(std.testing.allocator, .{ .array_bytes = 64 });
+    defer fresh.deinit();
+    var none: Fragments = .{ .rest = "", .source = undefined };
+    try std.testing.expectError(error.InvalidState, fresh.decodeText(&none));
+    // A beginArray stopped by the array limit leaves an array with no values.
+    try std.testing.expectError(error.LimitExceeded, fresh.beginArray(first, 1000, &.{}, 0));
+    fresh.complete();
+    try std.testing.expectEqual(@as(usize, 0), fresh.get(0).?.values.int32.len);
+}

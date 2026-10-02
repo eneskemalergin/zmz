@@ -67,6 +67,7 @@ metadata: ?owned.Header = null,
 contexts: [2]?FragmentAncestors = .{ null, null },
 counts: [2]usize = .{ 0, 0 },
 lookup_reader: ?Engine = null,
+active: bool = false,
 lookup_kind: ?model.Kind = null,
 failure: ?Diagnostic = null,
 
@@ -220,9 +221,12 @@ const Target = union(enum) { id: []const u8, ordinal: struct { kind: model.Kind,
 
 // Every lookup: clears the last failure and, with output, earlier decoded results.
 fn lookup(self: *IndexedReader, allocator: std.mem.Allocator, target: Target, output: ?*DecodedArrays) Error!?owned.Record {
-    // A selection callback of a lookup in progress must leave it and its output alone.
-    if (self.lookup_reader) |*reader| if (reader.selecting) return error.InvalidState;
+    // Caller code runs inside a lookup (selection callbacks, the allocator, the source's Io);
+    // it must leave the lookup and its output alone.
+    if (self.active) return error.InvalidState;
     if (output) |decoded| if (decoded.busy) return error.InvalidState;
+    self.active = true;
+    defer self.active = false;
     self.failure = null;
     errdefer |err| self.capture(err, .index, .none);
     if (output) |decoded| decoded.reset();

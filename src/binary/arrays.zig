@@ -75,10 +75,12 @@ pub const Source = struct {
         try self.check();
         switch (self.values) {
             inline else => |values| {
+                if (overlaps(writer.buffer, std.mem.sliceAsBytes(values))) return error.OverlappingBuffers;
                 const T = @typeInfo(@TypeOf(values)).pointer.child;
                 if (!self.options.pipeline.hasZlib()) return writeWire(T, values, self.options, writer);
                 const compressor = try (self.encoder orelse return error.MissingCompressor).compressor();
                 const compressed = try compressor.startWriter(writer);
+                errdefer compressor.cancel();
                 try writeWire(T, values, self.options, compressed);
                 try compressor.finishWriter();
             },
@@ -187,6 +189,7 @@ pub fn encodeWire(
     try checkOptions(T, values.len, options, compressor != null);
     if (options.pipeline.hasZlib()) {
         const writer = try compressor.?.start(scratch.transport);
+        errdefer compressor.?.cancel();
         writeWire(T, values, options, writer) catch |err| switch (err) {
             error.WriteFailed => return error.OutputTooSmall,
             else => |e| return e,
@@ -288,6 +291,13 @@ pub const Encoder = struct {
     pub fn compressor(self: *Encoder) std.mem.Allocator.Error!*zlib.Compressor {
         if (self.compressor_state == null) self.compressor_state = try zlib.Compressor.init(self.allocator, self.preset);
         return &self.compressor_state.?;
+    }
+
+    /// Whether the next encode reuses storage holding bytes, which a reset left there: the
+    /// encode would overwrite or free them.
+    pub fn reuses(self: *const Encoder, bytes: []const u8) bool {
+        if (self.used == self.outputs.items.len) return false;
+        return overlaps(self.outputs.items[self.used].allocatedSlice(), bytes);
     }
 
     fn nextOutput(self: *Encoder, size: usize) std.mem.Allocator.Error![]u8 {

@@ -22,6 +22,7 @@ const base64 = @import("../binary/base64.zig");
 const numpress = @import("../binary/numpress.zig");
 const zlib = @import("../binary/zlib.zig");
 const Diagnostic = @import("diagnostic.zig");
+const overlaps = @import("../binary/core.zig").overlaps;
 
 const DecodedArrays = @This();
 
@@ -97,6 +98,8 @@ pub fn decodeRecord(self: *DecodedArrays, record: model.Record, groups: []const 
     if (self.busy) return error.InvalidState;
     self.reset();
     errdefer self.reset();
+    self.busy = true;
+    defer self.busy = false;
     for (record.binaryArrays(), 0..) |node, position| try self.decodeRetained(node, record.default_array_length, groups, position);
     self.complete();
 }
@@ -107,12 +110,21 @@ pub fn decodeArray(self: *DecodedArrays, node: model.Node, default_length: ?usiz
     if (self.busy) return error.InvalidState;
     self.reset();
     errdefer self.reset();
+    self.busy = true;
+    defer self.busy = false;
     try self.decodeRetained(node, default_length, groups, 0);
     self.complete();
     return self.get(0).?.values;
 }
 
 fn decodeRetained(self: *DecodedArrays, node: model.Node, default_length: ?usize, groups: []const cv.Group, source_position: usize) Error!void {
+    // Text kept in this owner's storage would be freed or overwritten as arrays are sized.
+    if (node.child(.binary)) |binary| if (binary.text) |retained| {
+        if (overlaps(self.window.allocatedSlice(), retained)) return error.OverlappingBuffers;
+        for (self.outputs.items) |output| {
+            if (overlaps(std.mem.sliceAsBytes(output.words.allocatedSlice()), retained)) return error.OverlappingBuffers;
+        }
+    };
     try self.beginArray(node, default_length, groups, source_position);
     const binary = node.child(.binary) orelse return error.PayloadNotRetained;
     var source = RetainedText{ .text = binary.text orelse return error.PayloadNotRetained };
@@ -135,6 +147,7 @@ const RetainedText = struct {
 /// errors pass through unchanged and take precedence, as do Base64 errors anywhere in the text
 /// over zlib errors, and zlib errors over Numpress errors.
 pub fn decodeText(self: *DecodedArrays, source: anytype) !void {
+    if (self.count == 0) return error.InvalidState;
     const pipeline = self.outputs.items[self.count - 1].encoding.pipeline;
     if (pipeline.hasZlib()) return self.decompressText(source);
     while (try source.next()) |bytes| try self.text(bytes);
@@ -191,7 +204,8 @@ pub fn beginArray(self: *DecodedArrays, node: model.Node, default_length: ?usize
     self.count += 1;
     output.source_position = source_position;
     output.encoding = array.encoding;
-    output.length = array.length;
+    // Set once the words are sized, so a failure here exposes no values.
+    output.length = 0;
     output.bytes = 0;
     const bytes = std.math.mul(usize, array.length, output.primitive().size()) catch return error.LengthOverflow;
     if (bytes > self.limits.array_bytes) {
@@ -199,6 +213,7 @@ pub fn beginArray(self: *DecodedArrays, node: model.Node, default_length: ?usize
         return error.LimitExceeded;
     }
     try output.words.resize(self.allocator, bytes / 8 + @intFromBool(bytes % 8 != 0));
+    output.length = array.length;
     output.bytes = bytes;
     const pipeline = array.encoding.pipeline;
     if (pipeline != .none) try self.window.resize(self.allocator, WINDOW);

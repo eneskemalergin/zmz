@@ -508,6 +508,12 @@ test "[integration] - [prepared construction]: keeps builder and writer failure 
     try std.testing.expectError(error.InvalidArrayLength, builder.record(.spectrum, "scan=1", 0, 2, &.{}, &.{}, &.{ a.array, b.array }));
     const single = try builder.record(.spectrum, "scan=1", 0, 1, &.{}, &.{}, &.{a.array});
     try std.testing.expectEqual(@as(usize, 1), single.binaryArrays().len);
+    // A reset frees what the arrays point into.
+    var stale = mzml.Builder.init(std.testing.allocator, .{});
+    defer stale.deinit();
+    const old = try stale.prepareArray(f64, &.{1}, options, &encoder);
+    stale.reset();
+    try std.testing.expectError(error.InvalidRecord, stale.record(.spectrum, "scan=1", 0, 1, &.{}, &.{}, &.{old.array}));
     var bad = options;
     bad.role.unit.cv_ref = "UO";
     const partial = try builder.prepareArray(f64, &.{1}, bad, &encoder);
@@ -774,4 +780,23 @@ test "[integration] - [mzML header IDs]: preserves document labels, run labels, 
     var builder = mzml.Builder.init(std.testing.allocator, .{});
     defer builder.deinit();
     try support.expectNode(header.run, (try builder.header(header)).run);
+}
+
+test "[failure] - [group reencoding]: refuses a reencoding whose builder was reset" {
+    var input = std.Io.Reader.fixed(support.DOCUMENT);
+    var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+    defer reader.deinit();
+    const header = try reader.readHeader();
+    const record = (try reader.nextRecord()).?;
+    var header_builder = mzml.Builder.init(std.testing.allocator, .{});
+    defer header_builder.deinit();
+    var builder = mzml.Builder.init(std.testing.allocator, .{});
+    defer builder.deinit();
+    var encoder = mzml.arrays.Encoder.init(std.testing.allocator, .fast);
+    defer encoder.deinit();
+    const prepared = try header_builder.reencoding(header.*, &.{.{ .primitive = .float32, .pipeline = .zlib }});
+    const values = [_]f32{1};
+    _ = try prepared.prepareArray(&builder, f32, &values, record.binaryArrays()[0], .{ .pipeline = .zlib }, &encoder);
+    header_builder.reset();
+    try std.testing.expectError(error.InvalidState, prepared.prepareArray(&builder, f32, &values, record.binaryArrays()[0], .{ .pipeline = .zlib }, &encoder));
 }

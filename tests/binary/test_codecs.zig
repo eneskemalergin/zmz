@@ -447,6 +447,24 @@ test "[failure] - [zlib]: streaming calls out of order fail with InvalidState" {
     try std.testing.expectError(error.InvalidState, compressor.finishWriter());
 }
 
+test "[failure] - [zlib]: a stream whose source failed is closed" {
+    var encoder = arrays.Encoder.init(std.testing.allocator, .fast);
+    defer encoder.deinit();
+    const bad = [_]f64{ 1, -1 };
+    const options: arrays.EncodeOptions = .{ .pipeline = .linear_zlib, .fixed_point = 1 };
+    try std.testing.expectError(error.InvalidValue, encoder.encode(f64, &bad, options));
+    const compressor = try encoder.compressor();
+    try std.testing.expectError(error.InvalidState, compressor.finish());
+    var discard: std.Io.Writer.Discarding = .init(&.{});
+    try std.testing.expectError(error.InvalidValue, arrays.Source.of(f64, &bad, options, &encoder).writeTo(&discard.writer));
+    try std.testing.expectError(error.InvalidState, compressor.finishWriter());
+    // A failed start leaves no earlier stream open either.
+    var output: [64]u8 = undefined;
+    _ = try compressor.start(&output);
+    try std.testing.expectError(error.OutputTooSmall, compressor.start(output[0..1]));
+    try std.testing.expectError(error.InvalidState, compressor.finish());
+}
+
 test "[failure] - [zlib]: releases partially allocated compression storage" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, allocateCompressor, .{});
 }
@@ -782,6 +800,18 @@ test "[failure] - [array sources]: writeTo checks options before writing a byte"
         try std.testing.expectError(case[1], case[0].writeTo(&writer));
         try std.testing.expectEqual(@as(usize, 0), writer.end);
     }
+}
+
+test "[failure] - [array sources]: values inside the destination's buffer are refused" {
+    var buffer: [64]f64 = undefined;
+    @memset(&buffer, 1);
+    var writer = std.Io.Writer.fixed(std.mem.sliceAsBytes(&buffer));
+    const values = buffer[32..40];
+    try std.testing.expectError(error.OverlappingBuffers, arrays.Source.of(f64, values, .{}, null).writeTo(&writer));
+    try std.testing.expectError(error.OverlappingBuffers, mzml.numpress.encodePicTo(values, &writer));
+    try std.testing.expectError(error.OverlappingBuffers, mzml.numpress.encodeLinearTo(values, 1, &writer));
+    try std.testing.expectError(error.OverlappingBuffers, mzml.numpress.encodeSlofTo(values, 1, &writer));
+    try std.testing.expectEqual(@as(usize, 0), writer.end);
 }
 
 test "[integration] - [array encoder]: keeps every wire until reset for all pipelines" {

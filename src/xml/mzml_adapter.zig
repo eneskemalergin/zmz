@@ -1627,9 +1627,9 @@ const WriterFrame = struct {
 pub const Writer = struct {
     allocator: std.mem.Allocator,
     sink: *std.Io.Writer,
-    /// A buffer the sink drains into, such as a hashing sink's destination. Written bytes may
-    /// overlap neither it nor the sink's buffer.
-    guard: []const u8 = &.{},
+    /// A writer the sink drains into, such as a hashing sink's destination. Written bytes may
+    /// overlap neither its buffer nor the sink's, read at each write since either can grow.
+    guard: ?*const std.Io.Writer = null,
     state: WriterState = .initial,
     failure: ?WriterError = null,
     logical_offset: u64 = 0,
@@ -1661,7 +1661,8 @@ pub const Writer = struct {
 
     /// Whether bytes share memory with the buffers the writer writes into.
     pub fn overlapsOutput(self: *const Writer, bytes: []const u8) bool {
-        return overlaps(self.sink.buffer, bytes) or overlaps(self.guard, bytes);
+        const guard = if (self.guard) |writer| writer.buffer else &.{};
+        return overlaps(self.sink.buffer, bytes) or overlaps(guard, bytes);
     }
 
     // Caller bytes are copied into the sink's buffer, so they must not live there.
