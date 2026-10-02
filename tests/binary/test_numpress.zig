@@ -310,9 +310,13 @@ test "[property] - [numpress encoders]: block encoding matches the value-by-valu
         const array = values[0..count];
         const slof_fixed_point = try numpress.optimalSlofFixedPoint(array);
         // An output of exactly the encoded length is below the worst-case bound, so the
-        // encoders take their value-by-value path for it.
+        // encoders take their value-by-value path for it; an output of exactly the bound
+        // takes the block path to its last byte.
         const pic_len = try numpress.encodePic(array, &block);
         try std.testing.expectEqual(pic_len, try numpress.encodePic(array, checked[0..pic_len]));
+        try std.testing.expectEqualSlices(u8, block[0..pic_len], checked[0..pic_len]);
+        const pic_bound = try numpress.picMaxEncodedLen(count);
+        try std.testing.expectEqual(pic_len, try numpress.encodePic(array, checked[0..pic_bound]));
         try std.testing.expectEqualSlices(u8, block[0..pic_len], checked[0..pic_len]);
         const slof_len = try numpress.encodeSlof(array, slof_fixed_point, &block);
         try std.testing.expectEqual(slof_len, try numpress.encodeSlof(array, slof_fixed_point, checked[0..slof_len]));
@@ -322,6 +326,9 @@ test "[property] - [numpress encoders]: block encoding matches the value-by-valu
         const linear_fixed_point = try numpress.optimalLinearFixedPoint(array);
         const linear_len = try numpress.encodeLinear(array, linear_fixed_point, &block);
         try std.testing.expectEqual(linear_len, try numpress.encodeLinear(array, linear_fixed_point, checked[0..linear_len]));
+        try std.testing.expectEqualSlices(u8, block[0..linear_len], checked[0..linear_len]);
+        const linear_bound = try numpress.linearMaxEncodedLen(count);
+        try std.testing.expectEqual(linear_len, try numpress.encodeLinear(array, linear_fixed_point, checked[0..linear_bound]));
         try std.testing.expectEqualSlices(u8, block[0..linear_len], checked[0..linear_len]);
     }
 }

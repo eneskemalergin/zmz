@@ -217,24 +217,13 @@ const U64s = @Vector(LANES, u64);
 /// and applying the Numpress integer code.
 pub noinline fn encodePic(input: anytype, output: []u8) Error!usize {
     const values = slice(input);
-    // The sink writes only filled bytes, so the worst-case bound is enough room; a smaller
-    // output takes the checked encoder, which reports OutputTooSmall only when it is needed.
     const bound = picMaxEncodedLen(values.len) catch return encodePicChecked(values, output);
     if (output.len < bound) return encodePicChecked(values, output);
-    var codes: [BLOCK]u32 = undefined;
-    var leading: [BLOCK]u32 = undefined;
-    var sink = RawSink{ .out = output };
-    var i: usize = 0;
-    while (i < values.len) {
-        const n: usize = @min(BLOCK, values.len - i);
-        switch (roundPicBlock(values[i..][0..n], codes[0..n], leading[0..n])) {
-            .invalid => return encodePicChecked(values, output),
-            .wide => sink.putAll(codes[0..n]),
-            .simple => sink.putAllLeading(codes[0..n], leading[0..n]),
-        }
-        i += n;
-    }
-    return sink.finish();
+    var writer = std.Io.Writer.fixed(output);
+    return encodePicTo(values, &writer) catch |err| switch (err) {
+        error.WriteFailed => encodePicChecked(values, output),
+        else => |e| e,
+    };
 }
 
 /// Encodes nonnegative doubles with MS-Numpress linear prediction.
@@ -242,37 +231,12 @@ pub noinline fn encodeLinear(input: anytype, fixed_point: f64, output: []u8) Err
     const values = slice(input);
     const bound = linearMaxEncodedLen(values.len) catch
         return encodeLinearChecked(values, fixed_point, output);
-    if (values.len < 3 or !(fixed_point > 0 and fixed_point <= std.math.floatMax(f64)) or
-        output.len < bound)
-    {
-        return encodeLinearChecked(values, fixed_point, output);
-    }
-    var scaled: [BLOCK + 2]i64 = undefined;
-    if (!scaleLinearBlock(values[0..2], fixed_point, scaled[0..2]) or
-        scaled[0] > std.math.maxInt(u32) or scaled[1] > std.math.maxInt(u32))
-    {
-        return encodeLinearChecked(values, fixed_point, output);
-    }
-    writeFixedPoint(output[0..8], fixed_point);
-    std.mem.writeInt(u32, output[8..12], @intCast(scaled[0]), .little);
-    std.mem.writeInt(u32, output[12..16], @intCast(scaled[1]), .little);
-    var sink = RawSink{ .out = output[16..] };
-    var residuals: [BLOCK]u32 = undefined;
-    var i: usize = 2;
-    while (i < values.len) {
-        const n: usize = @min(BLOCK, values.len - i);
-        // scaled[0..2] carries the previous two values into the block.
-        if (!scaleLinearBlock(values[i..][0..n], fixed_point, scaled[2..][0..n]) or
-            !linearResiduals(scaled[0 .. n + 2], residuals[0..n]))
-        {
-            return encodeLinearChecked(values, fixed_point, output);
-        }
-        sink.putAll(residuals[0..n]);
-        scaled[0] = scaled[n];
-        scaled[1] = scaled[n + 1];
-        i += n;
-    }
-    return 16 + sink.finish();
+    if (output.len < bound) return encodeLinearChecked(values, fixed_point, output);
+    var writer = std.Io.Writer.fixed(output);
+    return encodeLinearTo(values, fixed_point, &writer) catch |err| switch (err) {
+        error.WriteFailed => encodeLinearChecked(values, fixed_point, output),
+        else => |e| e,
+    };
 }
 
 /// Encodes nonnegative doubles with the MS-Numpress short logged float transform.
@@ -280,36 +244,26 @@ pub noinline fn encodeSlof(input: anytype, fixed_point: f64, output: []u8) Error
     const values = slice(input);
     const encoded_len = slofEncodedLen(values.len) catch
         return encodeSlofChecked(values, fixed_point, output);
-    if (!(fixed_point > 0 and fixed_point <= std.math.floatMax(f64)) or output.len < encoded_len)
-        return encodeSlofChecked(values, fixed_point, output);
-    writeFixedPoint(output[0..8], fixed_point);
-    const guard = slofGuard(fixed_point);
-    var i: usize = 0;
-    while (values.len - i >= SLOF_LANES) : (i += SLOF_LANES) {
-        const codes = slofBlock(values[i..][0..SLOF_LANES], fixed_point, guard) orelse
-            return encodeSlofChecked(values, fixed_point, output);
-        storeCodes(output[8 + 2 * i ..][0 .. 2 * SLOF_LANES], codes);
-    }
-    for (values[i..], i..) |value, index| {
-        const code = slofCode(value, fixed_point) catch
-            return encodeSlofChecked(values, fixed_point, output);
-        std.mem.writeInt(u16, output[8 + 2 * index ..][0..2], code, .little);
-    }
-    return encoded_len;
+    if (output.len < encoded_len) return encodeSlofChecked(values, fixed_point, output);
+    var writer = std.Io.Writer.fixed(output);
+    return encodeSlofTo(values, fixed_point, &writer) catch |err| switch (err) {
+        error.WriteFailed => encodeSlofChecked(values, fixed_point, output),
+        else => |e| e,
+    };
 }
 
 /// Writes the PIC encoding of `values` to `writer` and returns the bytes written. Errors match
 /// `encodePic`; after one, the writer holds an unspecified prefix.
 pub fn encodePicTo(input: anytype, writer: *std.Io.Writer) WriteError!usize {
     const values = slice(input);
-    var block: [BLOCK_BYTES]u8 = undefined;
-    var sink = RawSink{ .out = &block };
+    var blocks: Blocks = .{ .writer = writer };
+    var sink: RawSink = .{ .out = &.{} };
     var codes: [BLOCK]u32 = undefined;
     var leading: [BLOCK]u32 = undefined;
-    var written: usize = 0;
     var i: usize = 0;
     while (i < values.len) {
         const n: usize = @min(BLOCK, values.len - i);
+        try blocks.start(&sink, n);
         switch (roundPicBlock(values[i..][0..n], codes[0..n], leading[0..n])) {
             .simple => sink.putAllLeading(codes[0..n], leading[0..n]),
             .wide => sink.putAll(codes[0..n]),
@@ -318,12 +272,11 @@ pub fn encodePicTo(input: anytype, writer: *std.Io.Writer) WriteError!usize {
                 sink.putAll(codes[0..n]);
             },
         }
-        written += try sink.drain(writer);
+        try blocks.commit(&sink);
         i += n;
     }
-    const tail = sink.finish();
-    try writer.writeAll(block[0..tail]);
-    return written + tail;
+    try blocks.finish(&sink);
+    return blocks.written;
 }
 
 /// Writes the Linear encoding of `values` to `writer` and returns the bytes written. Errors
@@ -347,13 +300,13 @@ pub fn encodeLinearTo(input: anytype, fixed_point: f64, writer: *std.Io.Writer) 
     scaled[1] = try scaleLinearInitial(values[1], fixed_point);
     std.mem.writeInt(u32, header[12..16], @intCast(scaled[1]), .little);
     try writer.writeAll(&header);
-    var block: [BLOCK_BYTES]u8 = undefined;
-    var sink = RawSink{ .out = &block };
+    var blocks: Blocks = .{ .writer = writer, .written = 16 };
+    var sink: RawSink = .{ .out = &.{} };
     var residuals: [BLOCK]u32 = undefined;
-    var written: usize = 16;
     var i: usize = 2;
     while (i < values.len) {
         const n: usize = @min(BLOCK, values.len - i);
+        // scaled[0..2] carries the previous two values into the block.
         if (!scaleLinearBlock(values[i..][0..n], fixed_point, scaled[2..][0..n]) or
             !linearResiduals(scaled[0 .. n + 2], residuals[0..n]))
         {
@@ -362,15 +315,15 @@ pub fn encodeLinearTo(input: anytype, fixed_point: f64, writer: *std.Io.Writer) 
                 residuals[j] = @bitCast(try linearResidual(scaled[j + 2], scaled[j], scaled[j + 1]));
             }
         }
+        try blocks.start(&sink, n);
         sink.putAll(residuals[0..n]);
-        written += try sink.drain(writer);
+        try blocks.commit(&sink);
         scaled[0] = scaled[n];
         scaled[1] = scaled[n + 1];
         i += n;
     }
-    const tail = sink.finish();
-    try writer.writeAll(block[0..tail]);
-    return written + tail;
+    try blocks.finish(&sink);
+    return blocks.written;
 }
 
 /// Writes the SLOF encoding of `values` to `writer` and returns the bytes written. Errors
@@ -382,26 +335,74 @@ pub fn encodeSlofTo(input: anytype, fixed_point: f64, writer: *std.Io.Writer) Wr
     writeFixedPoint(&header, fixed_point);
     try writer.writeAll(&header);
     const guard = slofGuard(fixed_point);
-    var out: [2 * SLOF_LANES]u8 = undefined;
+    var blocks: Blocks = .{ .writer = writer, .written = 8 };
     var i: usize = 0;
-    while (values.len - i >= SLOF_LANES) : (i += SLOF_LANES) {
-        const block = values[i..][0..SLOF_LANES];
-        var codes: SlofCodes = undefined;
-        if (slofBlock(block, fixed_point, guard)) |fast| {
-            codes = fast;
-        } else {
-            inline for (0..SLOF_LANES) |lane| codes[lane] = try slofCode(block[lane], fixed_point);
+    while (i < values.len) {
+        const n: usize = @min(BLOCK, values.len - i);
+        const out = try blocks.room(2 * n);
+        var j: usize = 0;
+        while (n - j >= SLOF_LANES) : (j += SLOF_LANES) {
+            const block = values[i + j ..][0..SLOF_LANES];
+            var codes: SlofCodes = undefined;
+            if (slofBlock(block, fixed_point, guard)) |fast| {
+                codes = fast;
+            } else {
+                inline for (0..SLOF_LANES) |lane| codes[lane] = try slofCode(block[lane], fixed_point);
+            }
+            storeCodes(out[2 * j ..][0 .. 2 * SLOF_LANES], codes);
         }
-        storeCodes(&out, codes);
-        try writer.writeAll(&out);
+        for (values[i + j .. i + n], j..) |value, k| {
+            std.mem.writeInt(u16, out[2 * k ..][0..2], try slofCode(value, fixed_point), .little);
+        }
+        try blocks.advance(out, 2 * n);
+        i += n;
     }
-    for (values[i..]) |value| {
-        var code: [2]u8 = undefined;
-        std.mem.writeInt(u16, &code, try slofCode(value, fixed_point), .little);
-        try writer.writeAll(&code);
-    }
-    return 8 + 2 * values.len;
+    return blocks.written;
 }
+
+// Where encoded blocks go. A writer whose buffer holds a whole block gets the bytes written
+// straight into that buffer: a fixed writer over the caller's output (the slice encoders) or
+// a compressor's input buffer. Smaller buffers go through a local block. Do not copy a Blocks
+// while a room it returned is in use.
+const Blocks = struct {
+    writer: *std.Io.Writer,
+    written: usize = 0,
+    staged: [BLOCK_BYTES]u8 = undefined,
+
+    // At least `needed` bytes of room, needed <= BLOCK_BYTES.
+    inline fn room(self: *Blocks, needed: usize) std.Io.Writer.Error![]u8 {
+        const writer = self.writer;
+        if (writer.buffer.len - writer.end >= needed) return writer.buffer[writer.end..];
+        if (writer.buffer.len >= BLOCK_BYTES) return writer.writableSliceGreedy(needed);
+        return &self.staged;
+    }
+
+    inline fn advance(self: *Blocks, out: []const u8, length: usize) std.Io.Writer.Error!void {
+        if (out.ptr == &self.staged) try self.writer.writeAll(self.staged[0..length]) else self.writer.advance(length);
+        self.written += length;
+    }
+
+    // Points the sink at room for n more values: at most 36 bits each, after the bits the
+    // sink carries in. This never exceeds what an output of the worst-case length has left,
+    // so the slice encoders never fall back for room.
+    inline fn start(self: *Blocks, sink: *RawSink, n: usize) std.Io.Writer.Error!void {
+        sink.out = try self.room((sink.bits + 36 * n + 7) / 8);
+        sink.pos = 0;
+        sink.swapped = 0;
+    }
+
+    inline fn commit(self: *Blocks, sink: *RawSink) std.Io.Writer.Error!void {
+        try self.advance(sink.out, sink.pos);
+    }
+
+    // Writes the final half byte, if any.
+    inline fn finish(self: *Blocks, sink: *RawSink) std.Io.Writer.Error!void {
+        if (sink.bits == 0) return;
+        try self.start(sink, 0);
+        _ = sink.finish();
+        try self.commit(sink);
+    }
+};
 
 // The checked encoders: one value at a time, every check in the reference order. The block
 // encoders fall back to them for invalid input or an output below the worst-case bound, so
@@ -1076,16 +1077,6 @@ const RawSink = struct {
         }
         while (i < self.pos) : (i += 1) self.out[i] = (self.out[i] << 4) | (self.out[i] >> 4);
         self.swapped = self.pos;
-    }
-
-    // Writes the finished bytes to `writer` and restarts at the buffer's start; the pending
-    // half byte stays in the accumulator.
-    fn drain(self: *RawSink, writer: *std.Io.Writer) std.Io.Writer.Error!usize {
-        const n = self.pos;
-        try writer.writeAll(self.out[0..n]);
-        self.pos = 0;
-        self.swapped = 0;
-        return n;
     }
 
     fn finish(self: *RawSink) usize {
