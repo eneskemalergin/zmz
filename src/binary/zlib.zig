@@ -58,24 +58,24 @@ fn mapped(err: zipir.zlib.DecompressError) Error {
 /// Reusable streaming decompression storage with one owner. Do not copy a live instance.
 /// Each `start` decodes one zlib stream, with the errors of `decompress`, in caller-sized
 /// pieces, so no buffer for the whole decoded stream is needed.
-pub const Inflater = struct {
+pub const Decompressor = struct {
     allocator: std.mem.Allocator,
     state: *zipir.zlib.Decompressor,
     input: std.Io.Reader = undefined,
     empty: bool = false,
 
     /// Allocates one zipir decompressor.
-    pub fn init(allocator: std.mem.Allocator) std.mem.Allocator.Error!Inflater {
+    pub fn init(allocator: std.mem.Allocator) std.mem.Allocator.Error!Decompressor {
         return .{ .allocator = allocator, .state = try allocator.create(zipir.zlib.Decompressor) };
     }
 
-    pub fn deinit(self: *Inflater) void {
+    pub fn deinit(self: *Decompressor) void {
         self.allocator.destroy(self.state);
         self.* = undefined;
     }
 
     /// Starts decoding source, which stays borrowed until the stream ends or fails.
-    pub fn start(self: *Inflater, source: []const u8) void {
+    pub fn start(self: *Decompressor, source: []const u8) void {
         self.input = std.Io.Reader.fixed(source);
         self.empty = source.len == 0;
         self.state.init(&self.input, .{});
@@ -83,14 +83,14 @@ pub const Inflater = struct {
 
     /// Starts decoding a stream pulled from input, which stays borrowed until the stream ends
     /// or fails. A failed read of input is InvalidData here; its owner keeps the cause.
-    pub fn startReader(self: *Inflater, input: *std.Io.Reader) void {
+    pub fn startReader(self: *Decompressor, input: *std.Io.Reader) void {
         self.empty = false;
         self.state.init(input, .{});
     }
 
-    /// Returns up to limit next decoded bytes from the inflater's own buffer, valid until the
+    /// Returns up to limit next decoded bytes from the decompressor's own buffer, valid until the
     /// next call; an empty result means the stream ended and was checked.
-    pub fn next(self: *Inflater, limit: usize) Error![]const u8 {
+    pub fn next(self: *Decompressor, limit: usize) Error![]const u8 {
         if (self.empty) return error.TruncatedInput;
         const reader = &self.state.reader;
         const available = reader.peekGreedy(1) catch |err| switch (err) {
@@ -104,7 +104,7 @@ pub const Inflater = struct {
 
     /// Fills window with the next decoded bytes and returns them, short only at the end; an
     /// empty result means the stream ended and its checksum and trailing bytes were checked.
-    pub fn read(self: *Inflater, window: []u8) Error![]u8 {
+    pub fn read(self: *Decompressor, window: []u8) Error![]u8 {
         if (self.empty) return error.TruncatedInput;
         const length = self.state.reader.readSliceShort(window) catch
             return mapped(self.state.err orelse error.ReadFailed);

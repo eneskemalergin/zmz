@@ -450,8 +450,8 @@ test "[property] - [zlib]: matches valid streaming output and bounds corrupt or 
 test "[property] - [zlib]: streamed inflation matches whole-stream results and errors" {
     var compressor = try zlib.Compressor.init(std.testing.allocator, .even);
     defer compressor.deinit();
-    var inflater = try zlib.Inflater.init(std.testing.allocator);
-    defer inflater.deinit();
+    var decompressor = try zlib.Decompressor.init(std.testing.allocator);
+    defer decompressor.deinit();
     var random = std.Random.DefaultPrng.init(0x7a6c_6962_5354_524d);
     var source: [3000]u8 = undefined;
     var compressed: [4096]u8 = undefined;
@@ -469,11 +469,11 @@ test "[property] - [zlib]: streamed inflation matches whole-stream results and e
             };
             const expected = zlib.decompress(&whole, wire);
             for ([_]usize{ 1, 100, 4096 }) |window| {
-                inflater.start(wire);
+                decompressor.start(wire);
                 var total: usize = 0;
                 const actual = while (true) {
                     if (total > whole.len) break error.OutputTooSmall;
-                    const piece = inflater.read(streamed[total..][0..@min(window, streamed.len - total)]) catch |err| break err;
+                    const piece = decompressor.read(streamed[total..][0..@min(window, streamed.len - total)]) catch |err| break err;
                     if (piece.len == 0) break total;
                     total += piece.len;
                 };

@@ -1203,7 +1203,7 @@ test "[integration] - [mzML decoded reading]: preserves encoded length hints wit
             var input = std.Io.Reader.fixed(source);
             var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
             defer reader.deinit();
-            // Room for the fixed streaming state (window and zlib inflater), far below the
+            // Room for the fixed streaming state (window and zlib decompressor), far below the
             // largest hint, which would not fit if it sized anything.
             const backing = try std.testing.allocator.alloc(u8, 256 * 1024);
             defer std.testing.allocator.free(backing);

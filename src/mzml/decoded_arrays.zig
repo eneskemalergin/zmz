@@ -4,7 +4,7 @@
 //! Each array keeps its source primitive, except Numpress output is always f64. Numeric
 //! buffers grow as needed and are reused between records. Every array decodes as its text
 //! arrives: Base64 goes straight into typed output, into a fixed window for Numpress, or, with
-//! zlib, through a window that the inflater pulls from. No buffer holds a payload whole.
+//! zlib, through a window that the decompressor pulls from. No buffer holds a payload whole.
 //! Selected results stay in source order; source_position indexes record.binaryArrays().
 //! Results become visible only after the complete record succeeds. Returned slices last
 //! until the next decoded read using this owner, reset, or deinit; ordinary reads do not
@@ -37,7 +37,7 @@ pub const Array = struct { source_position: usize, encoding: model.Encoding, val
 /// binary_text_bytes bounds the Base64 text.
 pub const Limits = struct { array_bytes: usize = 192 * 1024 * 1024 };
 
-// Bytes decoded per step: Numpress input from Base64, or Base64 output for the inflater. A
+// Bytes decoded per step: Numpress input from Base64, or Base64 output for the decompressor. A
 // zlib payload that fits whole (most spectra) is decoded in one call, straight into its values.
 const WINDOW = 64 * 1024;
 
@@ -45,7 +45,7 @@ allocator: std.mem.Allocator,
 limits: Limits,
 outputs: std.ArrayList(Output) = .empty,
 window: std.ArrayList(u8) = .empty,
-inflater: ?zlib.Inflater = null,
+decompressor: ?zlib.Decompressor = null,
 count: usize = 0,
 ready: bool = false,
 default_length: ?usize = null,
@@ -64,7 +64,7 @@ pub fn deinit(self: *DecodedArrays) void {
     for (self.outputs.items) |*output| output.words.deinit(self.allocator);
     self.outputs.deinit(self.allocator);
     self.window.deinit(self.allocator);
-    if (self.inflater) |*inflater| inflater.deinit();
+    if (self.decompressor) |*decompressor| decompressor.deinit();
     self.* = undefined;
 }
 
@@ -144,7 +144,7 @@ pub fn startRecord(self: *DecodedArrays, node: model.Node) Error!void {
 /// over zlib errors, and zlib errors over Numpress errors.
 pub fn decodeText(self: *DecodedArrays, source: anytype) !void {
     const pipeline = self.outputs.items[self.count - 1].encoding.pipeline;
-    if (pipeline.hasZlib()) return self.inflateText(source);
+    if (pipeline.hasZlib()) return self.decompressText(source);
     while (try source.next()) |bytes| try self.text(bytes);
     return self.finishArray();
 }
@@ -242,21 +242,21 @@ fn finishNumpress(self: *DecodedArrays) Error!void {
     _ = try self.values.finish();
 }
 
-// Inflates a zlib array while its text arrives. The inflater pulls Base64-decoded bytes from
+// Inflates a zlib array while its text arrives. The decompressor pulls Base64-decoded bytes from
 // the text through a window, and its output goes straight into typed values or to Numpress.
 // The error order of decoding each layer whole is kept: after a zlib error the rest of the
 // text is still Base64-checked, and its errors and the source's come first.
-fn inflateText(self: *DecodedArrays, source: anytype) !void {
+fn decompressText(self: *DecodedArrays, source: anytype) !void {
     const output = &self.outputs.items[self.count - 1];
     var input = Base64Input(@TypeOf(source)).init(source, self.window.items);
     if (!output.encoding.pipeline.isNumpress()) {
         input.fill();
-        if (input.ended and input.failure == null) return self.inflateWhole(output, input.reader.buffered(), input.decoder.counts);
+        if (input.ended and input.failure == null) return self.decompressWhole(output, input.reader.buffered(), input.decoder.counts);
     }
-    if (self.inflater == null) self.inflater = try zlib.Inflater.init(self.allocator);
-    const inflater = &self.inflater.?;
-    inflater.startReader(&input.reader);
-    const inflated = self.inflateInto(inflater, output);
+    if (self.decompressor == null) self.decompressor = try zlib.Decompressor.init(self.allocator);
+    const decompressor = &self.decompressor.?;
+    decompressor.startReader(&input.reader);
+    const inflated = self.decompressInto(decompressor, output);
     if (input.failure) |err| return input.fail(self, err);
     input.drain() catch |err| return input.fail(self, err);
     const counts = input.decoder.counts;
@@ -274,7 +274,7 @@ fn inflateText(self: *DecodedArrays, source: anytype) !void {
 
 // A primitive zlib payload that fit the window whole: the slice decoder writes straight into
 // the values, with the same checks and errors as decoding a retained payload.
-fn inflateWhole(self: *DecodedArrays, output: *Output, wire: []const u8, counts: base64.Counts) Error!void {
+fn decompressWhole(self: *DecodedArrays, output: *Output, wire: []const u8, counts: base64.Counts) Error!void {
     errdefer self.failure = .{ .stage = .array };
     const pipeline = output.encoding.payloadPipeline(output.length, counts.significant_bytes == 0);
     switch (output.primitive()) {
@@ -290,14 +290,14 @@ fn inflateWhole(self: *DecodedArrays, output: *Output, wire: []const u8, counts:
     }
 }
 
-fn inflateInto(self: *DecodedArrays, inflater: *zlib.Inflater, output: *Output) Error!void {
+fn decompressInto(self: *DecodedArrays, decompressor: *zlib.Decompressor, output: *Output) Error!void {
     if (output.encoding.pipeline.isNumpress()) {
         // More than the Numpress bound means the stream holds more than the declared values;
         // never read more than one byte past it, so a zlib error beyond stays unseen.
         const bound = try arrays.wireBound(f64, output.length, output.encoding.pipeline);
         var total: usize = 0;
         while (true) {
-            const piece = try inflater.next(bound - total + 1);
+            const piece = try decompressor.next(bound - total + 1);
             if (piece.len == 0) return;
             total += piece.len;
             if (total > bound) return error.DecodedSizeMismatch;
@@ -305,13 +305,13 @@ fn inflateInto(self: *DecodedArrays, inflater: *zlib.Inflater, output: *Output) 
         }
     }
     const bytes = std.mem.sliceAsBytes(output.words.items)[0..output.byteLength()];
-    if ((try inflater.read(bytes)).len != bytes.len) return error.DecodedSizeMismatch;
+    if ((try decompressor.read(bytes)).len != bytes.len) return error.DecodedSizeMismatch;
     var extra: [1]u8 = undefined;
-    if ((try inflater.read(&extra)).len != 0) return error.DecodedSizeMismatch;
+    if ((try decompressor.read(&extra)).len != 0) return error.DecodedSizeMismatch;
     output.toNative();
 }
 
-// A reader over binary text that Base64-decodes into a window as the inflater pulls.
+// A reader over binary text that Base64-decodes into a window as the decompressor pulls.
 // Source and Base64 errors are kept in failure, since a reader can only report ReadFailed.
 fn Base64Input(comptime Source: type) type {
     const SourceError = @typeInfo(@typeInfo(@TypeOf(std.meta.Child(Source).next)).@"fn".return_type.?).error_union.error_set;
