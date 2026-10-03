@@ -459,7 +459,7 @@ test "[failure] - [mzML extensions]: rejects incomplete content and bounds fragm
         .{ .items = &.{.{ .params = 1 }}, .err = error.InvalidStructure },
         .{ .items = &.{.{ .children = 1 }}, .err = error.InvalidStructure },
         .{ .items = &.{.{ .xml = "<extra>" }}, .err = error.InvalidXml },
-        .{ .items = &.{.{ .xml = "<extra>" ** mzml.MAX_DEPTH ++ "</extra>" ** mzml.MAX_DEPTH }}, .err = error.WriterLimit },
+        .{ .items = &.{.{ .xml = "<extra>" ** mzml.MAX_DEPTH ++ "</extra>" ** mzml.MAX_DEPTH }}, .err = error.LimitExceeded },
         .{ .items = &.{.{ .xml = "<extra/>" }}, .limits = .{ .nodes = 1 }, .err = error.LimitExceeded },
         .{ .items = &.{.{ .xml = "<extra/>" }}, .limits = .{ .text_bytes = 7 }, .err = error.LimitExceeded },
     };
@@ -671,7 +671,7 @@ test "[integration] - [mzML references]: preserves unresolved and external links
                 try support.expectNode(record.node, found.value.node);
                 for (next.binaryArrays()) |array| {
                     var values: [1]f64 = undefined;
-                    try mzml.model.decodeArray(f64, &values, array, next.default_array_length, rewritten_header.groups, .{ .transport = &.{}, .transformed = &.{} });
+                    _ = try mzml.model.decodeArray(f64, &values, array, next.default_array_length, rewritten_header.groups, .{ .transport = &.{}, .transformed = &.{} });
                     try std.testing.expectEqual(@as(f64, 1), values[0]);
                 }
                 count += 1;
@@ -729,11 +729,10 @@ test "[integration] - [mzML prepared writing]: preserves primitive bytes across 
                     binaries[i] = node.children[0];
                     binaries[i].text = encoded_text;
                     node.children = binaries[i..][0..1];
-                    for (node.attributes, attributes[i][0..node.attributes.len]) |attribute, *copy| {
-                        copy.* = attribute;
-                        if (std.mem.eql(u8, attribute.name, "encodedLength")) copy.value = length;
-                    }
-                    node.attributes = attributes[i][0..node.attributes.len];
+                    // The writer writes the missing encodedLength first.
+                    attributes[i][0] = .{ .name = "encodedLength", .value = length };
+                    @memcpy(attributes[i][1..][0..node.attributes.len], node.attributes);
+                    node.attributes = attributes[i][0 .. node.attributes.len + 1];
                 }
                 var list = metadata.child(.binary_data_array_list).?;
                 list.children = &nodes;
@@ -1375,7 +1374,8 @@ test "[failure] - [mzML file writer]: flush, count patch, and checksum read fail
         vtable.fileWritePositional = Sink.write;
         vtable.fileReadPositional = Sink.read;
         const io: std.Io = .{ .userdata = &injected, .vtable = &vtable };
-        var buffer: [8192]u8 = undefined;
+        // A buffer smaller than a record, so the count has left it before endList patches it.
+        var buffer: [64]u8 = undefined;
         var sink = file.writer(io, &buffer);
         var writer = try mzml.Writer.initFile(std.testing.allocator, &sink, .{}, .{});
         defer writer.deinit();
@@ -1509,11 +1509,11 @@ test "[property] - [mzML streamed writing]: every pipeline round trips through s
                 const indexed = output_kind % 2 == 1;
                 const options = struct {
                     fn of(p: mzml.arrays.Pipeline, values: anytype) !mzml.arrays.EncodeOptions {
-                        return .{ .pipeline = p, .fixed_point = switch (p.transform()) {
+                        return .{ .pipeline = p, .fixed_point = if (p.transform()) |transform| switch (transform) {
                             .linear => try mzml.numpress.optimalLinearFixedPoint(values),
                             .slof => try mzml.numpress.optimalSlofFixedPoint(values),
-                            else => null,
-                        } };
+                            .pic => null,
+                        } else null };
                     }
                 };
                 const mz_options = try options.of(pipeline, mz[0..count]);
@@ -1624,6 +1624,10 @@ test "[failure] - [mzML streamed writing]: Numpress value errors write nothing t
         const before = writer.engine.byteOffset();
         try std.testing.expectError(error.InvalidValue, writer.writeRecordWithArrays(record.node, &.{prepared.payload}));
         try std.testing.expectEqual(before, writer.engine.byteOffset());
+        const stream_report = writer.diagnostic().?;
+        try std.testing.expectEqual(.array, stream_report.stage);
+        try std.testing.expectEqual(.binary_data_array, stream_report.element.?);
+        try std.testing.expectEqual(@as(usize, 0), stream_report.array_position.?);
         try std.testing.expectError(error.FailedState, writer.finish());
 
         var dir = std.testing.tmpDir(.{});
@@ -1637,8 +1641,220 @@ test "[failure] - [mzML streamed writing]: Numpress value errors write nothing t
         try file_writer.writeHeader(header.*);
         try file_writer.beginList(.spectrum_list, 1, "dp");
         try std.testing.expectError(error.InvalidValue, file_writer.writeRecordWithArrays(record.node, &.{prepared.payload}));
+        // File output finds the error while writing, and reports it as stream output does.
+        const file_report = file_writer.diagnostic().?;
+        try std.testing.expectEqual(stream_report.stage, file_report.stage);
+        try std.testing.expectEqual(stream_report.element, file_report.element);
+        try std.testing.expectEqual(stream_report.array_position, file_report.array_position);
         try std.testing.expectError(error.FailedState, file_writer.finish());
         builder.reset();
         encoder.reset();
     }
+}
+
+test "[failure] - [mzML streamed writing]: the text limit stops streams first and files after the text" {
+    const allocator = std.testing.allocator;
+    var input = std.Io.Reader.fixed(support.DOCUMENT);
+    var source_reader = try mzml.StreamReader.init(allocator, &input, .{});
+    defer source_reader.deinit();
+    const header = try source_reader.readHeader();
+    var encoder = mzml.arrays.Encoder.init(allocator, .fast);
+    defer encoder.deinit();
+    var builder = mzml.Builder.init(allocator, .{});
+    defer builder.deinit();
+    const values = [_]f64{ 1, 2, 3, 4 };
+    const prepared = try builder.prepareArray(f64, &values, .{
+        .cv_ref = "MS",
+        .encoding = .{ .pipeline = .pic },
+        .role = .{ .cv_ref = "MS", .accession = mzml.model.Terms.INTENSITY_ARRAY, .name = "intensity array" },
+    }, &encoder);
+    const record = try builder.record(.spectrum, "scan=1", 0, values.len, &.{}, &.{}, &.{prepared.array});
+    const limits: mzml.Writer.Limits = .{ .text_bytes = 3 };
+
+    var stream: std.Io.Writer.Allocating = .init(allocator);
+    defer stream.deinit();
+    var writer = try mzml.Writer.init(allocator, &stream.writer, limits);
+    defer writer.deinit();
+    try writer.writeHeader(header.*);
+    try writer.beginList(.spectrum_list, 1, "dp");
+    const before = writer.engine.byteOffset();
+    try std.testing.expectError(error.LimitExceeded, writer.writeRecordWithArrays(record.node, &.{prepared.payload}));
+    try std.testing.expectEqual(before, writer.engine.byteOffset());
+    try std.testing.expectEqual(.text_bytes, writer.diagnostic().?.detail.limit.name);
+
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    const file = try dir.dir.createFile(std.testing.io, "limited.mzML", .{ .read = true });
+    defer file.close(std.testing.io);
+    var buffer: [4096]u8 = undefined;
+    var sink = file.writer(std.testing.io, &buffer);
+    var file_writer = try mzml.Writer.initFile(allocator, &sink, limits, null);
+    defer file_writer.deinit();
+    try file_writer.writeHeader(header.*);
+    try file_writer.beginList(.spectrum_list, 1, "dp");
+    const file_before = file_writer.engine.byteOffset().?;
+    try std.testing.expectError(error.LimitExceeded, file_writer.writeRecordWithArrays(record.node, &.{prepared.payload}));
+    try std.testing.expect(file_writer.engine.byteOffset().? > file_before);
+    try std.testing.expectEqual(.text_bytes, file_writer.diagnostic().?.detail.limit.name);
+    try std.testing.expectError(error.FailedState, file_writer.finish());
+}
+
+test "[failure] - [mzML file writer]: refuses to patch after others wrote to the file writer" {
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    for ([_]usize{ 16, 8192 }) |buffer_size| {
+        const file = try dir.dir.createFile(std.testing.io, "out.mzML", .{ .read = true });
+        defer file.close(std.testing.io);
+        var buffer: [8192]u8 = undefined;
+        var sink = file.writer(std.testing.io, buffer[0..buffer_size]);
+        var writer = try mzml.Writer.initFile(std.testing.allocator, &sink, .{}, null);
+        defer writer.deinit();
+        var input = std.Io.Reader.fixed(support.DOCUMENT);
+        var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+        defer reader.deinit();
+        try writer.writeHeader((try reader.readHeader()).*);
+        try writer.beginList(.spectrum_list, null, "dp");
+        try writer.writeRecord((try reader.nextRecord()).?.node);
+        // Against the contract: the count's recorded offset no longer matches the file.
+        try sink.interface.writeAll("<!-- -->");
+        try std.testing.expectError(error.InvalidState, writer.endList());
+        try std.testing.expectError(error.FailedState, writer.finish());
+    }
+}
+
+test "[failure] - [mzML writer]: rejects metadata that shares memory with its output buffers" {
+    var input = std.Io.Reader.fixed(support.DOCUMENT);
+    var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+    defer reader.deinit();
+    const header = try reader.readHeader();
+    const record = (try reader.nextRecord()).?;
+    for ([_]bool{ false, true }) |indexed| {
+        var output: [8192]u8 = undefined;
+        var sink = std.Io.Writer.fixed(&output);
+        var writer = if (indexed) try mzml.Writer.initIndexed(std.testing.allocator, &sink, .{}, .{}) else try mzml.Writer.init(std.testing.allocator, &sink, .{});
+        defer writer.deinit();
+        try writer.writeHeader(header.*);
+        try writer.beginList(.spectrum_list, 1, "dp");
+        // An attribute value inside the caller's sink buffer, ahead of what was written.
+        const aliased = output[output.len - 8 ..];
+        @memcpy(aliased, "aliased!");
+        var attributes: [8]mzml.model.Attribute = undefined;
+        @memcpy(attributes[0..record.node.attributes.len], record.node.attributes);
+        attributes[record.node.attributes.len] = .{ .name = "note", .value = aliased };
+        var node = record.node;
+        node.attributes = attributes[0 .. record.node.attributes.len + 1];
+        try std.testing.expectError(error.InvalidState, writer.writeRecord(node));
+        try std.testing.expectError(error.FailedState, writer.finish());
+    }
+    // A growing caller sink behind the indexed writer's hashing writer is checked as it is now.
+    var grown: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer grown.deinit();
+    var writer = try mzml.Writer.initIndexed(std.testing.allocator, &grown.writer, .{}, .{});
+    defer writer.deinit();
+    try writer.writeHeader(header.*);
+    try writer.beginList(.spectrum_list, 1, "dp");
+    try grown.ensureUnusedCapacity(64);
+    const aliased = grown.writer.buffer[grown.writer.end..][0..8];
+    @memcpy(aliased, "aliased!");
+    var attributes: [8]mzml.model.Attribute = undefined;
+    @memcpy(attributes[0..record.node.attributes.len], record.node.attributes);
+    attributes[record.node.attributes.len] = .{ .name = "note", .value = aliased };
+    var node = record.node;
+    node.attributes = attributes[0 .. record.node.attributes.len + 1];
+    try std.testing.expectError(error.InvalidState, writer.writeRecord(node));
+}
+
+test "[failure] - [mzML writer]: a sink cannot reenter the writer that drains into it" {
+    const Reentrant = struct {
+        interface: std.Io.Writer,
+        out: *std.Io.Writer,
+        target: ?*mzml.Writer = null,
+        refused: usize = 0,
+
+        fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+            const self: *@This() = @alignCast(@fieldParentPtr("interface", w));
+            if (self.target) |target| {
+                if (target.writeItem(.{ .xml = "<extra/>" })) |_| {} else |err| {
+                    if (err == error.InvalidState) self.refused += 1;
+                }
+            }
+            try self.out.writeAll(w.buffered());
+            w.end = 0;
+            var written: usize = 0;
+            for (data[0 .. data.len - 1]) |bytes| {
+                try self.out.writeAll(bytes);
+                written += bytes.len;
+            }
+            for (0..splat) |_| try self.out.writeAll(data[data.len - 1]);
+            return written + data[data.len - 1].len * splat;
+        }
+    };
+    var expected: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer expected.deinit();
+    try support.rewriteFixture(std.testing.allocator, &expected.writer);
+    var actual: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer actual.deinit();
+    var buffer: [16]u8 = undefined;
+    var sink: Reentrant = .{ .interface = .{ .vtable = &.{ .drain = Reentrant.drain }, .buffer = &buffer }, .out = &actual.writer };
+    var input = std.Io.Reader.fixed(support.DOCUMENT);
+    var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+    defer reader.deinit();
+    var writer = try mzml.Writer.init(std.testing.allocator, &sink.interface, .{});
+    defer writer.deinit();
+    sink.target = &writer;
+    try writer.writeHeader((try reader.readHeader()).*);
+    while (try reader.nextItem()) |item| try writer.writeItem(item);
+    try writer.finish();
+    try sink.interface.flush();
+    try std.testing.expectEqualStrings(expected.written(), actual.written());
+    try std.testing.expect(sink.refused != 0);
+}
+
+test "[failure] - [mzML writer]: refuses a wire that a source in the same record would overwrite" {
+    var input = std.Io.Reader.fixed(support.DOCUMENT);
+    var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+    defer reader.deinit();
+    const header = try reader.readHeader();
+    const record = (try reader.nextRecord()).?;
+    var encoder = mzml.arrays.Encoder.init(std.testing.allocator, .fast);
+    defer encoder.deinit();
+    const values = [_]f64{1};
+    const options: mzml.arrays.EncodeOptions = .{ .pipeline = .zlib };
+    const wire = try encoder.encode(f64, &values, options);
+    // Against the contract: the wire is still needed, but its slot is free for reuse.
+    encoder.reset();
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var writer = try mzml.Writer.init(std.testing.allocator, &output.writer, .{});
+    defer writer.deinit();
+    try writer.writeHeader(header.*);
+    try writer.beginList(.spectrum_list, 1, "dp");
+    const before = writer.engine.byteOffset();
+    try std.testing.expectError(error.InvalidState, writer.writeRecordWithArrays(record.node, &.{
+        .{ .wire = wire },
+        .{ .source = mzml.arrays.Source.of(f64, &values, options, &encoder) },
+    }));
+    try std.testing.expectEqual(before, writer.engine.byteOffset());
+}
+
+test "[failure] - [mzML writer]: rejects node arrays that live in its output buffer" {
+    var input = std.Io.Reader.fixed(support.DOCUMENT);
+    var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+    defer reader.deinit();
+    const header = try reader.readHeader();
+    const record = (try reader.nextRecord()).?;
+    var output: [8192]u8 align(@alignOf(mzml.model.Attribute)) = undefined;
+    var sink = std.Io.Writer.fixed(&output);
+    var writer = try mzml.Writer.init(std.testing.allocator, &sink, .{});
+    defer writer.deinit();
+    try writer.writeHeader(header.*);
+    try writer.beginList(.spectrum_list, 1, "dp");
+    // Writing the first attributes would overwrite the structs of the later ones.
+    const aliased: []mzml.model.Attribute = @ptrCast(@alignCast(output[4096..][0 .. record.node.attributes.len * @sizeOf(mzml.model.Attribute)]));
+    @memcpy(aliased, record.node.attributes);
+    var node = record.node;
+    node.attributes = aliased;
+    const before = writer.engine.byteOffset();
+    try std.testing.expectError(error.InvalidState, writer.writeRecord(node));
+    try std.testing.expectEqual(before, writer.engine.byteOffset());
 }

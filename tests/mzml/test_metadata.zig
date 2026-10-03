@@ -239,10 +239,10 @@ test "[integration] - [mzML scientific metadata]: keeps all scans ions and windo
     try std.testing.expectEqual(@as(f64, 1.25), time.value);
     try std.testing.expectEqualStrings("UO:0000031", time.parameter.unit.accession.?.raw);
     try std.testing.expectEqual(@as(f64, 76), (try scans[1].scanStartTime(groups)).?.value);
-    const nodes = header.value.document.child(.cv_list).?.children;
-    var declarations: [2]mzml.cv.Declaration = undefined;
-    for (&declarations, nodes) |*declaration, node| declaration.* = try node.cvDeclaration();
-    const resolver = mzml.cv.Resolver.init(&declarations);
+    const declarations = try header.value.cvDeclarations(std.testing.allocator);
+    defer std.testing.allocator.free(declarations);
+    try std.testing.expectEqual(@as(usize, 2), declarations.len);
+    const resolver = mzml.cv.Resolver.init(declarations);
     const quantity = try resolver.quantity(f64, time.parameter);
     try std.testing.expectEqual(@as(f64, 1.25), quantity.value);
     try std.testing.expectEqual(.allowed, quantity.parameter.unit_allowed);

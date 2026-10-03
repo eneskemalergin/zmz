@@ -53,8 +53,7 @@ pub const Curie = struct {
     pub fn numericLocal(self: Curie, comptime T: type) error{Overflow}!?T {
         if (@typeInfo(T) != .int or @typeInfo(T).int.signedness != .unsigned)
             @compileError("numericLocal requires an unsigned integer type");
-        if (self.local.len == 0) return null;
-        for (self.local) |byte| if (byte < '0' or byte > '9') return null;
+        if (!allDigits(self.local)) return null;
         return std.fmt.parseInt(T, self.local, 10) catch return error.Overflow;
     }
 };
@@ -129,6 +128,9 @@ pub const ExpansionError = error{
     ExpansionLimit,
 };
 
+/// The work budget of one parameter expansion, which ExpansionLimit reports as exhausted.
+pub const EXPANSION_WORK = 1_000_000;
+
 /// Yields local parameters with each group reference replaced by its group's parameters,
 /// keeping every repeat. Keep the inputs alive and unchanged while iterating. Group IDs match
 /// after collapsing surrounding XML whitespace.
@@ -136,7 +138,7 @@ pub const EffectiveIterator = struct {
     entries: []const Entry,
     groups: []const Group,
     /// Bounds entry visits and group comparisons, including repeated references.
-    remaining_work: usize = 1_000_000,
+    remaining_work: usize = EXPANSION_WORK,
     position: usize = 0,
     expanded: []const Entry = &.{},
     expanded_position: usize = 0,
@@ -212,12 +214,18 @@ pub fn parseBoolean(value: ?[]const u8) ValueError!bool {
     return error.InvalidValue;
 }
 
+// Whether bytes is a nonempty run of ASCII decimal digits.
+fn allDigits(bytes: []const u8) bool {
+    if (bytes.len == 0) return false;
+    for (bytes) |byte| if (!std.ascii.isDigit(byte)) return false;
+    return true;
+}
+
 /// Parses a decimal integer; out of range is Overflow.
 pub fn parseInteger(comptime T: type, value: ?[]const u8) ValueError!T {
     const bytes = try lexical(value);
     const digits = if (bytes[0] == '+' or bytes[0] == '-') bytes[1..] else bytes;
-    if (digits.len == 0) return error.InvalidValue;
-    for (digits) |byte| if (byte < '0' or byte > '9') return error.InvalidValue;
+    if (!allDigits(digits)) return error.InvalidValue;
     return std.fmt.parseInt(T, bytes, 10) catch |failure| switch (failure) {
         error.Overflow => error.Overflow,
         error.InvalidCharacter => error.InvalidValue,

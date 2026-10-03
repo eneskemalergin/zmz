@@ -8,6 +8,7 @@
 const std = @import("std");
 const model = @import("model.zig");
 const xml = @import("../xml/mzml_adapter.zig");
+const cv = @import("../cv/source.zig");
 
 const Diagnostic = @This();
 const Errors = @import("stream_reader.zig").StreamReader.Error || @import("indexed_reader.zig").Error || @import("writer.zig").Error;
@@ -52,6 +53,7 @@ pub const Id = enum(u16) {
     io_failed = 27,
     canceled = 28,
     count_mismatch = 29,
+    // 30 (encodedLength differs from the written text) is retired: the writer now sets it.
 
     pub fn description(self: Id) []const u8 {
         return switch (self) {
@@ -64,7 +66,7 @@ pub const Id = enum(u16) {
             .decoded_size_mismatch => "decoded size differs from the expected size",
             .invalid_index => "record index or index entry is invalid",
             .write_failed => "output write failed",
-            .array_decode_failed => "array decoding failed",
+            .array_decode_failed => "array bytes cannot be encoded or decoded",
             .invalid_xml => "XML cannot be processed",
             .invalid_structure => "structure cannot be processed",
             .invalid_value => "value cannot be interpreted",
@@ -90,7 +92,7 @@ pub const Id = enum(u16) {
 
 pub const Operation = enum { read_header, read_record, read_item, open_index, rebuild_index, lookup_record, write_header, open_list, write_record, write_item, close_list, finish };
 pub const Stage = enum { xml, metadata, base64, array, index, output };
-pub const Location = union(enum) { input_event: u64, input_byte: u64, output_byte: u64 };
+pub const Location = union(enum) { input_event: u64, output_byte: u64 };
 pub const RecordPosition = struct {
     kind: enum { spectrum, chromatogram },
     ordinal: usize,
@@ -106,8 +108,6 @@ pub const Attribute = enum {
     count,
     default_array_length,
     array_length,
-    encoded_length,
-    ref,
     name,
     id_ref,
 
@@ -115,7 +115,6 @@ pub const Attribute = enum {
         return switch (self) {
             .default_array_length => "defaultArrayLength",
             .array_length => "arrayLength",
-            .encoded_length => "encodedLength",
             .id_ref => "idRef",
             else => @tagName(self),
         };
@@ -137,7 +136,8 @@ pub const Limit = enum {
     id_bytes,
     text_bytes,
     xml_declaration_bytes,
-    xml_text_bytes,
+    /// The fixed work budget of expanding one array's or node's parameter groups.
+    expansion_work,
 };
 pub const Detail = union(enum) {
     none,
@@ -145,14 +145,14 @@ pub const Detail = union(enum) {
     limit: struct { name: Limit, maximum: u64, needed: ?u64 = null },
     size: struct { expected: u64, actual: u64, unit: SizeUnit },
 };
-pub const SizeUnit = enum { bytes, values, records, arrays, index };
+pub const SizeUnit = enum { bytes, records, arrays, index };
 
 /// Maps a typed operation error using its capture stage and any known limit.
 /// New errors must be assigned deliberately; generic I/O errors are listed explicitly.
 pub fn init(code: Errors, operation: Operation, stage: Stage, detail: Detail) Diagnostic {
     const id: Id = switch (code) {
         error.OutOfMemory => .out_of_memory,
-        error.LimitExceeded, error.WriterLimit => if (detail == .limit) .limit_exceeded else .size_overflow,
+        error.LimitExceeded => if (detail == .limit) .limit_exceeded else .size_overflow,
         error.UnsupportedEncoding => if (stage == .xml) .xml_encoding_unavailable else .array_encoding_unavailable,
         error.MissingAttribute => .missing_attribute,
         error.MissingValue => if (detail == .attribute) .missing_attribute else .invalid_value,
@@ -162,7 +162,10 @@ pub fn init(code: Errors, operation: Operation, stage: Stage, detail: Detail) Di
         error.DecodedSizeMismatch => .decoded_size_mismatch,
         error.InvalidIndex => .invalid_index,
         error.WriteFailed => .write_failed,
-        error.InvalidData, error.ChecksumMismatch, error.TrailingInput, error.UnsupportedDictionary, error.InvalidFixedPoint, error.MissingFixedPoint, error.UnexpectedFixedPoint, error.ToleranceUnattainable, error.ValueOutOfRange, error.MissingCompressor => .array_decode_failed,
+        error.InvalidData, error.ChecksumMismatch, error.TrailingInput, error.UnsupportedDictionary, error.ToleranceUnattainable, error.ValueOutOfRange => .array_decode_failed,
+        // A fixed point is the caller's option when writing and a payload header when reading.
+        error.InvalidFixedPoint => if (writing(operation)) .invalid_options else .array_decode_failed,
+        error.MissingFixedPoint, error.UnexpectedFixedPoint, error.MissingCompressor => .invalid_options,
         error.InvalidXml, error.InvalidEncoding, error.UnsupportedVersion, error.DtdForbidden, error.WrongNamespace, error.UnexpectedEnd, error.EndOfStream, error.NoText, error.InvalidName, error.InvalidNamespace, error.DuplicateAttribute => .invalid_xml,
         error.InvalidStructure, error.UnknownAttribute, error.UnexpectedElement => .invalid_structure,
         error.EmptyValue, error.InvalidValue, error.Overflow, error.RepeatedParameter, error.RepeatedArray, error.ConflictingParameter => .invalid_value,
@@ -171,7 +174,8 @@ pub fn init(code: Errors, operation: Operation, stage: Stage, detail: Detail) Di
         error.LengthOverflow => .size_overflow,
         error.OutputTooSmall, error.OverlappingBuffers => .buffer_error,
         error.PayloadNotRetained => .missing_payload,
-        error.MissingGroup, error.DuplicateGroup, error.NestedGroup, error.ExpansionLimit => .group_error,
+        error.MissingGroup, error.DuplicateGroup, error.NestedGroup => .group_error,
+        error.ExpansionLimit => return .{ .id = .limit_exceeded, .code = code, .operation = operation, .stage = stage, .detail = .{ .limit = .{ .name = .expansion_work, .maximum = cv.EXPANSION_WORK } } },
         error.MissingPrimitive, error.MissingCompression, error.ConflictingPrimitive, error.ConflictingCompression, error.NotBinaryArray, error.TypeMismatch => .array_declaration_error,
         error.MissingIndex => .missing_index,
         error.DuplicateId => .duplicate_id,
@@ -186,25 +190,23 @@ pub fn init(code: Errors, operation: Operation, stage: Stage, detail: Detail) Di
     return .{ .id = id, .code = code, .operation = operation, .stage = stage, .detail = detail };
 }
 
+fn writing(operation: Operation) bool {
+    return switch (operation) {
+        .write_header, .open_list, .write_record, .write_item, .close_list, .finish => true,
+        else => false,
+    };
+}
+
+/// The cursor's limit failure as detail. The node budget belongs to the caller, which
+/// reports it with its own maximum, so it gives no detail here.
 pub fn xmlDetail(cursor: *const xml.Cursor) Detail {
     const limit = cursor.limit_failure orelse return .none;
-    return .{ .limit = .{
-        .name = switch (limit) {
-            .depth => .depth,
-            .attributes => .attributes,
-            .attribute_bytes => .attribute_bytes,
-            .nodes => .nodes,
-            .declaration_bytes => .xml_declaration_bytes,
-            .text_bytes => .xml_text_bytes,
-        },
-        .maximum = switch (limit) {
-            .depth => cursor.max_depth,
-            .attributes => cursor.max_attributes,
-            .attribute_bytes => cursor.max_attribute_bytes,
-            .nodes => 0,
-            .declaration_bytes => 4096,
-            .text_bytes => 64 * 1024,
-        },
+    return .{ .limit = switch (limit) {
+        .depth => .{ .name = .depth, .maximum = xml.MAX_DEPTH },
+        .attributes => .{ .name = .attributes, .maximum = cursor.max_attributes },
+        .attribute_bytes => .{ .name = .attribute_bytes, .maximum = cursor.max_attribute_bytes, .needed = cursor.limit_needed },
+        .declaration_bytes => .{ .name = .xml_declaration_bytes, .maximum = xml.MAX_DECLARATION_BYTES },
+        .nodes => return .none,
     } };
 }
 

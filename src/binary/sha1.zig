@@ -108,34 +108,31 @@ noinline fn compress(state: *[5]u32, data: []const u8) void {
     state[4] = e[3];
 }
 
-test "[property] - [SHA-1]: matches std across lengths, splits, and both paths" {
+// Without SHA extensions update is std's own, so this checks the extension path where the CPU
+// has it.
+test "[property] - [SHA-1]: matches std across lengths and splits" {
     var source: [1200]u8 = undefined;
     var random = std.Random.DefaultPrng.init(std.testing.random_seed);
     random.random().bytes(&source);
-    const saved = core.sha_cached.load(.monotonic);
-    defer core.sha_cached.store(saved, .monotonic);
-    for ([_]u8{ saved, 1 }) |state| {
-        core.sha_cached.store(state, .monotonic);
-        for (0..source.len + 1) |len| {
-            var expected: [20]u8 = undefined;
-            std.crypto.hash.Sha1.hash(source[0..len], &expected, .{});
-            var whole: Sha1 = .{};
-            whole.update(source[0..len]);
-            try std.testing.expectEqualSlices(u8, &expected, &whole.finalResult());
-            for ([_]usize{ 1, 63, 64, 65, 127, 200 }) |split| {
-                if (split > len) continue;
-                var parts: Sha1 = .{};
-                parts.update(source[0..split]);
-                parts.update(source[split..len]);
-                try std.testing.expectEqualSlices(u8, &expected, &parts.finalResult());
-            }
-        }
-        var bytes: Sha1 = .{};
-        for (source) |byte| bytes.update(&.{byte});
+    for (0..source.len + 1) |len| {
         var expected: [20]u8 = undefined;
-        std.crypto.hash.Sha1.hash(&source, &expected, .{});
-        try std.testing.expectEqualSlices(u8, &expected, &bytes.finalResult());
+        std.crypto.hash.Sha1.hash(source[0..len], &expected, .{});
+        var whole: Sha1 = .{};
+        whole.update(source[0..len]);
+        try std.testing.expectEqualSlices(u8, &expected, &whole.finalResult());
+        for ([_]usize{ 1, 63, 64, 65, 127, 200 }) |split| {
+            if (split > len) continue;
+            var parts: Sha1 = .{};
+            parts.update(source[0..split]);
+            parts.update(source[split..len]);
+            try std.testing.expectEqualSlices(u8, &expected, &parts.finalResult());
+        }
     }
+    var bytes: Sha1 = .{};
+    for (source) |byte| bytes.update(&.{byte});
+    var expected: [20]u8 = undefined;
+    std.crypto.hash.Sha1.hash(&source, &expected, .{});
+    try std.testing.expectEqualSlices(u8, &expected, &bytes.finalResult());
 }
 
 test "[unit] - [SHA-1]: matches the FIPS 180 vectors" {

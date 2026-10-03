@@ -5,13 +5,14 @@
 //! buffers grow as needed and are reused between records. Every array decodes as its text
 //! arrives: Base64 goes straight into typed output, into a fixed window for Numpress, or, with
 //! zlib, through a window that the decompressor pulls from. No buffer holds a payload whole.
-//! Selected results stay in source order; source_position indexes record.binaryArrays().
+//! Selected results stay in source order; source_position indexes record.binaryArrays(),
+//! and is 0 for decodeArray.
 //! Results become visible only after the complete record succeeds. Returned slices last
 //! until the next decoded read using this owner, reset, or deinit; ordinary reads do not
 //! invalidate them. No source metadata is borrowed by this owner.
 //!
-//! startRecord, beginArray, decodeText, and complete are the reader engine's entry points
-//! while it parses a record; callers use the reads and decode functions.
+//! beginArray, decodeText, and complete are internal: the reader engine calls them while it
+//! parses a record. Callers use the reads and the decode functions.
 
 const std = @import("std");
 const model = @import("model.zig");
@@ -21,16 +22,12 @@ const base64 = @import("../binary/base64.zig");
 const numpress = @import("../binary/numpress.zig");
 const zlib = @import("../binary/zlib.zig");
 const Diagnostic = @import("diagnostic.zig");
+const overlaps = @import("../binary/core.zig").overlaps;
 
 const DecodedArrays = @This();
 
-pub const Error = model.EncodingError || cv.ValueError || arrays.Error || std.mem.Allocator.Error || error{LimitExceeded};
-pub const Values = union(model.Primitive) {
-    float32: []const f32,
-    float64: []const f64,
-    int32: []const i32,
-    int64: []const i64,
-};
+pub const Error = model.EncodingError || cv.ValueError || arrays.Error || std.mem.Allocator.Error || error{ LimitExceeded, InvalidState };
+pub const Values = arrays.Values;
 pub const Array = struct { source_position: usize, encoding: model.Encoding, values: Values };
 
 /// Bounds each array's decoded typed bytes, allocated from its declared length. The reader's
@@ -48,13 +45,14 @@ window: std.ArrayList(u8) = .empty,
 decompressor: ?zlib.Decompressor = null,
 count: usize = 0,
 ready: bool = false,
-default_length: ?usize = null,
 decoder: base64.Decoder = undefined,
 values: numpress.Decoder = undefined,
 // The first Numpress error of the current array. It is reported only after the Base64 and
 // zlib layers finish, so their errors come first, as when each layer decodes the whole payload.
 deferred: ?numpress.Error = null,
 failure: ?struct { stage: Diagnostic.Stage, detail: Diagnostic.Detail = .none } = null,
+// A read decodes into this owner; a selection callback must not reset or reuse it meanwhile.
+busy: bool = false,
 
 pub fn init(allocator: std.mem.Allocator, limits: Limits) DecodedArrays {
     return .{ .allocator = allocator, .limits = limits };
@@ -68,8 +66,10 @@ pub fn deinit(self: *DecodedArrays) void {
     self.* = undefined;
 }
 
-/// Invalidates results while retaining allocated capacity.
+/// Invalidates results while retaining allocated capacity. Does nothing while a read decodes
+/// into this owner, as from one of its selection callbacks.
 pub fn reset(self: *DecodedArrays) void {
+    if (self.busy) return;
     self.count = 0;
     self.ready = false;
     self.failure = null;
@@ -86,10 +86,7 @@ pub fn get(self: *const DecodedArrays, position: usize) ?Array {
         .source_position = output.source_position,
         .encoding = output.encoding,
         .values = switch (output.primitive()) {
-            .float32 => .{ .float32 = output.values(f32) },
-            .float64 => .{ .float64 = output.values(f64) },
-            .int32 => .{ .int32 = output.values(i32) },
-            .int64 => .{ .int64 = output.values(i64) },
+            inline else => |kind| .of(kind.Type(), output.values(kind.Type())),
         },
     };
 }
@@ -98,26 +95,37 @@ pub fn get(self: *const DecodedArrays, position: usize) ?Array {
 /// from nextRecord or an IndexedReader lookup), replacing earlier results. Order, types,
 /// and limits follow nextDecodedRecord; after a failure no results are visible.
 pub fn decodeRecord(self: *DecodedArrays, record: model.Record, groups: []const cv.Group) Error!void {
+    if (self.busy) return error.InvalidState;
     self.reset();
     errdefer self.reset();
-    try self.startRecord(record.node);
-    for (record.binaryArrays(), 0..) |node, position| try self.decodeRetained(node, groups, position);
+    self.busy = true;
+    defer self.busy = false;
+    for (record.binaryArrays(), 0..) |node, position| try self.decodeRetained(node, record.default_array_length, groups, position);
     self.complete();
 }
 
 /// Decodes one binary array node with retained text, replacing earlier results, and returns
 /// its values; get(0) returns the same array. default_length is the record's defaultArrayLength.
 pub fn decodeArray(self: *DecodedArrays, node: model.Node, default_length: ?usize, groups: []const cv.Group) Error!Values {
+    if (self.busy) return error.InvalidState;
     self.reset();
     errdefer self.reset();
-    self.default_length = default_length;
-    try self.decodeRetained(node, groups, 0);
+    self.busy = true;
+    defer self.busy = false;
+    try self.decodeRetained(node, default_length, groups, 0);
     self.complete();
     return self.get(0).?.values;
 }
 
-fn decodeRetained(self: *DecodedArrays, node: model.Node, groups: []const cv.Group, source_position: usize) Error!void {
-    try self.beginArray(node, groups, source_position);
+fn decodeRetained(self: *DecodedArrays, node: model.Node, default_length: ?usize, groups: []const cv.Group, source_position: usize) Error!void {
+    // Text kept in this owner's storage would be freed or overwritten as arrays are sized.
+    if (node.child(.binary)) |binary| if (binary.text) |retained| {
+        if (overlaps(self.window.allocatedSlice(), retained)) return error.OverlappingBuffers;
+        for (self.outputs.items) |output| {
+            if (overlaps(std.mem.sliceAsBytes(output.words.allocatedSlice()), retained)) return error.OverlappingBuffers;
+        }
+    };
+    try self.beginArray(node, default_length, groups, source_position);
     const binary = node.child(.binary) orelse return error.PayloadNotRetained;
     var source = RetainedText{ .text = binary.text orelse return error.PayloadNotRetained };
     try self.decodeText(&source);
@@ -134,15 +142,12 @@ const RetainedText = struct {
 
 // --- Reader engine entry points ---
 
-pub fn startRecord(self: *DecodedArrays, node: model.Node) Error!void {
-    self.default_length = if (node.attribute("defaultArrayLength")) |value| try cv.parseInteger(usize, value) else null;
-}
-
 /// Decodes the current array's binary text, pulled from source until its next() returns null.
 /// source.next() returns the next logical text fragment, valid until the following call; its
 /// errors pass through unchanged and take precedence, as do Base64 errors anywhere in the text
 /// over zlib errors, and zlib errors over Numpress errors.
 pub fn decodeText(self: *DecodedArrays, source: anytype) !void {
+    if (self.count == 0) return error.InvalidState;
     const pipeline = self.outputs.items[self.count - 1].encoding.pipeline;
     if (pipeline.hasZlib()) return self.decompressText(source);
     while (try source.next()) |bytes| try self.text(bytes);
@@ -155,8 +160,12 @@ fn text(self: *DecodedArrays, bytes: []const u8) Error!void {
     };
     const pipeline = self.outputs.items[self.count - 1].encoding.pipeline;
     if (pipeline.isNumpress()) return self.numpressText(bytes);
-    self.decoder.update(bytes) catch |err|
-        return if (err == error.OutputTooSmall) error.DecodedSizeMismatch else err;
+    self.decoder.update(bytes) catch |err| {
+        if (err != error.OutputTooSmall) return err;
+        // An overlong array is an array error, as a short one is in finishArray.
+        self.failure = .{ .stage = .array };
+        return error.DecodedSizeMismatch;
+    };
 }
 
 // Decodes Base64 in pieces whose bytes always fit the window and hands them to Numpress.
@@ -182,39 +191,33 @@ pub fn complete(self: *DecodedArrays) void {
     self.ready = true;
 }
 
-pub fn beginArray(self: *DecodedArrays, node: model.Node, groups: []const cv.Group, source_position: usize) Error!void {
+pub fn beginArray(self: *DecodedArrays, node: model.Node, default_length: ?usize, groups: []const cv.Group, source_position: usize) Error!void {
     errdefer |err| if (self.failure == null) {
         self.failure = .{ .stage = .array, .detail = switch (@as(anyerror, err)) {
             error.MissingValue, error.EmptyValue, error.InvalidValue, error.Overflow => .{ .attribute = .array_length },
             else => .none,
         } };
     };
-    const array = try model.BinaryArray.init(node, self.default_length, groups);
+    const array = try model.BinaryArray.init(node, default_length, groups);
     if (self.count == self.outputs.items.len) try self.outputs.append(self.allocator, .{});
     const output = &self.outputs.items[self.count];
     self.count += 1;
     output.source_position = source_position;
     output.encoding = array.encoding;
-    output.length = array.length;
-    const width: usize = switch (output.primitive()) {
-        .float32, .int32 => 4,
-        .float64, .int64 => 8,
-    };
-    const bytes = std.math.mul(usize, array.length, width) catch return error.LengthOverflow;
+    // Set once the words are sized, so a failure here exposes no values.
+    output.length = 0;
+    output.bytes = 0;
+    const bytes = std.math.mul(usize, array.length, output.primitive().size()) catch return error.LengthOverflow;
     if (bytes > self.limits.array_bytes) {
         self.failure = .{ .stage = .array, .detail = .{ .limit = .{ .name = .array_bytes, .maximum = self.limits.array_bytes, .needed = bytes } } };
         return error.LimitExceeded;
     }
     try output.words.resize(self.allocator, bytes / 8 + @intFromBool(bytes % 8 != 0));
+    output.length = array.length;
+    output.bytes = bytes;
     const pipeline = array.encoding.pipeline;
     if (pipeline != .none) try self.window.resize(self.allocator, WINDOW);
-    if (pipeline.isNumpress()) {
-        const transform: numpress.Transform = switch (pipeline.transform()) {
-            .linear => .linear,
-            .pic => .pic,
-            .slof => .slof,
-            .none => unreachable,
-        };
+    if (pipeline.transform()) |transform| {
         self.values = numpress.Decoder.initExact(transform, output.values(f64));
         self.deferred = null;
     }
@@ -230,10 +233,10 @@ fn finishArray(self: *DecodedArrays) Error!void {
     errdefer |err| {
         self.failure = .{ .stage = .array };
         if (err == error.DecodedSizeMismatch and output.encoding.pipeline == .none)
-            self.failure.?.detail = .{ .size = .{ .expected = output.byteLength(), .actual = counts.decoded_bytes, .unit = .bytes } };
+            self.failure.?.detail = .{ .size = .{ .expected = output.bytes, .actual = counts.decoded_bytes, .unit = .bytes } };
     }
     if (output.encoding.pipeline.isNumpress()) return self.finishNumpress();
-    if (counts.decoded_bytes != output.byteLength()) return error.DecodedSizeMismatch;
+    if (counts.decoded_bytes != output.bytes) return error.DecodedSizeMismatch;
     output.toNative();
 }
 
@@ -251,19 +254,19 @@ fn decompressText(self: *DecodedArrays, source: anytype) !void {
     var input = Base64Input(@TypeOf(source)).init(source, self.window.items);
     if (!output.encoding.pipeline.isNumpress()) {
         input.fill();
-        if (input.ended and input.failure == null) return self.decompressWhole(output, input.reader.buffered(), input.decoder.counts);
+        if (input.failure) |err| return input.fail(self, err);
+        if (input.ended) return self.decompressWhole(output, input.reader.buffered(), input.decoder.counts);
     }
     if (self.decompressor == null) self.decompressor = try zlib.Decompressor.init(self.allocator);
     const decompressor = &self.decompressor.?;
     decompressor.startReader(&input.reader);
-    const inflated = self.decompressInto(decompressor, output);
+    var short: ?usize = null;
+    const inflated = self.decompressInto(decompressor, output, &short);
     if (input.failure) |err| return input.fail(self, err);
     input.drain() catch |err| return input.fail(self, err);
-    const counts = input.decoder.counts;
+    // An empty plain zlib array has no text and was decoded whole above.
     inflated catch |err| {
-        // An empty zlib array with no text is valid, as for decoding the payload whole.
-        if (output.encoding.payloadPipeline(output.length, counts.significant_bytes == 0) == .none) return;
-        self.failure = .{ .stage = .array };
+        self.failure = .{ .stage = .array, .detail = output.shortDetail(short) };
         return err;
     };
     if (output.encoding.pipeline.isNumpress()) {
@@ -275,37 +278,41 @@ fn decompressText(self: *DecodedArrays, source: anytype) !void {
 // A primitive zlib payload that fit the window whole: the slice decoder writes straight into
 // the values, with the same checks and errors as decoding a retained payload.
 fn decompressWhole(self: *DecodedArrays, output: *Output, wire: []const u8, counts: base64.Counts) Error!void {
-    errdefer self.failure = .{ .stage = .array };
     const pipeline = output.encoding.payloadPipeline(output.length, counts.significant_bytes == 0);
     switch (output.primitive()) {
-        inline else => |kind| {
-            const T = switch (kind) {
-                .float32 => f32,
-                .float64 => f64,
-                .int32 => i32,
-                .int64 => i64,
-            };
-            try arrays.decodeWire(T, output.values(T), wire, pipeline, &.{});
+        inline else => |kind| arrays.decodeWire(kind.Type(), output.values(kind.Type()), wire, pipeline, &.{}) catch |err| {
+            // Only on this error path: inflate again for the length of a stream that ended short.
+            const bytes = std.mem.sliceAsBytes(output.words.items)[0..output.bytes];
+            const short = if (err == error.DecodedSizeMismatch and pipeline == .zlib)
+                if (zlib.decompress(bytes, wire)) |inflated| inflated.len else |_| null
+            else
+                null;
+            self.failure = .{ .stage = .array, .detail = output.shortDetail(short) };
+            return err;
         },
     }
 }
 
-fn decompressInto(self: *DecodedArrays, decompressor: *zlib.Decompressor, output: *Output) Error!void {
+// short receives the decoded length of a primitive stream that ended before the values did.
+fn decompressInto(self: *DecodedArrays, decompressor: *zlib.Decompressor, output: *Output, short: *?usize) Error!void {
     if (output.encoding.pipeline.isNumpress()) {
         // More than the Numpress bound means the stream holds more than the declared values;
         // never read more than one byte past it, so a zlib error beyond stays unseen.
         const bound = try arrays.wireBound(f64, output.length, output.encoding.pipeline);
         var total: usize = 0;
         while (true) {
-            const piece = try decompressor.next(bound - total + 1);
-            if (piece.len == 0) return;
+            const piece = try decompressor.next(bound - total + 1) orelse return;
             total += piece.len;
             if (total > bound) return error.DecodedSizeMismatch;
             self.feed(piece);
         }
     }
-    const bytes = std.mem.sliceAsBytes(output.words.items)[0..output.byteLength()];
-    if ((try decompressor.read(bytes)).len != bytes.len) return error.DecodedSizeMismatch;
+    const bytes = std.mem.sliceAsBytes(output.words.items)[0..output.bytes];
+    const length = (try decompressor.read(bytes)).len;
+    if (length != bytes.len) {
+        short.* = length;
+        return error.DecodedSizeMismatch;
+    }
     var extra: [1]u8 = undefined;
     if ((try decompressor.read(&extra)).len != 0) return error.DecodedSizeMismatch;
     output.toNative();
@@ -368,8 +375,7 @@ fn Base64Input(comptime Source: type) type {
                 const room = r.buffer.len - r.end;
                 if (room < 6) return;
                 const part = self.pending[0..@min(self.pending.len, base64.Decoder.pieceFor(room))];
-                self.decoder.output = r.buffer[r.end..];
-                self.decoder.taken = self.decoder.counts.decoded_bytes;
+                self.decoder.retarget(r.buffer[r.end..]);
                 self.decoder.update(part) catch |err| return self.stop(err, true);
                 r.end += self.decoder.take().len;
                 self.pending = self.pending[part.len..];
@@ -410,6 +416,14 @@ const Output = struct {
     source_position: usize = 0,
     encoding: model.Encoding = undefined,
     length: usize = 0,
+    // length times the primitive's size, set once its words are allocated.
+    bytes: usize = 0,
+
+    // The size detail of an array whose stream decoded to short bytes, when that is known.
+    fn shortDetail(self: *const Output, short: ?usize) Diagnostic.Detail {
+        const actual = short orelse return .none;
+        return .{ .size = .{ .expected = self.bytes, .actual = actual, .unit = .bytes } };
+    }
 
     fn primitive(self: *const Output) model.Primitive {
         return self.encoding.decodedPrimitive();
@@ -420,23 +434,11 @@ const Output = struct {
         if (comptime @import("builtin").cpu.arch.endian() == .little) return;
         switch (self.primitive()) {
             inline else => |kind| {
-                const T = switch (kind) {
-                    .float32 => f32,
-                    .float64 => f64,
-                    .int32 => i32,
-                    .int64 => i64,
-                };
+                const T = kind.Type();
                 const Bits = @Int(.unsigned, @bitSizeOf(T));
                 for (std.mem.bytesAsSlice(Bits, std.mem.sliceAsBytes(self.values(T)))) |*bits| bits.* = @byteSwap(bits.*);
             },
         }
-    }
-
-    fn byteLength(self: *const Output) usize {
-        return switch (self.primitive()) {
-            .float32, .int32 => self.length * 4,
-            .float64, .int64 => self.length * 8,
-        };
     }
 
     fn values(self: *const Output, comptime T: type) []T {

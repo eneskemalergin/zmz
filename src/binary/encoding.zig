@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const cv = @import("../cv/source.zig");
+const numpress = @import("numpress.zig");
 
 pub const Primitive = enum {
     float32,
@@ -19,10 +20,25 @@ pub const Primitive = enum {
             else => @compileError("array values must be f32, f64, i32, or i64"),
         };
     }
-};
 
-/// The Numpress step of a pipeline, applied before optional zlib.
-pub const Transform = enum { none, linear, pic, slof };
+    /// The Zig type of the primitive.
+    pub fn Type(comptime self: Primitive) type {
+        return switch (self) {
+            .float32 => f32,
+            .float64 => f64,
+            .int32 => i32,
+            .int64 => i64,
+        };
+    }
+
+    /// Bytes per value.
+    pub fn size(self: Primitive) usize {
+        return switch (self) {
+            .float32, .int32 => 4,
+            .float64, .int64 => 8,
+        };
+    }
+};
 
 /// Names follow encoding order before Base64.
 pub const Pipeline = enum {
@@ -35,9 +51,10 @@ pub const Pipeline = enum {
     pic_zlib,
     slof_zlib,
 
-    pub fn transform(self: Pipeline) Transform {
+    /// The Numpress step, applied before optional zlib.
+    pub fn transform(self: Pipeline) ?numpress.Transform {
         return switch (self) {
-            .none, .zlib => .none,
+            .none, .zlib => null,
             .linear, .linear_zlib => .linear,
             .pic, .pic_zlib => .pic,
             .slof, .slof_zlib => .slof,
@@ -52,7 +69,7 @@ pub const Pipeline = enum {
     }
 
     pub fn isNumpress(self: Pipeline) bool {
-        return self.transform() != .none;
+        return self.transform() != null;
     }
 };
 
@@ -118,9 +135,6 @@ pub const Error = cv.ExpansionError || error{
     ConflictingPrimitive,
     ConflictingCompression,
     UnsupportedEncoding,
-    NotBinaryArray,
-    PayloadNotRetained,
-    TypeMismatch,
 };
 
 /// Classifies the reviewed primitive and compression terms. A missing term is an error, and

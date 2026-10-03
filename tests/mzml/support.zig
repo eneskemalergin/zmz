@@ -223,7 +223,7 @@ pub fn checkIndexed(allocator: std.mem.Allocator, bytes: []const u8) !void {
             var output: [3]f64 = undefined;
             var transport: [128]u8 = undefined;
             var transformed: [128]u8 = undefined;
-            try mzml.model.decodeArray(f64, &output, array, 3, index.header().groups, .{ .transport = &transport, .transformed = &transformed });
+            _ = try mzml.model.decodeArray(f64, &output, array, 3, index.header().groups, .{ .transport = &transport, .transformed = &transformed });
             for (output, [_]f64{ 1, 2, 3 }) |value, expected| try std.testing.expectApproxEqAbs(expected, value, 0.001);
         }
     }
@@ -373,7 +373,7 @@ pub fn checkLookupAllocator(record_allocator: std.mem.Allocator) !void {
     try std.testing.expectEqualStrings("scan=none", retained.value.id);
     var values: [3]f64 = undefined;
     var transport: [128]u8 = undefined;
-    try mzml.model.decodeArray(f64, &values, retained.value.binaryArrays()[0], 3, &.{}, .{ .transport = &transport, .transformed = &.{} });
+    _ = try mzml.model.decodeArray(f64, &values, retained.value.binaryArrays()[0], 3, &.{}, .{ .transport = &transport, .transformed = &.{} });
     try std.testing.expectEqualSlices(f64, &.{ 1, 2, 3 }, &values);
 }
 
@@ -393,7 +393,7 @@ pub fn checkOpenEmbedded(allocator: std.mem.Allocator, bytes: []const u8) !void 
             var values: [3]f64 = undefined;
             var transport: [128]u8 = undefined;
             var transformed: [128]u8 = undefined;
-            try mzml.model.decodeArray(f64, &values, array, 3, index.header().groups, .{ .transport = &transport, .transformed = &transformed });
+            _ = try mzml.model.decodeArray(f64, &values, array, 3, index.header().groups, .{ .transport = &transport, .transformed = &transformed });
             for (values, [_]f64{ 1, 2, 3 }) |value, expected| try std.testing.expectApproxEqAbs(expected, value, 0.001);
         }
     }
@@ -429,7 +429,7 @@ pub fn copyRetained(allocator: std.mem.Allocator) !void {
     var transport: [16]u8 = undefined;
     var transformed: [16]u8 = undefined;
     for (record.value.binaryArrays()) |array| {
-        try mzml.model.decodeArray(f64, &output, array, record.value.default_array_length, header.value.groups, .{
+        _ = try mzml.model.decodeArray(f64, &output, array, record.value.default_array_length, header.value.groups, .{
             .transport = &transport,
             .transformed = &transformed,
         });

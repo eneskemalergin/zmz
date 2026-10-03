@@ -63,7 +63,7 @@ fn run(init: std.process.Init) !void {
         try stdout.interface.flush();
         return;
     }
-    const baseline = mzml.cv.Resolver.init(&.{}).resources;
+    const baseline = mzml.cv.Resolver.BUNDLED;
     const blocked = try review(&stdout.interface, baseline, &resources);
     try stdout.interface.flush();
     if (blocked) return error.UnreviewedUpdate;
@@ -156,10 +156,8 @@ fn scan(allocator: std.mem.Allocator, io: std.Io, path: []const u8, output: *std
     var reader = try mzml.StreamReader.init(allocator, &input.interface, .{ .payload = .skip });
     defer reader.deinit();
     const header = try reader.readHeader();
-    const nodes = if (header.document.child(.cv_list)) |list| list.children else &.{};
-    const declarations = try allocator.alloc(mzml.cv.Declaration, nodes.len);
+    const declarations = try header.cvDeclarations(allocator);
     defer allocator.free(declarations);
-    for (declarations, nodes) |*declaration, node| declaration.* = try node.cvDeclaration();
     const resolver = mzml.cv.Resolver.init(declarations);
     for (declarations) |declaration| {
         const found = try resolver.resolve(.{ .cv_ref = declaration.id });
@@ -644,10 +642,6 @@ fn isKernel(id: []const u8) bool {
     inline for (comptime std.meta.declarations(mzml.model.Terms)) |declaration| {
         if (std.mem.eql(u8, id, @field(mzml.model.Terms, declaration.name).raw)) return true;
     }
-    for ([_][]const u8{
-        "MS:1000519", "MS:1000521", "MS:1000522", "MS:1000523", "MS:1000574", "MS:1000576",
-        "MS:1002312", "MS:1002313", "MS:1002314", "MS:1002746", "MS:1002747", "MS:1002748",
-    }) |known| if (std.mem.eql(u8, id, known)) return true;
     for (DISPOSITIONS) |entry| {
         if (entry.family == 1) continue;
         for (entry.terms) |known| if (std.mem.eql(u8, id, known)) return true;
@@ -984,7 +978,7 @@ test "[unit] - [vocabulary update]: reports each metadata change without changin
 }
 
 test "[failure] - [vocabulary update]: blocks removals kernel changes and new family terms" {
-    const baseline = mzml.cv.Resolver.init(&.{}).resources;
+    const baseline = mzml.cv.Resolver.BUNDLED;
     var next = [_]Vocabulary{ baseline[0], baseline[1] };
     const terms = try std.testing.allocator.dupe(Vocabulary.Term, baseline[0].terms);
     defer std.testing.allocator.free(terms);
@@ -1021,7 +1015,7 @@ test "[failure] - [vocabulary update]: blocks removals kernel changes and new fa
 }
 
 test "[property] - [vocabulary coverage]: every active monitored term has one reviewed disposition" {
-    const resources = mzml.cv.Resolver.init(&.{}).resources;
+    const resources = mzml.cv.Resolver.BUNDLED;
     var counts = [_]usize{ 0, 0, 0 };
     for (resources[0].terms) |term| {
         const families = try monitored(resources[0], term);
@@ -1040,7 +1034,7 @@ test "[property] - [vocabulary coverage]: every active monitored term has one re
 }
 
 test "[property] - [vocabulary manifest]: matches pinned identities and rejects invalid metadata" {
-    const resources = mzml.cv.Resolver.init(&.{}).resources;
+    const resources = mzml.cv.Resolver.BUNDLED;
     const pinned = try std.json.parseFromSlice(Manifest, std.testing.allocator, @embedFile("pinned_manifest"), .{});
     defer pinned.deinit();
     try checkManifest(pinned.value);

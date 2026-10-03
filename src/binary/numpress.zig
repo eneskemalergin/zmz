@@ -11,6 +11,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const libm = @import("libm_data.zig");
+const overlaps = @import("core.zig").overlaps;
 
 /// Errors returned by checked MS-Numpress operations.
 ///
@@ -27,11 +28,62 @@ pub const Error = error{
     InvalidValue,
     LengthOverflow,
     OutputTooSmall,
+    OverlappingBuffers,
     ToleranceUnattainable,
     ValueOutOfRange,
 };
 
 pub const WriteError = Error || std.Io.Writer.Error;
+
+/// The three MS-Numpress transforms. The functions below select one at run time; PIC ignores
+/// fixed_point.
+pub const Transform = enum { linear, pic, slof };
+
+/// The encoded length bound of the transform: linearMaxEncodedLen, picMaxEncodedLen, or
+/// slofEncodedLen.
+pub fn maxEncodedLen(transform: Transform, value_count: usize) Error!usize {
+    return switch (transform) {
+        .linear => linearMaxEncodedLen(value_count),
+        .pic => picMaxEncodedLen(value_count),
+        .slof => slofEncodedLen(value_count),
+    };
+}
+
+/// encodeLinear, encodePic, or encodeSlof.
+pub fn encode(transform: Transform, input: anytype, fixed_point: f64, output: []u8) Error!usize {
+    return switch (transform) {
+        .linear => encodeLinear(input, fixed_point, output),
+        .pic => encodePic(input, output),
+        .slof => encodeSlof(input, fixed_point, output),
+    };
+}
+
+/// encodeLinearTo, encodePicTo, or encodeSlofTo.
+pub fn encodeTo(transform: Transform, input: anytype, fixed_point: f64, writer: *std.Io.Writer) WriteError!usize {
+    return switch (transform) {
+        .linear => encodeLinearTo(input, fixed_point, writer),
+        .pic => encodePicTo(input, writer),
+        .slof => encodeSlofTo(input, fixed_point, writer),
+    };
+}
+
+/// decodeLinear, decodePic, or decodeSlof.
+pub fn decode(transform: Transform, input: []const u8, output: []f64) Error!usize {
+    return switch (transform) {
+        .linear => decodeLinear(input, output),
+        .pic => decodePic(input, output),
+        .slof => decodeSlof(input, output),
+    };
+}
+
+/// decodeLinearExact, decodePicExact, or decodeSlofExact.
+pub fn decodeExact(transform: Transform, input: []const u8, output: []f64) Error!void {
+    return switch (transform) {
+        .linear => decodeLinearExact(input, output),
+        .pic => decodePicExact(input, output),
+        .slof => decodeSlofExact(input, output),
+    };
+}
 
 /// Returns a safe upper bound for a linear encoding of `value_count` doubles.
 pub fn linearMaxEncodedLen(value_count: usize) Error!usize {
@@ -256,6 +308,7 @@ pub noinline fn encodeSlof(input: anytype, fixed_point: f64, output: []u8) Error
 /// `encodePic`; after one, the writer holds an unspecified prefix.
 pub fn encodePicTo(input: anytype, writer: *std.Io.Writer) WriteError!usize {
     const values = slice(input);
+    try checkDestination(values, writer);
     var blocks: Blocks = .{ .writer = writer };
     var sink: RawSink = .{ .out = &.{} };
     var codes: [BLOCK]u32 = undefined;
@@ -283,6 +336,7 @@ pub fn encodePicTo(input: anytype, writer: *std.Io.Writer) WriteError!usize {
 /// match `encodeLinear`; after one, the writer holds an unspecified prefix.
 pub fn encodeLinearTo(input: anytype, fixed_point: f64, writer: *std.Io.Writer) WriteError!usize {
     const values = slice(input);
+    try checkDestination(values, writer);
     try validateFixedPoint(fixed_point, values.len == 0);
     var header: [16]u8 = undefined;
     writeFixedPoint(header[0..8], fixed_point);
@@ -308,8 +362,11 @@ pub fn encodeLinearTo(input: anytype, fixed_point: f64, writer: *std.Io.Writer) 
     var i: usize = 2;
     while (i < values.len) {
         const n: usize = @min(BLOCK, values.len - i);
-        // scaled[0..2] carries the previous two values into the block.
-        if (scaleLinearBlock(values[i..][0..n], fixed_point, scaled[2..][0..n]) and
+        // scaled[0..2] carries the previous two values into the block. They come from the
+        // checked path when the previous block did, so they too must stay below 2^62 for the
+        // unchecked residuals.
+        if (scaled[0] < 1 << 62 and scaled[1] < 1 << 62 and
+            scaleLinearBlock(values[i..][0..n], fixed_point, scaled[2..][0..n]) and
             linearResiduals(scaled[0 .. n + 2], residuals[0..n], heads[0..n], leading[0..n]))
         {
             try blocks.start(&sink, n);
@@ -335,6 +392,7 @@ pub fn encodeLinearTo(input: anytype, fixed_point: f64, writer: *std.Io.Writer) 
 /// match `encodeSlof`; after one, the writer holds an unspecified prefix.
 pub fn encodeSlofTo(input: anytype, fixed_point: f64, writer: *std.Io.Writer) WriteError!usize {
     const values = slice(input);
+    try checkDestination(values, writer);
     try validateFixedPoint(fixed_point, values.len == 0);
     var header: [8]u8 = undefined;
     writeFixedPoint(&header, fixed_point);
@@ -615,8 +673,6 @@ inline fn storeCodes(bytes: *[2 * SLOF_LANES]u8, codes: SlofCodes) void {
 
 // --- Decoding ---
 
-pub const Transform = enum { linear, pic, slof };
-
 // Bytes staged between updates: the unconsumed tail of a fragment (under one value, at most 5
 // bytes) plus the first JOIN_BYTES of the next fragment, so a value split across fragments is
 // decoded from one buffer. Everything else is decoded in place.
@@ -698,39 +754,28 @@ pub const Decoder = struct {
             .pic => return self.nibbles(input),
             .linear => {
                 if (!self.started) {
-                    if (self.header_len == 0 and input.len >= 16) {
-                        self.header = input[0..16].*;
-                        self.header_len = 16;
-                        input = input[16..];
-                    } else {
-                        const take = @min(16 - self.header_len, input.len);
-                        for (0..take) |k| self.header[self.header_len + k] = input[k];
-                        self.header_len += take;
-                        input = input[take..];
-                        if (self.header_len < 16) return;
-                    }
+                    if (!self.gatherHeader(&input, 16)) return;
                     try self.startLinear();
                 }
                 return self.nibbles(input);
             },
             .slof => {
                 if (self.header_len < 8) {
-                    if (self.header_len == 0 and input.len >= 8) {
-                        self.header[0..8].* = input[0..8].*;
-                        self.header_len = 8;
-                        input = input[8..];
-                    } else {
-                        const take = @min(8 - self.header_len, input.len);
-                        for (0..take) |k| self.header[self.header_len + k] = input[k];
-                        self.header_len += take;
-                        input = input[take..];
-                        if (self.header_len < 8) return;
-                    }
+                    if (!self.gatherHeader(&input, 8)) return;
                     self.fixed_point = readFixedPoint(self.header[0..8]);
                 }
                 self.slofCodes(input);
             },
         }
+    }
+
+    // Moves header bytes from the front of input until size are gathered; true once they are.
+    fn gatherHeader(self: *Decoder, input: *[]const u8, size: usize) bool {
+        const take = @min(size - self.header_len, input.len);
+        @memcpy(self.header[self.header_len..][0..take], input.*[0..take]);
+        self.header_len += take;
+        input.* = input.*[take..];
+        return self.header_len == size;
     }
 
     // The 16-byte header is complete, so the payload is at least 16 bytes long and the length
@@ -1318,12 +1363,19 @@ const NibbleWriter = struct {
 
 // --- Value checks ---
 
+// The values are read while the writer's buffer is written, and an allocating writer may
+// move it, so they must not live in it.
+fn checkDestination(values: anytype, writer: *const std.Io.Writer) Error!void {
+    if (overlaps(writer.buffer, std.mem.sliceAsBytes(values))) return error.OverlappingBuffers;
+}
+
 fn validateNonnegative(value: f64) Error!void {
     if (!std.math.isFinite(value)) return error.InvalidValue;
     if (value < 0) return error.InvalidValue;
 }
 
-fn validateFixedPoint(fixed_point: f64, allow_zero: bool) Error!void {
+/// The Linear and SLOF rule: a finite, nonnegative fixed point, zero only with no values.
+pub fn validateFixedPoint(fixed_point: f64, allow_zero: bool) Error!void {
     if (!std.math.isFinite(fixed_point) or fixed_point < 0) return error.InvalidFixedPoint;
     if (!allow_zero and fixed_point == 0) return error.InvalidFixedPoint;
 }

@@ -163,6 +163,33 @@ test "[failure] - [base64]: rejects reuse after finish" {
     try std.testing.expectError(error.AlreadyFinished, decoder.update(""));
 }
 
+test "[property] - [base64]: pieces of pieceFor characters always fit a retargeted window" {
+    var source: [300]u8 = undefined;
+    var random = std.Random.DefaultPrng.init(std.testing.random_seed);
+    random.random().bytes(&source);
+    var encoded: [400]u8 = undefined;
+    const text = try base64.encode(&encoded, &source);
+    for (3..40) |size| {
+        var window: [40]u8 = undefined;
+        var decoded: [300]u8 = undefined;
+        var length: usize = 0;
+        var decoder = base64.Decoder.init(&.{});
+        var rest: []const u8 = text;
+        while (rest.len != 0) {
+            // Shorter pieces leave a partial quartet for the next one.
+            const piece = @min(rest.len, 1 + random.random().uintLessThan(usize, base64.Decoder.pieceFor(size)));
+            decoder.retarget(window[0..size]);
+            try decoder.update(rest[0..piece]);
+            const bytes = decoder.take();
+            @memcpy(decoded[length..][0..bytes.len], bytes);
+            length += bytes.len;
+            rest = rest[piece..];
+        }
+        _ = try decoder.finish();
+        try std.testing.expectEqualSlices(u8, &source, decoded[0..length]);
+    }
+}
+
 test "[property] - [base64]: preserves all one-byte and two-byte inputs" {
     var input: [2]u8 = undefined;
     var encoded: [4]u8 = undefined;
@@ -268,7 +295,6 @@ fn compareBase64Updates(text: []const u8, capacity: usize) !void {
     };
     try std.testing.expectEqual(scalar_error, bulk_error);
     try std.testing.expectEqualDeep(scalar.counts, bulk.counts);
-    try std.testing.expectEqual(scalar.error_offset, bulk.error_offset);
     if (bulk_error == null) try std.testing.expectEqualSlices(u8, scalar_output[0..scalar.counts.decoded_bytes], bulk_output[0..bulk.counts.decoded_bytes]);
 }
 
@@ -396,6 +422,47 @@ test "[property] - [zlib]: incompressible input fits the compression bound" {
             _ = try compressor.compress(output[0..zlib.compressBound(len)], source[0..len]);
         }
     }
+}
+
+test "[failure] - [zlib]: streaming calls out of order fail with InvalidState" {
+    var decompressor = try zlib.Decompressor.init(std.testing.allocator);
+    defer decompressor.deinit();
+    var window: [16]u8 = undefined;
+    try std.testing.expectError(error.InvalidState, decompressor.next(16));
+    try std.testing.expectError(error.InvalidState, decompressor.read(&window));
+
+    var compressor = try zlib.Compressor.init(std.testing.allocator, .fast);
+    defer compressor.deinit();
+    try std.testing.expectError(error.InvalidState, compressor.finish());
+    try std.testing.expectError(error.InvalidState, compressor.finishWriter());
+    var output: [64]u8 = undefined;
+    _ = try compressor.start(&output);
+    _ = try compressor.finish();
+    try std.testing.expectError(error.InvalidState, compressor.finish());
+    // finish returns start's output, which a startWriter stream does not have.
+    var sink = std.Io.Writer.fixed(&output);
+    _ = try compressor.startWriter(&sink);
+    try std.testing.expectError(error.InvalidState, compressor.finish());
+    try compressor.finishWriter();
+    try std.testing.expectError(error.InvalidState, compressor.finishWriter());
+}
+
+test "[failure] - [zlib]: a stream whose source failed is closed" {
+    var encoder = arrays.Encoder.init(std.testing.allocator, .fast);
+    defer encoder.deinit();
+    const bad = [_]f64{ 1, -1 };
+    const options: arrays.EncodeOptions = .{ .pipeline = .linear_zlib, .fixed_point = 1 };
+    try std.testing.expectError(error.InvalidValue, encoder.encode(f64, &bad, options));
+    const compressor = try encoder.compressor();
+    try std.testing.expectError(error.InvalidState, compressor.finish());
+    var discard: std.Io.Writer.Discarding = .init(&.{});
+    try std.testing.expectError(error.InvalidValue, arrays.Source.of(f64, &bad, options, &encoder).writeTo(&discard.writer));
+    try std.testing.expectError(error.InvalidState, compressor.finishWriter());
+    // A failed start leaves no earlier stream open either.
+    var output: [64]u8 = undefined;
+    _ = try compressor.start(&output);
+    try std.testing.expectError(error.OutputTooSmall, compressor.start(output[0..1]));
+    try std.testing.expectError(error.InvalidState, compressor.finish());
 }
 
 test "[failure] - [zlib]: releases partially allocated compression storage" {
@@ -719,6 +786,49 @@ test "[failure] - [zlib arrays]: returns DecodedSizeMismatch when a stream outgr
     }));
 }
 
+test "[failure] - [array sources]: writeTo checks options before writing a byte" {
+    var output: [64]u8 = undefined;
+    const cases = .{
+        .{ arrays.Source.of(i32, &.{ 1, 2 }, .{ .pipeline = .pic }, null), error.TypeMismatch },
+        .{ arrays.Source.of(f64, &.{ 1, 2 }, .{ .pipeline = .linear, .fixed_point = 0 }, null), error.InvalidFixedPoint },
+        .{ arrays.Source.of(f64, &.{ 1, 2 }, .{ .pipeline = .slof, .fixed_point = std.math.nan(f64) }, null), error.InvalidFixedPoint },
+        .{ arrays.Source.of(f64, &.{1}, .{ .pipeline = .zlib }, null), error.MissingCompressor },
+    };
+    inline for (cases) |case| {
+        var writer = std.Io.Writer.fixed(&output);
+        try std.testing.expectError(case[1], case[0].check());
+        try std.testing.expectError(case[1], case[0].writeTo(&writer));
+        try std.testing.expectEqual(@as(usize, 0), writer.end);
+    }
+}
+
+test "[failure] - [array sources]: values inside the destination's buffer are refused" {
+    var buffer: [64]f64 = undefined;
+    @memset(&buffer, 1);
+    var writer = std.Io.Writer.fixed(std.mem.sliceAsBytes(&buffer));
+    const values = buffer[32..40];
+    try std.testing.expectError(error.OverlappingBuffers, arrays.Source.of(f64, values, .{}, null).writeTo(&writer));
+    try std.testing.expectError(error.OverlappingBuffers, mzml.numpress.encodePicTo(values, &writer));
+    try std.testing.expectError(error.OverlappingBuffers, mzml.numpress.encodeLinearTo(values, 1, &writer));
+    try std.testing.expectError(error.OverlappingBuffers, mzml.numpress.encodeSlofTo(values, 1, &writer));
+    try std.testing.expectEqual(@as(usize, 0), writer.end);
+}
+
+test "[failure] - [array pipelines]: too many Numpress values are the file's fault at any scratch size" {
+    var encoded: [128]u8 = undefined;
+    var wire: [64]u8 = undefined;
+    const many = [_]f64{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
+    const text = try base64.encode(&encoded, wire[0..try mzml.numpress.encodePic(&many, &wire)]);
+    var output: [1]f64 = undefined;
+    const bound = try arrays.wireBound(f64, output.len, .pic);
+    var transport: [64]u8 = undefined;
+    for ([_]usize{ bound, bound + 1, transport.len }) |size| {
+        try std.testing.expectError(error.DecodedSizeMismatch, arrays.decode(f64, &output, text, .pic, .{ .transport = transport[0..size], .transformed = &.{} }));
+    }
+    // Scratch below the bound is the caller's.
+    try std.testing.expectError(error.OutputTooSmall, arrays.decode(f64, &output, text, .pic, .{ .transport = transport[0 .. bound - 1], .transformed = &.{} }));
+}
+
 test "[integration] - [array encoder]: keeps every wire until reset for all pipelines" {
     var encoder = arrays.Encoder.init(std.testing.allocator, .even);
     defer encoder.deinit();
@@ -798,11 +908,11 @@ test "[property] - [array encoder]: f32 Numpress input matches its f64 copy and 
     }
     var transformed: [16 + 9 * narrow.len / 2 + 16]u8 = undefined;
     for ([_]arrays.Pipeline{ .linear, .pic, .slof, .linear_zlib, .pic_zlib, .slof_zlib }) |pipeline| {
-        const fixed_point: ?f64 = switch (pipeline.transform()) {
+        const fixed_point: ?f64 = if (pipeline.transform()) |transform| switch (transform) {
             .linear => try mzml.numpress.optimalLinearFixedPoint(&narrow),
             .slof => try mzml.numpress.optimalSlofFixedPoint(&narrow),
-            else => null,
-        };
+            .pic => null,
+        } else null;
         encoder.reset();
         const options: arrays.EncodeOptions = .{ .pipeline = pipeline, .fixed_point = fixed_point };
         const from_narrow = try encoder.encode(f32, &narrow, options);

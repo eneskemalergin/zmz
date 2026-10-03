@@ -333,6 +333,42 @@ test "[property] - [numpress encoders]: block encoding matches the value-by-valu
     }
 }
 
+test "[regression] - [numpress Linear]: values falling below 2^62 at a block boundary encode" {
+    // Second differences of 2^30 fit a residual, but the values peak between 2^62 and 2^63.
+    // The block before the fall takes the checked path; the next one starts below 2^62 with
+    // carried values above it.
+    const allocator = std.testing.allocator;
+    const n: i64 = 80_000;
+    var scaled: std.ArrayList(i64) = .empty;
+    defer scaled.deinit(allocator);
+    var value: i64 = 0;
+    var step: i64 = 0;
+    var fall: ?usize = null;
+    var high = false;
+    var i: i64 = 0;
+    while (fall == null or scaled.items.len < fall.? + 300) : (i += 1) {
+        try scaled.append(allocator, value);
+        const below = @as(f64, @floatFromInt(value)) + 0.5 < 0x1p62;
+        if (high and below and fall == null) fall = scaled.items.len - 1;
+        high = high or !below;
+        step += if (i < n) 1 << 30 else -(1 << 30);
+        value += step;
+    }
+    // Leading zeros move the fall to the first value of a 128-value block, which starts at 2.
+    const zeros = (128 - (fall.? - 2) % 128) % 128;
+    const values = try allocator.alloc(f64, zeros + scaled.items.len);
+    defer allocator.free(values);
+    @memset(values[0..zeros], 0);
+    for (scaled.items, values[zeros..]) |source, *destination| destination.* = @floatFromInt(source);
+    const encoded = try allocator.alloc(u8, try numpress.linearMaxEncodedLen(values.len));
+    defer allocator.free(encoded);
+    const length = try numpress.encodeLinear(values, 1, encoded);
+    const decoded = try allocator.alloc(f64, values.len);
+    defer allocator.free(decoded);
+    try numpress.decodeLinearExact(encoded[0..length], decoded);
+    try std.testing.expectEqualSlices(f64, values, decoded);
+}
+
 test "[property] - [numpress encoders]: f32 input encodes as its f64 copy" {
     var random = std.Random.DefaultPrng.init(0x4e55_4d50_4633_3200);
     const source = random.random();
@@ -544,14 +580,14 @@ test "[property] - [numpress writer encoders]: match the slice encoders' bytes a
             };
             for ([_]f64{ 1_000, 0, -1, 0.5 }) |fixed_point| {
                 for ([_]numpress.Transform{ .linear, .pic, .slof }) |transform| {
-                    const slice_result = encodeSlice(transform, array, fixed_point, &expected);
+                    const slice_result = numpress.encode(transform, array, fixed_point, &expected);
                     var fixed = std.Io.Writer.fixed(&fixed_bytes);
-                    const fixed_result = encodeTo(transform, array, fixed_point, &fixed);
+                    const fixed_result = numpress.encodeTo(transform, array, fixed_point, &fixed);
                     var collected: std.Io.Writer.Allocating = .init(std.testing.allocator);
                     defer collected.deinit();
                     var small: [64]u8 = undefined;
                     var forward = Forward{ .target = &collected.writer, .interface = .{ .vtable = &Forward.vtable, .buffer = &small } };
-                    const forward_result = encodeTo(transform, array, fixed_point, &forward.interface);
+                    const forward_result = numpress.encodeTo(transform, array, fixed_point, &forward.interface);
                     if (slice_result) |len| {
                         try std.testing.expectEqual(len, try fixed_result);
                         try std.testing.expectEqualSlices(u8, expected[0..len], fixed.buffered());
@@ -585,19 +621,9 @@ fn fillAscending(values: []f64, source: std.Random) void {
 }
 
 fn decodeWhole(transform: numpress.Transform, exact: bool, input: []const u8, output: []f64) numpress.Error!usize {
-    if (exact) {
-        switch (transform) {
-            .linear => try numpress.decodeLinearExact(input, output),
-            .pic => try numpress.decodePicExact(input, output),
-            .slof => try numpress.decodeSlofExact(input, output),
-        }
-        return output.len;
-    }
-    return switch (transform) {
-        .linear => numpress.decodeLinear(input, output),
-        .pic => numpress.decodePic(input, output),
-        .slof => numpress.decodeSlof(input, output),
-    };
+    if (!exact) return numpress.decode(transform, input, output);
+    try numpress.decodeExact(transform, input, output);
+    return output.len;
 }
 
 fn decodeFed(
@@ -632,22 +658,6 @@ fn expectSameDecode(
         std.mem.sliceAsBytes(expected_values[0..count]),
         std.mem.sliceAsBytes(actual_values[0..count]),
     );
-}
-
-fn encodeSlice(transform: numpress.Transform, values: []const f64, fixed_point: f64, output: []u8) numpress.Error!usize {
-    return switch (transform) {
-        .linear => numpress.encodeLinear(values, fixed_point, output),
-        .pic => numpress.encodePic(values, output),
-        .slof => numpress.encodeSlof(values, fixed_point, output),
-    };
-}
-
-fn encodeTo(transform: numpress.Transform, values: []const f64, fixed_point: f64, writer: *std.Io.Writer) numpress.WriteError!usize {
-    return switch (transform) {
-        .linear => numpress.encodeLinearTo(values, fixed_point, writer),
-        .pic => numpress.encodePicTo(values, writer),
-        .slof => numpress.encodeSlofTo(values, fixed_point, writer),
-    };
 }
 
 // A writer with a small buffer that forwards every drain, so encoders see partial drains.

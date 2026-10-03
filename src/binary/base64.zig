@@ -68,8 +68,6 @@ pub const Decoder = struct {
     padded: bool = false,
     finished: bool = false,
     failed: bool = false,
-    /// Offset in concatenated logical text, not the physical XML source.
-    error_offset: ?usize = null,
 
     pub fn init(output: []u8) Decoder {
         return .{ .output = output };
@@ -95,10 +93,8 @@ pub const Decoder = struct {
             }
             const byte = text[index];
             index += 1;
-            const offset = self.counts.text_bytes;
             self.counts.text_bytes += 1;
             if (isWhitespace(byte)) continue;
-            self.error_offset = offset;
             if (self.padded) return error.InvalidPadding;
             if (byte != '=' and alphabet(byte) == null) return error.InvalidCharacter;
             self.counts.significant_bytes += 1;
@@ -106,7 +102,6 @@ pub const Decoder = struct {
             self.quartet_len += 1;
             if (self.quartet_len == 4) try self.flushQuartet();
         }
-        self.error_offset = null;
     }
 
     fn decodeRun(self: *Decoder, text: []const u8) usize {
@@ -142,10 +137,16 @@ pub const Decoder = struct {
         return self.output[0..n];
     }
 
-    /// Text characters per update that always fit a window of `window` bytes with take: 3
-    /// bytes per 4 characters, plus the bytes of a quartet left from the previous update.
+    /// Decodes later updates into output, from its start, as take does.
+    pub fn retarget(self: *Decoder, output: []u8) void {
+        self.output = output;
+        self.taken = self.counts.decoded_bytes;
+    }
+
+    /// Text characters per update that always fit a window of `window` bytes with take: a
+    /// quartet left from the previous update has at most 3 characters, so 4 per 3 bytes fit.
     pub fn pieceFor(window: usize) usize {
-        return (window - 3) / 3 * 4;
+        return window / 3 * 4;
     }
 
     /// Checks the final quartet and returns the counts; call it once.
@@ -153,10 +154,7 @@ pub const Decoder = struct {
         if (self.failed) return error.FailedState;
         if (self.finished) return error.AlreadyFinished;
         errdefer self.failed = true;
-        if (self.quartet_len != 0) {
-            self.error_offset = self.counts.text_bytes;
-            return error.TruncatedInput;
-        }
+        if (self.quartet_len != 0) return error.TruncatedInput;
         self.finished = true;
         return self.counts;
     }

@@ -5,7 +5,6 @@
 //! Failed copies release their allocated storage.
 
 const std = @import("std");
-const cv = @import("../cv/source.zig");
 const model = @import("model.zig");
 const copy = @import("internal/owned_copy.zig");
 const schema = @import("schema.zig");
@@ -66,17 +65,5 @@ fn copyRecord(copier: *copy.Copier, source: model.Record, depth: usize) Error!mo
 }
 
 fn copyHeader(copier: *copy.Copier, source: model.Header, depth: usize) Error!model.Header {
-    var value = source;
-    value.namespace_uri = try copier.text(source.namespace_uri);
-    value.document = try copier.node(source.document, depth);
-    value.run = try copier.node(source.run, depth);
-    const groups = try copier.alloc(cv.Group, source.groups.len);
-    for (source.groups, groups) |group, *destination| destination.* = .{
-        .id = try copier.text(group.id),
-        .entries = try copier.entries(group.entries),
-    };
-    value.groups = groups;
-    value.spectrum_list = try copier.list(source.spectrum_list);
-    value.chromatogram_list = try copier.list(source.chromatogram_list);
-    return value;
+    return copier.header(source, depth);
 }

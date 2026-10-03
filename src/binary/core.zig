@@ -6,9 +6,9 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const AVX_STATE: u32 = (1 << 26) | (1 << 27) | (1 << 28);
-// Zero until detected, then 1 for absent and 2 for present; tests store 1 to force fallbacks.
+// Zero until detected, then 1 for absent and 2 for present.
 var avx2_cached = std.atomic.Value(u8).init(0);
-pub var sha_cached = std.atomic.Value(u8).init(0);
+var sha_cached = std.atomic.Value(u8).init(0);
 
 pub fn hasAvx2() bool {
     return cached(&avx2_cached, detectAvx2);
