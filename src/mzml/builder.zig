@@ -32,6 +32,9 @@ pub const ArrayOptions = struct {
     cv_ref: []const u8,
     encoding: arrays.EncodeOptions = .{},
     data_processing_ref: ?[]const u8 = null,
+    /// Writes `value=""` on the primitive and codec terms generated here, as ProteoWizard does;
+    /// by default they have no value attribute.
+    empty_values: bool = false,
 };
 
 /// An encoded array with its known value count, used to check the enclosing record length.
@@ -444,10 +447,11 @@ fn arrayMetadata(self: *Builder, comptime T: type, value_count: usize, options: 
         attrs[attribute_count] = attrs[1];
         attribute_count += 1;
     }
+    const value: ?[]const u8 = if (options.empty_values) "" else null;
     const params = [_]cv.Entry{
         .{ .cv = options.role },
-        .{ .cv = .{ .cv_ref = options.cv_ref, .accession = .{ .raw = primitive.accession }, .name = primitive.name } },
-        .{ .cv = .{ .cv_ref = options.cv_ref, .accession = .{ .raw = codec.accession }, .name = codec.name } },
+        .{ .cv = .{ .cv_ref = options.cv_ref, .accession = .{ .raw = primitive.accession }, .name = primitive.name, .value = value } },
+        .{ .cv = .{ .cv_ref = options.cv_ref, .accession = .{ .raw = codec.accession }, .name = codec.name, .value = value } },
     };
     const result: model.Node = .{
         .kind = .binary_data_array,

@@ -374,6 +374,21 @@ pub const Record = struct {
 
 pub const Primitive = encoding.Primitive;
 pub const Encoding = encoding.Descriptor;
+/// What one CV accession declares about an array's encoding: a primitive, a compression, or an
+/// unsupported encoding; null when it declares nothing. `arrayEncoding` and every reader use it.
+pub const EncodingTerm = encoding.Declared;
+pub const encodingTerm = encoding.declared;
+/// What an array holds, from its array-type term.
+pub const ArrayRole = enum { mz, intensity, time, other };
+
+/// The role of a binary array node: m/z, intensity, or time by their terms (also through groups,
+/// checked in that order, a repeated term counting once), otherwise other.
+pub fn arrayRole(node: Node, groups: []const cv.Group) !ArrayRole {
+    const roles = .{ .{ Terms.MZ_ARRAY, ArrayRole.mz }, .{ Terms.INTENSITY_ARRAY, ArrayRole.intensity }, .{ Terms.TIME_ARRAY, ArrayRole.time } };
+    inline for (roles) |role| if (try cv.findOne(node.params, groups, role[0]) != .missing) return role[1];
+    return .other;
+}
+
 /// encoding.Error, and the failures of reading a modeled array node.
 pub const EncodingError = encoding.Error || error{ NotBinaryArray, PayloadNotRetained, TypeMismatch };
 

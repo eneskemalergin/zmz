@@ -12,7 +12,8 @@
 //! invalidate them. No source metadata is borrowed by this owner.
 //!
 //! beginArray, decodeText, and complete are internal: the reader engine calls them while it
-//! parses a record. Callers use the reads and the decode functions.
+//! parses a record. Callers use the reads and the decode functions (decodeArrayText for text
+//! read as events).
 
 const std = @import("std");
 const model = @import("model.zig");
@@ -28,18 +29,25 @@ const DecodedArrays = @This();
 
 pub const Error = model.EncodingError || cv.ValueError || arrays.Error || std.mem.Allocator.Error || error{ LimitExceeded, InvalidState };
 pub const Values = arrays.Values;
-pub const Array = struct { source_position: usize, encoding: model.Encoding, values: Values };
+/// One decoded array: its position among the record's arrays, its declared encoding, its role
+/// (null when decoded from text without its node), and its values.
+pub const Array = struct { source_position: usize, encoding: model.Encoding, role: ?model.ArrayRole, values: Values };
 
-/// Bounds each array's decoded typed bytes, allocated from its declared length. The reader's
-/// binary_text_bytes bounds the Base64 text.
-pub const Limits = struct { array_bytes: usize = 192 * 1024 * 1024 };
+pub const Options = struct {
+    /// Bounds each array's decoded typed bytes, allocated from its declared length. The reader's
+    /// binary_text_bytes bounds the Base64 text.
+    array_bytes: usize = 192 * 1024 * 1024,
+    /// Numpress decodes to f64. `declared` returns arrays declared 32-bit float as f32, rounded
+    /// to the nearest (as pyteomics and pyOpenMS do); integer declarations stay f64.
+    numpress_precision: enum { decoded, declared } = .decoded,
+};
 
 // Bytes decoded per step: Numpress input from Base64, or Base64 output for the decompressor. A
 // zlib payload that fits whole (most spectra) is decoded in one call, straight into its values.
 const WINDOW = 64 * 1024;
 
 allocator: std.mem.Allocator,
-limits: Limits,
+options: Options,
 outputs: std.ArrayList(Output) = .empty,
 window: std.ArrayList(u8) = .empty,
 decompressor: ?zlib.Decompressor = null,
@@ -54,8 +62,8 @@ failure: ?struct { stage: Diagnostic.Stage, detail: Diagnostic.Detail = .none } 
 // A read decodes into this owner; a selection callback must not reset or reuse it meanwhile.
 busy: bool = false,
 
-pub fn init(allocator: std.mem.Allocator, limits: Limits) DecodedArrays {
-    return .{ .allocator = allocator, .limits = limits };
+pub fn init(allocator: std.mem.Allocator, options: Options) DecodedArrays {
+    return .{ .allocator = allocator, .options = options };
 }
 
 pub fn deinit(self: *DecodedArrays) void {
@@ -85,6 +93,7 @@ pub fn get(self: *const DecodedArrays, position: usize) ?Array {
     return .{
         .source_position = output.source_position,
         .encoding = output.encoding,
+        .role = output.role,
         .values = switch (output.primitive()) {
             inline else => |kind| .of(kind.Type(), output.values(kind.Type())),
         },
@@ -113,6 +122,23 @@ pub fn decodeArray(self: *DecodedArrays, node: model.Node, default_length: ?usiz
     self.busy = true;
     defer self.busy = false;
     try self.decodeRetained(node, default_length, groups, 0);
+    self.complete();
+    return self.get(0).?.values;
+}
+
+/// Decodes one array whose Base64 text arrives in pieces from source, given its encoding and
+/// value count, for callers that read the document as events: classify the array's terms with
+/// `model.encodingTerm` and pass a source whose `next()` returns the array's text runs (for
+/// example `Events` text events) and then null. Same decoding, error order, and limits as the
+/// readers; replaces earlier results, and after a failure none are visible.
+pub fn decodeArrayText(self: *DecodedArrays, encoding: model.Encoding, length: usize, source: anytype) !Values {
+    if (self.busy) return error.InvalidState;
+    self.reset();
+    errdefer self.reset();
+    self.busy = true;
+    defer self.busy = false;
+    try self.beginArrayWith(encoding, length, 0);
+    try self.decodeText(source);
     self.complete();
     return self.get(0).?.values;
 }
@@ -148,10 +174,19 @@ const RetainedText = struct {
 /// over zlib errors, and zlib errors over Numpress errors.
 pub fn decodeText(self: *DecodedArrays, source: anytype) !void {
     if (self.count == 0) return error.InvalidState;
-    const pipeline = self.outputs.items[self.count - 1].encoding.pipeline;
-    if (pipeline.hasZlib()) return self.decompressText(source);
-    while (try source.next()) |bytes| try self.text(bytes);
-    return self.finishArray();
+    const output = &self.outputs.items[self.count - 1];
+    if (output.encoding.pipeline.hasZlib()) try self.decompressText(source) else {
+        while (try source.next()) |bytes| try self.text(bytes);
+        try self.finishArray();
+    }
+    if (self.options.numpress_precision == .declared and output.encoding.pipeline.isNumpress() and output.encoding.primitive == .float32) {
+        // Each f32 lands inside f64 values already read, so narrowing in place is safe.
+        const wide = output.values(f64);
+        const narrow = std.mem.bytesAsSlice(f32, std.mem.sliceAsBytes(output.words.items))[0..output.length];
+        for (narrow, 0..) |*value, i| value.* = @floatCast(wide[i]);
+        output.narrowed = true;
+        output.bytes = output.length * @sizeOf(f32);
+    }
 }
 
 fn text(self: *DecodedArrays, bytes: []const u8) Error!void {
@@ -199,23 +234,33 @@ pub fn beginArray(self: *DecodedArrays, node: model.Node, default_length: ?usize
         } };
     };
     const array = try model.BinaryArray.init(node, default_length, groups);
+    try self.beginArrayWith(array.encoding, array.length, source_position);
+    self.outputs.items[self.count - 1].role = try model.arrayRole(node, groups);
+}
+
+fn beginArrayWith(self: *DecodedArrays, encoding: model.Encoding, length: usize, source_position: usize) Error!void {
+    errdefer if (self.failure == null) {
+        self.failure = .{ .stage = .array };
+    };
     if (self.count == self.outputs.items.len) try self.outputs.append(self.allocator, .{});
     const output = &self.outputs.items[self.count];
     self.count += 1;
     output.source_position = source_position;
-    output.encoding = array.encoding;
+    output.encoding = encoding;
+    output.role = null;
+    output.narrowed = false;
     // Set once the words are sized, so a failure here exposes no values.
     output.length = 0;
     output.bytes = 0;
-    const bytes = std.math.mul(usize, array.length, output.primitive().size()) catch return error.LengthOverflow;
-    if (bytes > self.limits.array_bytes) {
-        self.failure = .{ .stage = .array, .detail = .{ .limit = .{ .name = .array_bytes, .maximum = self.limits.array_bytes, .needed = bytes } } };
+    const bytes = std.math.mul(usize, length, output.primitive().size()) catch return error.LengthOverflow;
+    if (bytes > self.options.array_bytes) {
+        self.failure = .{ .stage = .array, .detail = .{ .limit = .{ .name = .array_bytes, .maximum = self.options.array_bytes, .needed = bytes } } };
         return error.LimitExceeded;
     }
     try output.words.resize(self.allocator, bytes / 8 + @intFromBool(bytes % 8 != 0));
-    output.length = array.length;
+    output.length = length;
     output.bytes = bytes;
-    const pipeline = array.encoding.pipeline;
+    const pipeline = encoding.pipeline;
     if (pipeline != .none) try self.window.resize(self.allocator, WINDOW);
     if (pipeline.transform()) |transform| {
         self.values = numpress.Decoder.initExact(transform, output.values(f64));
@@ -415,6 +460,9 @@ const Output = struct {
     words: std.ArrayList(u64) = .empty,
     source_position: usize = 0,
     encoding: model.Encoding = undefined,
+    role: ?model.ArrayRole = null,
+    // Numpress values narrowed to the declared f32.
+    narrowed: bool = false,
     length: usize = 0,
     // length times the primitive's size, set once its words are allocated.
     bytes: usize = 0,
@@ -426,7 +474,7 @@ const Output = struct {
     }
 
     fn primitive(self: *const Output) model.Primitive {
-        return self.encoding.decodedPrimitive();
+        return if (self.narrowed) .float32 else self.encoding.decodedPrimitive();
     }
 
     // Values arrive as little-endian bytes; big-endian targets swap them in place.

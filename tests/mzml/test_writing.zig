@@ -568,6 +568,22 @@ test "[failure] - [mzML lists]: attribute errors leave the writer failed" {
     }
 }
 
+test "[failure] - [mzML writer]: a parameter attribute repeating a fixed field is a duplicate" {
+    const extra = mzml.cv.ParameterXml{ .attributes = &.{.{ .name = "accession", .value = "MS:2" }} };
+    var bytes: [4096]u8 = undefined;
+    var sink = std.Io.Writer.fixed(&bytes);
+    var writer = try mzml.Writer.init(std.testing.allocator, &sink, .{});
+    defer writer.deinit();
+    try writer.writeHeader(.{ .document = .{ .kind = .mzml }, .run = .{ .kind = .run } });
+    try writer.beginList(.spectrum_list, 1, "dp");
+    try std.testing.expectError(error.DuplicateAttribute, writer.writeRecord(.{
+        .kind = .spectrum,
+        .attributes = &.{ .{ .name = "id", .value = "scan=1" }, .{ .name = "index", .value = "0" } },
+        .params = &.{.{ .cv = .{ .cv_ref = "MS", .accession = .{ .raw = "MS:1" }, .name = "term", .xml = &extra } }},
+    }));
+    try std.testing.expectError(error.FailedState, writer.endList());
+}
+
 test "[integration] - [mzML writer]: preserves metadata and records through a plain rewrite" {
     var bytes: [8192]u8 = undefined;
     var sink = std.Io.Writer.fixed(&bytes);
@@ -1857,4 +1873,62 @@ test "[failure] - [mzML writer]: rejects node arrays that live in its output buf
     const before = writer.engine.byteOffset();
     try std.testing.expectError(error.InvalidState, writer.writeRecord(node));
     try std.testing.expectEqual(before, writer.engine.byteOffset());
+}
+
+test "[integration] - [writer conventions]: writes empty generated values and indexedmzML attributes on request" {
+    const xsi = "http://www.w3.org/2001/XMLSchema-instance";
+    const location = "http://psi.hupo.org/ms/mzml http://psidev.info/files/ms/mzML/xsd/mzML1.1.2_idx.xsd";
+    const wrapper = [_]mzml.model.Attribute{
+        .{ .name = "xmlns:xsi", .value = xsi, .namespace_uri = "http://www.w3.org/2000/xmlns/" },
+        .{ .name = "xsi:schemaLocation", .value = location, .namespace_uri = xsi },
+    };
+    var empty_counts: [2]usize = undefined;
+    for ([_]bool{ false, true }, 0..) |requested, case| {
+        var sink: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer sink.deinit();
+        var input = std.Io.Reader.fixed(support.DOCUMENT);
+        var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+        defer reader.deinit();
+        var builder = mzml.Builder.init(std.testing.allocator, .{});
+        defer builder.deinit();
+        var encoder = mzml.arrays.Encoder.init(std.testing.allocator, .fast);
+        defer encoder.deinit();
+        var writer = try mzml.Writer.initIndexed(std.testing.allocator, &sink.writer, .{}, .{ .wrapper_attributes = if (requested) &wrapper else &.{} });
+        defer writer.deinit();
+        try writer.writeHeader(try builder.header((try reader.readHeader()).*));
+        try writer.beginList(.spectrum_list, 1, "dp");
+        const prepared = try builder.prepareArray(f64, &.{ 1, 2 }, .{
+            .cv_ref = "MS",
+            .role = .{ .cv_ref = "MS", .accession = mzml.model.Terms.MZ_ARRAY, .name = "m/z array" },
+            .encoding = .{ .pipeline = .zlib },
+            .empty_values = requested,
+        }, &encoder);
+        const record = try builder.record(.spectrum, "scan=1", 0, 2, &.{}, &.{}, &.{prepared.array});
+        try writer.writeRecordWithArrays(record.node, &.{prepared.payload});
+        try writer.endList();
+        try writer.finish();
+        const written = sink.written();
+        const start = if (requested)
+            "<indexedmzML xmlns=\"http://psi.hupo.org/ms/mzml\" xmlns:xsi=\"" ++ xsi ++ "\" xsi:schemaLocation=\"" ++ location ++ "\">"
+        else
+            "<indexedmzML xmlns=\"http://psi.hupo.org/ms/mzml\">";
+        try std.testing.expect(std.mem.indexOf(u8, written, start) != null);
+        empty_counts[case] = std.mem.count(u8, written, "value=\"\"");
+        // The checksum and offsets cover the wrapper; values read back unchanged.
+        var index = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = written }, .{ .policy = .open_embedded });
+        defer index.deinit();
+        var decoded = mzml.StreamReader.DecodedArrays.init(std.testing.allocator, .{});
+        defer decoded.deinit();
+        var found = (try index.byIdDecoded(std.testing.allocator, "scan=1", &decoded)).?;
+        defer found.deinit();
+        try std.testing.expectEqualSlices(f64, &.{ 1, 2 }, decoded.get(0).?.values.float64);
+    }
+    // The primitive and codec terms carry the two empty values.
+    try std.testing.expectEqual(empty_counts[0] + 2, empty_counts[1]);
+
+    var sink: std.Io.Writer.Discarding = .init(&.{});
+    try std.testing.expectError(error.InvalidOptions, mzml.Writer.initIndexed(std.testing.allocator, &sink.writer, .{}, .{ .wrapper_attributes = &.{.{ .name = "version", .value = "1" }} }));
+    var writer = try mzml.Writer.initIndexed(std.testing.allocator, &sink.writer, .{}, .{ .wrapper_attributes = &.{.{ .name = "q:x", .value = "1", .namespace_uri = "urn:q" }} });
+    defer writer.deinit();
+    try std.testing.expectError(error.InvalidNamespace, writer.writeHeader(.{ .document = .{ .kind = .mzml }, .run = .{ .kind = .run } }));
 }

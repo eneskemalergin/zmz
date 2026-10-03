@@ -800,3 +800,72 @@ test "[failure] - [group reencoding]: refuses a reencoding whose builder was res
     header_builder.reset();
     try std.testing.expectError(error.InvalidState, prepared.prepareArray(&builder, f32, &values, record.binaryArrays()[0], .{ .pipeline = .zlib }, &encoder));
 }
+
+test "[integration] - [decoded arrays]: reports roles and narrows Numpress to its declared precision" {
+    var buffer: [16384]u8 = undefined;
+    var sink = std.Io.Writer.fixed(&buffer);
+    {
+        var input = std.Io.Reader.fixed(support.DOCUMENT);
+        var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+        defer reader.deinit();
+        var builder = mzml.Builder.init(std.testing.allocator, .{});
+        defer builder.deinit();
+        var encoder = mzml.arrays.Encoder.init(std.testing.allocator, .fast);
+        defer encoder.deinit();
+        var writer = try mzml.Writer.init(std.testing.allocator, &sink, .{});
+        defer writer.deinit();
+        try writer.writeHeader(try builder.header((try reader.readHeader()).*));
+        try writer.beginList(.spectrum_list, 1, "dp");
+        const mz = [_]f32{ 100.123456, 200.654321, 300.5 };
+        const intensity = [_]f32{ 1234.5678, 0.25, 98765.43 };
+        // Written as f64, then declared a 32-bit integer below; the writer refuses integer Numpress.
+        const charge = [_]f64{ 1, 2, 3 };
+        const Role = struct { accession: []const u8, name: []const u8 };
+        const roles = [_]Role{ .{ .accession = "MS:1000514", .name = "m/z array" }, .{ .accession = "MS:1000515", .name = "intensity array" }, .{ .accession = "X:charge", .name = "charge" } };
+        const pipelines = [_]mzml.arrays.EncodeOptions{ .{ .pipeline = .linear, .fixed_point = 100000 }, .{ .pipeline = .slof_zlib, .fixed_point = 5000 }, .{ .pipeline = .pic } };
+        var nodes: [3]mzml.Builder.Array = undefined;
+        var wires: [3]mzml.Writer.ArrayPayload = undefined;
+        inline for (.{ &mz, &intensity, &charge }, 0..) |values, i| {
+            const prepared = try builder.prepareArray(@TypeOf(values[0]), values, .{
+                .cv_ref = "MS",
+                .role = .{ .cv_ref = "MS", .accession = .{ .raw = roles[i].accession }, .name = roles[i].name },
+                .encoding = pipelines[i],
+            }, &encoder);
+            nodes[i] = prepared.array;
+            wires[i] = prepared.payload;
+        }
+        const record = try builder.record(.spectrum, "scan=1", 0, 3, &.{}, &.{}, &nodes);
+        try writer.writeRecordWithArrays(record.node, &wires);
+        try writer.endList();
+        try writer.finish();
+    }
+    // The last 64-bit float declaration is the third array's.
+    const written = sink.buffered();
+    const at = std.mem.lastIndexOf(u8, written, "MS:1000523\" name=\"64-bit float").?;
+    const source = try std.mem.concat(std.testing.allocator, u8, &.{ written[0..at], "MS:1000519\" name=\"32-bit integer", written[at + 30 ..] });
+    defer std.testing.allocator.free(source);
+    var wide: [3][3]f64 = undefined;
+    inline for (.{ .decoded, .declared }) |precision| {
+        var input = std.Io.Reader.fixed(source);
+        var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+        defer reader.deinit();
+        _ = try reader.readHeader();
+        var decoded = mzml.StreamReader.DecodedArrays.init(std.testing.allocator, .{ .numpress_precision = precision });
+        defer decoded.deinit();
+        _ = (try reader.nextDecodedRecord(&decoded)).?;
+        try std.testing.expectEqual(@as(usize, 3), decoded.len());
+        for ([_]mzml.model.ArrayRole{ .mz, .intensity, .other }, 0..) |role, i| {
+            const array = decoded.get(i).?;
+            try std.testing.expectEqual(role, array.role.?);
+            if (precision == .decoded) {
+                @memcpy(&wide[i], array.values.float64);
+            } else if (i == 2) {
+                // An integer declaration keeps the decoded f64 values.
+                try std.testing.expectEqual(mzml.model.Primitive.int32, array.encoding.primitive);
+                try std.testing.expectEqualSlices(f64, &wide[i], array.values.float64);
+            } else {
+                for (wide[i], array.values.float32) |value, narrow| try std.testing.expectEqual(@as(f32, @floatCast(value)), narrow);
+            }
+        }
+    }
+}
