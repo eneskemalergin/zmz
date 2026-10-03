@@ -50,7 +50,7 @@ pub const Copier = struct {
 
     pub fn entry(self: *Copier, source: cv.Entry) Error!cv.Entry {
         return switch (source) {
-            .group_ref => |ref| .{ .group_ref = .{ .ref = try self.optionalText(ref.ref), .xml = try self.xmlAttributes(ref.xml) } },
+            .group_ref => |ref| .{ .group_ref = .{ .ref = try self.optionalText(ref.ref), .xml = try self.xmlAttributes(ref.xml), .position = ref.position } },
             .cv => |param| .{ .cv = .{
                 .cv_ref = try self.optionalText(param.cv_ref),
                 .accession = try self.accession(param.accession),

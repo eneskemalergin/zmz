@@ -314,9 +314,11 @@ fn readFragment(
     expected: Engine.FragmentTarget,
 ) Error!owned.Record {
     reader.header.groups = groups;
+    reader.reference_groups = groups;
     reader.decoded_arrays = output;
     defer {
         reader.header.groups = &.{};
+        reader.reference_groups = &.{};
         reader.decoded_arrays = null;
     }
     return reader.readFragment(allocator, input, ancestors, physical_start, prefix_length, complete, reuse_ancestors, expected);

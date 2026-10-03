@@ -297,6 +297,42 @@ test "[regression] - [mzML namespaces]: parameters share their scope's declarati
     for (copy.value.node.params) |param| try std.testing.expectEqual(copied.ptr, param.cv.xml.?.attributes.ptr);
 }
 
+test "[regression] - [mzML parameters]: group references resolve without searching every group" {
+    const allocator = std.testing.allocator;
+    const groups = 20_000;
+    var source: std.Io.Writer.Allocating = .init(allocator);
+    defer source.deinit();
+    const list_start = std.mem.indexOf(u8, support.HEADER, "<referenceableParamGroup id='encoding'>").?;
+    try source.writer.writeAll(support.HEADER[0..list_start]);
+    for (0..groups) |n| try source.writer.print("<referenceableParamGroup id='g{d}'><cvParam accession='X:{d}'/></referenceableParamGroup>", .{ n, n });
+    try source.writer.writeAll(support.HEADER[list_start..]);
+    try source.writer.writeAll("<spectrumList count='1' defaultDataProcessingRef='dp'><spectrum id='s' index='0' defaultArrayLength='1'>" ++
+        "<binaryDataArrayList count='1'><binaryDataArray encodedLength='12'><referenceableParamGroupRef ref='encoding'/>");
+    // 50 references to the last group: R * (G + 3) comparisons once passed the expansion budget.
+    for (0..50) |_| try source.writer.writeAll("<referenceableParamGroupRef ref=' g19999 '/>");
+    try source.writer.writeAll("<binary>AAAAAAAA8D8=</binary></binaryDataArray></binaryDataArrayList></spectrum></spectrumList></run></mzML>");
+    const document = try std.mem.replaceOwned(u8, allocator, source.written(), "referenceableParamGroupList count='1'", "referenceableParamGroupList count='20001'");
+    defer allocator.free(document);
+
+    var input = std.Io.Reader.fixed(document);
+    var reader = try mzml.StreamReader.init(allocator, &input, .{});
+    defer reader.deinit();
+    _ = try reader.readHeader();
+    var output = mzml.StreamReader.DecodedArrays.init(allocator, .{});
+    defer output.deinit();
+    const record = (try reader.nextDecodedRecord(&output)).?;
+    try std.testing.expectEqualSlices(f64, &.{1}, output.get(0).?.values.float64);
+    try std.testing.expectEqual(@as(?usize, groups - 1), record.binaryArrays()[0].params[1].group_ref.position);
+
+    // A repeated ID gets no position, so referencing it still reports the duplicate.
+    const repeated = try std.mem.replaceOwned(u8, allocator, document, "id='g19998'", "id='g19999'");
+    defer allocator.free(repeated);
+    var repeated_input = std.Io.Reader.fixed(repeated);
+    var repeated_reader = try mzml.StreamReader.init(allocator, &repeated_input, .{});
+    defer repeated_reader.deinit();
+    try std.testing.expectError(error.DuplicateGroup, repeated_reader.nextDecodedRecord(&output));
+}
+
 fn expectSameValues(expected: mzml.StreamReader.DecodedArrays.Values, actual: mzml.StreamReader.DecodedArrays.Values) !void {
     try std.testing.expectEqual(std.meta.activeTag(expected), std.meta.activeTag(actual));
     switch (expected) {
@@ -863,7 +899,7 @@ test "[integration] - [mzML parameters]: preserves source order and absent field
     const expected = [_]mzml.cv.Entry{
         .{ .user = .{ .value = "" } },
         .{ .cv = .{ .accession = .{ .raw = "X:first" } } },
-        .{ .group_ref = .{ .ref = "encoding" } },
+        .{ .group_ref = .{ .ref = "encoding", .position = 0 } },
         .{ .cv = .{} },
         .{ .user = .{ .name = "", .unit = .{ .name = "" } } },
         .{ .group_ref = .{ .ref = null } },
@@ -875,7 +911,10 @@ test "[integration] - [mzML parameters]: preserves source order and absent field
     var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
     defer reader.deinit();
     const header = try reader.readHeader();
-    try std.testing.expectEqualDeep(&expected, header.run.params);
+    // References read before the group list have no recorded group position.
+    var header_expected = expected;
+    header_expected[2].group_ref.position = null;
+    try std.testing.expectEqualDeep(&header_expected, header.run.params);
     const record = (try reader.nextRecord()).?;
     try std.testing.expectEqualDeep(&expected, record.node.params);
     try std.testing.expectEqual(null, try reader.nextRecord());
@@ -886,7 +925,7 @@ test "[integration] - [mzML parameters]: preserves source order and absent field
     defer output.deinit();
     var fetched = (try index.atDecoded(std.testing.allocator, .spectrum, 0, &output)).?;
     defer fetched.deinit();
-    try std.testing.expectEqualDeep(&expected, index.header().run.params);
+    try std.testing.expectEqualDeep(&header_expected, index.header().run.params);
     try std.testing.expectEqualDeep(&expected, fetched.value.node.params);
     try std.testing.expectEqual(@as(usize, 2), output.len());
     for (0..output.len()) |i| try std.testing.expectEqualSlices(f64, &.{1}, output.get(i).?.values.float64);
@@ -906,7 +945,7 @@ test "[integration] - [mzML parameters]: preserves parent parameters between chi
     try std.testing.expectEqualDeep(&[_]mzml.cv.Entry{
         .{ .user = .{ .name = "first" } },
         .{ .cv = .{ .accession = .{ .raw = "MS:1000511" }, .value = "2" } },
-        .{ .group_ref = .{ .ref = "encoding" } },
+        .{ .group_ref = .{ .ref = "encoding", .position = 0 } },
         .{ .user = .{ .name = "last" } },
     }, record.node.params);
     try std.testing.expectEqual(@as(?i32, 2), try record.msLevel((try reader.readHeader()).groups));

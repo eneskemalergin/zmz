@@ -8,7 +8,12 @@ pub const XML_WHITESPACE = " \t\r\n";
 
 /// Compares ID or IDREF values after collapsing surrounding XML whitespace.
 pub fn sameId(a: []const u8, b: []const u8) bool {
-    return std.mem.eql(u8, std.mem.trim(u8, a, XML_WHITESPACE), std.mem.trim(u8, b, XML_WHITESPACE));
+    return std.mem.eql(u8, idKey(a), idKey(b));
+}
+
+/// An ID or IDREF value with surrounding XML whitespace removed, as `sameId` compares it.
+pub fn idKey(id: []const u8) []const u8 {
+    return std.mem.trim(u8, id, XML_WHITESPACE);
 }
 
 /// Attribute text after XML normalization. Names may include a source prefix;
@@ -105,6 +110,10 @@ pub const UserParam = struct {
 pub const GroupRef = struct {
     ref: ?[]const u8 = null,
     xml: ?*const ParameterXml = null,
+    /// The group's position in the groups a reader resolved this reference against, set only
+    /// when its ID is unique there. Expansion uses it when the ID at that position matches and
+    /// otherwise searches every group, so a caller leaves it null.
+    position: ?usize = null,
 };
 
 /// A source entry; sequences preserve ordering, repetition, and group references.
@@ -173,6 +182,11 @@ pub const EffectiveIterator = struct {
             self.position += 1;
             if (entry != .group_ref) return entry;
             const id = entry.group_ref.ref orelse return error.MissingGroup;
+            if (entry.group_ref.position) |position| if (position < self.groups.len and sameId(id, self.groups[position].id)) {
+                self.expanded = self.groups[position].entries;
+                self.expanded_position = 0;
+                continue;
+            };
             var found: ?[]const Entry = null;
             for (self.groups) |group| {
                 try self.charge();

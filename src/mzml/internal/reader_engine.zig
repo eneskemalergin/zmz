@@ -93,6 +93,11 @@ header_store: Storage,
 record_store: Storage,
 header: model.Header = undefined,
 header_ready: bool = false,
+// The groups that references in records resolve against, and each unique ID's position in
+// them (`REPEATED_ID` for a repeated ID), built once per groups slice.
+reference_groups: []const cv.Group = &.{},
+group_positions: std.StringHashMapUnmanaged(usize) = .empty,
+group_positions_of: []const cv.Group = &.{},
 done: bool = false,
 failure: ?Diagnostic = null,
 active_list: ?model.Kind = null,
@@ -135,6 +140,7 @@ pub fn deinit(self: *StreamReader) void {
     self.cursor.deinit();
     self.child_scratch.deinit(self.allocator);
     self.param_scratch.deinit(self.allocator);
+    self.group_positions.deinit(self.allocator);
     self.header_store.arena.deinit();
     self.record_store.arena.deinit();
     self.* = undefined;
@@ -528,6 +534,7 @@ fn readHeaderInner(self: *StreamReader) Error!void {
     }
     self.header = .{ .document = document, .run = run, .namespace_uri = self.cursor.mzml_namespace, .groups = groups, .indexed = indexed };
     self.header_ready = true;
+    self.reference_groups = groups;
     try self.openList();
 }
 
@@ -908,7 +915,7 @@ fn parseParams(self: *StreamReader, storage: *Storage, comptime retain: bool, co
             .accession = if (attrs.unit_accession) |value| .{ .raw = value } else null,
         };
         const entry: cv.Entry = switch (selected) {
-            0 => .{ .group_ref = .{ .ref = attrs.ref, .xml = extra } },
+            0 => .{ .group_ref = .{ .ref = attrs.ref, .xml = extra, .position = try self.groupPosition(attrs.ref) } },
             1 => .{ .cv = .{
                 .cv_ref = attrs.cv_ref,
                 .name = attrs.name,
@@ -997,6 +1004,26 @@ fn copyParamAttributes(storage: *Storage, start: xml.StartElement, selected: u2,
         }
     }
     return result;
+}
+
+const REPEATED_ID = std.math.maxInt(usize);
+
+// The position of the group a reference names, when its ID is unique in reference_groups.
+fn groupPosition(self: *StreamReader, ref: ?[]const u8) Error!?usize {
+    const groups = self.reference_groups;
+    const id = ref orelse return null;
+    if (groups.len == 0) return null;
+    if (groups.ptr != self.group_positions_of.ptr or groups.len != self.group_positions_of.len) {
+        self.group_positions.clearRetainingCapacity();
+        try self.group_positions.ensureTotalCapacity(self.allocator, std.math.cast(u32, groups.len) orelse return error.LimitExceeded);
+        for (groups, 0..) |group, position| {
+            const slot = self.group_positions.getOrPutAssumeCapacity(cv.idKey(group.id));
+            slot.value_ptr.* = if (slot.found_existing) REPEATED_ID else position;
+        }
+        self.group_positions_of = groups;
+    }
+    const position = self.group_positions.get(cv.idKey(id)) orelse return null;
+    return if (position == REPEATED_ID) null else position;
 }
 
 fn copyAttributes(
