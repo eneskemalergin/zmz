@@ -2,7 +2,6 @@
 set -euo pipefail
 
 TOOLS_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-REPO_DIR=$(cd "$TOOLS_DIR/.." && pwd)
 BIN_DIR="$TOOLS_DIR/bin"
 READER_PEERS=(mzdata-peer pyteomics-peer pymzml-peer mzmlpy-peer pyopenms-peer)
 CODEC_PEERS=(ms-numpress-cpp-peer numpress-rs-peer)
@@ -184,11 +183,6 @@ benchmark_readers() {
 
 vector_values() {
   local algorithm=$1
-  local vector_file="$REPO_DIR/tmp/bench/numpress.tsv"
-  if [[ -f "$vector_file" ]]; then
-    awk -v algorithm="$algorithm" '$1 == algorithm { print $2 }' "$vector_file"
-    return
-  fi
   case "$algorithm" in
     linear) printf '%s\n' 100.0 100.1 100.2 100.3 100.4 100.5 100.6 100.7 ;;
     pic) printf '%s\n' 0 1 2 3 4 5 6 7 8 9 10 ;;
