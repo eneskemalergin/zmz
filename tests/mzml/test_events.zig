@@ -57,6 +57,18 @@ test "[unit] - [mzML events]: report source spans of every element in any root a
     }
 }
 
+test "[regression] - [mzML events]: an undeclared default namespace is null in both spellings" {
+    var input = std.Io.Reader.fixed("<r xmlns='urn:r'><a xmlns=''/><b/></r>");
+    var events = try mzml.Events.init(std.testing.allocator, &input, .{});
+    defer events.deinit();
+    _ = try events.next();
+    const a = (try events.next()).?.data.start_element;
+    try std.testing.expectEqual(@as(?[]const u8, null), a.name.expanded.namespace_uri);
+    _ = try events.next();
+    const b = (try events.next()).?.data.start_element;
+    try std.testing.expectEqualStrings("urn:r", b.name.expanded.namespace_uri.?);
+}
+
 test "[unit] - [mzML events]: give attributes decoded and namespaces resolved" {
     var input = std.Io.Reader.fixed("<root xmlns='urn:d' xmlns:p='urn:p' a='&lt;1&gt;' p:b='2'><p:c/></root>");
     var events = try mzml.Events.init(std.testing.allocator, &input, .{});

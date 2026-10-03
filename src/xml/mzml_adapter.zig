@@ -1351,6 +1351,12 @@ pub const Cursor = struct {
         }
     }
 
+    // `xmlns=""` undeclares the default namespace: no namespace, as when none is bound.
+    fn defaultNamespace(self: *const Cursor) ?[]const u8 {
+        const uri = self.resolveNamespace(null) orelse return null;
+        return if (uri.len == 0) null else uri;
+    }
+
     fn resolveNamespace(self: *const Cursor, prefix: ?[]const u8) ?[]const u8 {
         if (prefix) |value| if (std.mem.eql(u8, value, "xml")) return XML_NAMESPACE;
         const wanted = prefix orelse "";
@@ -1371,8 +1377,9 @@ pub const Cursor = struct {
         const raw = bytes[range.start..][0..range.len];
         const prefix = if (range.prefix_len == 0) null else raw[0..range.prefix_len];
         const local = if (range.prefix_len == 0) raw else raw[range.prefix_len + 1 ..];
-        const namespace_uri = if (attribute and prefix == null) null else self.resolveNamespace(prefix);
-        if (prefix != null and namespace_uri == null) return self.malformedAt(.unbound_prefix, offset);
+        const namespace_uri = if (prefix) |value|
+            self.resolveNamespace(value) orelse return self.malformedAt(.unbound_prefix, offset)
+        else if (attribute) null else self.defaultNamespace();
         return .{ .raw = raw, .expanded = .{
             .prefix = prefix,
             .local = local,
