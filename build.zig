@@ -2,7 +2,11 @@
 
 const std = @import("std");
 
-const ZipirKernelBackend = enum { dispatch, portable };
+const KernelBackend = enum { dispatch, portable };
+/// How the x86-64-v3 zlib decoder reaches a build: the target already has the features (the
+/// module's own decoder is that fast), a separate object chosen at run time, or not at all.
+const FastZlib = enum { direct, object, absent };
+const V3_FEATURES = [_]std.Target.x86.Feature{ .avx, .avx2, .bmi, .bmi2, .f16c, .fma, .lzcnt, .movbe };
 const LibraryTest = struct {
     root_source_file: []const u8,
     add_gates_support: bool = false,
@@ -20,36 +24,74 @@ const library_test_specs = [_]LibraryTest{
     .{ .root_source_file = "tests/mzml/test_events.zig" },
 };
 
-fn configureLibraryModule(
-    module: *std.Build.Module,
-    base64_options: *std.Build.Step.Options,
+const Kernels = struct {
+    options: *std.Build.Step.Options,
     zipir: *std.Build.Module,
-) void {
-    module.addImport("zipir", zipir);
-    module.addOptions("base64_options", base64_options);
+    fast_zlib: ?*std.Build.Step.Compile,
+};
+
+fn configureLibraryModule(module: *std.Build.Module, library_kernels: Kernels) void {
+    module.addImport("zipir", library_kernels.zipir);
+    module.addOptions("kernel_options", library_kernels.options);
+    if (library_kernels.fast_zlib) |object| module.addObject(object);
+}
+
+/// One option for every CPU-specific path: Base64's AVX2, SHA-1's SHA extensions, zipir's
+/// checksum kernels, and the x86-64-v3 zlib decoder, each chosen at run time under `dispatch`.
+fn buildKernels(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, backend: KernelBackend) Kernels {
+    const zipir = b.dependency("zipir", .{ .target = target, .optimize = optimize, .@"kernel-backend" = backend }).module("zipir");
+    const fast_zlib: FastZlib = if (backend == .portable or target.result.cpu.arch != .x86_64)
+        .absent
+    else if (std.Target.x86.featureSetHasAll(target.result.cpu.features, V3_FEATURES))
+        .direct
+    else
+        .object;
+    const options = b.addOptions();
+    options.addOption(bool, "dispatch", backend == .dispatch);
+    options.addOption(FastZlib, "zlib_fast", fast_zlib);
+    options.addOption(bool, "as_object", false);
+    var object: ?*std.Build.Step.Compile = null;
+    if (fast_zlib == .object) {
+        var query = target.query;
+        query.cpu_model = .{ .explicit = &std.Target.x86.cpu.x86_64_v3 };
+        // PCLMUL (on every x86-64-v3 CPU) keeps zipir's CRC-32 kernel inside this instance, so
+        // its exported symbols are not linked twice.
+        query.cpu_features_add = std.Target.x86.featureSet(&.{.pclmul});
+        query.cpu_features_sub = .empty;
+        const v3_target = b.resolveTargetQuery(query);
+        // zlib.zig again, built for x86-64-v3, exporting its fast decoder (see zlib.zig).
+        const object_options = b.addOptions();
+        object_options.addOption(bool, "dispatch", true);
+        object_options.addOption(FastZlib, "zlib_fast", .absent);
+        object_options.addOption(bool, "as_object", true);
+        const module = b.createModule(.{
+            .root_source_file = b.path("src/binary/zlib.zig"),
+            .target = v3_target,
+            .optimize = optimize,
+            .single_threaded = true,
+        });
+        module.addImport("zipir", b.dependency("zipir", .{ .target = v3_target, .optimize = optimize, .@"kernel-backend" = backend }).module("zipir"));
+        module.addOptions("kernel_options", object_options);
+        object = b.addObject(.{ .name = "zmz_zlib_fast", .root_module = module, .use_llvm = true });
+    }
+    return .{ .options = options, .zipir = zipir, .fast_zlib = object };
 }
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{ .default_target = .{ .cpu_model = .baseline } });
     const optimize = b.standardOptimizeOption(.{});
     const strip = optimize == .ReleaseFast or optimize == .ReleaseSmall;
-    const zipir_kernel_backend = b.option(
-        ZipirKernelBackend,
-        "zipir_kernel_backend",
-        "Select zipir's runtime-dispatched or portable checksum kernels",
+    const kernel_backend = b.option(
+        KernelBackend,
+        "kernel_backend",
+        "dispatch: pick CPU-specific code for the running CPU; portable: never use it",
     ) orelse .dispatch;
-    const zipir = b.dependency("zipir", .{
-        .target = target,
-        .optimize = optimize,
-        .@"kernel-backend" = zipir_kernel_backend,
-    }).module("zipir");
+    const library_kernels = buildKernels(b, target, optimize, kernel_backend);
     const zmz = b.addModule("zmz", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
     });
-    const base64_options = b.addOptions();
-    base64_options.addOption(bool, "simd", b.option(bool, "base64_simd", "Select AVX2 at runtime when available; false forces scalar") orelse true);
-    configureLibraryModule(zmz, base64_options, zipir);
+    configureLibraryModule(zmz, library_kernels);
 
     const test_step = b.step("test", "Run library tests");
     const gates_test_support = b.createModule(.{
@@ -77,7 +119,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .strip = strip,
     });
-    configureLibraryModule(package_tests_module, base64_options, zipir);
+    configureLibraryModule(package_tests_module, library_kernels);
     const package_tests = b.addTest(.{ .root_module = package_tests_module });
     test_step.dependOn(&b.addRunArtifact(package_tests).step);
 

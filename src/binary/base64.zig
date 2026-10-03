@@ -4,11 +4,11 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const options = @import("base64_options");
+const kernel = @import("kernel_options");
 const core = @import("core.zig");
 const overlaps = core.overlaps;
 // Zig's self-hosted x86 backend cannot assemble vector memory operands yet.
-const USE_AVX2 = builtin.cpu.arch == .x86_64 and options.simd and builtin.zig_backend == .stage2_llvm;
+const USE_AVX2 = builtin.cpu.arch == .x86_64 and kernel.dispatch and builtin.zig_backend == .stage2_llvm;
 
 pub const Error = error{
     InvalidCharacter,

@@ -5,7 +5,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const core = @import("core.zig");
 
-const USE_SHA_NI = builtin.cpu.arch == .x86_64 and builtin.zig_backend == .stage2_llvm;
+const USE_SHA_NI = builtin.cpu.arch == .x86_64 and builtin.zig_backend == .stage2_llvm and @import("kernel_options").dispatch;
 
 /// Streaming SHA-1 with std's update and finalResult. It keeps std's state, partial block,
 /// and padding; only whole blocks take the SHA extension path.

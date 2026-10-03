@@ -9,6 +9,7 @@ const AVX_STATE: u32 = (1 << 26) | (1 << 27) | (1 << 28);
 // Zero until detected, then 1 for absent and 2 for present.
 var avx2_cached = std.atomic.Value(u8).init(0);
 var sha_cached = std.atomic.Value(u8).init(0);
+var v3_cached = std.atomic.Value(u8).init(0);
 
 pub fn hasAvx2() bool {
     return cached(&avx2_cached, detectAvx2);
@@ -17,6 +18,12 @@ pub fn hasAvx2() bool {
 /// SHA extensions with the SSSE3 byte shuffle their message loads need.
 pub fn hasSha() bool {
     return cached(&sha_cached, detectSha);
+}
+
+/// Every x86-64-v3 feature and PCLMUL (what the fast zlib decoder object is built for) and the
+/// OS state for its vector registers.
+pub fn hasX86_64V3() bool {
+    return cached(&v3_cached, detectV3);
 }
 
 fn cached(cache: *std.atomic.Value(u8), comptime detect: fn () bool) bool {
@@ -48,6 +55,29 @@ fn detectAvx2() bool {
         : [_] "{ecx}" (@as(u32, 0)),
         : .{ .edx = true });
     return avx2Usable(leaf1, leaf7, xcr0);
+}
+
+// x86-64-v3 bits, plus PCLMUL the object is also built with. Leaf 1 ECX: SSE3, PCLMUL, SSSE3,
+// FMA, CX16, SSE4.1, SSE4.2, MOVBE, POPCNT, XSAVE, OSXSAVE, AVX, F16C. Leaf 7 EBX: BMI1, AVX2,
+// BMI2. Leaf 0x80000001 ECX: LAHF, LZCNT.
+const V3_LEAF1: u32 = (1 << 0) | (1 << 1) | (1 << 9) | (1 << 12) | (1 << 13) | (1 << 19) | (1 << 20) | (1 << 22) | (1 << 23) | (1 << 26) | (1 << 27) | (1 << 28) | (1 << 29);
+const V3_LEAF7: u32 = (1 << 3) | (1 << 5) | (1 << 8);
+const V3_EXTENDED: u32 = (1 << 0) | (1 << 5);
+
+fn detectV3() bool {
+    if (cpuid(0, 0).eax < 7 or cpuid(0x80000000, 0).eax < 0x80000001) return false;
+    const leaf1 = cpuid(1, 0).ecx;
+    if (leaf1 & AVX_STATE != AVX_STATE) return false;
+    const xcr0 = asm volatile (
+        \\xgetbv
+        : [_] "={eax}" (-> u32),
+        : [_] "{ecx}" (@as(u32, 0)),
+        : .{ .edx = true });
+    return v3Usable(leaf1, cpuid(7, 0).ebx, cpuid(0x80000001, 0).ecx, xcr0);
+}
+
+fn v3Usable(leaf1: u32, leaf7: u32, extended: u32, xcr0: u32) bool {
+    return leaf1 & V3_LEAF1 == V3_LEAF1 and leaf7 & V3_LEAF7 == V3_LEAF7 and extended & V3_EXTENDED == V3_EXTENDED and xcr0 & 6 == 6;
 }
 
 fn detectSha() bool {
@@ -114,4 +144,15 @@ test "[property] - [base64 dispatch]: cached scalar fallback preserves both dire
     try std.testing.expectEqualSlices(u8, std.base64.standard.Encoder.encode(&expected, &source), text);
     const counts = try base64.decode(&decoded, text);
     try std.testing.expectEqualSlices(u8, &source, decoded[0..counts.decoded_bytes]);
+}
+
+test "[property] - [x86-64-v3 detection]: requires every feature and OS vector state" {
+    try std.testing.expect(v3Usable(V3_LEAF1, V3_LEAF7, V3_EXTENDED, 6));
+    for (0..32) |bit| {
+        const mask = @as(u32, 1) << @intCast(bit);
+        if (V3_LEAF1 & mask != 0) try std.testing.expect(!v3Usable(V3_LEAF1 & ~mask, V3_LEAF7, V3_EXTENDED, 6));
+        if (V3_LEAF7 & mask != 0) try std.testing.expect(!v3Usable(V3_LEAF1, V3_LEAF7 & ~mask, V3_EXTENDED, 6));
+        if (V3_EXTENDED & mask != 0) try std.testing.expect(!v3Usable(V3_LEAF1, V3_LEAF7, V3_EXTENDED & ~mask, 6));
+    }
+    try std.testing.expect(!v3Usable(V3_LEAF1, V3_LEAF7, V3_EXTENDED, 2));
 }
