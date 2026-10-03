@@ -628,13 +628,14 @@ const SlofCodes = @Vector(SLOF_LANES, u16);
 
 // The codes of a SLOF block, or null when a value needs the checked path. Codes whose scaled
 // logarithm lies within `guard` of a rounding boundary are recomputed with the glibc-exact
-// scalar log, so every code matches C++.
+// scalar log, so every code matches C++; the range limit is such a boundary, so a block within
+// `guard` of 65535 takes the checked path, which rejects what C++ rejects.
 inline fn slofBlock(values: anytype, fixed_point: f64, guard: f64) ?SlofCodes {
     const v = load(SLOF_LANES, values, 0);
     const valid = (v >= @as(SlofF64s, @splat(0))) & (v <= @as(SlofF64s, @splat(std.math.floatMax(f64))));
     if (!@reduce(.And, valid)) return null;
     const scaled = logAtLeastOne(SLOF_LANES, v + @as(SlofF64s, @splat(1.0))) * @as(SlofF64s, @splat(fixed_point));
-    if (!@reduce(.And, scaled <= @as(SlofF64s, @splat(65_535.0)))) return null;
+    if (!@reduce(.And, scaled <= @as(SlofF64s, @splat(65_535.0 - guard)))) return null;
     const shifted = scaled + @as(SlofF64s, @splat(0.5));
     const truncated: @Vector(SLOF_LANES, i32) = @intFromFloat(shifted);
     const fraction = shifted - @as(SlofF64s, @floatFromInt(truncated));

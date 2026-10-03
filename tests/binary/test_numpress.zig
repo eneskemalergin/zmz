@@ -299,6 +299,37 @@ fn expectLinearErrorBound(expected: []const f64, actual: []const f64, fixed_poin
     }
 }
 
+test "[regression] - [numpress SLOF]: block and value encoders agree at the 65535 boundary" {
+    const fixed_point = 2.636635300905972e4;
+    const value = 1.1007773364781926e1;
+    var one: [8 + 2]u8 = undefined;
+    var many: [8 + 32]u8 = undefined;
+    try std.testing.expectError(error.ValueOutOfRange, numpress.encodeSlof(&[_]f64{value}, fixed_point, &one));
+    try std.testing.expectError(error.ValueOutOfRange, numpress.encodeSlof(&([_]f64{value} ** 16), fixed_point, &many));
+}
+
+test "[property] - [numpress SLOF]: a block of 16 encodes like each value alone around the range limit" {
+    var random = std.Random.DefaultPrng.init(0x534c_4f46_4c49_4d49);
+    const source = random.random();
+    var one: [8 + 2]u8 = undefined;
+    var many: [8 + 32]u8 = undefined;
+    for (0..200) |_| {
+        const fixed_point = 100.0 + source.float(f64) * 60_000.0;
+        // The value whose scaled logarithm is the limit, then a few ULPs either side of it.
+        var value = std.math.expm1(65_535.0 / fixed_point);
+        for (0..4) |_| value = std.math.nextAfter(f64, value, 0);
+        for (0..9) |_| {
+            const alone = numpress.encodeSlof(&[_]f64{value}, fixed_point, &one);
+            const block = numpress.encodeSlof(&([_]f64{value} ** 16), fixed_point, &many);
+            if (alone) |_| {
+                _ = try block;
+                for (0..16) |lane| try std.testing.expectEqualSlices(u8, one[8..10], many[8 + 2 * lane ..][0..2]);
+            } else |err| try std.testing.expectError(err, block);
+            value = std.math.nextAfter(f64, value, std.math.inf(f64));
+        }
+    }
+}
+
 test "[property] - [numpress encoders]: block encoding matches the value-by-value encoding" {
     var random = std.Random.DefaultPrng.init(0x4e55_4d50_424c_4f43);
     const source = random.random();
