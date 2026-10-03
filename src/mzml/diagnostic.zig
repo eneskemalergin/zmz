@@ -130,6 +130,7 @@ pub const Limit = enum {
     list_entries,
     binary_text_bytes,
     array_bytes,
+    record_array_bytes,
     index_bytes,
     record_span_bytes,
     records,

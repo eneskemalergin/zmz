@@ -37,6 +37,9 @@ pub const Options = struct {
     /// Bounds each array's decoded typed bytes, allocated from its declared length. The reader's
     /// binary_text_bytes bounds the Base64 text.
     array_bytes: usize = 192 * 1024 * 1024,
+    /// Bounds the decoded typed bytes of all of a record's arrays together, so the memory one
+    /// record takes does not grow with its array count.
+    record_array_bytes: usize = 512 * 1024 * 1024,
     /// Numpress decodes to f64. `declared` returns arrays declared 32-bit float as f32, rounded
     /// to the nearest (as pyteomics and pyOpenMS do); integer declarations stay f64.
     numpress_precision: enum { decoded, declared } = .decoded,
@@ -284,6 +287,12 @@ fn beginArrayWith(self: *DecodedArrays, encoding: model.Encoding, length: usize,
     const bytes = std.math.mul(usize, length, output.primitive().size()) catch return error.LengthOverflow;
     if (bytes > self.options.array_bytes) {
         self.failure = .{ .stage = .array, .detail = .{ .limit = .{ .name = .array_bytes, .maximum = self.options.array_bytes, .needed = bytes } } };
+        return error.LimitExceeded;
+    }
+    var record_bytes = bytes;
+    for (self.outputs.items[0 .. self.count - 1]) |previous| record_bytes +|= previous.bytes;
+    if (record_bytes > self.options.record_array_bytes) {
+        self.failure = .{ .stage = .array, .detail = .{ .limit = .{ .name = .record_array_bytes, .maximum = self.options.record_array_bytes, .needed = record_bytes } } };
         return error.LimitExceeded;
     }
     try output.words.resize(self.allocator, bytes / 8 + @intFromBool(bytes % 8 != 0));

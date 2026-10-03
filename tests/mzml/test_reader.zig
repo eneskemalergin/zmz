@@ -55,6 +55,29 @@ test "[failure] - [mzML diagnostics]: retains selected source positions and phys
     }
 }
 
+test "[failure] - [mzML diagnostics]: bounds the decoded bytes of a record's arrays together" {
+    // The fixture's spectrum has two one-value f64 arrays: 16 decoded bytes in all.
+    var fits_input = std.Io.Reader.fixed(support.DOCUMENT);
+    var fits_reader = try mzml.StreamReader.init(std.testing.allocator, &fits_input, .{});
+    defer fits_reader.deinit();
+    var fits = mzml.StreamReader.DecodedArrays.init(std.testing.allocator, .{ .record_array_bytes = 16 });
+    defer fits.deinit();
+    _ = (try fits_reader.nextDecodedRecord(&fits)).?;
+    try std.testing.expectEqual(@as(usize, 2), fits.len());
+
+    var input = std.Io.Reader.fixed(support.DOCUMENT);
+    var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+    defer reader.deinit();
+    var output = mzml.StreamReader.DecodedArrays.init(std.testing.allocator, .{ .record_array_bytes = 15 });
+    defer output.deinit();
+    try std.testing.expectError(error.LimitExceeded, reader.nextDecodedRecord(&output));
+    const report = reader.diagnostic().?;
+    try std.testing.expectEqual(.record_array_bytes, report.detail.limit.name);
+    try std.testing.expectEqual(@as(u64, 15), report.detail.limit.maximum);
+    try std.testing.expectEqual(@as(u64, 16), report.detail.limit.needed.?);
+    try std.testing.expectEqual(@as(usize, 1), report.array_position.?);
+}
+
 test "[failure] - [mzML diagnostics]: names selected array attributes limits and encoding origins" {
     inline for (.{
         .{ "arrayLength='bad'", error.InvalidValue, mzml.Diagnostic.Id.invalid_value },
