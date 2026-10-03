@@ -107,8 +107,9 @@ pub fn namespaceAt(self: *const Events, position: *usize) ?Namespace {
     return self.cursor.namespaceAt(position);
 }
 
-/// Returns a copy of the first failure: the error, the input offset of the failing event, and
-/// the broken XML rule or exceeded limit when known.
+/// Returns a copy of the first failure: the error, its input offset (the offending byte for
+/// broken XML rules and encodings, otherwise the failing event), and the broken XML rule or
+/// exceeded limit when known.
 pub fn diagnostic(self: *const Events) ?Diagnostic {
     return self.failure;
 }

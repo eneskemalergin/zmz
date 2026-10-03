@@ -238,6 +238,8 @@ const Source = struct {
     pending: [4]Codepoint = undefined,
     pending_len: usize = 0,
     borrowed_len: usize = 0,
+    // Start of the last codepoint read or peeked, including one that failed to decode.
+    last_start: u64 = 0,
 
     fn init(reader: *std.Io.Reader) Source {
         return .{ .reader = reader };
@@ -331,19 +333,19 @@ const Source = struct {
             var index: usize = 1;
             while (index < self.pending_len) : (index += 1) self.pending[index - 1] = self.pending[index];
             self.pending_len -= 1;
+            self.last_start = value.start;
             return value;
         }
 
         try self.ensureDetected();
         const start = self.position;
+        self.last_start = start;
         if (self.encoding == .utf16_le or self.encoding == .utf16_be) {
             const unit = try self.readUtf16Unit();
             if (unit >= 0xD800 and unit <= 0xDBFF) {
-                const next = self.readUtf16Unit() catch |err| return switch (err) {
-                    error.EndOfStream => error.InvalidEncoding,
-                    else => err,
-                };
-                if (next < 0xDC00 or next > 0xDFFF) return error.InvalidEncoding;
+                const next_start = self.position;
+                const next = self.readUtf16Unit() catch |err| return self.brokenAt(next_start, err);
+                if (next < 0xDC00 or next > 0xDFFF) return self.brokenAt(next_start, error.InvalidEncoding);
                 const value: u21 = 0x10000 +
                     (@as(u21, unit - 0xD800) << 10) +
                     @as(u21, next - 0xDC00);
@@ -355,19 +357,34 @@ const Source = struct {
 
         const first = try self.readByte();
         if (first < 0x80 or self.encoding == .latin1) return .{ .value = first, .start = start, .end = self.position };
-        const length: usize = std.unicode.utf8ByteSequenceLength(first) catch return error.InvalidEncoding;
-        if (length < 2 or length > 4) return error.InvalidEncoding;
-        var bytes: [4]u8 = undefined;
-        bytes[0] = first;
+        // Unicode's well-formed sequences: the first byte sets the length and the second byte's
+        // range, so a failure is reported at the first byte that cannot continue the sequence.
+        const length: u3, const low: u8, const high: u8 = switch (first) {
+            0xC2...0xDF => .{ 2, 0x80, 0xBF },
+            0xE0 => .{ 3, 0xA0, 0xBF },
+            0xE1...0xEC, 0xEE, 0xEF => .{ 3, 0x80, 0xBF },
+            0xED => .{ 3, 0x80, 0x9F },
+            0xF0 => .{ 4, 0x90, 0xBF },
+            0xF1...0xF3 => .{ 4, 0x80, 0xBF },
+            0xF4 => .{ 4, 0x80, 0x8F },
+            else => return error.InvalidEncoding,
+        };
+        var value: u21 = first & (@as(u8, 0x7F) >> length);
         for (1..length) |index| {
-            const byte = self.readByte() catch |err| return switch (err) {
-                error.EndOfStream => error.InvalidEncoding,
-                else => err,
-            };
-            bytes[index] = byte;
+            const byte_start = self.position;
+            const byte = self.readByte() catch |err| return self.brokenAt(byte_start, err);
+            if (byte < (if (index == 1) low else 0x80) or byte > (if (index == 1) high else 0xBF))
+                return self.brokenAt(byte_start, error.InvalidEncoding);
+            value = (value << 6) | (byte & 0x3F);
         }
-        const value = std.unicode.utf8Decode(bytes[0..length]) catch return error.InvalidEncoding;
         return .{ .value = value, .start = start, .end = self.position };
+    }
+
+    // A sequence broken at offset, or cut off there by the end of input.
+    fn brokenAt(self: *Source, offset: u64, err: ParserError) ParserError {
+        if (err != error.EndOfStream and err != error.InvalidEncoding) return err;
+        self.last_start = offset;
+        return error.InvalidEncoding;
     }
 
     fn unread(self: *Source, value: Codepoint) Error!void {
@@ -387,6 +404,11 @@ const Source = struct {
 
     fn currentOffset(self: *const Source) u64 {
         return if (self.pending_len != 0) self.pending[0].start else self.position;
+    }
+
+    // Bytes per ASCII character.
+    fn unitWidth(self: *const Source) u64 {
+        return if (self.encoding == .utf16_le or self.encoding == .utf16_be) 2 else 1;
     }
 
     fn commitBorrowed(self: *Source) ParserError!void {
@@ -425,6 +447,7 @@ const AttributeRange = struct {
 const NamespaceDeclaration = struct {
     prefix: Range,
     uri: Range,
+    offset: u64,
 };
 
 const NamespaceBinding = struct {
@@ -486,6 +509,10 @@ pub const Cursor = struct {
     limit_failure: ?enum { depth, attributes, attribute_bytes, nodes, declaration_bytes } = null,
     // The rule broken by the input when `failure` is `InvalidXml`.
     xml_rule: ?Rule = null,
+    // Where the input broke a rule or its declared encoding, reported as `offset`.
+    failure_offset: ?u64 = null,
+    // Source offset of the XML declaration's first byte after `<?xml `.
+    declaration_start: u64 = 0,
     // The bytes an over-limit attribute value needed, when known.
     limit_needed: ?usize = null,
 
@@ -574,6 +601,7 @@ pub const Cursor = struct {
         self.limit_failure = null;
         self.limit_needed = null;
         self.xml_rule = null;
+        self.failure_offset = null;
         self.current = null;
         self.offset = 0;
         self.document_started = false;
@@ -615,7 +643,7 @@ pub const Cursor = struct {
         self.current = null;
         while (true) {
             const maybe_event = self.nextEvent(!text) catch |err| {
-                self.offset = self.source.currentOffset();
+                self.offset = self.failedAt(err);
                 if (err == error.EndOfStream or err == error.NoText)
                     self.xml_rule = if (err == error.EndOfStream) .unexpected_end else .malformed_markup;
                 return switch (err) {
@@ -713,13 +741,13 @@ pub const Cursor = struct {
                     for (start.attributes) |attribute| try output.attribute(attribute.name.raw, attribute.value);
                 },
                 .end_element => {
-                    if (nesting == 0) return self.malformed(.mismatched_end_tag);
+                    if (nesting == 0) return self.malformedAt(.mismatched_end_tag, event.span.start);
                     try output.endElement();
                     nesting -= 1;
                     if (nesting == 0) return;
                 },
                 .text => |value| try output.text(value.bytes),
-                else => return self.malformed(.malformed_markup),
+                else => return self.malformedAt(.malformed_markup, event.span.start),
             }
             try self.advanceFragment(true);
         }
@@ -737,12 +765,12 @@ pub const Cursor = struct {
                     nesting += 1;
                 },
                 .end_element => {
-                    if (nesting == 0) return self.malformed(.mismatched_end_tag);
+                    if (nesting == 0) return self.malformedAt(.mismatched_end_tag, event.span.start);
                     nesting -= 1;
                     if (nesting == 0) return;
                 },
                 .text => {},
-                else => return self.malformed(.malformed_markup),
+                else => return self.malformedAt(.malformed_markup, event.span.start),
             }
             try self.advanceFragment(true);
         }
@@ -759,9 +787,12 @@ pub const Cursor = struct {
         }
         var nested: usize = 1;
         while (nested != 0) {
-            const event = (self.nextEvent(false) catch |err| return switch (err) {
-                error.EndOfStream, error.NoText => error.UnexpectedEnd,
-                else => err,
+            const event = (self.nextEvent(false) catch |err| {
+                self.offset = self.failedAt(err);
+                return switch (err) {
+                    error.EndOfStream, error.NoText => error.UnexpectedEnd,
+                    else => err,
+                };
             }) orelse return error.UnexpectedEnd;
             switch (event.data) {
                 .start_element => nested += 1,
@@ -858,7 +889,7 @@ pub const Cursor = struct {
                         continue;
                     }
                     if (declaration_marker.value == '[') {
-                        try self.readCdataStart();
+                        try self.readCdataStart(opening.start);
                         continue;
                     }
                     return error.DtdForbidden;
@@ -1053,13 +1084,14 @@ pub const Cursor = struct {
     /// Reads an entity or character reference after '&' through its ';'.
     /// Digits stream, so any number of leading zeros is accepted.
     fn readEntity(self: *Cursor) Error!u21 {
+        const start = self.source.last_start;
         const first = (try self.requiredCodepoint()).value;
         if (first != '#') {
             var name: [4]u8 = undefined;
             var length: usize = 0;
             var value = first;
             while (value != ';') : (value = (try self.requiredCodepoint()).value) {
-                if (value > 0x7F or length == name.len) return self.malformed(.unknown_entity);
+                if (value > 0x7F or length == name.len) return self.malformedAt(.unknown_entity, start);
                 name[length] = @intCast(value);
                 length += 1;
             }
@@ -1069,7 +1101,7 @@ pub const Cursor = struct {
             for (entities) |entity| {
                 if (std.mem.eql(u8, name[0..length], entity[0])) return entity[1];
             }
-            return self.malformed(.unknown_entity);
+            return self.malformedAt(.unknown_entity, start);
         }
 
         var value = (try self.requiredCodepoint()).value;
@@ -1081,13 +1113,13 @@ pub const Cursor = struct {
         var number: u32 = 0;
         var digits: usize = 0;
         while (value != ';') : (value = (try self.requiredCodepoint()).value) {
-            if (value > 0x7F) return self.malformed(.invalid_character_reference);
-            const digit = digitValue(@intCast(value), base) orelse return self.malformed(.invalid_character_reference);
+            if (value > 0x7F) return self.malformedAt(.invalid_character_reference, start);
+            const digit = digitValue(@intCast(value), base) orelse return self.malformedAt(.invalid_character_reference, start);
             number = number * base + digit;
-            if (number > 0x10FFFF) return self.malformed(.invalid_character_reference);
+            if (number > 0x10FFFF) return self.malformedAt(.invalid_character_reference, start);
             digits += 1;
         }
-        if (digits == 0 or !isXmlChar(@intCast(number))) return self.malformed(.invalid_character_reference);
+        if (digits == 0 or !isXmlChar(@intCast(number))) return self.malformedAt(.invalid_character_reference, start);
         return @intCast(number);
     }
 
@@ -1172,10 +1204,11 @@ pub const Cursor = struct {
             });
         }
 
+        const name_offset = self.source.position;
         const end = std.math.add(u64, self.source.position, position) catch return null;
         reader.toss(position);
         self.source.position = end;
-        return try self.finishStartElement(bytes, start_offset, name_range, empty);
+        return try self.finishStartElement(bytes, start_offset, name_offset, name_range, empty);
     }
 
     fn readStartElement(self: *Cursor, start_offset: u64) Error!Event {
@@ -1183,6 +1216,7 @@ pub const Cursor = struct {
         self.attribute_ranges.clearRetainingCapacity();
         self.namespace_declarations.clearRetainingCapacity();
         self.attributes.clearRetainingCapacity();
+        const name_offset = self.source.currentOffset();
         const name_range = try self.parseQName();
         var empty = false;
 
@@ -1219,7 +1253,7 @@ pub const Cursor = struct {
                 break :opening value.value;
             };
             const attribute_value = try self.parseAttributeValue(quote);
-            if (self.hasAttribute(self.event_bytes.items, attribute_name)) return self.malformed(.duplicate_attribute);
+            if (self.hasAttribute(self.event_bytes.items, attribute_name)) return self.malformedAt(.duplicate_attribute, attribute_offset);
             const raw_name = self.event_bytes.items[attribute_name.start..][0..attribute_name.len];
             const namespace_declaration = std.mem.eql(u8, raw_name, "xmlns") or
                 (std.mem.startsWith(u8, raw_name, "xmlns:") and raw_name.len > 6);
@@ -1228,7 +1262,7 @@ pub const Cursor = struct {
                     Range{ .start = attribute_name.start, .len = 0 }
                 else
                     Range{ .start = attribute_name.start + 6, .len = attribute_name.len - 6 };
-                try self.namespace_declarations.append(self.allocator, .{ .prefix = prefix, .uri = attribute_value });
+                try self.namespace_declarations.append(self.allocator, .{ .prefix = prefix, .uri = attribute_value, .offset = attribute_offset });
             }
             try self.attribute_ranges.append(self.allocator, .{
                 .name = attribute_name,
@@ -1238,12 +1272,12 @@ pub const Cursor = struct {
             });
         }
 
-        return self.finishStartElement(self.event_bytes.items, start_offset, name_range, empty);
+        return self.finishStartElement(self.event_bytes.items, start_offset, name_offset, name_range, empty);
     }
 
-    fn finishStartElement(self: *Cursor, bytes: []const u8, start_offset: u64, name_range: NameRange, empty: bool) Error!Event {
+    fn finishStartElement(self: *Cursor, bytes: []const u8, start_offset: u64, name_offset: u64, name_range: NameRange, empty: bool) Error!Event {
         if (self.depth == 0) {
-            if (self.root_closed) return self.malformed(.content_after_root);
+            if (self.root_closed) return self.malformedAt(.content_after_root, start_offset);
             self.root_seen = true;
         }
         if (self.depth == MAX_DEPTH) return self.limitError(.depth);
@@ -1251,7 +1285,7 @@ pub const Cursor = struct {
         const binding_start = self.namespace_bindings.items.len;
         const namespace_bytes_start = self.namespace_bytes.items.len;
         try self.installNamespaces();
-        const element_name = try self.makeName(bytes, name_range, false);
+        const element_name = try self.makeName(bytes, name_range, false, name_offset);
 
         const frame_name_start = self.open_names.items.len;
         try self.open_names.appendSlice(self.allocator, bytes[name_range.start..][0..name_range.len]);
@@ -1269,10 +1303,10 @@ pub const Cursor = struct {
         try self.attributes.ensureTotalCapacityPrecise(self.allocator, self.attribute_ranges.items.len);
         for (self.attribute_ranges.items) |attribute_range| {
             if (attribute_range.namespace_declaration) continue;
-            const attribute_name = try self.makeName(bytes, attribute_range.name, true);
+            const attribute_name = try self.makeName(bytes, attribute_range.name, true, attribute_range.offset);
             const expanded = attribute_name.expanded;
             for (self.attributes.items) |previous| {
-                if (previous.name.eql(expanded.namespace_uri, expanded.local)) return self.malformed(.duplicate_attribute);
+                if (previous.name.eql(expanded.namespace_uri, expanded.local)) return self.malformedAt(.duplicate_attribute, attribute_range.offset);
             }
             try self.attributes.append(self.allocator, .{
                 .name = attribute_name,
@@ -1296,14 +1330,14 @@ pub const Cursor = struct {
         for (self.namespace_declarations.items) |declaration| {
             const prefix = self.event_bytes.items[declaration.prefix.start..][0..declaration.prefix.len];
             const uri = self.event_bytes.items[declaration.uri.start..][0..declaration.uri.len];
-            if (std.mem.eql(u8, prefix, "xmlns")) return self.malformed(.invalid_namespace_declaration);
+            if (std.mem.eql(u8, prefix, "xmlns")) return self.malformedAt(.invalid_namespace_declaration, declaration.offset);
             if (std.mem.eql(u8, prefix, "xml")) {
-                if (!std.mem.eql(u8, uri, XML_NAMESPACE)) return self.malformed(.invalid_namespace_declaration);
+                if (!std.mem.eql(u8, uri, XML_NAMESPACE)) return self.malformedAt(.invalid_namespace_declaration, declaration.offset);
             } else if (std.mem.eql(u8, uri, XML_NAMESPACE)) {
-                return self.malformed(.invalid_namespace_declaration);
+                return self.malformedAt(.invalid_namespace_declaration, declaration.offset);
             }
-            if (std.mem.eql(u8, uri, XMLNS_NAMESPACE)) return self.malformed(.invalid_namespace_declaration);
-            if (prefix.len != 0 and uri.len == 0) return self.malformed(.invalid_namespace_declaration);
+            if (std.mem.eql(u8, uri, XMLNS_NAMESPACE)) return self.malformedAt(.invalid_namespace_declaration, declaration.offset);
+            if (prefix.len != 0 and uri.len == 0) return self.malformedAt(.invalid_namespace_declaration, declaration.offset);
             const prefix_start = self.namespace_bytes.items.len;
             try self.namespace_bytes.appendSlice(self.allocator, prefix);
             const uri_start = self.namespace_bytes.items.len;
@@ -1333,12 +1367,12 @@ pub const Cursor = struct {
     }
 
     // An unprefixed attribute has no namespace; an unprefixed element has the default one.
-    fn makeName(self: *Cursor, bytes: []const u8, range: NameRange, comptime attribute: bool) Error!Name {
+    fn makeName(self: *Cursor, bytes: []const u8, range: NameRange, comptime attribute: bool, offset: u64) Error!Name {
         const raw = bytes[range.start..][0..range.len];
         const prefix = if (range.prefix_len == 0) null else raw[0..range.prefix_len];
         const local = if (range.prefix_len == 0) raw else raw[range.prefix_len + 1 ..];
         const namespace_uri = if (attribute and prefix == null) null else self.resolveNamespace(prefix);
-        if (prefix != null and namespace_uri == null) return self.malformed(.unbound_prefix);
+        if (prefix != null and namespace_uri == null) return self.malformedAt(.unbound_prefix, offset);
         return .{ .raw = raw, .expanded = .{
             .prefix = prefix,
             .local = local,
@@ -1356,7 +1390,8 @@ pub const Cursor = struct {
     }
 
     fn readEndElement(self: *Cursor, start_offset: u64) Error!Event {
-        if (self.depth == 0) return self.malformed(.mismatched_end_tag);
+        if (self.depth == 0) return self.malformedAt(.mismatched_end_tag, start_offset);
+        const name_offset = self.source.currentOffset();
         const name_range = try self.parseQName();
         try self.skipWhitespace();
         const close = try self.requiredCodepoint();
@@ -1364,8 +1399,8 @@ pub const Cursor = struct {
         const frame = self.frames[self.depth - 1];
         const raw = self.event_bytes.items[name_range.start..][0..name_range.len];
         const expected = self.open_names.items[frame.name_start..][0..frame.name_len];
-        if (!std.mem.eql(u8, raw, expected)) return self.malformed(.mismatched_end_tag);
-        const name = try self.makeName(self.event_bytes.items, name_range, false);
+        if (!std.mem.eql(u8, raw, expected)) return self.malformedAt(.mismatched_end_tag, start_offset);
+        const name = try self.makeName(self.event_bytes.items, name_range, false, name_offset);
         self.popFrame(frame);
         return .{
             .span = .{ .start = start_offset, .end = self.source.position },
@@ -1378,7 +1413,7 @@ pub const Cursor = struct {
         const frame = self.frames[self.depth - 1];
         self.event_bytes.clearRetainingCapacity();
         try self.event_bytes.appendSlice(self.allocator, self.open_names.items[frame.name_start..][0..frame.name_len]);
-        const name = try self.makeName(self.event_bytes.items, .{ .start = 0, .len = self.event_bytes.items.len, .prefix_len = frame.prefix_len }, false);
+        const name = try self.makeName(self.event_bytes.items, .{ .start = 0, .len = self.event_bytes.items.len, .prefix_len = frame.prefix_len }, false, frame.opening_end);
         self.pending_empty = false;
         self.popFrame(frame);
         return .{
@@ -1426,7 +1461,7 @@ pub const Cursor = struct {
                 if (self.normal_text_brackets < 2) self.normal_text_brackets += 1;
                 try self.appendTextCodepoint(value.value);
             } else if (value.value == '>' and self.normal_text_brackets == 2) {
-                return self.malformed(.malformed_markup);
+                return self.malformedAt(.malformed_markup, value.start - 2 * self.source.unitWidth());
             } else if (value.value == '\r') {
                 self.normal_text_brackets = 0;
                 const next = self.source.peekCodepoint() catch |err| switch (err) {
@@ -1449,8 +1484,8 @@ pub const Cursor = struct {
         };
     }
 
-    fn readCdataStart(self: *Cursor) Error!void {
-        if (self.depth == 0) return self.malformed(.malformed_markup);
+    fn readCdataStart(self: *Cursor, start_offset: u64) Error!void {
+        if (self.depth == 0) return self.malformedAt(.malformed_markup, start_offset);
         for ("CDATA[") |expected| {
             const value = try self.requiredCodepoint();
             if (value.value != expected) return self.malformed(.malformed_markup);
@@ -1531,13 +1566,15 @@ pub const Cursor = struct {
 
     fn readProcessingInstruction(self: *Cursor, initial: bool) Error!void {
         self.event_bytes.clearRetainingCapacity();
+        const target_offset = self.source.currentOffset();
         const target = try self.parseQName();
         const target_bytes = self.event_bytes.items[target.start..][0..target.len];
         const separator = try self.requiredCodepoint();
         if (!isXmlWhitespace(separator.value) and separator.value != '?') return self.malformed(.malformed_markup);
         const declaration = initial and std.mem.eql(u8, target_bytes, "xml");
-        if (std.ascii.eqlIgnoreCase(target_bytes, "xml") and !declaration) return self.malformed(.malformed_markup);
+        if (std.ascii.eqlIgnoreCase(target_bytes, "xml") and !declaration) return self.malformedAt(.malformed_markup, target_offset);
         self.declaration_bytes.clearRetainingCapacity();
+        self.declaration_start = self.source.currentOffset();
         if (separator.value == '?') {
             const close = try self.requiredCodepoint();
             if (close.value != '>') return self.malformed(.malformed_markup);
@@ -1566,9 +1603,33 @@ pub const Cursor = struct {
         try self.declaration_bytes.append(self.allocator, value);
     }
 
+    // The rule's offending character is the last one read, except at the end of input.
     fn malformed(self: *Cursor, rule: Rule) Error {
+        return self.malformedAt(rule, if (rule == .unexpected_end) self.source.currentOffset() else self.source.last_start);
+    }
+
+    fn malformedAt(self: *Cursor, rule: Rule, offset: u64) Error {
         self.xml_rule = rule;
+        self.failure_offset = offset;
+        self.offset = offset;
         return error.InvalidXml;
+    }
+
+    // Declaration bytes are ASCII, one character each.
+    fn declarationError(self: *Cursor, position: usize, err: Error) Error {
+        const offset = self.declaration_start + position * self.source.unitWidth();
+        if (err == error.InvalidXml) return self.malformedAt(.malformed_declaration, offset);
+        self.failure_offset = offset;
+        self.offset = offset;
+        return err;
+    }
+
+    // A failure's offset: the offending character for broken rules and encodings, otherwise
+    // the next unread byte.
+    fn failedAt(self: *const Cursor, err: Error) u64 {
+        if (self.failure_offset) |offset| return offset;
+        if (err == error.InvalidEncoding) return self.source.last_start;
+        return self.source.currentOffset();
     }
 
     fn limitError(self: *Cursor, limit: @TypeOf(self.limit_failure.?)) Error {
@@ -1577,62 +1638,67 @@ pub const Cursor = struct {
     }
 
     fn parseXmlDeclaration(self: *Cursor) Error!void {
+        const bytes = self.declaration_bytes.items;
         var position: usize = 0;
         var version: ?[]const u8 = null;
+        var version_at: usize = 0;
         var encoding: ?[]const u8 = null;
+        var encoding_at: usize = 0;
         var order: u2 = 0;
-        while (position < self.declaration_bytes.items.len and isXmlWhitespace(self.declaration_bytes.items[position])) position += 1;
+        while (position < bytes.len and isXmlWhitespace(bytes[position])) position += 1;
         while (true) {
-            if (position == self.declaration_bytes.items.len) break;
+            if (position == bytes.len) break;
             const name_start = position;
-            if (!isAsciiNameStart(self.declaration_bytes.items[position])) return self.malformed(.malformed_declaration);
+            if (!isAsciiNameStart(bytes[position])) return self.declarationError(position, error.InvalidXml);
             position += 1;
-            while (position < self.declaration_bytes.items.len and isAsciiNameChar(self.declaration_bytes.items[position])) position += 1;
-            const name = self.declaration_bytes.items[name_start..position];
-            while (position < self.declaration_bytes.items.len and isXmlWhitespace(self.declaration_bytes.items[position])) position += 1;
-            if (position == self.declaration_bytes.items.len or self.declaration_bytes.items[position] != '=') return self.malformed(.malformed_declaration);
+            while (position < bytes.len and isAsciiNameChar(bytes[position])) position += 1;
+            const name = bytes[name_start..position];
+            while (position < bytes.len and isXmlWhitespace(bytes[position])) position += 1;
+            if (position == bytes.len or bytes[position] != '=') return self.declarationError(position, error.InvalidXml);
             position += 1;
-            while (position < self.declaration_bytes.items.len and isXmlWhitespace(self.declaration_bytes.items[position])) position += 1;
-            if (position == self.declaration_bytes.items.len) return self.malformed(.malformed_declaration);
-            const quote = self.declaration_bytes.items[position];
-            if (quote != '\'' and quote != '"') return self.malformed(.malformed_declaration);
+            while (position < bytes.len and isXmlWhitespace(bytes[position])) position += 1;
+            if (position == bytes.len) return self.declarationError(position, error.InvalidXml);
+            const quote = bytes[position];
+            if (quote != '\'' and quote != '"') return self.declarationError(position, error.InvalidXml);
             position += 1;
             const value_start = position;
-            while (position < self.declaration_bytes.items.len and self.declaration_bytes.items[position] != quote) position += 1;
-            if (position == self.declaration_bytes.items.len) return self.malformed(.malformed_declaration);
-            const value = self.declaration_bytes.items[value_start..position];
+            while (position < bytes.len and bytes[position] != quote) position += 1;
+            if (position == bytes.len) return self.declarationError(position, error.InvalidXml);
+            const value = bytes[value_start..position];
             position += 1;
             if (std.mem.eql(u8, name, "version")) {
-                if (version != null or order != 0) return self.malformed(.malformed_declaration);
+                if (version != null or order != 0) return self.declarationError(name_start, error.InvalidXml);
                 version = value;
+                version_at = value_start;
             } else if (std.mem.eql(u8, name, "encoding")) {
-                if (version == null or encoding != null or order > 0) return self.malformed(.malformed_declaration);
+                if (version == null or encoding != null or order > 0) return self.declarationError(name_start, error.InvalidXml);
                 encoding = value;
+                encoding_at = value_start;
                 order = 1;
             } else if (std.mem.eql(u8, name, "standalone")) {
-                if (version == null or order > 1) return self.malformed(.malformed_declaration);
-                if (!std.mem.eql(u8, value, "yes") and !std.mem.eql(u8, value, "no")) return self.malformed(.malformed_declaration);
+                if (version == null or order > 1) return self.declarationError(name_start, error.InvalidXml);
+                if (!std.mem.eql(u8, value, "yes") and !std.mem.eql(u8, value, "no")) return self.declarationError(value_start, error.InvalidXml);
                 order = 2;
             } else {
-                return self.malformed(.malformed_declaration);
+                return self.declarationError(name_start, error.InvalidXml);
             }
-            if (position == self.declaration_bytes.items.len) break;
-            if (!isXmlWhitespace(self.declaration_bytes.items[position])) return self.malformed(.malformed_declaration);
-            while (position < self.declaration_bytes.items.len and isXmlWhitespace(self.declaration_bytes.items[position])) position += 1;
+            if (position == bytes.len) break;
+            if (!isXmlWhitespace(bytes[position])) return self.declarationError(position, error.InvalidXml);
+            while (position < bytes.len and isXmlWhitespace(bytes[position])) position += 1;
         }
-        const version_value = version orelse return self.malformed(.malformed_declaration);
-        if (!std.mem.eql(u8, version_value, "1.0")) return error.UnsupportedVersion;
+        const version_value = version orelse return self.declarationError(0, error.InvalidXml);
+        if (!std.mem.eql(u8, version_value, "1.0")) return self.declarationError(version_at, error.UnsupportedVersion);
         if (encoding) |value| {
             if (std.ascii.eqlIgnoreCase(value, "UTF-8")) {
-                if (self.source.encoding != .utf8) return error.InvalidEncoding;
+                if (self.source.encoding != .utf8) return self.declarationError(encoding_at, error.InvalidEncoding);
             } else if (std.ascii.eqlIgnoreCase(value, "UTF-16")) {
-                if (self.source.encoding != .utf16_le and self.source.encoding != .utf16_be) return error.InvalidEncoding;
+                if (self.source.encoding != .utf16_le and self.source.encoding != .utf16_be) return self.declarationError(encoding_at, error.InvalidEncoding);
             } else if (std.ascii.eqlIgnoreCase(value, "ISO-8859-1")) {
                 if (self.source.encoding != .utf8 or
-                    std.mem.startsWith(u8, self.source.probe[0..self.source.probe_len], "\xef\xbb\xbf")) return error.InvalidEncoding;
+                    std.mem.startsWith(u8, self.source.probe[0..self.source.probe_len], "\xef\xbb\xbf")) return self.declarationError(encoding_at, error.InvalidEncoding);
                 self.source.encoding = .latin1;
             } else {
-                return error.UnsupportedEncoding;
+                return self.declarationError(encoding_at, error.UnsupportedEncoding);
             }
         }
     }
@@ -2281,35 +2347,114 @@ test "[failure] - [mzML XML cursor]: keeps encoding errors distinct from Latin-1
     }
 }
 
-test "[failure] - [mzML XML cursor]: names the XML rule malformed input breaks" {
+test "[failure] - [mzML XML cursor]: names the XML rule malformed input breaks and where" {
+    // Each case's offset is the first byte of what broke the rule, or the end of input.
     const cases = .{
-        .{ "<mzML><spectrum>", Rule.unexpected_end, true },
-        .{ "<mzML></spectrum>", Rule.mismatched_end_tag, true },
-        .{ "<mzML>text</mzML>", Rule.unexpected_text, false },
-        .{ "<mzML/><mzML/>", Rule.content_after_root, true },
-        .{ "<mzML a=1/>", Rule.malformed_tag, true },
-        .{ "<mzML a='<'/>", Rule.less_than_in_attribute, true },
-        .{ "<mzML><!-x--></mzML>", Rule.malformed_markup, true },
-        .{ "<mzML>]]></mzML>", Rule.malformed_markup, true },
-        .{ "<?xml version='1.0' size='1'?><mzML/>", Rule.malformed_declaration, true },
-        .{ "<1mzML/>", Rule.invalid_name, true },
-        .{ "<mzML a='1' a='2'/>", Rule.duplicate_attribute, true },
-        .{ "<p:mzML/>", Rule.unbound_prefix, true },
-        .{ "<mzML xmlns:p=''/>", Rule.invalid_namespace_declaration, true },
-        .{ "<mzML>&nbsp;</mzML>", Rule.unknown_entity, true },
-        .{ "<mzML>&#0;</mzML>", Rule.invalid_character_reference, true },
-        .{ "<mzML>\x01</mzML>", Rule.invalid_character, true },
+        .{ "<mzML><spectrum>", Rule.unexpected_end, true, 16 },
+        .{ "<mzML></spectrum>", Rule.mismatched_end_tag, true, 6 },
+        .{ "<mzML>text</mzML>", Rule.unexpected_text, false, 6 },
+        .{ "<mzML/><mzML/>", Rule.content_after_root, true, 7 },
+        .{ "<mzML a=1/>", Rule.malformed_tag, true, 8 },
+        .{ "<mzML a='<'/>", Rule.less_than_in_attribute, true, 9 },
+        .{ "<mzML><!-x--></mzML>", Rule.malformed_markup, true, 9 },
+        .{ "<mzML>]]></mzML>", Rule.malformed_markup, true, 6 },
+        .{ "<?xml version='1.0' size='1'?><mzML/>", Rule.malformed_declaration, true, 20 },
+        .{ "<1mzML/>", Rule.invalid_name, true, 1 },
+        .{ "<spec\x01trum/>", Rule.invalid_name, true, 5 },
+        .{ "<mzML a='1' a='2'/>", Rule.duplicate_attribute, true, 12 },
+        .{ "<mzML xmlns:p='u' xmlns:q='u' p:a='1' q:a='2'/>", Rule.duplicate_attribute, true, 38 },
+        .{ "<p:mzML/>", Rule.unbound_prefix, true, 1 },
+        .{ "<mzML q:a='1'/>", Rule.unbound_prefix, true, 6 },
+        .{ "<mzML xmlns:p=''/>", Rule.invalid_namespace_declaration, true, 6 },
+        .{ "<mzML>&nbsp;</mzML>", Rule.unknown_entity, true, 6 },
+        .{ "<mzML a='&#0;'/>", Rule.invalid_character_reference, true, 9 },
+        .{ "<mzML>\x01</mzML>", Rule.invalid_character, true, 6 },
     };
-    inline for (cases) |case| {
+    // A one-byte buffer takes the character-by-character paths instead of the buffered scans.
+    for ([_]usize{ 0, 1 }) |buffer_size| {
+        inline for (cases) |case| {
+            var fixed = std.Io.Reader.fixed(case[0]);
+            var small: [1]u8 = undefined;
+            var limited = fixed.limited(.unlimited, &small);
+            const input = if (buffer_size == 0) &fixed else &limited.interface;
+            var cursor = try Cursor.init(std.testing.allocator, input, 64, 1024);
+            defer cursor.deinit();
+            const failure = while (true) {
+                cursor.advanceFragment(case[2]) catch |err| break err;
+                if (cursor.current == null) return error.TestUnexpectedResult;
+            };
+            try std.testing.expectEqual(error.InvalidXml, failure);
+            try std.testing.expectEqual(@as(?Rule, case[1]), cursor.xml_rule);
+            try std.testing.expectEqual(@as(u64, case[3]), cursor.offset);
+        }
+    }
+    // A broken encoding is reported at the first byte that cannot continue a well-formed
+    // sequence (the end of input when cut off); in UTF-16, offsets count two bytes per unit.
+    const encoded = .{
+        .{ "<mzML>ab\xc3(</mzML>", error.InvalidEncoding, 9 },
+        .{ "<mzML a='\xe2\x82'/>", error.InvalidEncoding, 11 },
+        .{ "<mzML>\x80</mzML>", error.InvalidEncoding, 6 },
+        .{ "<mzML>\xc0\x80</mzML>", error.InvalidEncoding, 6 },
+        .{ "<mzML>\xe0\x9f\xbf</mzML>", error.InvalidEncoding, 7 },
+        .{ "<mzML>\xed\xa0\x80</mzML>", error.InvalidEncoding, 7 },
+        .{ "<mzML>\xf4\x90\x80\x80</mzML>", error.InvalidEncoding, 7 },
+        .{ "<mzML>\xf0\x9f\x98", error.InvalidEncoding, 9 },
+        .{ "<?xml version='1.1'?><mzML/>", error.UnsupportedVersion, 15 },
+        .{ "<?xml version='1.0' encoding='UTF-16'?><mzML/>", error.InvalidEncoding, 30 },
+    };
+    inline for (encoded) |case| {
         var input = std.Io.Reader.fixed(case[0]);
         var cursor = try Cursor.init(std.testing.allocator, &input, 64, 1024);
         defer cursor.deinit();
         const failure = while (true) {
-            cursor.advanceFragment(case[2]) catch |err| break err;
+            cursor.advanceFragment(true) catch |err| break err;
             if (cursor.current == null) return error.TestUnexpectedResult;
         };
-        try std.testing.expectEqual(error.InvalidXml, failure);
-        try std.testing.expectEqual(@as(?Rule, case[1]), cursor.xml_rule);
+        try std.testing.expectEqual(case[1], failure);
+        try std.testing.expectEqual(@as(u64, case[2]), cursor.offset);
+    }
+    const wide = .{
+        .{ "<?xml version='1.0' encoding='ISO-8859-1'?><mzML/>", error.InvalidEncoding, 2 + 30 * 2 },
+        .{ "<mzML>]]></mzML>", error.InvalidXml, 2 + 6 * 2 },
+        // '#' stands for a high surrogate unit and '%' for a low one.
+        .{ "<mzML>#a</mzML>", error.InvalidEncoding, 2 + 7 * 2 },
+        .{ "<mzML>%</mzML>", error.InvalidEncoding, 2 + 6 * 2 },
+    };
+    inline for (wide) |case| {
+        var bytes: [2 + case[0].len * 2]u8 = undefined;
+        std.mem.writeInt(u16, bytes[0..2], 0xfeff, .little);
+        for (case[0], 0..) |byte, i| {
+            const unit: u16 = switch (byte) {
+                '#' => 0xD800,
+                '%' => 0xDC00,
+                else => byte,
+            };
+            std.mem.writeInt(u16, bytes[2 + i * 2 ..][0..2], unit, .little);
+        }
+        var input = std.Io.Reader.fixed(&bytes);
+        var cursor = try Cursor.init(std.testing.allocator, &input, 64, 1024);
+        defer cursor.deinit();
+        const failure = while (true) {
+            cursor.advanceFragment(true) catch |err| break err;
+            if (cursor.current == null) return error.TestUnexpectedResult;
+        };
+        try std.testing.expectEqual(case[1], failure);
+        try std.testing.expectEqual(@as(u64, case[2]), cursor.offset);
+    }
+}
+
+test "[unit] - [mzML XML cursor]: decodes UTF-8 at the bounds of every well-formed range" {
+    // U+0080, U+07FF, U+0800, U+D7FF, U+E000, U+FFFD, U+10000, U+10FFFF.
+    const text = "\xc2\x80\xdf\xbf\xe0\xa0\x80\xed\x9f\xbf\xee\x80\x80\xef\xbf\xbd\xf0\x90\x80\x80\xf4\x8f\xbf\xbf";
+    for ([_]usize{ 0, 1 }) |buffer_size| {
+        var fixed = std.Io.Reader.fixed("<m>" ++ text ++ "</m>");
+        var small: [1]u8 = undefined;
+        var limited = fixed.limited(.unlimited, &small);
+        var cursor = try Cursor.init(std.testing.allocator, if (buffer_size == 0) &fixed else &limited.interface, 64, 1024);
+        defer cursor.deinit();
+        try cursor.advanceFragment(true);
+        try cursor.advanceFragment(true);
+        try std.testing.expectEqualStrings(text, cursor.current.?.data.text.bytes);
     }
 }
 
