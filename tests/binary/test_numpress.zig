@@ -310,9 +310,13 @@ test "[property] - [numpress encoders]: block encoding matches the value-by-valu
         const array = values[0..count];
         const slof_fixed_point = try numpress.optimalSlofFixedPoint(array);
         // An output of exactly the encoded length is below the worst-case bound, so the
-        // encoders take their value-by-value path for it.
+        // encoders take their value-by-value path for it; an output of exactly the bound
+        // takes the block path to its last byte.
         const pic_len = try numpress.encodePic(array, &block);
         try std.testing.expectEqual(pic_len, try numpress.encodePic(array, checked[0..pic_len]));
+        try std.testing.expectEqualSlices(u8, block[0..pic_len], checked[0..pic_len]);
+        const pic_bound = try numpress.picMaxEncodedLen(count);
+        try std.testing.expectEqual(pic_len, try numpress.encodePic(array, checked[0..pic_bound]));
         try std.testing.expectEqualSlices(u8, block[0..pic_len], checked[0..pic_len]);
         const slof_len = try numpress.encodeSlof(array, slof_fixed_point, &block);
         try std.testing.expectEqual(slof_len, try numpress.encodeSlof(array, slof_fixed_point, checked[0..slof_len]));
@@ -323,7 +327,61 @@ test "[property] - [numpress encoders]: block encoding matches the value-by-valu
         const linear_len = try numpress.encodeLinear(array, linear_fixed_point, &block);
         try std.testing.expectEqual(linear_len, try numpress.encodeLinear(array, linear_fixed_point, checked[0..linear_len]));
         try std.testing.expectEqualSlices(u8, block[0..linear_len], checked[0..linear_len]);
+        const linear_bound = try numpress.linearMaxEncodedLen(count);
+        try std.testing.expectEqual(linear_len, try numpress.encodeLinear(array, linear_fixed_point, checked[0..linear_bound]));
+        try std.testing.expectEqualSlices(u8, block[0..linear_len], checked[0..linear_len]);
     }
+}
+
+test "[property] - [numpress encoders]: f32 input encodes as its f64 copy" {
+    var random = std.Random.DefaultPrng.init(0x4e55_4d50_4633_3200);
+    const source = random.random();
+    var narrow: [700]f32 = undefined;
+    var wide: [narrow.len]f64 = undefined;
+    var from_narrow: [16 + 9 * narrow.len / 2 + 16]u8 = undefined;
+    var from_wide: [from_narrow.len]u8 = undefined;
+    for ([_]usize{ 0, 1, 3, 17, 129, 700 }) |count| {
+        var current: f32 = 100;
+        for (narrow[0..count], wide[0..count]) |*n, *w| {
+            current += source.float(f32) * 3;
+            n.* = if (source.uintLessThan(u8, 8) == 0) 0 else current;
+            w.* = n.*;
+        }
+        const n = narrow[0..count];
+        const w = wide[0..count];
+        try std.testing.expectEqual(try numpress.optimalLinearFixedPoint(w), try numpress.optimalLinearFixedPoint(n));
+        try std.testing.expectEqual(try numpress.optimalSlofFixedPoint(w), try numpress.optimalSlofFixedPoint(n));
+        const linear_fixed_point = try numpress.optimalLinearFixedPoint(w);
+        const slof_fixed_point = try numpress.optimalSlofFixedPoint(w);
+        try expectSameBytes(
+            numpress.encodeLinear(n, linear_fixed_point, &from_narrow),
+            numpress.encodeLinear(w, linear_fixed_point, &from_wide),
+            &from_narrow,
+            &from_wide,
+        );
+        try expectSameBytes(numpress.encodePic(n, &from_narrow), numpress.encodePic(w, &from_wide), &from_narrow, &from_wide);
+        try expectSameBytes(
+            numpress.encodeSlof(n, slof_fixed_point, &from_narrow),
+            numpress.encodeSlof(w, slof_fixed_point, &from_wide),
+            &from_narrow,
+            &from_wide,
+        );
+        var narrow_writer = std.Io.Writer.fixed(&from_narrow);
+        var wide_writer = std.Io.Writer.fixed(&from_wide);
+        _ = try numpress.encodeSlofTo(n, slof_fixed_point, &narrow_writer);
+        _ = try numpress.encodeSlofTo(w, slof_fixed_point, &wide_writer);
+        try std.testing.expectEqualSlices(u8, wide_writer.buffered(), narrow_writer.buffered());
+    }
+    var invalid = [_]f32{ 1, std.math.nan(f32), 3 };
+    try std.testing.expectError(error.InvalidValue, numpress.encodePic(&invalid, &from_narrow));
+    invalid[1] = -1;
+    try std.testing.expectError(error.InvalidValue, numpress.encodeLinear(&invalid, 1, &from_narrow));
+}
+
+fn expectSameBytes(narrow: numpress.Error!usize, wide: numpress.Error!usize, narrow_bytes: []const u8, wide_bytes: []const u8) !void {
+    const length = try wide;
+    try std.testing.expectEqual(length, try narrow);
+    try std.testing.expectEqualSlices(u8, wide_bytes[0..length], narrow_bytes[0..length]);
 }
 
 test "[property] - [numpress SLOF]: vector blocks and tails give the frozen codes" {

@@ -450,8 +450,8 @@ test "[property] - [zlib]: matches valid streaming output and bounds corrupt or 
 test "[property] - [zlib]: streamed inflation matches whole-stream results and errors" {
     var compressor = try zlib.Compressor.init(std.testing.allocator, .even);
     defer compressor.deinit();
-    var inflater = try zlib.Inflater.init(std.testing.allocator);
-    defer inflater.deinit();
+    var decompressor = try zlib.Decompressor.init(std.testing.allocator);
+    defer decompressor.deinit();
     var random = std.Random.DefaultPrng.init(0x7a6c_6962_5354_524d);
     var source: [3000]u8 = undefined;
     var compressed: [4096]u8 = undefined;
@@ -469,11 +469,11 @@ test "[property] - [zlib]: streamed inflation matches whole-stream results and e
             };
             const expected = zlib.decompress(&whole, wire);
             for ([_]usize{ 1, 100, 4096 }) |window| {
-                inflater.start(wire);
+                decompressor.start(wire);
                 var total: usize = 0;
                 const actual = while (true) {
                     if (total > whole.len) break error.OutputTooSmall;
-                    const piece = inflater.read(streamed[total..][0..@min(window, streamed.len - total)]) catch |err| break err;
+                    const piece = decompressor.read(streamed[total..][0..@min(window, streamed.len - total)]) catch |err| break err;
                     if (piece.len == 0) break total;
                     total += piece.len;
                 };
@@ -781,6 +781,37 @@ test "[property] - [array encoder]: streamed zlib matches encoding whole then co
                 } else |err| try std.testing.expectError(err, actual);
             }
         }
+    }
+}
+
+test "[property] - [array encoder]: f32 Numpress input matches its f64 copy and decodes to f64" {
+    var encoder = arrays.Encoder.init(std.testing.allocator, .even);
+    defer encoder.deinit();
+    var narrow: [3_000]f32 = undefined;
+    var wide: [narrow.len]f64 = undefined;
+    var current: f32 = 100;
+    var random = std.Random.DefaultPrng.init(0x6633_3220_6172_7279);
+    for (&narrow, &wide) |*n, *w| {
+        current += random.random().float(f32) * 2;
+        n.* = current;
+        w.* = current;
+    }
+    var transformed: [16 + 9 * narrow.len / 2 + 16]u8 = undefined;
+    for ([_]arrays.Pipeline{ .linear, .pic, .slof, .linear_zlib, .pic_zlib, .slof_zlib }) |pipeline| {
+        const fixed_point: ?f64 = switch (pipeline.transform()) {
+            .linear => try mzml.numpress.optimalLinearFixedPoint(&narrow),
+            .slof => try mzml.numpress.optimalSlofFixedPoint(&narrow),
+            else => null,
+        };
+        encoder.reset();
+        const options: arrays.EncodeOptions = .{ .pipeline = pipeline, .fixed_point = fixed_point };
+        const from_narrow = try encoder.encode(f32, &narrow, options);
+        const from_wide = try encoder.encode(f64, &wide, options);
+        try std.testing.expectEqualSlices(u8, from_wide, from_narrow);
+        var decoded: [narrow.len]f64 = undefined;
+        try arrays.decodeWire(f64, &decoded, from_narrow, pipeline, &transformed);
+        var narrow_output: [narrow.len]f32 = undefined;
+        try std.testing.expectError(error.TypeMismatch, arrays.decodeWire(f32, &narrow_output, from_narrow, pipeline, &transformed));
     }
 }
 

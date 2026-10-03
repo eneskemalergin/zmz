@@ -718,14 +718,22 @@ test "[integration] - [mzML prepared writing]: preserves primitive bytes across 
                 }, &encoder)).array;
                 const metadata = (try builder.record(.spectrum, "scan=1", 0, count, &.{}, &.{}, &arrays)).node;
                 const wire = try mzml.arrays.encodeWire(T, values[0..count], .{ .pipeline = pipeline }, scratch, &compressor);
-                // The same record carrying the wire as retained Base64 text.
+                // The same record carrying the wire as retained Base64 text, declaring its length.
                 const encoded_text = try mzml.base64.encode(&text, wire);
+                var length_text: [32]u8 = undefined;
+                const length = length_text[0..std.fmt.printInt(&length_text, encoded_text.len, 10, .lower, .{})];
                 var binaries: [2]mzml.model.Node = undefined;
+                var attributes: [2][4]mzml.model.Attribute = undefined;
                 var nodes = [_]mzml.model.Node{ arrays[0].node, arrays[1].node };
                 for (&nodes, 0..) |*node, i| {
                     binaries[i] = node.children[0];
                     binaries[i].text = encoded_text;
                     node.children = binaries[i..][0..1];
+                    for (node.attributes, attributes[i][0..node.attributes.len]) |attribute, *copy| {
+                        copy.* = attribute;
+                        if (std.mem.eql(u8, attribute.name, "encodedLength")) copy.value = length;
+                    }
+                    node.attributes = attributes[i][0..node.attributes.len];
                 }
                 var list = metadata.child(.binary_data_array_list).?;
                 list.children = &nodes;
@@ -738,9 +746,9 @@ test "[integration] - [mzML prepared writing]: preserves primitive bytes across 
                     try support.writeSingleRecord(std.testing.allocator, &expected, header.*, retained, indexed, null);
                     var actual_bytes: [32768]u8 = undefined;
                     var actual = std.Io.Writer.fixed(&actual_bytes);
-                    try support.writeSingleRecord(std.testing.allocator, &actual, header.*, metadata, indexed, &.{ wire, wire });
+                    try support.writeSingleRecord(std.testing.allocator, &actual, header.*, metadata, indexed, &.{ .{ .wire = wire }, .{ .wire = wire } });
                     try std.testing.expectEqualStrings(expected.buffered(), actual.buffered());
-                    for ([_][2]?[]const u8{ .{ wire, null }, .{ null, wire }, .{ null, null } }) |choices| {
+                    for ([_][2]?mzml.Writer.ArrayPayload{ .{ .{ .wire = wire }, null }, .{ null, .{ .wire = wire } }, .{ null, null } }) |choices| {
                         var mixed = std.Io.Writer.fixed(&actual_bytes);
                         var writer = if (indexed) try mzml.Writer.initIndexed(std.testing.allocator, &mixed, .{}, .{}) else try mzml.Writer.init(std.testing.allocator, &mixed, .{});
                         defer writer.deinit();
@@ -768,7 +776,7 @@ test "[integration] - [mzML prepared writing]: preserves primitive bytes across 
                     const reencoded = try mzml.arrays.encodeWire(T, typed, .{ .pipeline = pipeline }, scratch, &compressor);
                     var rewritten_bytes: [32768]u8 = undefined;
                     var rewritten = std.Io.Writer.fixed(&rewritten_bytes);
-                    try support.writeSingleRecord(std.testing.allocator, &rewritten, header.*, decoded_record.node, indexed, &.{ reencoded, reencoded });
+                    try support.writeSingleRecord(std.testing.allocator, &rewritten, header.*, decoded_record.node, indexed, &.{ .{ .wire = reencoded }, .{ .wire = reencoded } });
                     try std.testing.expectEqualSlices(u8, expected.buffered(), rewritten.buffered());
                     if (indexed) {
                         var index = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = rewritten.buffered() }, .{});
@@ -787,7 +795,7 @@ test "[integration] - [mzML prepared writing]: preserves primitive bytes across 
                         const fetched_wire = try mzml.arrays.encodeWire(T, fetched_typed, .{ .pipeline = pipeline }, scratch, &compressor);
                         var fetched_bytes: [32768]u8 = undefined;
                         var fetched_sink = std.Io.Writer.fixed(&fetched_bytes);
-                        try support.writeSingleRecord(std.testing.allocator, &fetched_sink, header.*, fetched.value.node, true, &.{ fetched_wire, fetched_wire });
+                        try support.writeSingleRecord(std.testing.allocator, &fetched_sink, header.*, fetched.value.node, true, &.{ .{ .wire = fetched_wire }, .{ .wire = fetched_wire } });
                         try std.testing.expectEqualSlices(u8, expected.buffered(), fetched_sink.buffered());
                     }
                     try std.testing.expectEqual(null, try decoded_reader.nextDecodedRecord(&decoded_arrays));
@@ -835,7 +843,7 @@ test "[integration] - [mzML mixed writing]: retains unknown arrays and replaces 
         try writer.beginListWithAttributes(.spectrum_list, 1, &.{});
         var first = [_]u8{ 1, 2, 3 };
         var last = [_]u8{ 4, 5, 6, 7 };
-        var choices = [_]?[]const u8{ null, null, &first, &.{}, &last };
+        var choices = [_]?mzml.Writer.ArrayPayload{ null, null, .{ .wire = &first }, .{ .wire = &.{} }, .{ .wire = &last } };
         try writer.writeRecordWithSelectedArrays(record.node, &choices);
         @memset(&first, 0);
         @memset(&last, 0);
@@ -866,21 +874,21 @@ test "[failure] - [mzML mixed writing]: checks supplied bytes and keeps failures
     const record = (try reader.nextRecord()).?;
     const wire = [_]u8{0} ** 8;
     const errors = [_]mzml.Writer.Error{
-        error.CountMismatch,      error.EncodedLengthMismatch, error.OverlappingBuffers,
-        error.LimitExceeded,      error.PayloadNotRetained,    error.InvalidStructure,
+        error.CountMismatch,      error.LimitExceeded,      error.OverlappingBuffers,
+        error.LimitExceeded,      error.PayloadNotRetained, error.InvalidStructure,
         error.OverlappingBuffers, error.WriteFailed,
     };
     for ([_]bool{ false, true }) |indexed| {
         for (errors, 0..) |expected_error, case| {
-            var output: [8192]u8 align(@alignOf(?[]const u8)) = undefined;
+            var output: [8192]u8 align(@alignOf(?mzml.Writer.ArrayPayload)) = undefined;
             var sink = std.Io.Writer.fixed(&output);
             var writer = if (indexed) try mzml.Writer.initIndexed(std.testing.allocator, &sink, .{}, .{}) else try mzml.Writer.init(std.testing.allocator, &sink, .{});
             defer writer.deinit();
             try writer.writeHeader(header.*);
             try writer.beginList(.spectrum_list, 1, "dp");
             const before = writer.engine.byteOffset();
-            var choices = [_]?[]const u8{ null, &wire };
-            var supplied: []const ?[]const u8 = &choices;
+            var choices = [_]?mzml.Writer.ArrayPayload{ null, .{ .wire = &wire } };
+            var supplied: []const ?mzml.Writer.ArrayPayload = &choices;
             var arrays = [_]mzml.model.Node{ record.binaryArrays()[0], record.binaryArrays()[1] };
             var list = record.node.child(.binary_data_array_list).?;
             list.children = &arrays;
@@ -888,13 +896,16 @@ test "[failure] - [mzML mixed writing]: checks supplied bytes and keeps failures
             node.children = &.{list};
             switch (case) {
                 0 => supplied = choices[0..1],
-                1 => choices[1] = wire[0..1],
-                2 => choices[1] = output[0..8],
+                1 => {
+                    choices[1] = .{ .wire = wire[0..1] };
+                    writer.limits.text_bytes = 3;
+                },
+                2 => choices[1] = .{ .wire = output[0..8] },
                 3 => writer.limits.text_bytes = 11,
                 4 => arrays[0].children = &.{.{ .kind = .binary }},
                 5 => arrays[1].children = &.{},
                 6 => {
-                    const aliased: *[2]?[]const u8 = @ptrCast(@alignCast(&output[4096]));
+                    const aliased: *[2]?mzml.Writer.ArrayPayload = @ptrCast(@alignCast(&output[4096]));
                     aliased.* = choices;
                     supplied = aliased;
                 },
@@ -935,16 +946,19 @@ test "[integration] - [mzML prepared writing]: rejects mismatches and keeps sink
             const before = writer.engine.byteOffset().?;
             switch (failure) {
                 0 => try std.testing.expectError(error.CountMismatch, writer.writeRecordWithArrays(record.node, &.{})),
-                1 => try std.testing.expectError(error.EncodedLengthMismatch, writer.writeRecordWithArrays(record.node, &.{ &bytes, bytes[0..1] })),
-                2 => try std.testing.expectError(error.OverlappingBuffers, writer.writeRecordWithArrays(record.node, &.{ output[0..8], &bytes })),
+                1 => {
+                    writer.limits.text_bytes = 3;
+                    try std.testing.expectError(error.LimitExceeded, writer.writeRecordWithArrays(record.node, &.{ .{ .wire = bytes[0..2] }, .{ .wire = bytes[0..1] } }));
+                },
+                2 => try std.testing.expectError(error.OverlappingBuffers, writer.writeRecordWithArrays(record.node, &.{ .{ .wire = output[0..8] }, .{ .wire = &bytes } })),
                 3 => {
                     writer.limits.text_bytes = 11;
-                    try std.testing.expectError(error.LimitExceeded, writer.writeRecordWithArrays(record.node, &.{ &bytes, &bytes }));
+                    try std.testing.expectError(error.LimitExceeded, writer.writeRecordWithArrays(record.node, &.{ .{ .wire = &bytes }, .{ .wire = &bytes } }));
                 },
                 // Indexed output reaches the sink in buffered chunks, so only plain output fails here.
                 4 => if (indexed) continue else {
                     sink.buffer = sink.buffer[0 .. sink.end + 1];
-                    try std.testing.expectError(error.WriteFailed, writer.writeRecordWithArrays(record.node, &.{ &bytes, &bytes }));
+                    try std.testing.expectError(error.WriteFailed, writer.writeRecordWithArrays(record.node, &.{ .{ .wire = &bytes }, .{ .wire = &bytes } }));
                 },
                 5, 6, 7 => {
                     var array = record.binaryArrays()[0];
@@ -956,13 +970,13 @@ test "[integration] - [mzML prepared writing]: rejects mismatches and keeps sink
                     list.children = &.{ array, record.binaryArrays()[1] };
                     var changed = record.node;
                     changed.children = &.{list};
-                    try std.testing.expectError(error.InvalidStructure, writer.writeRecordWithArrays(changed, &.{ &bytes, &bytes }));
+                    try std.testing.expectError(error.InvalidStructure, writer.writeRecordWithArrays(changed, &.{ .{ .wire = &bytes }, .{ .wire = &bytes } }));
                 },
                 8 => {
                     var changed = record.node;
                     const list = changed.child(.binary_data_array_list).?;
                     changed.children = &.{ list, list };
-                    try std.testing.expectError(error.InvalidStructure, writer.writeRecordWithArrays(changed, &.{ &bytes, &bytes }));
+                    try std.testing.expectError(error.InvalidStructure, writer.writeRecordWithArrays(changed, &.{ .{ .wire = &bytes }, .{ .wire = &bytes } }));
                     try std.testing.expect(writer.engine.byteOffset().? > before);
                 },
                 else => unreachable,
@@ -979,10 +993,9 @@ test "[integration] - [mzML prepared writing]: rejects mismatches and keeps sink
                     try std.testing.expectEqual(.arrays, report.detail.size.unit);
                 },
                 1 => {
-                    try std.testing.expectEqual(.encoded_length_mismatch, report.id);
-                    try std.testing.expectEqual(@as(usize, 1), report.array_position.?);
-                    try std.testing.expectEqual(@as(u64, 4), report.detail.size.expected);
-                    try std.testing.expectEqual(@as(u64, 12), report.detail.size.actual);
+                    try std.testing.expectEqual(@as(usize, 0), report.array_position.?);
+                    try std.testing.expectEqual(.text_bytes, report.detail.limit.name);
+                    try std.testing.expectEqual(@as(u64, 3), report.detail.limit.maximum);
                 },
                 3 => {
                     try std.testing.expectEqual(.text_bytes, report.detail.limit.name);
@@ -992,7 +1005,7 @@ test "[integration] - [mzML prepared writing]: rejects mismatches and keeps sink
                 else => {},
             }
             try std.testing.expectError(error.FailedState, writer.finish());
-            try std.testing.expectError(error.FailedState, writer.writeRecordWithArrays(record.node, &.{ &bytes, &bytes }));
+            try std.testing.expectError(error.FailedState, writer.writeRecordWithArrays(record.node, &.{ .{ .wire = &bytes }, .{ .wire = &bytes } }));
             try std.testing.expectEqualDeep(report, writer.diagnostic().?);
         }
     }
@@ -1174,7 +1187,7 @@ test "[integration] - [mzML file writer]: patches counts without changing record
                         try writer.writeRecord(node);
                     } else {
                         const one = [_]u8{ 0, 0, 0, 0, 0, 0, 0xf0, 0x3f };
-                        try writer.writeRecordWithArrays(node, &.{ &one, &one });
+                        try writer.writeRecordWithArrays(node, &.{ .{ .wire = &one }, .{ .wire = &one } });
                     }
                 }
                 try known.endList();
@@ -1456,5 +1469,176 @@ test "[integration] - [mzML declarations]: preserves version metadata across rea
             defer record.deinit();
             try std.testing.expectEqualSlices(f64, &.{1}, decoded.get(0).?.values.float64);
         }
+    }
+}
+
+test "[property] - [mzML streamed writing]: every pipeline round trips through stream and file output" {
+    const allocator = std.testing.allocator;
+    var input = std.Io.Reader.fixed(support.DOCUMENT);
+    var source_reader = try mzml.StreamReader.init(allocator, &input, .{});
+    defer source_reader.deinit();
+    const header = try source_reader.readHeader();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    const mz = try allocator.alloc(f64, 20_000);
+    defer allocator.free(mz);
+    const intensity = try allocator.alloc(f32, mz.len);
+    defer allocator.free(intensity);
+    var random = std.Random.DefaultPrng.init(0x7374_7265_616d_7772);
+    var current: f64 = 100;
+    for (mz, intensity) |*m, *i| {
+        current += random.random().float(f64) * 0.7;
+        m.* = current;
+        i.* = if (random.random().uintLessThan(u8, 4) == 0) 0 else @floatCast(random.random().float(f64) * 1e6);
+    }
+    var encoder = mzml.arrays.Encoder.init(allocator, .fast);
+    defer encoder.deinit();
+    var reference_encoder = mzml.arrays.Encoder.init(allocator, .fast);
+    defer reference_encoder.deinit();
+    var builder = mzml.Builder.init(allocator, .{});
+    defer builder.deinit();
+    var decoded = mzml.StreamReader.DecodedArrays.init(allocator, .{});
+    defer decoded.deinit();
+    for ([_]usize{ 0, 1, 3, 700, 20_000 }) |count| {
+        for (std.meta.tags(mzml.arrays.Pipeline)) |pipeline| {
+            // Outputs: stream plain, stream indexed, then file plain and indexed with a large
+            // buffer (placeholders patched in memory) and a small one (patched in the file).
+            for (0..6) |output_kind| {
+                builder.reset();
+                encoder.reset();
+                const indexed = output_kind % 2 == 1;
+                const options = struct {
+                    fn of(p: mzml.arrays.Pipeline, values: anytype) !mzml.arrays.EncodeOptions {
+                        return .{ .pipeline = p, .fixed_point = switch (p.transform()) {
+                            .linear => try mzml.numpress.optimalLinearFixedPoint(values),
+                            .slof => try mzml.numpress.optimalSlofFixedPoint(values),
+                            else => null,
+                        } };
+                    }
+                };
+                const mz_options = try options.of(pipeline, mz[0..count]);
+                const intensity_options = try options.of(pipeline, intensity[0..count]);
+                const first = try builder.prepareArray(f64, mz[0..count], .{
+                    .cv_ref = "MS",
+                    .encoding = mz_options,
+                    .role = .{ .cv_ref = "MS", .accession = mzml.model.Terms.MZ_ARRAY, .name = "m/z array" },
+                }, &encoder);
+                const second = try builder.prepareArray(f32, intensity[0..count], .{
+                    .cv_ref = "MS",
+                    .encoding = intensity_options,
+                    .role = .{ .cv_ref = "MS", .accession = mzml.model.Terms.INTENSITY_ARRAY, .name = "intensity array" },
+                }, &encoder);
+                const record = try builder.record(.spectrum, "scan=1", 0, count, &.{}, &.{}, &.{ first.array, second.array });
+                const payloads = [_]mzml.Writer.ArrayPayload{ first.payload, second.payload };
+
+                var stream: std.Io.Writer.Allocating = .init(allocator);
+                defer stream.deinit();
+                var file_bytes: ?[]u8 = null;
+                defer if (file_bytes) |bytes| allocator.free(bytes);
+                if (output_kind < 2) {
+                    var writer = if (indexed) try mzml.Writer.initIndexed(allocator, &stream.writer, .{}, .{}) else try mzml.Writer.init(allocator, &stream.writer, .{});
+                    defer writer.deinit();
+                    try writeStreamedRecord(&writer, header.*, record.node, &payloads);
+                } else {
+                    const file = try dir.dir.createFile(std.testing.io, "streamed.mzML", .{ .read = true });
+                    defer file.close(std.testing.io);
+                    var large: [64 * 1024]u8 = undefined;
+                    var small: [64]u8 = undefined;
+                    var sink = file.writer(std.testing.io, if (output_kind < 4) &large else &small);
+                    var writer = try mzml.Writer.initFile(allocator, &sink, .{}, if (indexed) .{} else null);
+                    defer writer.deinit();
+                    try writeStreamedRecord(&writer, header.*, record.node, &payloads);
+                    try sink.interface.flush();
+                    file_bytes = try dir.dir.readFileAlloc(std.testing.io, "streamed.mzML", allocator, .limited(4 * 1024 * 1024));
+                }
+                const bytes = file_bytes orelse stream.written();
+                try support.expectEncodedLengths(bytes);
+                if (indexed) {
+                    const end = try support.checksumStart(bytes);
+                    var digest: [20]u8 = undefined;
+                    std.crypto.hash.Sha1.hash(bytes[0..end], &digest, .{});
+                    try std.testing.expectEqualStrings(&std.fmt.bytesToHex(digest, .lower), bytes[end..][0..40]);
+                    var index = try mzml.IndexedReader.build(allocator, .{ .bytes = bytes }, .{});
+                    defer index.deinit();
+                    try std.testing.expectEqual(@as(usize, 1), index.entries.items.len);
+                }
+                var read_input = std.Io.Reader.fixed(bytes);
+                var reader = try mzml.StreamReader.init(allocator, &read_input, .{});
+                defer reader.deinit();
+                _ = try reader.readHeader();
+                _ = (try reader.nextDecodedRecord(&decoded)).?;
+                reference_encoder.reset();
+                try expectArray(f64, decoded.get(0).?.values, mz[0..count], mz_options, &reference_encoder);
+                try expectArray(f32, decoded.get(1).?.values, intensity[0..count], intensity_options, &reference_encoder);
+            }
+        }
+    }
+}
+
+fn writeStreamedRecord(writer: *mzml.Writer, header: mzml.model.Header, record: mzml.model.Node, payloads: []const mzml.Writer.ArrayPayload) !void {
+    try writer.writeHeader(header);
+    try writer.beginList(.spectrum_list, 1, "dp");
+    try writer.writeRecordWithArrays(record, payloads);
+    try writer.endList();
+    try writer.finish();
+}
+
+// Lossless pipelines give the values back; Numpress gives what decoding its encoding gives.
+fn expectArray(comptime T: type, actual: mzml.StreamReader.DecodedArrays.Values, values: []const T, options: mzml.arrays.EncodeOptions, encoder: *mzml.arrays.Encoder) !void {
+    if (!options.pipeline.isNumpress()) {
+        const typed = @field(actual, @tagName(mzml.model.Primitive.of(T)));
+        return std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(values), std.mem.sliceAsBytes(typed));
+    }
+    const expected = try std.testing.allocator.alloc(f64, values.len);
+    defer std.testing.allocator.free(expected);
+    const transformed = try std.testing.allocator.alloc(u8, try mzml.arrays.wireBound(f64, values.len, options.pipeline));
+    defer std.testing.allocator.free(transformed);
+    try mzml.arrays.decodeWire(f64, expected, try encoder.encode(T, values, options), options.pipeline, transformed);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(expected), std.mem.sliceAsBytes(actual.float64));
+}
+
+test "[failure] - [mzML streamed writing]: Numpress value errors write nothing to streams and stop files" {
+    const allocator = std.testing.allocator;
+    var input = std.Io.Reader.fixed(support.DOCUMENT);
+    var source_reader = try mzml.StreamReader.init(allocator, &input, .{});
+    defer source_reader.deinit();
+    const header = try source_reader.readHeader();
+    var encoder = mzml.arrays.Encoder.init(allocator, .fast);
+    defer encoder.deinit();
+    var builder = mzml.Builder.init(allocator, .{});
+    defer builder.deinit();
+    const values = [_]f64{ 1, 2, -3, 4 };
+    for ([_]mzml.arrays.Pipeline{ .pic, .pic_zlib }) |pipeline| {
+        const prepared = try builder.prepareArray(f64, &values, .{
+            .cv_ref = "MS",
+            .encoding = .{ .pipeline = pipeline },
+            .role = .{ .cv_ref = "MS", .accession = mzml.model.Terms.INTENSITY_ARRAY, .name = "intensity array" },
+        }, &encoder);
+        const record = try builder.record(.spectrum, "scan=1", 0, values.len, &.{}, &.{}, &.{prepared.array});
+        var stream: std.Io.Writer.Allocating = .init(allocator);
+        defer stream.deinit();
+        var writer = try mzml.Writer.init(allocator, &stream.writer, .{});
+        defer writer.deinit();
+        try writer.writeHeader(header.*);
+        try writer.beginList(.spectrum_list, 1, "dp");
+        const before = writer.engine.byteOffset();
+        try std.testing.expectError(error.InvalidValue, writer.writeRecordWithArrays(record.node, &.{prepared.payload}));
+        try std.testing.expectEqual(before, writer.engine.byteOffset());
+        try std.testing.expectError(error.FailedState, writer.finish());
+
+        var dir = std.testing.tmpDir(.{});
+        defer dir.cleanup();
+        const file = try dir.dir.createFile(std.testing.io, "failed.mzML", .{ .read = true });
+        defer file.close(std.testing.io);
+        var buffer: [4096]u8 = undefined;
+        var sink = file.writer(std.testing.io, &buffer);
+        var file_writer = try mzml.Writer.initFile(allocator, &sink, .{}, null);
+        defer file_writer.deinit();
+        try file_writer.writeHeader(header.*);
+        try file_writer.beginList(.spectrum_list, 1, "dp");
+        try std.testing.expectError(error.InvalidValue, file_writer.writeRecordWithArrays(record.node, &.{prepared.payload}));
+        try std.testing.expectError(error.FailedState, file_writer.finish());
+        builder.reset();
+        encoder.reset();
     }
 }

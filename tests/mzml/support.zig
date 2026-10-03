@@ -163,7 +163,7 @@ pub fn constructFixture(allocator: std.mem.Allocator, sink: *std.Io.Writer, inde
                 else => null,
             } };
             var nodes: [2]mzml.Builder.Array = undefined;
-            var wires: [2][]const u8 = undefined;
+            var wires: [2]mzml.Writer.ArrayPayload = undefined;
             inline for (0..2) |i| {
                 const array_options: mzml.Builder.ArrayOptions = .{
                     .cv_ref = "MS",
@@ -176,7 +176,7 @@ pub fn constructFixture(allocator: std.mem.Allocator, sink: *std.Io.Writer, inde
                 };
                 const built = try builder.prepareArray(f64, &.{ 1, 2, 3 }, array_options, &encoder);
                 nodes[i] = built.array;
-                wires[i] = built.wire;
+                wires[i] = built.payload;
             }
             var id: [64]u8 = undefined;
             const record = try builder.record(if (list_kind == .spectrum_list) .spectrum else .chromatogram, try std.fmt.bufPrint(&id, "{s}={s}", .{ if (list_kind == .spectrum_list) "scan" else "chromatogram", @tagName(pipeline) }), index, 3, if (list_kind == .spectrum_list) &.{.{ .group_ref = .{ .ref = "record-type" } }} else &.{}, &.{}, &nodes);
@@ -274,6 +274,22 @@ pub fn checksumStart(bytes: []const u8) !usize {
 }
 
 /// Indexed output must end with its wrapper, so a lost final flush fails here.
+/// Checks that every binaryDataArray's encodedLength equals the length of its binary text.
+pub fn expectEncodedLengths(document: []const u8) !void {
+    var at: usize = 0;
+    var arrays: usize = 0;
+    while (std.mem.indexOfPos(u8, document, at, "<binaryDataArray ")) |tag| {
+        const length = (std.mem.indexOfPos(u8, document, tag, "encodedLength=\"") orelse return error.TestUnexpectedResult) + "encodedLength=\"".len;
+        const length_end = std.mem.indexOfScalarPos(u8, document, length, '"') orelse return error.TestUnexpectedResult;
+        const text = (std.mem.indexOfPos(u8, document, tag, "<binary>") orelse return error.TestUnexpectedResult) + "<binary>".len;
+        const text_end = std.mem.indexOfPos(u8, document, text, "</binary>") orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(text_end - text, try std.fmt.parseInt(usize, document[length..length_end], 10));
+        arrays += 1;
+        at = text_end;
+    }
+    try std.testing.expect(arrays != 0);
+}
+
 pub fn expectCompleteIndexed(bytes: []const u8) !void {
     try std.testing.expect(std.mem.endsWith(u8, std.mem.trimEnd(u8, bytes, "\n"), "</fileChecksum></indexedmzML>"));
 }
@@ -421,7 +437,7 @@ pub fn copyRetained(allocator: std.mem.Allocator) !void {
     }
 }
 
-pub fn writeSingleRecord(allocator: std.mem.Allocator, sink: *std.Io.Writer, header: mzml.model.Header, record: mzml.model.Node, indexed: bool, arrays: ?[]const []const u8) !void {
+pub fn writeSingleRecord(allocator: std.mem.Allocator, sink: *std.Io.Writer, header: mzml.model.Header, record: mzml.model.Node, indexed: bool, arrays: ?[]const mzml.Writer.ArrayPayload) !void {
     var writer = if (indexed) try mzml.Writer.initIndexed(allocator, sink, .{}, .{}) else try mzml.Writer.init(allocator, sink, .{});
     defer writer.deinit();
     try writer.writeHeader(header);

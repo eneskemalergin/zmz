@@ -58,32 +58,53 @@ fn mapped(err: zipir.zlib.DecompressError) Error {
 /// Reusable streaming decompression storage with one owner. Do not copy a live instance.
 /// Each `start` decodes one zlib stream, with the errors of `decompress`, in caller-sized
 /// pieces, so no buffer for the whole decoded stream is needed.
-pub const Inflater = struct {
+pub const Decompressor = struct {
     allocator: std.mem.Allocator,
     state: *zipir.zlib.Decompressor,
     input: std.Io.Reader = undefined,
     empty: bool = false,
 
     /// Allocates one zipir decompressor.
-    pub fn init(allocator: std.mem.Allocator) std.mem.Allocator.Error!Inflater {
+    pub fn init(allocator: std.mem.Allocator) std.mem.Allocator.Error!Decompressor {
         return .{ .allocator = allocator, .state = try allocator.create(zipir.zlib.Decompressor) };
     }
 
-    pub fn deinit(self: *Inflater) void {
+    pub fn deinit(self: *Decompressor) void {
         self.allocator.destroy(self.state);
         self.* = undefined;
     }
 
     /// Starts decoding source, which stays borrowed until the stream ends or fails.
-    pub fn start(self: *Inflater, source: []const u8) void {
+    pub fn start(self: *Decompressor, source: []const u8) void {
         self.input = std.Io.Reader.fixed(source);
         self.empty = source.len == 0;
         self.state.init(&self.input, .{});
     }
 
-    /// Fills window with the next decoded bytes and returns them; an empty result means the
-    /// stream ended and its checksum and trailing bytes were checked.
-    pub fn read(self: *Inflater, window: []u8) Error![]u8 {
+    /// Starts decoding a stream pulled from input, which stays borrowed until the stream ends
+    /// or fails. A failed read of input is InvalidData here; its owner keeps the cause.
+    pub fn startReader(self: *Decompressor, input: *std.Io.Reader) void {
+        self.empty = false;
+        self.state.init(input, .{});
+    }
+
+    /// Returns up to limit next decoded bytes from the decompressor's own buffer, valid until the
+    /// next call; an empty result means the stream ended and was checked.
+    pub fn next(self: *Decompressor, limit: usize) Error![]const u8 {
+        if (self.empty) return error.TruncatedInput;
+        const reader = &self.state.reader;
+        const available = reader.peekGreedy(1) catch |err| switch (err) {
+            error.EndOfStream => return &.{},
+            error.ReadFailed => return mapped(self.state.err orelse error.ReadFailed),
+        };
+        const length = @min(available.len, limit);
+        reader.toss(length);
+        return available[0..length];
+    }
+
+    /// Fills window with the next decoded bytes and returns them, short only at the end; an
+    /// empty result means the stream ended and its checksum and trailing bytes were checked.
+    pub fn read(self: *Decompressor, window: []u8) Error![]u8 {
         if (self.empty) return error.TruncatedInput;
         const length = self.state.reader.readSliceShort(window) catch
             return mapped(self.state.err orelse error.ReadFailed);
@@ -130,17 +151,28 @@ pub const Compressor = struct {
     pub fn start(self: *Compressor, output: []u8) Error!*std.Io.Writer {
         self.destination = std.Io.Writer.fixed(output);
         // zipir's only compression error is a full output writer.
-        self.state.init(&self.destination, .{ .preset = switch (self.preset) {
-            .fast => .fast,
-            .even => .even,
-            .dense => .dense,
-        } }) catch return error.OutputTooSmall;
-        return &self.state.writer;
+        return self.startWriter(&self.destination) catch error.OutputTooSmall;
     }
 
     /// Ends the stream begun by start and returns the written prefix of its output.
     pub fn finish(self: *Compressor) Error![]u8 {
-        _ = self.state.finish() catch return error.OutputTooSmall;
+        self.finishWriter() catch return error.OutputTooSmall;
         return self.destination.buffered();
+    }
+
+    /// Starts one zlib stream into destination, which stays borrowed until finishWriter, and
+    /// returns the writer for its source. Write errors are destination's.
+    pub fn startWriter(self: *Compressor, destination: *std.Io.Writer) std.Io.Writer.Error!*std.Io.Writer {
+        try self.state.init(destination, .{ .preset = switch (self.preset) {
+            .fast => .fast,
+            .even => .even,
+            .dense => .dense,
+        } });
+        return &self.state.writer;
+    }
+
+    /// Ends the stream begun by startWriter.
+    pub fn finishWriter(self: *Compressor) std.Io.Writer.Error!void {
+        _ = try self.state.finish();
     }
 };

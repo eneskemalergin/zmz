@@ -15,6 +15,7 @@ const base64 = @import("../binary/base64.zig");
 const encoding = @import("../binary/encoding.zig");
 const schema = @import("schema.zig");
 const xml = @import("../xml/mzml_adapter.zig");
+const Writer = @import("writer.zig");
 
 const Builder = @This();
 
@@ -43,7 +44,9 @@ pub const Array = struct {
     owner: *const Builder,
 };
 
-pub const PreparedArray = struct { array: Array, wire: []const u8 };
+/// Array metadata and the payload the writer encodes while writing it. The values and the
+/// encoder stay borrowed until the record is written.
+pub const PreparedArray = struct { array: Array, payload: Writer.ArrayPayload };
 
 /// Prepared header and reference replacements, owned by the creating builder.
 /// Write header before records and keep this owner alive through the last preparation.
@@ -120,16 +123,23 @@ pub fn number(self: *Builder, parameter: cv.Param, value: f64) Error!cv.Param {
     return result.params[0].cv;
 }
 
-/// Encodes values with encoder and builds array metadata with its primitive, codec, and
-/// encodedLength. Default arrays (m/z, intensity, time) omit arrayLength; others carry it.
+/// Builds array metadata with its primitive and codec terms, and a payload that the writer
+/// encodes while writing (with encoder's compressor or buffer when needed). Options are
+/// checked here; Numpress value errors surface when the record is written. Default arrays
+/// (m/z, intensity, time) omit arrayLength; others carry it.
 pub fn prepareArray(self: *Builder, comptime T: type, values: []const T, options: ArrayOptions, encoder: *arrays.Encoder) Error!PreparedArray {
     try checkArrayOptions(options);
-    const wire = try encoder.encode(T, values, options.encoding);
-    return .{ .array = try self.arrayMetadata(T, values.len, options, try base64.encodedSize(wire.len)), .wire = wire };
+    const source = arrays.Source.of(T, values, options.encoding, encoder);
+    try source.check();
+    const encoded_length = if (source.wireLength()) |length| try base64.encodedSize(length) else 0;
+    return .{
+        .array = try self.arrayMetadata(T, values.len, options, encoded_length),
+        .payload = .{ .source = source },
+    };
 }
 
-/// Encodes values with encoder under a copy of the source array's metadata, replacing its
-/// primitive, codec, and length terms and keeping other fields in order. Bare group references
+/// Prepares values under a copy of the source array's metadata, like prepareArray, replacing
+/// its primitive, codec, and length terms and keeping other fields in order. Bare group references
 /// become local parameters; changing an annotated group's encoding needs a Reencoding header
 /// and otherwise returns GroupRewriteRequired. If a default array omits arrayLength, update
 /// the record's defaultArrayLength when the length changes.
@@ -150,7 +160,8 @@ fn prepareArrayFromInner(self: *Builder, comptime T: type, values: []const T, so
     if (source.children.len != 1 or source.children[0].kind != .binary) return error.InvalidStructure;
     const target: model.Encoding = .{ .primitive = encoding.Primitive.of(T), .pipeline = options.pipeline };
     const counted = try reencodedParams(null, source.params, groups, target, replacements, self.remaining / @sizeOf(cv.Entry));
-    const wire = try encoder.encode(T, values, options);
+    const prepared = arrays.Source.of(T, values, options, encoder);
+    try prepared.check();
     var copier = self.makeCopier();
     defer self.remaining = copier.remaining;
     const params = try copier.alloc(cv.Entry, counted.count);
@@ -159,7 +170,8 @@ fn prepareArrayFromInner(self: *Builder, comptime T: type, values: []const T, so
     const is_default = counted.is_default;
     var encoded_length: [32]u8 = undefined;
     var array_length: [32]u8 = undefined;
-    const encoded_text = encoded_length[0..std.fmt.printInt(&encoded_length, try base64.encodedSize(wire.len), 10, .lower, .{})];
+    const known_length = if (prepared.wireLength()) |length| try base64.encodedSize(length) else 0;
+    const encoded_text = encoded_length[0..std.fmt.printInt(&encoded_length, known_length, 10, .lower, .{})];
     const length_text = array_length[0..std.fmt.printInt(&array_length, values.len, 10, .lower, .{})];
     const add_encoded_length = source.attribute("encodedLength") == null;
     const add_array_length = !is_default and source.attribute("arrayLength") == null;
@@ -217,7 +229,7 @@ fn prepareArrayFromInner(self: *Builder, comptime T: type, values: []const T, so
         .length = values.len,
         .is_default = is_default,
         .owner = self,
-    }, .wire = wire };
+    }, .payload = .{ .source = prepared } };
 }
 
 /// Copies a header and adds a group definition for each requested output encoding, keeping

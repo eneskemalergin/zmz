@@ -1765,7 +1765,7 @@ fn writeLargeIndexed(writer: *mzml.Writer) !void {
         encoder.reset();
         for (&values, 0..) |*value, i| value.* = @as(f64, @floatFromInt(i)) * 0.5 + @as(f64, @floatFromInt(index));
         var arrays: [2]mzml.Builder.Array = undefined;
-        var wires: [2][]const u8 = undefined;
+        var wires: [2]mzml.Writer.ArrayPayload = undefined;
         inline for (.{ mzml.arrays.Pipeline.none, mzml.arrays.Pipeline.zlib }, 0..) |pipeline, i| {
             const prepared = try builder.prepareArray(f64, &values, .{
                 .cv_ref = "MS",
@@ -1776,7 +1776,7 @@ fn writeLargeIndexed(writer: *mzml.Writer) !void {
                     .{ .cv_ref = "MS", .accession = mzml.model.Terms.INTENSITY_ARRAY, .name = "intensity array" },
             }, &encoder);
             arrays[i] = prepared.array;
-            wires[i] = prepared.wire;
+            wires[i] = prepared.payload;
         }
         var id: [16]u8 = undefined;
         const record = try builder.record(.spectrum, try std.fmt.bufPrint(&id, "scan={d}", .{index}), index, LARGE_VALUES, &.{}, &.{}, &arrays);
@@ -1859,7 +1859,11 @@ test "[integration] - [mzML indexed writer]: streams multi-chunk output through 
     }
     const bytes = try dir.dir.readFileAlloc(std.testing.io, "large.mzML", std.testing.allocator, .limited(4 * 1024 * 1024));
     defer std.testing.allocator.free(bytes);
-    try std.testing.expectEqualStrings(whole.written(), bytes);
+    // File output patches each streamed encodedLength into a placeholder as wide as its longest
+    // possible text, so leading zeros can shift bytes and offsets; the document must still be
+    // complete and consistent, with every length equal to its text.
+    try checkLargeIndexed(bytes);
+    try support.expectEncodedLengths(bytes);
 
     // A sink that fills mid-document fails a record write when the chunk drains, not finish.
     const capacity = 100 * 1024;

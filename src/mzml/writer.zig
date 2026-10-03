@@ -12,6 +12,8 @@ const model = @import("model.zig");
 const schema = @import("schema.zig");
 const xml = @import("../xml/mzml_adapter.zig");
 const base64 = @import("../binary/base64.zig");
+const arrays = @import("../binary/arrays.zig");
+const zlib = @import("../binary/zlib.zig");
 const overlaps = @import("../binary/core.zig").overlaps;
 const Sha1 = @import("../binary/sha1.zig").Sha1;
 const Diagnostic = @import("diagnostic.zig");
@@ -22,12 +24,35 @@ const COUNT_PLACEHOLDER = "0" ** std.fmt.comptimePrint("{d}", .{std.math.maxInt(
 
 pub const Limits = schema.Limits;
 
-pub const Error = xml.WriterError || xml.Error || cv.ValueError || base64.Error || schema.Error || std.Io.File.WritePositionalError || std.Io.File.ReadPositionalError || error{
+/// One modeled array for writeRecordWithArrays. The writer sets each written array's
+/// encodedLength from the text it writes, whatever the node declares.
+pub const ArrayPayload = union(enum) {
+    /// Finished wire bytes, written as Base64.
+    wire: []const u8,
+    /// Values encoded while they are written. File output streams every source, writing a
+    /// placeholder encodedLength as wide as the longest possible text and patching it after
+    /// the text, so it may carry leading zeros. Other output streams sources whose length is known without encoding (primitives
+    /// without zlib) or after a counting pass (Numpress without zlib), and encodes zlib
+    /// sources into the source's encoder first, so a failing source writes nothing there. On
+    /// file output a Numpress value error can stop a record midway; the writer then fails as
+    /// for an output error.
+    source: arrays.Source,
+};
+
+// How one modeled array is written: its retained text, Base64 of wire bytes, or a source
+// encoded while written, with its known text length or, for a patched placeholder, null and
+// the placeholder's width.
+const Plan = union(enum) {
+    keep,
+    wire: []const u8,
+    source: struct { payload: arrays.Source, text_length: ?usize, width: usize = 0 },
+};
+
+pub const Error = xml.WriterError || xml.Error || cv.ValueError || arrays.EncodeError || schema.Error || std.Io.File.WritePositionalError || std.Io.File.ReadPositionalError || error{
     InvalidStructure,
     MissingAttribute,
     UnknownAttribute,
     CountMismatch,
-    EncodedLengthMismatch,
     PayloadNotRetained,
     InvalidIndex,
     InvalidState,
@@ -50,6 +75,9 @@ index_state: ?*IndexState = null,
 file_sink: ?*std.Io.File.Writer = null,
 count_offset: ?u64 = null,
 namespace_uri: []const u8 = xml.NAMESPACE,
+plans: std.ArrayList(Plan) = .empty,
+// Base64 length of the last streamed source, for its encodedLength patch.
+source_text_length: usize = 0,
 
 /// Bounds retained index entries and ID bytes, including historical native/spot IDs.
 pub const IndexLimits = struct { records: usize = 1_000_000, id_bytes: usize = 64 * 1024 * 1024 };
@@ -89,6 +117,7 @@ pub fn initFile(allocator: std.mem.Allocator, sink: *std.Io.File.Writer, limits:
 /// Neither finishes nor flushes output.
 pub fn deinit(self: *Writer) void {
     self.engine.deinit();
+    self.plans.deinit(self.allocator);
     if (self.index_state) |state| state.deinit();
     self.* = undefined;
 }
@@ -212,7 +241,7 @@ pub fn beginListWithAttributes(self: *Writer, kind: model.Kind, count: ?usize, a
 /// Writes a record with its retained binary text, escaped as XML; the Base64 and encodedLength
 /// are not checked.
 pub fn writeRecord(self: *Writer, node: model.Node) Error!void {
-    return self.writeRecordInner(node, false, @as([]const []const u8, &.{}));
+    return self.writeRecordInner(node, false, @as([]const ArrayPayload, &.{}));
 }
 
 /// Writes one forward item. List openings keep their source counts; use
@@ -238,20 +267,21 @@ pub fn writeItem(self: *Writer, item: model.Item) Error!void {
     }
 }
 
-/// Writes a record with one prepared wire slice per modeled array, encoded as Base64 in place
-/// of any binary text. The array count and each encodedLength must match, and wire must not
-/// share memory with the output buffers.
-pub fn writeRecordWithArrays(self: *Writer, node: model.Node, wire_arrays: []const []const u8) Error!void {
-    return self.writeRecordInner(node, true, wire_arrays);
+/// Writes a record with one payload per modeled array, written as Base64 in place of any
+/// binary text. The array count must match; wire and source values must not share memory
+/// with the output buffers.
+pub fn writeRecordWithArrays(self: *Writer, node: model.Node, payloads: []const ArrayPayload) Error!void {
+    return self.writeRecordInner(node, true, payloads);
 }
 
 /// Like writeRecordWithArrays with one choice per modeled array: null keeps that array's
-/// binary text, and a slice, even an empty one, replaces it. Only supplied slices are checked.
-pub fn writeRecordWithSelectedArrays(self: *Writer, node: model.Node, wire_arrays: []const ?[]const u8) Error!void {
-    return self.writeRecordInner(node, true, wire_arrays);
+/// binary text, and a payload, even an empty one, replaces it. Only supplied payloads are
+/// checked.
+pub fn writeRecordWithSelectedArrays(self: *Writer, node: model.Node, payloads: []const ?ArrayPayload) Error!void {
+    return self.writeRecordInner(node, true, payloads);
 }
 
-fn writeRecordInner(self: *Writer, node: model.Node, comptime replace_arrays: bool, wire_arrays: anytype) Error!void {
+fn writeRecordInner(self: *Writer, node: model.Node, comptime replace_arrays: bool, payloads: anytype) Error!void {
     if (self.failure != null) return error.FailedState;
     errdefer |err| {
         self.fail(err, .write_record);
@@ -266,13 +296,18 @@ fn writeRecordInner(self: *Writer, node: model.Node, comptime replace_arrays: bo
         if (self.written_count < std.math.maxInt(usize)) return try self.sizeError(error.CountMismatch, self.expected_count, self.written_count + 1, .records);
         return error.CountMismatch;
     }
+    self.plans.clearRetainingCapacity();
     if (replace_arrays) {
         const list = node.child(.binary_data_array_list);
-        const arrays = if (list) |value| value.children else &.{};
-        if (arrays.len != wire_arrays.len) return try self.sizeError(error.CountMismatch, arrays.len, wire_arrays.len, .arrays);
-        if (self.overlapsOutput(std.mem.sliceAsBytes(wire_arrays))) return error.OverlappingBuffers;
-        for (arrays, wire_arrays, 0..) |array, supplied, position| {
-            const wire = @as(?[]const u8, supplied) orelse continue;
+        const array_nodes = if (list) |value| value.children else &.{};
+        if (array_nodes.len != payloads.len) return try self.sizeError(error.CountMismatch, array_nodes.len, payloads.len, .arrays);
+        if (self.overlapsOutput(std.mem.sliceAsBytes(payloads))) return error.OverlappingBuffers;
+        try self.plans.ensureTotalCapacity(self.allocator, payloads.len);
+        for (array_nodes, payloads, 0..) |array, supplied, position| {
+            const payload = @as(?ArrayPayload, supplied) orelse {
+                self.plans.appendAssumeCapacity(.keep);
+                continue;
+            };
             errdefer |err| {
                 self.capture(err, .array, .none);
                 self.failure.?.element = .binary_data_array;
@@ -280,11 +315,14 @@ fn writeRecordInner(self: *Writer, node: model.Node, comptime replace_arrays: bo
             }
             if (array.kind != .binary_data_array or array.children.len != 1 or
                 array.children[0].kind != .binary) return error.InvalidStructure;
-            if (self.overlapsOutput(wire)) return error.OverlappingBuffers;
-            const length = try base64.encodedSize(wire.len);
-            if (length > self.limits.text_bytes) return try self.limitError(.text_bytes, self.limits.text_bytes, length);
-            const declared = try self.number(array, .encoded_length);
-            if (declared != length) return try self.sizeError(error.EncodedLengthMismatch, length, declared, .bytes);
+            self.plans.appendAssumeCapacity(switch (payload) {
+                .wire => |wire| plan: {
+                    if (self.overlapsOutput(wire)) return error.OverlappingBuffers;
+                    _ = try self.textLength(wire.len);
+                    break :plan .{ .wire = wire };
+                },
+                .source => |source| try self.planSource(source),
+            });
         }
     }
     const index = try self.number(node, .index);
@@ -317,11 +355,147 @@ fn writeRecordInner(self: *Writer, node: model.Node, comptime replace_arrays: bo
         state.entries.appendAssumeCapacity(.{ .id = copied, .offset = offset });
         if (node.kind == .spectrum) state.spectra += 1;
     }
-    var remaining = wire_arrays;
+    var remaining: []const Plan = self.plans.items;
     var budget = self.limits.nodes;
     try self.writeNode(node, replace_arrays, &remaining, &budget);
-    if (remaining.len != 0) return try self.sizeError(error.CountMismatch, wire_arrays.len - remaining.len, wire_arrays.len, .arrays);
+    if (remaining.len != 0) return try self.sizeError(error.CountMismatch, payloads.len - remaining.len, payloads.len, .arrays);
     self.written_count += 1;
+}
+
+fn textLength(self: *Writer, wire_length: usize) Error!usize {
+    const length = try base64.encodedSize(wire_length);
+    if (length > self.limits.text_bytes) return try self.limitError(.text_bytes, self.limits.text_bytes, length);
+    return length;
+}
+
+// Decides how a source is written before any of its record is, so that on output that cannot
+// be patched every length is known and every encoding error found first.
+fn planSource(self: *Writer, source: arrays.Source) Error!Plan {
+    try source.check();
+    switch (source.values) {
+        inline else => |values| if (self.overlapsOutput(std.mem.sliceAsBytes(values))) return error.OverlappingBuffers,
+    }
+    if (source.wireLength()) |length| return .{ .source = .{ .payload = source, .text_length = try self.textLength(length) } };
+    if (self.file_sink != null) {
+        // The placeholder is as wide as the longest text the source could produce.
+        var longest = switch (source.values) {
+            inline else => |values| try arrays.wireBound(@typeInfo(@TypeOf(values)).pointer.child, values.len, source.options.pipeline),
+        };
+        if (source.options.pipeline.hasZlib()) longest = zlib.compressBound(longest);
+        var digits: [32]u8 = undefined;
+        const width = std.fmt.printInt(&digits, try base64.encodedSize(longest), 10, .lower, .{});
+        return .{ .source = .{ .payload = source, .text_length = null, .width = width } };
+    }
+    if (!source.options.pipeline.hasZlib()) {
+        var counter = std.Io.Writer.Discarding.init(&.{});
+        source.writeTo(&counter.writer) catch |err| switch (err) {
+            error.WriteFailed => unreachable,
+            else => |e| return e,
+        };
+        return .{ .source = .{ .payload = source, .text_length = try self.textLength(@intCast(counter.fullCount())) } };
+    }
+    const wire = try source.encoder.?.encodeSource(source);
+    _ = try self.textLength(wire.len);
+    return .{ .wire = wire };
+}
+
+// Streams a source as Base64 into the open binary element and records its text length.
+fn writeSource(self: *Writer, source: arrays.Source) Error!void {
+    try self.engine.binaryPart(&.{});
+    const start = self.engine.byteOffset() orelse return error.LimitExceeded;
+    if (source.options.pipeline == .none and @import("builtin").cpu.arch.endian() == .little) {
+        switch (source.values) {
+            inline else => |values| try self.engine.binary(std.mem.sliceAsBytes(values)),
+        }
+    } else {
+        var buffer: [3 * 4096]u8 = undefined;
+        var out: Base64Out = .{ .engine = &self.engine, .writer = .{ .vtable = &Base64Out.vtable, .buffer = &buffer } };
+        source.writeTo(&out.writer) catch |err| switch (err) {
+            error.WriteFailed => return out.failure orelse error.WriteFailed,
+            else => |e| return e,
+        };
+        out.writer.flush() catch return out.failure orelse error.WriteFailed;
+        try self.engine.binaryEnd();
+    }
+    const end = self.engine.byteOffset() orelse return error.LimitExceeded;
+    self.source_text_length = @intCast(end - start);
+    if (self.source_text_length > self.limits.text_bytes)
+        return try self.limitError(.text_bytes, self.limits.text_bytes, self.source_text_length);
+}
+
+// A writer that Base64-encodes everything written to it into the engine's open binary text.
+const Base64Out = struct {
+    writer: std.Io.Writer,
+    engine: *xml.Writer,
+    failure: ?xml.WriterError = null,
+
+    const vtable: std.Io.Writer.VTable = .{ .drain = drain };
+
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *Base64Out = @alignCast(@fieldParentPtr("writer", w));
+        self.part(w.buffered()) catch return error.WriteFailed;
+        w.end = 0;
+        var written: usize = 0;
+        for (data[0 .. data.len - 1]) |bytes| {
+            self.part(bytes) catch return error.WriteFailed;
+            written += bytes.len;
+        }
+        for (0..splat) |_| self.part(data[data.len - 1]) catch return error.WriteFailed;
+        return written + data[data.len - 1].len * splat;
+    }
+
+    fn part(self: *Base64Out, bytes: []const u8) xml.WriterError!void {
+        self.engine.binaryPart(bytes) catch |err| {
+            self.failure = err;
+            return err;
+        };
+    }
+};
+
+// Writes the encodedLength of a streamed source over its placeholder: in the sink's buffer
+// when the placeholder is still there, otherwise at its file position.
+fn patchLength(self: *Writer, offset: u64, length: usize, width: usize) Error!void {
+    var buffer: [32]u8 = undefined;
+    const text = buffer[0..std.fmt.printInt(&buffer, length, 10, .lower, .{})];
+    var padded = COUNT_PLACEHOLDER.*;
+    const digits = padded[0..width];
+    @memcpy(digits[width - text.len ..], text);
+    const sink = self.engine.sink;
+    const end = self.engine.byteOffset() orelse return error.LimitExceeded;
+    const buffered_start = end - sink.end;
+    if (offset >= buffered_start) {
+        @memcpy(sink.buffer[@intCast(offset - buffered_start)..][0..digits.len], digits);
+        return;
+    }
+    const file = self.file_sink.?;
+    file.interface.flush() catch |err| return try self.ioFailure(err);
+    file.file.writePositionalAll(file.io, digits, offset) catch |err| return try self.ioFailure(err);
+}
+
+// Writes a written array's attributes with the encodedLength of its text: the known value, or
+// a placeholder of width digits whose offset is returned. A missing encodedLength is written
+// first.
+fn writeArrayAttributes(self: *Writer, attrs: []const model.Attribute, text_length: ?usize, width: usize) Error!?u64 {
+    var has_length = false;
+    for (attrs) |attr| {
+        if (attr.namespace_uri == null and std.mem.eql(u8, attr.name, "encodedLength")) has_length = true;
+    }
+    var placeholder: ?u64 = null;
+    if (!has_length) placeholder = try self.writeEncodedLength(text_length, width);
+    for (attrs) |attr| {
+        if (attr.namespace_uri == null and std.mem.eql(u8, attr.name, "encodedLength")) {
+            placeholder = try self.writeEncodedLength(text_length, width);
+        } else try self.writeAttributes(&.{attr});
+    }
+    return placeholder;
+}
+
+fn writeEncodedLength(self: *Writer, text_length: ?usize, width: usize) Error!?u64 {
+    var buffer: [32]u8 = undefined;
+    const value = if (text_length) |length| buffer[0..std.fmt.printInt(&buffer, length, 10, .lower, .{})] else COUNT_PLACEHOLDER[0..width];
+    try self.engine.attribute("encodedLength", value);
+    if (text_length != null) return null;
+    return (self.engine.byteOffset() orelse return error.LimitExceeded) - 1 - width;
 }
 
 /// Closes the active list, checking a supplied count or patching an unknown count.
@@ -445,27 +619,36 @@ fn writeNode(self: *Writer, node: model.Node, comptime replace_arrays: bool, rem
     }
     if (budget.* == 0) return try self.limitError(.nodes, self.limits.nodes, null);
     budget.* -= 1;
-    const wire: ?[]const u8 = if (replace_arrays and node.kind == .binary) blk: {
+    const plan: Plan = if (replace_arrays and (node.kind == .binary or node.kind == .binary_data_array)) blk: {
         if (remaining.len == 0) return error.CountMismatch;
         break :blk remaining.*[0];
-    } else null;
+    } else .keep;
     if (node.kind == .binary) {
         if (node.params.len != 0) return error.InvalidStructure;
-        if (wire == null and node.text == null) return error.PayloadNotRetained;
+        if (plan == .keep and node.text == null) return error.PayloadNotRetained;
     } else if (node.text != null) return error.InvalidStructure;
     try self.startKnown(node.kind.xmlName(), node.attributes, false);
-    try self.writeAttributes(node.attributes);
-    if (wire) |bytes| {
-        try self.engine.binary(bytes);
-    } else if (node.text) |text| {
-        if (text.len > self.limits.text_bytes) return try self.limitError(.text_bytes, self.limits.text_bytes, text.len);
-        try self.engine.text(text);
-    }
+    var placeholder: ?u64 = null;
+    if (node.kind == .binary_data_array and plan == .source) {
+        placeholder = try self.writeArrayAttributes(node.attributes, plan.source.text_length, plan.source.width);
+    } else if (node.kind == .binary_data_array and plan == .wire) {
+        _ = try self.writeArrayAttributes(node.attributes, try base64.encodedSize(plan.wire.len), 0);
+    } else try self.writeAttributes(node.attributes);
+    if (node.kind == .binary) switch (plan) {
+        .wire => |bytes| try self.engine.binary(bytes),
+        .source => |source| try self.writeSource(source.payload),
+        .keep => {
+            const text = node.text.?;
+            if (text.len > self.limits.text_bytes) return try self.limitError(.text_bytes, self.limits.text_bytes, text.len);
+            try self.engine.text(text);
+        },
+    };
     try self.writeContent(node, replace_arrays, remaining, budget);
     try self.engine.endElement();
     if (replace_arrays and node.kind == .binary_data_array) {
         if (remaining.len == 0) return error.CountMismatch;
         remaining.* = remaining.*[1..];
+        if (placeholder) |offset| try self.patchLength(offset, self.source_text_length, plan.source.width);
     }
 }
 

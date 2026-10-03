@@ -29,6 +29,67 @@ pub const EncodeOptions = struct {
     fixed_point: ?f64 = null,
 };
 
+/// Typed array values, borrowed.
+pub const Values = union(encoding.Primitive) {
+    float32: []const f32,
+    float64: []const f64,
+    int32: []const i32,
+    int64: []const i64,
+
+    pub fn of(comptime T: type, values: []const T) Values {
+        return @unionInit(Values, @tagName(encoding.Primitive.of(T)), values);
+    }
+
+    pub fn len(self: Values) usize {
+        return switch (self) {
+            inline else => |values| values.len,
+        };
+    }
+};
+
+/// Borrowed values and how to encode them, for encoding while they are written instead of
+/// into a buffer first. The values must stay unchanged until they are written. encoder
+/// supplies the zlib compressor, and a buffer where a length must be known before writing.
+pub const Source = struct {
+    values: Values,
+    options: EncodeOptions,
+    encoder: ?*Encoder = null,
+
+    pub fn of(comptime T: type, values: []const T, options: EncodeOptions, encoder: ?*Encoder) Source {
+        return .{ .values = .of(T, values), .options = options, .encoder = encoder };
+    }
+
+    /// Checks the options against the values' type, with the errors encode would return.
+    pub fn check(self: Source) Error!void {
+        switch (self.values) {
+            inline else => |values| try checkOptions(@typeInfo(@TypeOf(values)).pointer.child, self.options, self.encoder != null),
+        }
+    }
+
+    /// The exact wire length when it is known without encoding: primitives without zlib.
+    pub fn wireLength(self: Source) ?usize {
+        if (self.options.pipeline != .none) return null;
+        return switch (self.values) {
+            inline else => |values| values.len * @sizeOf(@typeInfo(@TypeOf(values)).pointer.child),
+        };
+    }
+
+    /// Writes the wire bytes to writer, through the encoder's compressor for zlib pipelines.
+    /// Numpress value errors surface here; after one, writer holds an unspecified prefix.
+    pub fn writeTo(self: Source, writer: *std.Io.Writer) WriteError!void {
+        switch (self.values) {
+            inline else => |values| {
+                const T = @typeInfo(@TypeOf(values)).pointer.child;
+                if (!self.options.pipeline.hasZlib()) return writeWire(T, values, self.options, writer);
+                const compressor = try (self.encoder orelse return error.MissingCompressor).compressor();
+                const compressed = try compressor.startWriter(writer);
+                try writeWire(T, values, self.options, compressed);
+                try compressor.finishWriter();
+            },
+        }
+    }
+};
+
 pub const Error = base64.Error || zlib.Error || numpress.Error || error{
     TypeMismatch,
     MissingFixedPoint,
@@ -106,7 +167,7 @@ fn decodeWireInner(comptime T: type, output: []T, source: []const u8, pipeline: 
 }
 
 /// Encodes values as Base64 into output and returns the written prefix. compressor is needed
-/// only for zlib pipelines.
+/// only for zlib pipelines. Numpress takes f32 or f64 values and always decodes to f64.
 pub fn encode(
     comptime T: type,
     output: []u8,
@@ -154,15 +215,15 @@ pub fn encodeWire(
             }
             break :blk required;
         },
-        .linear => if (T == f64)
+        .linear => if (T == f64 or T == f32)
             try numpress.encodeLinear(values, options.fixed_point.?, scratch.transformed)
         else
             unreachable,
-        .pic => if (T == f64)
+        .pic => if (T == f64 or T == f32)
             try numpress.encodePic(values, scratch.transformed)
         else
             unreachable,
-        .slof => if (T == f64)
+        .slof => if (T == f64 or T == f32)
             try numpress.encodeSlof(values, options.fixed_point.?, scratch.transformed)
         else
             unreachable,
@@ -178,13 +239,13 @@ fn writeWire(comptime T: type, values: []const T, options: EncodeOptions, writer
             const Bits = @Int(.unsigned, @bitSizeOf(T));
             for (values) |value| try writer.writeInt(Bits, @bitCast(value), .little);
         },
-        .linear => if (T == f64) {
+        .linear => if (T == f64 or T == f32) {
             _ = try numpress.encodeLinearTo(values, options.fixed_point.?, writer);
         } else unreachable,
-        .pic => if (T == f64) {
+        .pic => if (T == f64 or T == f32) {
             _ = try numpress.encodePicTo(values, writer);
         } else unreachable,
-        .slof => if (T == f64) {
+        .slof => if (T == f64 or T == f32) {
             _ = try numpress.encodeSlofTo(values, options.fixed_point.?, writer);
         } else unreachable,
     }
@@ -192,7 +253,7 @@ fn writeWire(comptime T: type, values: []const T, options: EncodeOptions, writer
 
 fn checkOptions(comptime T: type, options: EncodeOptions, has_compressor: bool) Error!void {
     const selected = options.pipeline.transform();
-    if (selected != .none and T != f64) return error.TypeMismatch;
+    if (selected != .none and T != f64 and T != f32) return error.TypeMismatch;
     if (options.pipeline.hasZlib() and !has_compressor) return error.MissingCompressor;
     if (selected == .linear or selected == .slof) {
         if (options.fixed_point == null) return error.MissingFixedPoint;
@@ -200,6 +261,7 @@ fn checkOptions(comptime T: type, options: EncodeOptions, has_compressor: bool) 
 }
 
 pub const EncodeError = Error || std.mem.Allocator.Error;
+pub const WriteError = EncodeError || std.Io.Writer.Error;
 
 /// Encodes arrays with storage it owns: the zlib compressor (allocated on first use) and one
 /// output buffer per array encoded since the last reset. With zlib, primitive or Numpress
@@ -208,7 +270,7 @@ pub const EncodeError = Error || std.mem.Allocator.Error;
 pub const Encoder = struct {
     allocator: std.mem.Allocator,
     preset: zlib.Preset,
-    compressor: ?zlib.Compressor = null,
+    compressor_state: ?zlib.Compressor = null,
     outputs: std.ArrayList(std.ArrayList(u8)) = .empty,
     used: usize = 0,
 
@@ -217,7 +279,7 @@ pub const Encoder = struct {
     }
 
     pub fn deinit(self: *Encoder) void {
-        if (self.compressor) |*compressor| compressor.deinit();
+        if (self.compressor_state) |*state| state.deinit();
         for (self.outputs.items) |*output| output.deinit(self.allocator);
         self.outputs.deinit(self.allocator);
         self.* = undefined;
@@ -239,9 +301,22 @@ pub const Encoder = struct {
             const output = try self.nextOutput(bound);
             return encodeWire(T, values, options, .{ .transport = &.{}, .transformed = output }, null);
         }
-        if (self.compressor == null) self.compressor = try zlib.Compressor.init(self.allocator, self.preset);
+        const state = try self.compressor();
         const output = try self.nextOutput(zlib.compressBound(bound));
-        return encodeWire(T, values, options, .{ .transport = output, .transformed = &.{} }, &self.compressor.?);
+        return encodeWire(T, values, options, .{ .transport = output, .transformed = &.{} }, state);
+    }
+
+    /// Encodes a source like encode.
+    pub fn encodeSource(self: *Encoder, source: Source) EncodeError![]const u8 {
+        return switch (source.values) {
+            inline else => |values| self.encode(@typeInfo(@TypeOf(values)).pointer.child, values, source.options),
+        };
+    }
+
+    /// The encoder's compressor, allocated on first use.
+    pub fn compressor(self: *Encoder) std.mem.Allocator.Error!*zlib.Compressor {
+        if (self.compressor_state == null) self.compressor_state = try zlib.Compressor.init(self.allocator, self.preset);
+        return &self.compressor_state.?;
     }
 
     fn nextOutput(self: *Encoder, size: usize) std.mem.Allocator.Error![]u8 {
@@ -257,7 +332,7 @@ pub const Encoder = struct {
 /// This is not a bound for the zlib stream or its Base64 representation.
 pub fn wireBound(comptime T: type, count: usize, pipeline: Pipeline) Error!usize {
     _ = encoding.Primitive.of(T);
-    if (pipeline.transform() != .none and T != f64) return error.TypeMismatch;
+    if (pipeline.transform() != .none and T != f64 and T != f32) return error.TypeMismatch;
     return switch (pipeline.transform()) {
         .none => std.math.mul(usize, count, @sizeOf(T)) catch error.LengthOverflow,
         .linear => numpress.linearMaxEncodedLen(count),

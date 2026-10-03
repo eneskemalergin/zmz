@@ -646,6 +646,50 @@ fn startNodeFor(self: *StreamReader, storage: *Storage, kind_value: model.Kind, 
     };
 }
 
+// An element's text events, one logical fragment per next(). DecodedArrays pulls binary text
+// through it, so a payload decodes as it is read. Each fragment is checked against the text
+// limit before it is handed out and retained only on the following call, after its consumer
+// has decoded it, so errors keep the order of decoding each fragment as it arrives.
+const TextSource = struct {
+    reader: *StreamReader,
+    storage: *Storage,
+    retain: bool,
+    text: std.ArrayList(u8) = .empty,
+    size: usize = 0,
+    // The fragment handed out last, still owned by the cursor until it advances.
+    pending: ?[]const u8 = null,
+    started: bool = false,
+    ended: bool = false,
+
+    pub fn next(self: *TextSource) Error!?[]const u8 {
+        if (self.ended) return null;
+        const reader = self.reader;
+        if (self.pending) |bytes| {
+            self.pending = null;
+            if (self.retain) {
+                if (self.size > self.storage.limit -| self.storage.used) return try self.storage.limitError();
+                try self.text.appendSlice(self.storage.arena.allocator(), bytes);
+            }
+        }
+        if (self.started) try reader.cursor.advance(true);
+        self.started = true;
+        const event = reader.cursor.current orelse {
+            self.ended = true;
+            return null;
+        };
+        if (event.data != .text) {
+            self.ended = true;
+            return null;
+        }
+        const bytes = event.data.text.bytes;
+        self.size = std.math.add(usize, self.size, bytes.len) catch return error.LimitExceeded;
+        const maximum = reader.options.limits.binary_text_bytes;
+        if (self.size > maximum) return try reader.limitError(.binary_text_bytes, maximum, self.size);
+        self.pending = bytes;
+        return bytes;
+    }
+};
+
 fn parseNodeFor(self: *StreamReader, storage: *Storage, depth: usize, advance_after: bool, payload: Payload, comptime retention: Retention) Error!model.Node {
     if (depth > schema.MAX_DEPTH) return try self.limitError(.depth, schema.MAX_DEPTH, depth);
     const kind_value = try self.kind();
@@ -667,25 +711,16 @@ fn parseNodeFor(self: *StreamReader, storage: *Storage, depth: usize, advance_af
     const has_text = kind_value == .binary or kind_value == .offset or kind_value == .index_list_offset or kind_value == .file_checksum;
     try self.cursor.advance(has_text);
     if (has_text) {
-        var text: std.ArrayList(u8) = .empty;
-        var text_size: usize = 0;
-        while (self.cursor.current) |event| {
-            if (event.data != .text) break;
-            const bytes = event.data.text.bytes;
-            text_size = std.math.add(usize, text_size, bytes.len) catch return error.LimitExceeded;
-            if (text_size > self.options.limits.binary_text_bytes) return try self.limitError(.binary_text_bytes, self.options.limits.binary_text_bytes, text_size);
-            if (kind_value == .binary and self.decode_binary) try self.decoded_arrays.?.text(bytes);
-            if (payload == .retain or kind_value != .binary) {
-                if (text_size > storage.limit -| storage.used) return try storage.limitError();
-                try text.appendSlice(storage.arena.allocator(), bytes);
-            }
-            try self.cursor.advance(true);
+        var source: TextSource = .{ .reader = self, .storage = storage, .retain = payload == .retain or kind_value != .binary };
+        if (kind_value == .binary and self.decode_binary) {
+            try self.decoded_arrays.?.decodeText(&source);
+        } else {
+            while (try source.next()) |_| {}
         }
-        if (payload == .retain or kind_value != .binary) {
-            storage.used += text.items.len;
-            node.text = text.items;
+        if (source.retain) {
+            storage.used += source.text.items.len;
+            node.text = source.text.items;
         }
-        if (kind_value == .binary and self.decode_binary) try self.decoded_arrays.?.finishArray();
     } else {
         const params_start = self.param_scratch.items.len;
         defer self.param_scratch.shrinkRetainingCapacity(params_start);

@@ -157,7 +157,7 @@ const Reencoder = struct {
     encoder: mzml.arrays.Encoder,
     arrays: std.ArrayList(mzml.model.Node) = .empty,
     children: std.ArrayList(mzml.model.Node) = .empty,
-    wires: std.ArrayList([]const u8) = .empty,
+    payloads: std.ArrayList(mzml.Writer.ArrayPayload) = .empty,
 
     fn init(allocator: std.mem.Allocator, reencoding: mzml.Builder.Reencoding) Reencoder {
         return .{ .allocator = allocator, .builder = .init(allocator, .{}), .reencoding = reencoding, .encoder = .init(allocator, .fast) };
@@ -166,7 +166,7 @@ const Reencoder = struct {
     fn deinit(self: *Reencoder) void {
         self.arrays.deinit(self.allocator);
         self.children.deinit(self.allocator);
-        self.wires.deinit(self.allocator);
+        self.payloads.deinit(self.allocator);
         self.encoder.deinit();
         self.builder.deinit();
     }
@@ -176,13 +176,13 @@ const Reencoder = struct {
         self.encoder.reset();
         const source_arrays = if (source.child(.binary_data_array_list)) |list| list.children else &.{};
         try self.arrays.resize(self.allocator, source_arrays.len);
-        try self.wires.resize(self.allocator, source_arrays.len);
-        for (source_arrays, self.arrays.items, self.wires.items, 0..) |array, *node, *wire, i| {
+        try self.payloads.resize(self.allocator, source_arrays.len);
+        for (source_arrays, self.arrays.items, self.payloads.items, 0..) |array, *node, *payload, i| {
             const prepared = switch (decoded.get(i).?.values) {
                 inline else => |values| try self.reencoding.prepareArray(&self.builder, @typeInfo(@TypeOf(values)).pointer.child, values, array, .{ .pipeline = .zlib }, &self.encoder),
             };
             node.* = prepared.array.node;
-            wire.* = prepared.wire;
+            payload.* = prepared.payload;
         }
         try self.children.resize(self.allocator, source.children.len);
         @memcpy(self.children.items, source.children);
@@ -191,6 +191,6 @@ const Reencoder = struct {
         }
         var record = source;
         record.children = self.children.items;
-        try writer.writeRecordWithArrays(record, self.wires.items);
+        try writer.writeRecordWithArrays(record, self.payloads.items);
     }
 };
