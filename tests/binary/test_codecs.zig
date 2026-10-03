@@ -190,6 +190,63 @@ test "[property] - [base64]: pieces of pieceFor characters always fit a retarget
     }
 }
 
+// Checks text of any length through one window: each update takes at most pieceFor(window)
+// characters, and take() hands the decoded bytes over before the next update reuses it.
+fn checkWindowed(text: []const u8, window: []u8, expected: []const u8) base64.Error!base64.Counts {
+    var decoder = base64.Decoder.init(window);
+    var compared: usize = 0;
+    var rest = text;
+    while (rest.len != 0) {
+        const piece = @min(rest.len, base64.Decoder.pieceFor(window.len));
+        try decoder.update(rest[0..piece]);
+        const bytes = decoder.take();
+        std.testing.expectEqualSlices(u8, expected[compared..][0..bytes.len], bytes) catch return error.FailedState;
+        compared += bytes.len;
+        rest = rest[piece..];
+    }
+    return decoder.finish();
+}
+
+test "[integration] - [base64]: checks text far larger than its window with exact counts and errors" {
+    var source: [10_000]u8 = undefined;
+    var random = std.Random.DefaultPrng.init(std.testing.random_seed);
+    random.random().bytes(&source);
+    var encoded: [13_336]u8 = undefined;
+    const plain = try base64.encode(&encoded, &source);
+    // XML text: the Base64 broken into lines of 76 characters.
+    var text_buffer: [13_336 + 13_336 / 76 * 2]u8 = undefined;
+    var text_length: usize = 0;
+    for (plain, 0..) |byte, i| {
+        if (i != 0 and i % 76 == 0) {
+            @memcpy(text_buffer[text_length..][0..2], "\r\n");
+            text_length += 2;
+        }
+        text_buffer[text_length] = byte;
+        text_length += 1;
+    }
+    const text = text_buffer[0..text_length];
+    var window: [48]u8 = undefined;
+    try std.testing.expectEqual(base64.Counts{ .text_bytes = text.len, .significant_bytes = plain.len, .decoded_bytes = source.len }, try checkWindowed(text, &window, &source));
+
+    // Errors far past the first window are found where they are, and stay.
+    const bad = try std.testing.allocator.dupe(u8, text);
+    defer std.testing.allocator.free(bad);
+    bad[9_000] = '*';
+    try std.testing.expectError(error.InvalidCharacter, checkWindowed(bad, &window, &source));
+    @memcpy(bad, text);
+    try std.testing.expectError(error.TruncatedInput, checkWindowed(bad[0 .. bad.len - 1], &window, &source));
+    // 10,000 bytes end in one byte and "==": a set unused bit in the last character is refused.
+    try std.testing.expectEqualStrings("==", text[text.len - 2 ..]);
+    bad[bad.len - 3] = switch (text[text.len - 3]) {
+        'A' => 'B',
+        else => |byte| byte ^ 1,
+    };
+    try std.testing.expectError(error.NonCanonicalTail, checkWindowed(bad, &window, &source));
+    var decoder = base64.Decoder.init(&window);
+    try std.testing.expectError(error.InvalidCharacter, decoder.update("AAAA*"));
+    try std.testing.expectError(error.FailedState, decoder.update("AAAA"));
+}
+
 test "[property] - [base64]: preserves all one-byte and two-byte inputs" {
     var input: [2]u8 = undefined;
     var encoded: [4]u8 = undefined;
