@@ -37,6 +37,9 @@ pub const Options = struct {
     /// Bounds each array's decoded typed bytes, allocated from its declared length. The reader's
     /// binary_text_bytes bounds the Base64 text.
     array_bytes: usize = 192 * 1024 * 1024,
+    /// Bounds the decoded typed bytes of all of a record's arrays together, so the memory one
+    /// record takes does not grow with its array count.
+    record_array_bytes: usize = 512 * 1024 * 1024,
     /// Numpress decodes to f64. `declared` returns arrays declared 32-bit float as f32, rounded
     /// to the nearest (as pyteomics and pyOpenMS do); integer declarations stay f64.
     numpress_precision: enum { decoded, declared } = .decoded,
@@ -59,6 +62,10 @@ values: numpress.Decoder = undefined,
 // zlib layers finish, so their errors come first, as when each layer decodes the whole payload.
 deferred: ?numpress.Error = null,
 failure: ?struct { stage: Diagnostic.Stage, detail: Diagnostic.Detail = .none } = null,
+// The failure of the last decodeRecord, decodeArray, or decodeArrayText; reset keeps it.
+report: ?Diagnostic = null,
+// Source position of the array those calls are decoding, for the report.
+position: usize = 0,
 // A read decodes into this owner; a selection callback must not reset or reuse it meanwhile.
 busy: bool = false,
 
@@ -105,10 +112,12 @@ pub fn get(self: *const DecodedArrays, position: usize) ?Array {
 /// and limits follow nextDecodedRecord; after a failure no results are visible.
 pub fn decodeRecord(self: *DecodedArrays, record: model.Record, groups: []const cv.Group) Error!void {
     if (self.busy) return error.InvalidState;
+    self.report = null;
     self.reset();
     errdefer self.reset();
     self.busy = true;
     defer self.busy = false;
+    errdefer |err| self.keepReport(err);
     for (record.binaryArrays(), 0..) |node, position| try self.decodeRetained(node, record.default_array_length, groups, position);
     self.complete();
 }
@@ -117,10 +126,12 @@ pub fn decodeRecord(self: *DecodedArrays, record: model.Record, groups: []const 
 /// its values; get(0) returns the same array. default_length is the record's defaultArrayLength.
 pub fn decodeArray(self: *DecodedArrays, node: model.Node, default_length: ?usize, groups: []const cv.Group) Error!Values {
     if (self.busy) return error.InvalidState;
+    self.report = null;
     self.reset();
     errdefer self.reset();
     self.busy = true;
     defer self.busy = false;
+    errdefer |err| self.keepReport(err);
     try self.decodeRetained(node, default_length, groups, 0);
     self.complete();
     return self.get(0).?.values;
@@ -133,17 +144,38 @@ pub fn decodeArray(self: *DecodedArrays, node: model.Node, default_length: ?usiz
 /// readers; replaces earlier results, and after a failure none are visible.
 pub fn decodeArrayText(self: *DecodedArrays, encoding: model.Encoding, length: usize, source: anytype) !Values {
     if (self.busy) return error.InvalidState;
+    self.report = null;
     self.reset();
     errdefer self.reset();
     self.busy = true;
     defer self.busy = false;
+    errdefer |err| self.keepReport(err);
+    self.position = 0;
     try self.beginArrayWith(encoding, length, 0);
     try self.decodeText(source);
     self.complete();
     return self.get(0).?.values;
 }
 
+/// Returns the failure of the last decodeRecord, decodeArray, or decodeArrayText call, with
+/// its stage, the failing array's position, and size or limit detail; null after a success.
+/// Decoding while reading reports through the reader's `diagnostic()` instead.
+pub fn diagnostic(self: *const DecodedArrays) ?Diagnostic {
+    return self.report;
+}
+
+// Runs before the failed call's reset clears `failure` and the array count.
+fn keepReport(self: *DecodedArrays, err: anyerror) void {
+    const stage: Diagnostic.Stage = if (self.failure) |failure| failure.stage else .array;
+    const detail: Diagnostic.Detail = if (self.failure) |failure| failure.detail else .none;
+    var report = Diagnostic.initAny(err, .decode_array, stage, detail);
+    report.element = .binary_data_array;
+    report.array_position = self.position;
+    self.report = report;
+}
+
 fn decodeRetained(self: *DecodedArrays, node: model.Node, default_length: ?usize, groups: []const cv.Group, source_position: usize) Error!void {
+    self.position = source_position;
     // Text kept in this owner's storage would be freed or overwritten as arrays are sized.
     if (node.child(.binary)) |binary| if (binary.text) |retained| {
         if (overlaps(self.window.allocatedSlice(), retained)) return error.OverlappingBuffers;
@@ -255,6 +287,12 @@ fn beginArrayWith(self: *DecodedArrays, encoding: model.Encoding, length: usize,
     const bytes = std.math.mul(usize, length, output.primitive().size()) catch return error.LengthOverflow;
     if (bytes > self.options.array_bytes) {
         self.failure = .{ .stage = .array, .detail = .{ .limit = .{ .name = .array_bytes, .maximum = self.options.array_bytes, .needed = bytes } } };
+        return error.LimitExceeded;
+    }
+    var record_bytes = bytes;
+    for (self.outputs.items[0 .. self.count - 1]) |previous| record_bytes +|= previous.bytes;
+    if (record_bytes > self.options.record_array_bytes) {
+        self.failure = .{ .stage = .array, .detail = .{ .limit = .{ .name = .record_array_bytes, .maximum = self.options.record_array_bytes, .needed = record_bytes } } };
         return error.LimitExceeded;
     }
     try output.words.resize(self.allocator, bytes / 8 + @intFromBool(bytes % 8 != 0));

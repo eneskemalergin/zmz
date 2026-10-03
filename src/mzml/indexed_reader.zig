@@ -314,9 +314,11 @@ fn readFragment(
     expected: Engine.FragmentTarget,
 ) Error!owned.Record {
     reader.header.groups = groups;
+    reader.reference_groups = groups;
     reader.decoded_arrays = output;
     defer {
         reader.header.groups = &.{};
+        reader.reference_groups = &.{};
         reader.decoded_arrays = null;
     }
     return reader.readFragment(allocator, input, ancestors, physical_start, prefix_length, complete, reuse_ancestors, expected);
@@ -441,6 +443,7 @@ fn openEmbedded(self: *IndexedReader, reader: *Engine) Error!void {
         search_end = start;
         const physical_start = tail_start + start;
         if (physical_start < prefix_len) continue;
+        if (!footerShape(tail, start, endian)) continue;
         const length = std.math.add(usize, prefix_len, tail.len - start) catch return error.LimitExceeded;
         const bytes = try self.allocator.alloc(u8, length);
         defer self.allocator.free(bytes);
@@ -622,6 +625,106 @@ fn offsetTag(bytes: []const u8, endian: ?std.builtin.Endian) ?usize {
     }
     return null;
 }
+
+// Whether the tail from an indexListOffset candidate has the only shape a footer can have:
+// the offset, fileChecksum, and the end of indexedmzML, apart only by whitespace, comments, and
+// processing instructions, then nothing else. A decoy fails at its first wrong tag, so the
+// search stays linear in the tail; the parse that follows still decides.
+fn footerShape(bytes: []const u8, start: usize, endian: ?std.builtin.Endian) bool {
+    var shape: FooterShape = .{ .bytes = bytes, .endian = endian, .position = start };
+    return shape.element("indexListOffset") and shape.space() and
+        shape.element("fileChecksum") and shape.space() and
+        shape.tag(true, "indexedmzML") != .none and shape.space() and shape.position == bytes.len;
+}
+
+const FooterShape = struct {
+    bytes: []const u8,
+    endian: ?std.builtin.Endian,
+    position: usize,
+
+    fn width(self: *const FooterShape) usize {
+        return if (self.endian != null) 2 else 1;
+    }
+
+    fn peek(self: *const FooterShape, ahead: usize) ?u16 {
+        const offset = self.position + ahead * self.width();
+        if (offset + self.width() > self.bytes.len) return null;
+        return codeUnit(self.bytes, offset, self.endian);
+    }
+
+    fn skip(self: *FooterShape, units: usize) void {
+        self.position += units * self.width();
+    }
+
+    fn startsWith(self: *const FooterShape, text: []const u8) bool {
+        for (text, 0..) |byte, i| if (self.peek(i) != byte) return false;
+        return true;
+    }
+
+    // Skips to just past `end`; false when the input ends first.
+    fn skipPast(self: *FooterShape, end: []const u8) bool {
+        while (self.peek(0) != null) : (self.skip(1)) {
+            if (self.startsWith(end)) {
+                self.skip(end.len);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Whitespace, comments, and processing instructions.
+    fn space(self: *FooterShape) bool {
+        while (self.peek(0)) |unit| {
+            if (unit == ' ' or unit == '\t' or unit == '\r' or unit == '\n') {
+                self.skip(1);
+            } else if (self.startsWith("<!--")) {
+                if (!self.skipPast("-->")) return false;
+            } else if (self.startsWith("<?")) {
+                if (!self.skipPast("?>")) return false;
+            } else break;
+        }
+        return true;
+    }
+
+    // An element with text and no children, or its empty form.
+    fn element(self: *FooterShape, name: []const u8) bool {
+        switch (self.tag(false, name)) {
+            .none => return false,
+            .empty => return true,
+            .open => {},
+        }
+        while (self.peek(0)) |unit| : (self.skip(1)) if (unit == '<') break;
+        return self.tag(true, name) != .none;
+    }
+
+    // A start or end tag whose local name is name, with any prefix and, for a start, attributes.
+    fn tag(self: *FooterShape, closing: bool, name: []const u8) enum { none, open, empty } {
+        if (self.peek(0) != '<') return .none;
+        self.skip(1);
+        if (closing) {
+            if (self.peek(0) != '/') return .none;
+            self.skip(1);
+        }
+        const name_start = self.position;
+        while (self.peek(0)) |unit| : (self.skip(1)) {
+            if (unit == '>' or unit == '/' or unit == ' ' or unit == '\t' or unit == '\r' or unit == '\n') break;
+        }
+        const units = (self.position - name_start) / self.width();
+        if (units < name.len) return .none;
+        const local = name_start + (units - name.len) * self.width();
+        for (name, 0..) |byte, i| if (codeUnit(self.bytes, local + i * self.width(), self.endian) != byte) return .none;
+        if (local != name_start and codeUnit(self.bytes, local - self.width(), self.endian) != ':') return .none;
+        while (self.peek(0)) |unit| : (self.skip(1)) {
+            if (unit == '<') return .none;
+            if (unit == '>') {
+                const empty = !closing and self.position >= self.width() and codeUnit(self.bytes, self.position - self.width(), self.endian) == '/';
+                self.skip(1);
+                return if (empty) .empty else .open;
+            }
+        }
+        return .none;
+    }
+};
 
 fn codeUnit(bytes: []const u8, start: usize, endian: ?std.builtin.Endian) u16 {
     return if (endian) |order| std.mem.readInt(u16, bytes[start..][0..2], order) else bytes[start];

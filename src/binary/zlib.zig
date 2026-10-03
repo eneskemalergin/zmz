@@ -356,7 +356,10 @@ pub const Compressor = struct {
     pub fn compress(self: *Compressor, output: []u8, source: []const u8) Error![]u8 {
         if (overlaps(output, source)) return error.OverlappingBuffers;
         const writer = try self.start(output);
-        writer.writeAll(source) catch return error.OutputTooSmall;
+        writer.writeAll(source) catch {
+            self.cancel();
+            return error.OutputTooSmall;
+        };
         return self.finish();
     }
 

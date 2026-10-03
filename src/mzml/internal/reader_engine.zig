@@ -3,6 +3,7 @@
 const std = @import("std");
 const cv = @import("../../cv/source.zig");
 const model = @import("../model.zig");
+const encoding = @import("../../binary/encoding.zig");
 const schema = @import("../schema.zig");
 const xml = @import("../../xml/mzml_adapter.zig");
 const owned = @import("../owned.zig");
@@ -92,6 +93,11 @@ header_store: Storage,
 record_store: Storage,
 header: model.Header = undefined,
 header_ready: bool = false,
+// The groups that references in records resolve against, and each unique ID's position in
+// them (`REPEATED_ID` for a repeated ID), built once per groups slice.
+reference_groups: []const cv.Group = &.{},
+group_positions: std.StringHashMapUnmanaged(usize) = .empty,
+group_positions_of: []const cv.Group = &.{},
 done: bool = false,
 failure: ?Diagnostic = null,
 active_list: ?model.Kind = null,
@@ -104,6 +110,8 @@ list_scopes: [2]?Scope = .{ null, null },
 child_scratch: std.ArrayList(model.Node) = .empty,
 param_scratch: std.ArrayList(cv.Entry) = .empty,
 decoded_arrays: ?*DecodedArrays = null,
+// The in-scope namespace declarations built for one scope and storage (scopeDeclarations).
+scope_declarations: struct { storage: ?*const Storage = null, resets: usize = 0, scope: u64 = 0, attributes: []const model.Attribute = &.{} } = .{},
 // The decoded record's defaultArrayLength, for its arrays.
 record_default_length: ?usize = null,
 // A call is in progress. Caller code runs inside it (selection callbacks, the input reader,
@@ -132,6 +140,7 @@ pub fn deinit(self: *StreamReader) void {
     self.cursor.deinit();
     self.child_scratch.deinit(self.allocator);
     self.param_scratch.deinit(self.allocator);
+    self.group_positions.deinit(self.allocator);
     self.header_store.arena.deinit();
     self.record_store.arena.deinit();
     self.* = undefined;
@@ -525,6 +534,7 @@ fn readHeaderInner(self: *StreamReader) Error!void {
     }
     self.header = .{ .document = document, .run = run, .namespace_uri = self.cursor.mzml_namespace, .groups = groups, .indexed = indexed };
     self.header_ready = true;
+    self.reference_groups = groups;
     try self.openList();
 }
 
@@ -809,19 +819,27 @@ fn parseNodeFor(self: *StreamReader, storage: *Storage, depth: usize, advance_af
                 (storage.limit -| storage.used) / @sizeOf(model.Node),
             ));
         var child_count: usize = 0;
+        // The array's encoding terms classified so far, so each later run is classified once.
+        var array_terms: ?encoding.Terms = null;
         while (self.cursor.current) |event| {
             if (event.data == .end_element) break;
             if (event.data == .start_element and self.paramKind(event.data.start_element) != null) {
                 if (retention == .tree and child_count != 0 and content.items.len == 0)
                     try self.startContent(&content, param_count, child_count);
                 const before = param_count;
+                const run_start = self.param_scratch.items.len;
                 try self.parseParams(storage, retention == .tree, &param_count);
                 if (retention == .tree and content.items.len != 0)
                     try content.append(self.allocator, .{ .params = param_count - before });
                 if (decode_array) {
                     node.params = self.param_scratch.items[params_start..];
-                    // Late declarations must agree with the bytes already decoded.
-                    _ = model.arrayEncoding(node, self.header.groups) catch |err| {
+                    // Late declarations must agree with the bytes already decoded. The terms before
+                    // the first late run decoded the array, so they classify completely.
+                    if (array_terms == null) {
+                        array_terms = .{};
+                        _ = array_terms.?.add(self.param_scratch.items[params_start..run_start], self.header.groups) catch {};
+                    }
+                    _ = array_terms.?.add(self.param_scratch.items[run_start..], self.header.groups) catch |err| {
                         self.capture(err, .array, .none);
                         self.failure.?.element = .binary_data_array;
                         return @as(Error!model.Node, err);
@@ -897,7 +915,7 @@ fn parseParams(self: *StreamReader, storage: *Storage, comptime retain: bool, co
             .accession = if (attrs.unit_accession) |value| .{ .raw = value } else null,
         };
         const entry: cv.Entry = switch (selected) {
-            0 => .{ .group_ref = .{ .ref = attrs.ref, .xml = extra } },
+            0 => .{ .group_ref = .{ .ref = attrs.ref, .xml = extra, .position = try self.groupPosition(attrs.ref) } },
             1 => .{ .cv = .{
                 .cv_ref = attrs.cv_ref,
                 .name = attrs.name,
@@ -986,6 +1004,26 @@ fn copyParamAttributes(storage: *Storage, start: xml.StartElement, selected: u2,
         }
     }
     return result;
+}
+
+const REPEATED_ID = std.math.maxInt(usize);
+
+// The position of the group a reference names, when its ID is unique in reference_groups.
+fn groupPosition(self: *StreamReader, ref: ?[]const u8) Error!?usize {
+    const groups = self.reference_groups;
+    const id = ref orelse return null;
+    if (groups.len == 0) return null;
+    if (groups.ptr != self.group_positions_of.ptr or groups.len != self.group_positions_of.len) {
+        self.group_positions.clearRetainingCapacity();
+        try self.group_positions.ensureTotalCapacity(self.allocator, std.math.cast(u32, groups.len) orelse return error.LimitExceeded);
+        for (groups, 0..) |group, position| {
+            const slot = self.group_positions.getOrPutAssumeCapacity(cv.idKey(group.id));
+            slot.value_ptr.* = if (slot.found_existing) REPEATED_ID else position;
+        }
+        self.group_positions_of = groups;
+    }
+    const position = self.group_positions.get(cv.idKey(id)) orelse return null;
+    return if (position == REPEATED_ID) null else position;
 }
 
 fn copyAttributes(
@@ -1121,7 +1159,36 @@ const FragmentBuffer = struct {
     }
 };
 
+// The in-scope declarations, then the element's own attributes (a parameter's fields excluded).
+// Nodes and parameters in one scope share the declarations, copied once into storage.
 fn copyForeignAttributes(self: *StreamReader, storage: *Storage, start: xml.StartElement, parameter: ?u2) Error![]const model.Attribute {
+    const scope = try self.scopeDeclarations(storage);
+    var own: usize = 0;
+    for (start.attributes) |attribute| {
+        if (parameter) |selected| if (parameterAttribute(attribute.name.expanded, selected) != null) continue;
+        own += 1;
+    }
+    if (own == 0) return scope;
+    const result = try storage.alloc(model.Attribute, scope.len + own);
+    @memcpy(result[0..scope.len], scope);
+    var i = scope.len;
+    for (start.attributes) |attribute| {
+        if (parameter) |selected| if (parameterAttribute(attribute.name.expanded, selected) != null) continue;
+        result[i] = .{
+            .name = try storage.copy(u8, attribute.name.raw),
+            .namespace_uri = if (attribute.name.expanded.namespace_uri) |uri| try storage.copy(u8, uri) else null,
+            .value = try storage.copy(u8, attribute.value),
+        };
+        i += 1;
+    }
+    return result;
+}
+
+// Every in-scope binding as an `xmlns` attribute, with `xmlns=""` when no default is bound.
+fn scopeDeclarations(self: *StreamReader, storage: *Storage) Error![]const model.Attribute {
+    const cache = &self.scope_declarations;
+    if (cache.storage == storage and cache.resets == storage.resets and cache.scope == self.cursor.namespace_scope)
+        return cache.attributes;
     var count: usize = 0;
     var position: usize = 0;
     var has_default = false;
@@ -1130,10 +1197,6 @@ fn copyForeignAttributes(self: *StreamReader, storage: *Storage, start: xml.Star
         has_default = has_default or binding.prefix.len == 0;
     }
     if (!has_default) count += 1;
-    for (start.attributes) |attribute| {
-        if (parameter) |selected| if (parameterAttribute(attribute.name.expanded, selected) != null) continue;
-        count += 1;
-    }
     const result = try storage.alloc(model.Attribute, count);
     position = 0;
     var i: usize = 0;
@@ -1147,19 +1210,8 @@ fn copyForeignAttributes(self: *StreamReader, storage: *Storage, start: xml.Star
         result[i] = .{ .name = name, .namespace_uri = xml.XMLNS_NAMESPACE, .value = try storage.copy(u8, binding.uri) };
         i += 1;
     }
-    if (!has_default) {
-        result[i] = .{ .name = "xmlns", .namespace_uri = xml.XMLNS_NAMESPACE, .value = "" };
-        i += 1;
-    }
-    for (start.attributes) |attribute| {
-        if (parameter) |selected| if (parameterAttribute(attribute.name.expanded, selected) != null) continue;
-        result[i] = .{
-            .name = try storage.copy(u8, attribute.name.raw),
-            .namespace_uri = if (attribute.name.expanded.namespace_uri) |uri| try storage.copy(u8, uri) else null,
-            .value = try storage.copy(u8, attribute.value),
-        };
-        i += 1;
-    }
+    if (!has_default) result[i] = .{ .name = "xmlns", .namespace_uri = xml.XMLNS_NAMESPACE, .value = "" };
+    cache.* = .{ .storage = storage, .resets = storage.resets, .scope = self.cursor.namespace_scope, .attributes = result };
     return result;
 }
 
@@ -1172,6 +1224,8 @@ const Storage = struct {
     exceeded: bool = false,
     // The bytes the failed request would have needed, when known.
     needed: ?usize = null,
+    // Counts resets, so a slice cached from this storage is not reused after one.
+    resets: usize = 0,
 
     fn init(allocator: std.mem.Allocator, limit: usize) Storage {
         return .{ .arena = .init(allocator), .limit = limit };
@@ -1184,6 +1238,7 @@ const Storage = struct {
         self.arrays = 0;
         self.exceeded = false;
         self.needed = null;
+        self.resets +%= 1;
     }
 
     fn charge(self: *Storage, comptime T: type, count: usize) Error!void {

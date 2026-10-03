@@ -90,7 +90,7 @@ pub const Id = enum(u16) {
     }
 };
 
-pub const Operation = enum { read_event, read_header, read_record, read_item, open_index, rebuild_index, lookup_record, write_header, open_list, write_record, write_item, close_list, finish };
+pub const Operation = enum { read_event, read_header, read_record, read_item, decode_array, open_index, rebuild_index, lookup_record, write_header, open_list, write_record, write_item, close_list, finish };
 pub const Stage = enum { xml, metadata, base64, array, index, output };
 pub const Location = union(enum) { input_event: u64, output_byte: u64 };
 pub const RecordPosition = struct {
@@ -130,6 +130,7 @@ pub const Limit = enum {
     list_entries,
     binary_text_bytes,
     array_bytes,
+    record_array_bytes,
     index_bytes,
     record_span_bytes,
     records,
@@ -191,6 +192,15 @@ pub fn init(code: Errors, operation: Operation, stage: Stage, detail: Detail) Di
         error.CountMismatch => .count_mismatch,
     };
     return .{ .id = id, .code = code, .operation = operation, .stage = stage, .detail = detail };
+}
+
+/// Like init for any error, including a caller's own (such as a text source's), which is
+/// reported as an I/O failure.
+pub fn initAny(code: anyerror, operation: Operation, stage: Stage, detail: Detail) Diagnostic {
+    inline for (@typeInfo(Errors).error_set.?) |known| {
+        if (code == @field(anyerror, known.name)) return init(@field(Errors, known.name), operation, stage, detail);
+    }
+    return .{ .id = .io_failed, .code = code, .operation = operation, .stage = stage, .detail = detail };
 }
 
 fn writing(operation: Operation) bool {

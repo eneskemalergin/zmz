@@ -504,6 +504,22 @@ test "[failure] - [zlib]: streaming calls out of order fail with InvalidState" {
     try std.testing.expectError(error.InvalidState, compressor.finishWriter());
 }
 
+test "[failure] - [zlib]: a one-call compression that runs out of output is closed" {
+    var compressor = try zlib.Compressor.init(std.testing.allocator, .fast);
+    defer compressor.deinit();
+    // Incompressible input fills the output while it is written, before the stream ends.
+    const source = try std.testing.allocator.alloc(u8, 4 * 1024 * 1024);
+    defer std.testing.allocator.free(source);
+    var random = std.Random.DefaultPrng.init(std.testing.random_seed);
+    random.random().bytes(source);
+    var output: [64]u8 = undefined;
+    try std.testing.expectError(error.OutputTooSmall, compressor.compress(&output, source));
+    try std.testing.expectError(error.InvalidState, compressor.finish());
+    const stream = try compressor.compress(&output, "abc");
+    var plain: [3]u8 = undefined;
+    try std.testing.expectEqualStrings("abc", try zlib.decompress(&plain, stream));
+}
+
 test "[failure] - [zlib]: a stream whose source failed is closed" {
     var encoder = arrays.Encoder.init(std.testing.allocator, .fast);
     defer encoder.deinit();
