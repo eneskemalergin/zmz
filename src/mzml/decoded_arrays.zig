@@ -2,7 +2,9 @@
 //! and from records whose Base64 text was retained (decodeRecord, decodeArray).
 //!
 //! Each array keeps its source primitive, except Numpress output is always f64. Numeric
-//! buffers and shared wire scratch grow as needed and are reused between records.
+//! buffers and shared wire scratch grow as needed and are reused between records. Numpress
+//! decodes through a fixed window as the text arrives: no buffer holds a Numpress payload
+//! whole, and with zlib only the compressed bytes are kept, as for zlib-only arrays.
 //! Selected results stay in source order; source_position indexes record.binaryArrays().
 //! Results become visible only after the complete record succeeds. Returned slices last
 //! until the next decoded read using this owner, reset, or deinit; ordinary reads do not
@@ -16,6 +18,8 @@ const model = @import("model.zig");
 const cv = @import("../cv/source.zig");
 const arrays = @import("../binary/arrays.zig");
 const base64 = @import("../binary/base64.zig");
+const numpress = @import("../binary/numpress.zig");
+const zlib = @import("../binary/zlib.zig");
 const Diagnostic = @import("diagnostic.zig");
 
 const DecodedArrays = @This();
@@ -33,15 +37,23 @@ pub const Array = struct { source_position: usize, encoding: model.Encoding, val
 /// binary_text_bytes bounds the Base64 text.
 pub const Limits = struct { array_bytes: usize = 192 * 1024 * 1024 };
 
+// Numpress bytes decoded per step, from Base64 or from zlib.
+const WINDOW = 16 * 1024;
+
 allocator: std.mem.Allocator,
 limits: Limits,
 outputs: std.ArrayList(Output) = .empty,
 wire: std.ArrayList(u8) = .empty,
-transformed: std.ArrayList(u8) = .empty,
+window: std.ArrayList(u8) = .empty,
+inflater: ?zlib.Inflater = null,
 count: usize = 0,
 ready: bool = false,
 default_length: ?usize = null,
 decoder: base64.Decoder = undefined,
+values: numpress.Decoder = undefined,
+// The first Numpress error of the current array. It is reported only after the Base64 and
+// zlib layers finish, so their errors come first, as when each layer decodes the whole payload.
+deferred: ?numpress.Error = null,
 failure: ?struct { stage: Diagnostic.Stage, detail: Diagnostic.Detail = .none } = null,
 
 pub fn init(allocator: std.mem.Allocator, limits: Limits) DecodedArrays {
@@ -52,7 +64,8 @@ pub fn deinit(self: *DecodedArrays) void {
     for (self.outputs.items) |*output| output.words.deinit(self.allocator);
     self.outputs.deinit(self.allocator);
     self.wire.deinit(self.allocator);
-    self.transformed.deinit(self.allocator);
+    self.window.deinit(self.allocator);
+    if (self.inflater) |*inflater| inflater.deinit();
     self.* = undefined;
 }
 
@@ -121,7 +134,9 @@ pub fn text(self: *DecodedArrays, bytes: []const u8) Error!void {
     errdefer if (self.failure == null) {
         self.failure = .{ .stage = .base64 };
     };
-    const compressed = self.outputs.items[self.count - 1].encoding.pipeline != .none;
+    const pipeline = self.outputs.items[self.count - 1].encoding.pipeline;
+    if (pipeline.isNumpress() and !pipeline.hasZlib()) return self.numpressText(bytes);
+    const compressed = pipeline.hasZlib();
     if (compressed) {
         const pending = std.math.add(usize, bytes.len, self.decoder.quartet_len) catch return error.LengthOverflow;
         const needed = std.math.add(usize, self.decoder.counts.decoded_bytes, pending / 4 * 3) catch return error.LengthOverflow;
@@ -130,6 +145,25 @@ pub fn text(self: *DecodedArrays, bytes: []const u8) Error!void {
     }
     self.decoder.update(bytes) catch |err|
         return if (err == error.OutputTooSmall and !compressed) error.DecodedSizeMismatch else err;
+}
+
+// Decodes Base64 in pieces whose bytes always fit the window and hands them to Numpress.
+fn numpressText(self: *DecodedArrays, bytes: []const u8) Error!void {
+    const piece = base64.Decoder.pieceFor(WINDOW);
+    var rest = bytes;
+    while (rest.len != 0) {
+        const part = rest[0..@min(rest.len, piece)];
+        try self.decoder.update(part);
+        self.feed(self.decoder.take());
+        rest = rest[part.len..];
+    }
+}
+
+fn feed(self: *DecodedArrays, bytes: []const u8) void {
+    if (self.deferred != null) return;
+    self.values.update(bytes) catch |err| {
+        self.deferred = err;
+    };
 }
 
 pub fn complete(self: *DecodedArrays) void {
@@ -161,11 +195,24 @@ pub fn beginArray(self: *DecodedArrays, node: model.Node, groups: []const cv.Gro
     }
     try output.words.resize(self.allocator, bytes / 8 + @intFromBool(bytes % 8 != 0));
     self.wire.clearRetainingCapacity();
-    try self.transformed.resize(self.allocator, switch (array.encoding.pipeline) {
-        .linear_zlib, .pic_zlib, .slof_zlib => try arrays.wireBound(f64, array.length, array.encoding.pipeline),
-        else => 0,
-    });
-    const destination = if (array.encoding.pipeline == .none) std.mem.sliceAsBytes(output.words.items)[0..bytes] else self.wire.items;
+    const pipeline = array.encoding.pipeline;
+    if (pipeline.isNumpress()) {
+        try self.window.resize(self.allocator, WINDOW);
+        const transform: numpress.Transform = switch (pipeline.transform()) {
+            .linear => .linear,
+            .pic => .pic,
+            .slof => .slof,
+            .none => unreachable,
+        };
+        self.values = numpress.Decoder.initExact(transform, output.values(f64));
+        self.deferred = null;
+    }
+    const destination = if (pipeline == .none)
+        std.mem.sliceAsBytes(output.words.items)[0..bytes]
+    else if (pipeline.isNumpress() and !pipeline.hasZlib())
+        self.window.items
+    else
+        self.wire.items;
     self.decoder = base64.Decoder.init(destination);
 }
 
@@ -175,7 +222,8 @@ pub fn finishArray(self: *DecodedArrays) Error!void {
         return err;
     };
     const output = &self.outputs.items[self.count - 1];
-    const wire = self.decoder.output[0..counts.decoded_bytes];
+    // Windowed Numpress has already handed its bytes out; take returns none for it.
+    const wire = self.decoder.take();
     const pipeline = output.encoding.payloadPipeline(output.length, counts.significant_bytes == 0);
     errdefer |err| {
         self.failure = .{ .stage = .array };
@@ -185,12 +233,37 @@ pub fn finishArray(self: *DecodedArrays) Error!void {
                 .float64, .int64 => output.length * 8,
             }, .actual = counts.decoded_bytes, .unit = .bytes } };
     }
+    if (pipeline.isNumpress()) return self.finishNumpress(wire, pipeline, output.length);
     switch (output.primitive()) {
-        .float32 => try arrays.decodeWire(f32, output.values(f32), wire, pipeline, self.transformed.items),
-        .float64 => try arrays.decodeWire(f64, output.values(f64), wire, pipeline, self.transformed.items),
-        .int32 => try arrays.decodeWire(i32, output.values(i32), wire, pipeline, self.transformed.items),
-        .int64 => try arrays.decodeWire(i64, output.values(i64), wire, pipeline, self.transformed.items),
+        .float32 => try arrays.decodeWire(f32, output.values(f32), wire, pipeline, &.{}),
+        .float64 => try arrays.decodeWire(f64, output.values(f64), wire, pipeline, &.{}),
+        .int32 => try arrays.decodeWire(i32, output.values(i32), wire, pipeline, &.{}),
+        .int64 => try arrays.decodeWire(i64, output.values(i64), wire, pipeline, &.{}),
     }
+}
+
+// Without zlib every byte was already fed during text. With zlib, wire holds the compressed
+// stream, inflated a window at a time; more than the Numpress bound means the stream holds
+// more than the declared values.
+fn finishNumpress(self: *DecodedArrays, wire: []const u8, pipeline: arrays.Pipeline, length: usize) Error!void {
+    if (pipeline.hasZlib()) {
+        if (self.inflater == null) self.inflater = try zlib.Inflater.init(self.allocator);
+        const inflater = &self.inflater.?;
+        inflater.start(wire);
+        const bound = try arrays.wireBound(f64, length, pipeline);
+        var total: usize = 0;
+        while (true) {
+            // Never more than one byte past the bound, so a zlib error beyond it stays unseen.
+            const room = @min(self.window.items.len, bound - total + 1);
+            const piece = try inflater.read(self.window.items[0..room]);
+            if (piece.len == 0) break;
+            total += piece.len;
+            if (total > bound) return error.DecodedSizeMismatch;
+            self.feed(piece);
+        }
+    }
+    if (self.deferred) |err| return err;
+    _ = try self.values.finish();
 }
 
 const Output = struct {

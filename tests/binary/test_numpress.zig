@@ -1,6 +1,7 @@
 //! Verifies the supported MS-Numpress API, wire bytes, loss bounds, and failures.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const numpress = @import("zmz").mzml.numpress;
 
 test "[unit] - [numpress bounds]: reports exact or safe encoded capacities" {
@@ -297,6 +298,320 @@ fn expectLinearErrorBound(expected: []const f64, actual: []const f64, fixed_poin
         try std.testing.expectApproxEqAbs(expected_value, actual_value, 0.5 / fixed_point);
     }
 }
+
+test "[property] - [numpress encoders]: block encoding matches the value-by-value encoding" {
+    var random = std.Random.DefaultPrng.init(0x4e55_4d50_424c_4f43);
+    const source = random.random();
+    var values: [700]f64 = undefined;
+    var block: [16 + 9 * values.len / 2 + 16]u8 = undefined;
+    var checked: [block.len]u8 = undefined;
+    for ([_]usize{ 3, 17, 129, 300, 700 }) |count| {
+        fillMixedWidths(values[0..count], source);
+        const array = values[0..count];
+        const slof_fixed_point = try numpress.optimalSlofFixedPoint(array);
+        // An output of exactly the encoded length is below the worst-case bound, so the
+        // encoders take their value-by-value path for it.
+        const pic_len = try numpress.encodePic(array, &block);
+        try std.testing.expectEqual(pic_len, try numpress.encodePic(array, checked[0..pic_len]));
+        try std.testing.expectEqualSlices(u8, block[0..pic_len], checked[0..pic_len]);
+        const slof_len = try numpress.encodeSlof(array, slof_fixed_point, &block);
+        try std.testing.expectEqual(slof_len, try numpress.encodeSlof(array, slof_fixed_point, checked[0..slof_len]));
+        try std.testing.expectEqualSlices(u8, block[0..slof_len], checked[0..slof_len]);
+
+        fillAscending(array, source);
+        const linear_fixed_point = try numpress.optimalLinearFixedPoint(array);
+        const linear_len = try numpress.encodeLinear(array, linear_fixed_point, &block);
+        try std.testing.expectEqual(linear_len, try numpress.encodeLinear(array, linear_fixed_point, checked[0..linear_len]));
+        try std.testing.expectEqualSlices(u8, block[0..linear_len], checked[0..linear_len]);
+    }
+}
+
+test "[property] - [numpress SLOF]: vector blocks and tails give the frozen codes" {
+    const pattern = [_]f64{ 0, 1, 10 };
+    const codes = [_]u16{ 0x0000, 0x0ad5, 0x2578 };
+    var values: [40]f64 = undefined;
+    var expected: [8 + 2 * values.len]u8 = undefined;
+    std.mem.writeInt(u64, expected[0..8], @bitCast(@as(f64, 4_000)), .big);
+    for (&values, 0..) |*value, index| {
+        value.* = pattern[index % 3];
+        std.mem.writeInt(u16, expected[8 + 2 * index ..][0..2], codes[index % 3], .little);
+    }
+    for (0..values.len + 1) |count| {
+        const wire_length = 8 + count * 2;
+        var encoded: [expected.len + 2]u8 = @splat(0xa5);
+        var decoded: [values.len + 2]f64 = @splat(-1);
+        const length = try numpress.encodeSlof(values[0..count], 4_000, encoded[1 .. 1 + wire_length]);
+        try std.testing.expectEqual(wire_length, length);
+        try std.testing.expectEqualSlices(u8, expected[0..length], encoded[1 .. 1 + length]);
+        try std.testing.expectEqual(@as(u8, 0xa5), encoded[0]);
+        try std.testing.expect(std.mem.allEqual(u8, encoded[1 + length ..], 0xa5));
+
+        try numpress.decodeSlofExact(encoded[1 .. 1 + length], decoded[1 .. 1 + count]);
+        try std.testing.expectEqual(@as(f64, -1), decoded[0]);
+        try std.testing.expect(std.mem.allEqual(f64, decoded[1 + count ..], -1));
+        try expectSlofErrorBound(values[0..count], decoded[1 .. 1 + count], 4_000);
+    }
+}
+
+test "[failure] - [numpress SLOF]: reports invalid values in vector blocks and tails" {
+    var values: [40]f64 = @splat(1);
+    var encoded: [8 + values.len * 2]u8 = undefined;
+    var decoded: [values.len]f64 = undefined;
+    for ([_]f64{ -1, std.math.inf(f64), std.math.nan(f64), 1e100 }) |invalid| {
+        for (0..values.len) |index| {
+            values[index] = invalid;
+            try std.testing.expectError(
+                if (invalid == 1e100) error.ValueOutOfRange else error.InvalidValue,
+                numpress.encodeSlof(&values, 4_000, &encoded),
+            );
+            values[index] = 1;
+        }
+    }
+    _ = try numpress.encodeSlof(&values, 1, &encoded);
+    for (0..values.len) |index| {
+        const code = encoded[8 + index * 2 ..][0..2];
+        std.mem.writeInt(u16, code, 65_535, .little);
+        try std.testing.expectError(error.InvalidData, numpress.decodeSlofExact(&encoded, &decoded));
+        std.mem.writeInt(u16, code, 1, .little);
+    }
+}
+
+test "[unit] - [numpress SLOF]: decodes to glibc's exp bit for bit" {
+    // glibc runs an FMA build of exp on CPUs with FMA and a plain build otherwise; the last
+    // code is one where the two differ, and each zmz build must match the one it targets.
+    const fused = switch (builtin.cpu.arch) {
+        .x86_64 => std.Target.x86.featureSetHas(builtin.cpu.features, .fma),
+        .aarch64 => true,
+        else => false,
+    };
+    const cases = [_]struct { fixed_point: f64, code: u16, bits: u64 }{
+        .{ .fixed_point = 4_000, .code = 1, .bits = 0x3f3062d40d8bc000 },
+        .{ .fixed_point = 4_000, .code = 31_752, .bits = 0x40a5e180b745f201 },
+        .{ .fixed_point = 4_000, .code = 34_671, .bits = 0x40b6b3681e31c5ff },
+        .{ .fixed_point = 100, .code = 51_200, .bits = 0x6e19476504ba852e },
+        .{ .fixed_point = 100, .code = 60_000, .bits = 0x76088a122d234b39 },
+        .{ .fixed_point = 100, .code = 65_535, .bits = if (fused) 0x7b062a2ceaa34527 else 0x7b062a2ceaa34526 },
+    };
+    for (cases) |case| {
+        var payload: [10]u8 = undefined;
+        std.mem.writeInt(u64, payload[0..8], @bitCast(case.fixed_point), .big);
+        std.mem.writeInt(u16, payload[8..10], case.code, .little);
+        var decoded: [1]f64 = undefined;
+        try numpress.decodeSlofExact(&payload, &decoded);
+        try std.testing.expectEqual(case.bits, @as(u64, @bitCast(decoded[0])));
+    }
+}
+
+test "[property] - [numpress Decoder]: every fragment split gives the one-shot result" {
+    var random = std.Random.DefaultPrng.init(0x4e55_4d50_5354_524d);
+    const source = random.random();
+    var values: [600]f64 = undefined;
+    var encoded: [16 + 9 * values.len / 2 + 16]u8 = undefined;
+    var whole: [values.len + 1]f64 = undefined;
+    var fed: [values.len + 1]f64 = undefined;
+    for ([_]usize{ 0, 1, 2, 3, 17, 300, 600 }) |count| {
+        const array = values[0..count];
+        for ([_]numpress.Transform{ .linear, .pic, .slof }) |transform| {
+            if (transform == .linear) fillAscending(array, source) else fillMixedWidths(array, source);
+            const len = switch (transform) {
+                .linear => try numpress.encodeLinear(array, try numpress.optimalLinearFixedPoint(array), &encoded),
+                .pic => try numpress.encodePic(array, &encoded),
+                .slof => try numpress.encodeSlof(array, try numpress.optimalSlofFixedPoint(array), &encoded),
+            };
+            const cuts = [_]usize{ len, len -| 1, len / 2, @min(len, 9), @min(len, 15) };
+            for (cuts) |cut| {
+                for ([_]usize{ count -| 1, count, count + 1 }) |capacity| {
+                    for ([_]bool{ false, true }) |exact| {
+                        const expected = decodeWhole(transform, exact, encoded[0..cut], whole[0..capacity]);
+                        for ([_]usize{ 1, 9, 600 }) |max_piece| {
+                            const actual = decodeFed(transform, exact, encoded[0..cut], fed[0..capacity], max_piece, source);
+                            try expectSameDecode(expected, whole[0..capacity], actual, fed[0..capacity]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    var bytes: [64]u8 = undefined;
+    for (0..2_000) |_| {
+        const input_len = source.uintLessThan(usize, bytes.len + 1);
+        source.bytes(bytes[0..input_len]);
+        if (input_len >= 8 and source.boolean()) {
+            std.mem.writeInt(u64, bytes[0..8], @bitCast(@as(f64, 1_000)), .big);
+        }
+        const transform = source.enumValue(numpress.Transform);
+        const capacity = source.uintLessThan(usize, 140);
+        const exact = source.boolean();
+        const expected = decodeWhole(transform, exact, bytes[0..input_len], whole[0..capacity]);
+        const actual = decodeFed(transform, exact, bytes[0..input_len], fed[0..capacity], 1 + source.uintLessThan(usize, 9), source);
+        try expectSameDecode(expected, whole[0..capacity], actual, fed[0..capacity]);
+    }
+}
+
+test "[failure] - [numpress Decoder]: calls after an error or finish report the state" {
+    var output: [4]f64 = undefined;
+    var finished = numpress.Decoder.init(.pic, &output);
+    try finished.update(&.{ 0x88, 0x88 });
+    try std.testing.expectEqual(@as(usize, 4), try finished.finish());
+    try std.testing.expectError(error.AlreadyFinished, finished.update(&.{0x88}));
+    try std.testing.expectError(error.AlreadyFinished, finished.finish());
+
+    var failed = numpress.Decoder.init(.pic, output[0..1]);
+    try std.testing.expectError(error.OutputTooSmall, failed.update(&.{ 0x88, 0x88 }));
+    try std.testing.expectError(error.FailedState, failed.update(&.{0x88}));
+    try std.testing.expectError(error.FailedState, failed.finish());
+
+    var exact = numpress.Decoder.initExact(.slof, output[0..1]);
+    try exact.update(&.{ 0x40, 0xaf, 0x40, 0, 0, 0, 0, 0, 0 });
+    try std.testing.expectError(error.InvalidData, exact.finish());
+    try std.testing.expectError(error.FailedState, exact.finish());
+}
+
+test "[property] - [numpress writer encoders]: match the slice encoders' bytes and errors" {
+    var random = std.Random.DefaultPrng.init(0x4e55_4d50_5752_4954);
+    const source = random.random();
+    var values: [300]f64 = undefined;
+    var expected: [16 + 9 * values.len / 2 + 16]u8 = undefined;
+    var fixed_bytes: [expected.len]u8 = undefined;
+    const invalid = [_]f64{ -1, std.math.nan(f64), std.math.inf(f64), 4_294_967_296, 1e300 };
+    for ([_]usize{ 0, 1, 2, 3, 16, 17, 129, 300 }) |count| {
+        fillMixedWidths(values[0..count], source);
+        for (0..invalid.len + 1) |variant| {
+            const array = values[0..count];
+            const position = if (count == 0) 0 else source.uintLessThan(usize, count);
+            const saved = if (count == 0) 0 else array[position];
+            if (variant < invalid.len and count != 0) array[position] = invalid[variant];
+            defer if (count != 0) {
+                array[position] = saved;
+            };
+            for ([_]f64{ 1_000, 0, -1, 0.5 }) |fixed_point| {
+                for ([_]numpress.Transform{ .linear, .pic, .slof }) |transform| {
+                    const slice_result = encodeSlice(transform, array, fixed_point, &expected);
+                    var fixed = std.Io.Writer.fixed(&fixed_bytes);
+                    const fixed_result = encodeTo(transform, array, fixed_point, &fixed);
+                    var collected: std.Io.Writer.Allocating = .init(std.testing.allocator);
+                    defer collected.deinit();
+                    var small: [64]u8 = undefined;
+                    var forward = Forward{ .target = &collected.writer, .interface = .{ .vtable = &Forward.vtable, .buffer = &small } };
+                    const forward_result = encodeTo(transform, array, fixed_point, &forward.interface);
+                    if (slice_result) |len| {
+                        try std.testing.expectEqual(len, try fixed_result);
+                        try std.testing.expectEqualSlices(u8, expected[0..len], fixed.buffered());
+                        try std.testing.expectEqual(len, try forward_result);
+                        try forward.interface.flush();
+                        try std.testing.expectEqualSlices(u8, expected[0..len], collected.written());
+                    } else |err| {
+                        try std.testing.expectError(err, fixed_result);
+                        try std.testing.expectError(err, forward_result);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Values of every nibble width, with fractions.
+fn fillMixedWidths(values: []f64, source: std.Random) void {
+    for (values) |*value| {
+        value.* = @as(f64, @floatFromInt(source.int(u32) >> source.int(u5))) + source.float(f64);
+    }
+}
+
+// Ascending values with irregular steps, the shape of m/z arrays.
+fn fillAscending(values: []f64, source: std.Random) void {
+    var current: f64 = 100 + source.float(f64) * 1_000;
+    for (values) |*value| {
+        current += source.float(f64) * @as(f64, @floatFromInt(@as(u32, 1) << source.int(u4)));
+        value.* = current;
+    }
+}
+
+fn decodeWhole(transform: numpress.Transform, exact: bool, input: []const u8, output: []f64) numpress.Error!usize {
+    if (exact) {
+        switch (transform) {
+            .linear => try numpress.decodeLinearExact(input, output),
+            .pic => try numpress.decodePicExact(input, output),
+            .slof => try numpress.decodeSlofExact(input, output),
+        }
+        return output.len;
+    }
+    return switch (transform) {
+        .linear => numpress.decodeLinear(input, output),
+        .pic => numpress.decodePic(input, output),
+        .slof => numpress.decodeSlof(input, output),
+    };
+}
+
+fn decodeFed(
+    transform: numpress.Transform,
+    exact: bool,
+    input: []const u8,
+    output: []f64,
+    max_piece: usize,
+    source: std.Random,
+) numpress.Error!usize {
+    var decoder = if (exact) numpress.Decoder.initExact(transform, output) else numpress.Decoder.init(transform, output);
+    var at: usize = 0;
+    while (at < input.len) {
+        const piece = @min(1 + source.uintLessThan(usize, max_piece), input.len - at);
+        try decoder.update(input[at..][0..piece]);
+        try decoder.update(input[at..][0..0]);
+        at += piece;
+    }
+    return decoder.finish();
+}
+
+fn expectSameDecode(
+    expected: numpress.Error!usize,
+    expected_values: []const f64,
+    actual: numpress.Error!usize,
+    actual_values: []const f64,
+) !void {
+    const count = expected catch |err| return std.testing.expectError(err, actual);
+    try std.testing.expectEqual(count, try actual);
+    try std.testing.expectEqualSlices(
+        u8,
+        std.mem.sliceAsBytes(expected_values[0..count]),
+        std.mem.sliceAsBytes(actual_values[0..count]),
+    );
+}
+
+fn encodeSlice(transform: numpress.Transform, values: []const f64, fixed_point: f64, output: []u8) numpress.Error!usize {
+    return switch (transform) {
+        .linear => numpress.encodeLinear(values, fixed_point, output),
+        .pic => numpress.encodePic(values, output),
+        .slof => numpress.encodeSlof(values, fixed_point, output),
+    };
+}
+
+fn encodeTo(transform: numpress.Transform, values: []const f64, fixed_point: f64, writer: *std.Io.Writer) numpress.WriteError!usize {
+    return switch (transform) {
+        .linear => numpress.encodeLinearTo(values, fixed_point, writer),
+        .pic => numpress.encodePicTo(values, writer),
+        .slof => numpress.encodeSlofTo(values, fixed_point, writer),
+    };
+}
+
+// A writer with a small buffer that forwards every drain, so encoders see partial drains.
+const Forward = struct {
+    target: *std.Io.Writer,
+    interface: std.Io.Writer,
+
+    const vtable: std.Io.Writer.VTable = .{ .drain = drain };
+
+    fn drain(writer: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *Forward = @alignCast(@fieldParentPtr("interface", writer));
+        try self.target.writeAll(writer.buffered());
+        writer.end = 0;
+        var written: usize = 0;
+        for (data[0 .. data.len - 1]) |bytes| {
+            try self.target.writeAll(bytes);
+            written += bytes.len;
+        }
+        for (0..splat) |_| try self.target.writeAll(data[data.len - 1]);
+        return written + data[data.len - 1].len * splat;
+    }
+};
 
 fn expectSlofErrorBound(expected: []const f64, actual: []const f64, fixed_point: f64) !void {
     try std.testing.expectEqual(expected.len, actual.len);

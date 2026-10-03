@@ -447,6 +447,45 @@ test "[property] - [zlib]: matches valid streaming output and bounds corrupt or 
     }
 }
 
+test "[property] - [zlib]: streamed inflation matches whole-stream results and errors" {
+    var compressor = try zlib.Compressor.init(std.testing.allocator, .even);
+    defer compressor.deinit();
+    var inflater = try zlib.Inflater.init(std.testing.allocator);
+    defer inflater.deinit();
+    var random = std.Random.DefaultPrng.init(0x7a6c_6962_5354_524d);
+    var source: [3000]u8 = undefined;
+    var compressed: [4096]u8 = undefined;
+    var whole: [source.len + 64]u8 = undefined;
+    // One byte more than whole, so a stream that outgrows whole shows as OutputTooSmall.
+    var streamed: [whole.len + 1]u8 = undefined;
+    for (&source, 0..) |*byte, index| byte.* = if (index % 50 < 45) @intCast(index % 7) else random.random().int(u8);
+    const valid = try compressor.compress(&compressed, &source);
+    for (0..valid.len + 1) |position| {
+        for ([_]u8{ 0, 1, 0x80, 0xff }) |mask| {
+            const wire = compressed[0..if (mask == 0) position else valid.len];
+            if (mask != 0 and position < valid.len) wire[position] ^= mask;
+            defer if (mask != 0 and position < valid.len) {
+                wire[position] ^= mask;
+            };
+            const expected = zlib.decompress(&whole, wire);
+            for ([_]usize{ 1, 100, 4096 }) |window| {
+                inflater.start(wire);
+                var total: usize = 0;
+                const actual = while (true) {
+                    if (total > whole.len) break error.OutputTooSmall;
+                    const piece = inflater.read(streamed[total..][0..@min(window, streamed.len - total)]) catch |err| break err;
+                    if (piece.len == 0) break total;
+                    total += piece.len;
+                };
+                if (expected) |bytes| {
+                    try std.testing.expectEqual(bytes.len, try actual);
+                    try std.testing.expectEqualSlices(u8, bytes, streamed[0..total]);
+                } else |err| try std.testing.expectError(err, actual);
+            }
+        }
+    }
+}
+
 fn decompressReference(output: []u8, source: []const u8) zlib.Error![]u8 {
     if (source.len < 2) return error.TruncatedInput;
     const header = std.mem.readInt(u16, source[0..2], .big);
@@ -708,6 +747,40 @@ test "[integration] - [array encoder]: keeps every wire until reset for all pipe
         var output: [3]T = undefined;
         try arrays.decodeWire(T, &output, try encoder.encode(T, &typed, .{ .pipeline = .zlib }), .zlib, &.{});
         try std.testing.expectEqualSlices(T, &typed, &output);
+    }
+}
+
+test "[property] - [array encoder]: streamed zlib matches encoding whole then compressing" {
+    var encoder = arrays.Encoder.init(std.testing.allocator, .even);
+    defer encoder.deinit();
+    var compressor = try zlib.Compressor.init(std.testing.allocator, .even);
+    defer compressor.deinit();
+    var values: [5_000]f64 = undefined;
+    var current: f64 = 100;
+    var random = std.Random.DefaultPrng.init(0x656e_636f_6465_7273);
+    for (&values) |*value| {
+        current += random.random().float(f64) * 3;
+        value.* = current;
+    }
+    const transformed = try std.testing.allocator.alloc(u8, 8 * values.len + 32);
+    defer std.testing.allocator.free(transformed);
+    const transport = try std.testing.allocator.alloc(u8, zlib.compressBound(transformed.len));
+    defer std.testing.allocator.free(transport);
+    const pairs = [_][2]arrays.Pipeline{
+        .{ .zlib, .none }, .{ .linear_zlib, .linear }, .{ .pic_zlib, .pic }, .{ .slof_zlib, .slof },
+    };
+    for ([_]?f64{ null, -1 }) |invalid| {
+        if (invalid) |bad| values[values.len / 2] = bad;
+        for (pairs) |pair| {
+            for ([_]?f64{ null, 1000 }) |fixed_point| {
+                encoder.reset();
+                const actual = encoder.encode(f64, &values, .{ .pipeline = pair[0], .fixed_point = fixed_point });
+                const plain = arrays.encodeWire(f64, &values, .{ .pipeline = pair[1], .fixed_point = fixed_point }, .{ .transport = &.{}, .transformed = transformed }, null);
+                if (plain) |bytes| {
+                    try std.testing.expectEqualSlices(u8, try compressor.compress(transport, bytes), try actual);
+                } else |err| try std.testing.expectError(err, actual);
+            }
+        }
     }
 }
 

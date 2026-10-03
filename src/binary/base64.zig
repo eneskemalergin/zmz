@@ -55,9 +55,14 @@ pub fn decode(output: []u8, source: []const u8) Error!Counts {
 /// Decodes XML text given in fragments into a borrowed output, keeping at most one incomplete
 /// quartet between updates; fragments are borrowed only during update. Failures are sticky,
 /// and counts and output are valid only after finish succeeds.
+///
+/// `take` hands out the bytes decoded since the last take and reuses output from its start,
+/// so a window that holds one update's bytes replaces a buffer for the whole payload.
 pub const Decoder = struct {
     output: []u8,
     counts: Counts = .{},
+    // Decoded bytes already handed out by take; output index = decoded_bytes - taken.
+    taken: usize = 0,
     quartet: [4]u8 = undefined,
     quartet_len: u3 = 0,
     padded: bool = false,
@@ -106,7 +111,7 @@ pub const Decoder = struct {
 
     fn decodeRun(self: *Decoder, text: []const u8) usize {
         if (self.quartet_len != 0 or self.padded or text.len < 4) return 0;
-        const output = self.output[self.counts.decoded_bytes..];
+        const output = self.output[self.counts.decoded_bytes - self.taken ..];
         const capacity = output.len;
         const input = text;
         const has_tail = input.len >= 4 and input.len % 4 == 0 and input[input.len - 1] == '=';
@@ -129,6 +134,20 @@ pub const Decoder = struct {
         return length;
     }
 
+    /// Returns the bytes decoded since the last take; the next update writes from output's
+    /// start again. The slice is valid until the next update.
+    pub fn take(self: *Decoder) []u8 {
+        const n = self.counts.decoded_bytes - self.taken;
+        self.taken = self.counts.decoded_bytes;
+        return self.output[0..n];
+    }
+
+    /// Text characters per update that always fit a window of `window` bytes with take: 3
+    /// bytes per 4 characters, plus the bytes of a quartet left from the previous update.
+    pub fn pieceFor(window: usize) usize {
+        return (window - 3) / 3 * 4;
+    }
+
     /// Checks the final quartet and returns the counts; call it once.
     pub fn finish(self: *Decoder) Error!Counts {
         if (self.failed) return error.FailedState;
@@ -146,9 +165,9 @@ pub const Decoder = struct {
         const group = try decodeQuartet(self.quartet);
         const end = std.math.add(usize, self.counts.decoded_bytes, group.len) catch
             return error.LengthOverflow;
-        if (end > self.output.len) return error.OutputTooSmall;
+        if (end - self.taken > self.output.len) return error.OutputTooSmall;
         inline for (0..3) |i| {
-            if (i < group.len) self.output[self.counts.decoded_bytes + i] = group.bytes[i];
+            if (i < group.len) self.output[self.counts.decoded_bytes - self.taken + i] = group.bytes[i];
         }
         self.counts.decoded_bytes = end;
         self.quartet_len = 0;
