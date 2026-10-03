@@ -182,6 +182,23 @@ test "[unit] - [mzML events]: classify encoding terms with the readers' table" {
     try std.testing.expectEqual(mzml.model.EncodingTerm{ .compression = .slof_zlib }, mzml.model.encodingTerm("MS:1002748").?);
     try std.testing.expectEqual(mzml.model.EncodingTerm.unsupported, mzml.model.encodingTerm("MS:1003780").?);
     try std.testing.expectEqual(null, mzml.model.encodingTerm("MS:1000514"));
+    // Every current binary data type and compression type term is classified, so none is
+    // silently ignored, and nothing else is.
+    const ms = for (mzml.cv.Resolver.BUNDLED) |vocabulary| {
+        if (std.mem.eql(u8, vocabulary.identity.key, "psi-ms")) break vocabulary;
+    } else return error.TestUnexpectedResult;
+    var classified: usize = 0;
+    for (ms.terms) |term| {
+        if (term.obsolete) continue;
+        const encoding_term = (try ms.isA(term.id, "MS:1000518", 1000) or try ms.isA(term.id, "MS:1000572", 1000)) and
+            !std.mem.eql(u8, term.id, "MS:1000518") and !std.mem.eql(u8, term.id, "MS:1000572");
+        std.testing.expectEqual(encoding_term, mzml.model.encodingTerm(term.id) != null) catch |err| {
+            std.debug.print("{s} {s}\n", .{ term.id, term.name });
+            return err;
+        };
+        classified += @intFromBool(encoding_term);
+    }
+    try std.testing.expect(classified >= 20);
 }
 
 fn wide(value: anytype) f64 {
