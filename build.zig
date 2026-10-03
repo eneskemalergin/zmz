@@ -17,6 +17,7 @@ const library_test_specs = [_]LibraryTest{
     .{ .root_source_file = "tests/mzml/test_ownership.zig" },
     .{ .root_source_file = "tests/mzml/test_writing.zig" },
     .{ .root_source_file = "tests/mzml/test_reader.zig", .add_gates_support = true },
+    .{ .root_source_file = "tests/mzml/test_events.zig" },
 };
 
 fn configureLibraryModule(

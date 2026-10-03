@@ -90,7 +90,7 @@ pub const Id = enum(u16) {
     }
 };
 
-pub const Operation = enum { read_header, read_record, read_item, open_index, rebuild_index, lookup_record, write_header, open_list, write_record, write_item, close_list, finish };
+pub const Operation = enum { read_event, read_header, read_record, read_item, open_index, rebuild_index, lookup_record, write_header, open_list, write_record, write_item, close_list, finish };
 pub const Stage = enum { xml, metadata, base64, array, index, output };
 pub const Location = union(enum) { input_event: u64, output_byte: u64 };
 pub const RecordPosition = struct {
@@ -139,9 +139,12 @@ pub const Limit = enum {
     /// The fixed work budget of expanding one array's or node's parameter groups.
     expansion_work,
 };
+/// The XML rule malformed input broke.
+pub const XmlRule = xml.Rule;
 pub const Detail = union(enum) {
     none,
     attribute: Attribute,
+    xml: XmlRule,
     limit: struct { name: Limit, maximum: u64, needed: ?u64 = null },
     size: struct { expected: u64, actual: u64, unit: SizeUnit },
 };
@@ -197,9 +200,10 @@ fn writing(operation: Operation) bool {
     };
 }
 
-/// The cursor's limit failure as detail. The node budget belongs to the caller, which
-/// reports it with its own maximum, so it gives no detail here.
+/// The cursor's limit failure or broken XML rule as detail. The node budget belongs to the
+/// caller, which reports it with its own maximum, so it gives no detail here.
 pub fn xmlDetail(cursor: *const xml.Cursor) Detail {
+    if (cursor.xml_rule) |rule| if (cursor.failure) |failure| if (failure == error.InvalidXml) return .{ .xml = rule };
     const limit = cursor.limit_failure orelse return .none;
     return .{ .limit = switch (limit) {
         .depth => .{ .name = .depth, .maximum = xml.MAX_DEPTH },
@@ -235,6 +239,7 @@ pub fn format(self: Diagnostic, writer: *std.Io.Writer) std.Io.Writer.Error!void
     switch (self.detail) {
         .none => {},
         .attribute => |attribute| try writer.print("; attribute={s}", .{attribute.xmlName()}),
+        .xml => |rule| try writer.print("; xml_rule={s}", .{@tagName(rule)}),
         .limit => |limit| {
             try writer.print("; limit={s}; maximum={d}", .{ @tagName(limit.name), limit.maximum });
             if (limit.needed) |needed| try writer.print("; needed={d}", .{needed});
