@@ -10,13 +10,6 @@ const DecodedArrays = @import("../decoded_arrays.zig");
 
 const StreamReader = @This();
 
-const ELEMENT_KINDS = std.StaticStringMap(model.Kind).initComptime(blk: {
-    const kinds = std.meta.tags(model.Kind);
-    var entries: [kinds.len]struct { []const u8, model.Kind } = undefined;
-    for (kinds, &entries) |value, *entry| entry.* = .{ value.xmlName(), value };
-    break :blk entries;
-});
-
 const ParamAttributes = struct {
     ref: ?[]const u8 = null,
     cv_ref: ?[]const u8 = null,
@@ -654,7 +647,7 @@ fn knownKind(self: *StreamReader) ?model.Kind {
     if (event.data != .start_element) return null;
     const name = event.data.start_element.name.expanded;
     if (!std.mem.eql(u8, name.namespace_uri orelse "", self.cursor.mzml_namespace)) return null;
-    const value = ELEMENT_KINDS.get(name.local) orelse return null;
+    const value = schema.kindOf(name.local) orelse return null;
     self.current_kind = value;
     return value;
 }

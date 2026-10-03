@@ -4,6 +4,8 @@
 const std = @import("std");
 const xml = @import("../xml/mzml_adapter.zig");
 const Diagnostic = @import("diagnostic.zig");
+const model = @import("model.zig");
+const schema = @import("schema.zig");
 
 /// Reads start, end, and text events from a forward byte stream it borrows until deinit;
 /// copy neither the input nor the reader. It checks XML well-formedness (names, quoting,
@@ -89,6 +91,14 @@ pub fn next(self: *Events) Error!?Event {
         .text => |text| .{ .text = text },
         .document_start, .document_end => return null,
     } };
+}
+
+/// The modeled kind of an element in either mzML namespace (1.1 or 1.0), from the table the
+/// readers use; null for other namespaces and for elements zmz does not model.
+pub fn kindOf(name: Name) ?model.Kind {
+    const uri = name.expanded.namespace_uri orelse return null;
+    if (!std.mem.eql(u8, uri, xml.NAMESPACE) and !std.mem.eql(u8, uri, xml.NAMESPACE_1_0)) return null;
+    return schema.kindOf(name.expanded.local);
 }
 
 /// Iterates the namespace bindings in scope at the current event, outermost first, skipping

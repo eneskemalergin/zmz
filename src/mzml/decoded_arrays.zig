@@ -12,7 +12,8 @@
 //! invalidate them. No source metadata is borrowed by this owner.
 //!
 //! beginArray, decodeText, and complete are internal: the reader engine calls them while it
-//! parses a record. Callers use the reads and the decode functions.
+//! parses a record. Callers use the reads and the decode functions (decodeArrayText for text
+//! read as events).
 
 const std = @import("std");
 const model = @import("model.zig");
@@ -117,6 +118,23 @@ pub fn decodeArray(self: *DecodedArrays, node: model.Node, default_length: ?usiz
     return self.get(0).?.values;
 }
 
+/// Decodes one array whose Base64 text arrives in pieces from source, given its encoding and
+/// value count, for callers that read the document as events: classify the array's terms with
+/// `model.encodingTerm` and pass a source whose `next()` returns the array's text runs (for
+/// example `Events` text events) and then null. Same decoding, error order, and limits as the
+/// readers; replaces earlier results, and after a failure none are visible.
+pub fn decodeArrayText(self: *DecodedArrays, encoding: model.Encoding, length: usize, source: anytype) !Values {
+    if (self.busy) return error.InvalidState;
+    self.reset();
+    errdefer self.reset();
+    self.busy = true;
+    defer self.busy = false;
+    try self.beginArrayWith(encoding, length, 0);
+    try self.decodeText(source);
+    self.complete();
+    return self.get(0).?.values;
+}
+
 fn decodeRetained(self: *DecodedArrays, node: model.Node, default_length: ?usize, groups: []const cv.Group, source_position: usize) Error!void {
     // Text kept in this owner's storage would be freed or overwritten as arrays are sized.
     if (node.child(.binary)) |binary| if (binary.text) |retained| {
@@ -199,23 +217,30 @@ pub fn beginArray(self: *DecodedArrays, node: model.Node, default_length: ?usize
         } };
     };
     const array = try model.BinaryArray.init(node, default_length, groups);
+    return self.beginArrayWith(array.encoding, array.length, source_position);
+}
+
+fn beginArrayWith(self: *DecodedArrays, encoding: model.Encoding, length: usize, source_position: usize) Error!void {
+    errdefer if (self.failure == null) {
+        self.failure = .{ .stage = .array };
+    };
     if (self.count == self.outputs.items.len) try self.outputs.append(self.allocator, .{});
     const output = &self.outputs.items[self.count];
     self.count += 1;
     output.source_position = source_position;
-    output.encoding = array.encoding;
+    output.encoding = encoding;
     // Set once the words are sized, so a failure here exposes no values.
     output.length = 0;
     output.bytes = 0;
-    const bytes = std.math.mul(usize, array.length, output.primitive().size()) catch return error.LengthOverflow;
+    const bytes = std.math.mul(usize, length, output.primitive().size()) catch return error.LengthOverflow;
     if (bytes > self.limits.array_bytes) {
         self.failure = .{ .stage = .array, .detail = .{ .limit = .{ .name = .array_bytes, .maximum = self.limits.array_bytes, .needed = bytes } } };
         return error.LimitExceeded;
     }
     try output.words.resize(self.allocator, bytes / 8 + @intFromBool(bytes % 8 != 0));
-    output.length = array.length;
+    output.length = length;
     output.bytes = bytes;
-    const pipeline = array.encoding.pipeline;
+    const pipeline = encoding.pipeline;
     if (pipeline != .none) try self.window.resize(self.allocator, WINDOW);
     if (pipeline.transform()) |transform| {
         self.values = numpress.Decoder.initExact(transform, output.values(f64));

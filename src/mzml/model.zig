@@ -374,6 +374,10 @@ pub const Record = struct {
 
 pub const Primitive = encoding.Primitive;
 pub const Encoding = encoding.Descriptor;
+/// What one CV accession declares about an array's encoding: a primitive, a compression, or an
+/// unsupported encoding; null when it declares nothing. `arrayEncoding` and every reader use it.
+pub const EncodingTerm = encoding.Declared;
+pub const encodingTerm = encoding.declared;
 /// encoding.Error, and the failures of reading a modeled array node.
 pub const EncodingError = encoding.Error || error{ NotBinaryArray, PayloadNotRetained, TypeMismatch };
 

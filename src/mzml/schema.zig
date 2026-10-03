@@ -3,6 +3,19 @@
 const std = @import("std");
 const model = @import("model.zig");
 
+const ELEMENT_KINDS = std.StaticStringMap(model.Kind).initComptime(blk: {
+    const kinds = std.meta.tags(model.Kind);
+    var entries: [kinds.len]struct { []const u8, model.Kind } = undefined;
+    for (kinds, &entries) |value, *entry| entry.* = .{ value.xmlName(), value };
+    break :blk entries;
+});
+
+/// The modeled kind of an mzML element's local name, or null for elements zmz does not model.
+/// The caller checks the namespace.
+pub fn kindOf(local_name: []const u8) ?model.Kind {
+    return ELEMENT_KINDS.get(local_name);
+}
+
 /// A child kind a parent allows, at most once unless many.
 pub const Rule = struct { kind: model.Kind, many: bool = false };
 

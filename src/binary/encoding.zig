@@ -137,6 +137,24 @@ pub const Error = cv.ExpansionError || error{
     UnsupportedEncoding,
 };
 
+/// What one CV accession declares about an array's encoding.
+pub const Declared = union(enum) { primitive: Primitive, compression: Pipeline, unsupported };
+
+/// The encoding meaning of one accession, or null when it says nothing about encoding. Recognized
+/// but unsupported encodings (zstd, byte shuffling, other Numpress forms) are `unsupported`.
+pub fn declared(accession: []const u8) ?Declared {
+    if (primitiveFromAccession(accession)) |primitive| return .{ .primitive = primitive };
+    if (codecFromAccession(accession)) |pipeline| return .{ .compression = pipeline };
+    inline for (.{
+        "MS:1000520", "MS:1001479", "MS:1003088", "MS:1003089", "MS:1003090",
+        "MS:1003780", "MS:1003781", "MS:1003782", "MS:1003783", "MS:1003784",
+        "MS:1003785",
+    }) |unsupported| {
+        if (std.mem.eql(u8, accession, unsupported)) return .unsupported;
+    }
+    return null;
+}
+
 /// Classifies the reviewed primitive and compression terms. A missing term is an error, and
 /// repeated terms must agree.
 pub fn classify(params: []const cv.Entry, groups: []const cv.Group) Error!Descriptor {
@@ -146,23 +164,16 @@ pub fn classify(params: []const cv.Entry, groups: []const cv.Group) Error!Descri
     while (try iterator.next()) |entry| {
         if (entry != .cv) continue;
         const accession = entry.cv.accession orelse continue;
-        const raw = accession.raw;
-        if (primitiveFromAccession(raw)) |selected| {
-            if (primitive != null and primitive.? != selected) return error.ConflictingPrimitive;
-            primitive = selected;
-        }
-        if (codecFromAccession(raw)) |selected| {
-            if (pipeline != null and pipeline.? != selected) return error.ConflictingCompression;
-            pipeline = selected;
-        }
-        if (std.mem.eql(u8, raw, "MS:1000520") or std.mem.eql(u8, raw, "MS:1001479"))
-            return error.UnsupportedEncoding;
-        inline for (.{
-            "MS:1003088", "MS:1003089", "MS:1003090",
-            "MS:1003780", "MS:1003781", "MS:1003782",
-            "MS:1003783", "MS:1003784", "MS:1003785",
-        }) |unsupported| {
-            if (std.mem.eql(u8, raw, unsupported)) return error.UnsupportedEncoding;
+        switch (declared(accession.raw) orelse continue) {
+            .primitive => |selected| {
+                if (primitive != null and primitive.? != selected) return error.ConflictingPrimitive;
+                primitive = selected;
+            },
+            .compression => |selected| {
+                if (pipeline != null and pipeline.? != selected) return error.ConflictingCompression;
+                pipeline = selected;
+            },
+            .unsupported => return error.UnsupportedEncoding,
         }
     }
     return .{

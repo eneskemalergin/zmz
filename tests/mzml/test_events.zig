@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const mzml = @import("zmz").mzml;
+const support = @import("support.zig");
 
 const Kind = enum { start, end, text };
 const Seen = struct { kind: Kind, start: u64, end: u64, value: []const u8 };
@@ -157,5 +158,111 @@ test "[unit] - [mzML events]: give each attribute's source offset in any split" 
         for (root.attributes, [_][]const u8{ "a=", "p:b=", "c =" }) |attribute, text| {
             try std.testing.expectEqual(std.mem.indexOf(u8, source, text).?, attribute.offset);
         }
+    }
+}
+
+test "[unit] - [mzML events]: name modeled elements in both mzML namespaces only" {
+    var input = std.Io.Reader.fixed("<mzML xmlns='http://psi.hupo.org/schema_revision/mzML_1.0.0'><run/><x:run xmlns:x='urn:other'/><unmodeled/></mzML>");
+    var events = try mzml.Events.init(std.testing.allocator, &input, .{});
+    defer events.deinit();
+    const expected = [_]?mzml.model.Kind{ .mzml, .run, null, null };
+    var position: usize = 0;
+    while (try events.next()) |event| switch (event.data) {
+        .start_element => |start| {
+            try std.testing.expectEqual(expected[position], mzml.Events.kindOf(start.name));
+            position += 1;
+        },
+        else => {},
+    };
+    try std.testing.expectEqual(expected.len, position);
+}
+
+test "[unit] - [mzML events]: classify encoding terms with the readers' table" {
+    try std.testing.expectEqual(mzml.model.EncodingTerm{ .primitive = .float64 }, mzml.model.encodingTerm("MS:1000523").?);
+    try std.testing.expectEqual(mzml.model.EncodingTerm{ .compression = .slof_zlib }, mzml.model.encodingTerm("MS:1002748").?);
+    try std.testing.expectEqual(mzml.model.EncodingTerm.unsupported, mzml.model.encodingTerm("MS:1003780").?);
+    try std.testing.expectEqual(null, mzml.model.encodingTerm("MS:1000514"));
+}
+
+fn wide(value: anytype) f64 {
+    return if (@typeInfo(@TypeOf(value)) == .float) @floatCast(value) else @floatFromInt(value);
+}
+
+// What an event app does: the array's text runs, ending at its next element event.
+const TextRuns = struct {
+    events: *mzml.Events,
+
+    pub fn next(self: *TextRuns) !?[]const u8 {
+        const event = try self.events.next() orelse return null;
+        return switch (event.data) {
+            .text => |run| run.bytes,
+            else => null,
+        };
+    }
+};
+
+test "[integration] - [mzML events]: decode arrays from text runs as the readers do" {
+    const allocator = std.testing.allocator;
+    var document: std.Io.Writer.Allocating = .init(allocator);
+    defer document.deinit();
+    try support.constructFixture(allocator, &document.writer, false, &.{ .none, .zlib, .linear, .pic, .slof, .linear_zlib, .pic_zlib, .slof_zlib });
+    const bytes = document.written();
+
+    var expected: std.ArrayList(f64) = .empty;
+    defer expected.deinit(allocator);
+    {
+        var input = std.Io.Reader.fixed(bytes);
+        var reader = try mzml.StreamReader.init(allocator, &input, .{});
+        defer reader.deinit();
+        var decoded = mzml.StreamReader.DecodedArrays.init(allocator, .{});
+        defer decoded.deinit();
+        while (try reader.nextDecodedRecord(&decoded)) |_| for (0..decoded.len()) |i| switch (decoded.get(i).?.values) {
+            inline else => |values| for (values) |value| try expected.append(allocator, wide(value)),
+        };
+    }
+
+    var buffer: [64]u8 = undefined;
+    for ([_]usize{ 1, 7, 64 }) |size| {
+        var input: std.testing.Reader = .init(buffer[0..size], &.{.{ .buffer = bytes }});
+        input.artificial_limit = .limited(size);
+        var events = try mzml.Events.init(allocator, &input.interface, .{});
+        defer events.deinit();
+        var decoded = mzml.StreamReader.DecodedArrays.init(allocator, .{});
+        defer decoded.deinit();
+        var record_length: usize = 0;
+        var primitive: ?mzml.model.Primitive = null;
+        var pipeline: ?mzml.arrays.Pipeline = null;
+        var position: usize = 0;
+        while (try events.next()) |event| switch (event.data) {
+            .start_element => |start| switch (mzml.Events.kindOf(start.name) orelse {
+                // Parameters are entries of a node, not node kinds.
+                if (!std.mem.eql(u8, start.name.expanded.local, "cvParam")) continue;
+                if (mzml.model.encodingTerm(start.attribute(null, "accession").?.value)) |term| switch (term) {
+                    .primitive => |value| primitive = value,
+                    .compression => |value| pipeline = value,
+                    .unsupported => return error.TestUnexpectedResult,
+                };
+                continue;
+            }) {
+                .spectrum, .chromatogram => record_length = try std.fmt.parseInt(usize, start.attribute(null, "defaultArrayLength").?.value, 10),
+                .binary_data_array => {
+                    primitive = null;
+                    pipeline = null;
+                },
+                .binary => {
+                    var runs: TextRuns = .{ .events = &events };
+                    const values = try decoded.decodeArrayText(.{ .primitive = primitive.?, .pipeline = pipeline.? }, record_length, &runs);
+                    switch (values) {
+                        inline else => |numbers| for (numbers) |value| {
+                            try std.testing.expectEqual(expected.items[position], wide(value));
+                            position += 1;
+                        },
+                    }
+                },
+                else => {},
+            },
+            else => {},
+        };
+        try std.testing.expectEqual(expected.items.len, position);
     }
 }
