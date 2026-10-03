@@ -505,6 +505,8 @@ pub const Cursor = struct {
     namespace_bytes: std.ArrayList(u8) = .empty,
     namespace_bindings: std.ArrayList(NamespaceBinding) = .empty,
     additional_namespaces: ?bool = null,
+    /// Changes whenever the in-scope bindings do, so a reader can reuse what it built for a scope.
+    namespace_scope: u64 = 0,
     failure: ?Error = null,
     limit_failure: ?enum { depth, attributes, attribute_bytes, nodes, declaration_bytes } = null,
     // The rule broken by the input when `failure` is `InvalidXml`.
@@ -613,7 +615,7 @@ pub const Cursor = struct {
         self.cdata_brackets = 0;
         self.normal_text_brackets = 0;
         self.mzml_namespace = NAMESPACE;
-        self.additional_namespaces = null;
+        self.scopeChanged();
         self.pending_empty = false;
         self.event_bytes.clearRetainingCapacity();
         self.text_bytes.clearRetainingCapacity();
@@ -1328,7 +1330,7 @@ pub const Cursor = struct {
 
     // Raw attribute names are unique, so each prefix is declared once per element.
     fn installNamespaces(self: *Cursor) Error!void {
-        if (self.namespace_declarations.items.len != 0) self.additional_namespaces = null;
+        if (self.namespace_declarations.items.len != 0) self.scopeChanged();
         for (self.namespace_declarations.items) |declaration| {
             const prefix = self.event_bytes.items[declaration.prefix.start..][0..declaration.prefix.len];
             const uri = self.event_bytes.items[declaration.uri.start..][0..declaration.uri.len];
@@ -1389,10 +1391,15 @@ pub const Cursor = struct {
         } };
     }
 
+    fn scopeChanged(self: *Cursor) void {
+        self.additional_namespaces = null;
+        self.namespace_scope +%= 1;
+    }
+
     fn popFrame(self: *Cursor, frame: Frame) void {
         self.depth -= 1;
         self.open_names.items.len = frame.name_start;
-        if (self.namespace_bindings.items.len != frame.binding_start) self.additional_namespaces = null;
+        if (self.namespace_bindings.items.len != frame.binding_start) self.scopeChanged();
         self.namespace_bindings.items.len = frame.binding_start;
         self.namespace_bytes.items.len = frame.namespace_bytes_start;
         if (self.depth == 0) self.root_closed = true;

@@ -9,6 +9,9 @@ pub const Error = std.mem.Allocator.Error || error{ LimitExceeded, MissingAttrib
 pub const Copier = struct {
     allocator: std.mem.Allocator,
     remaining: usize,
+    // The reader shares one attribute slice (a scope's namespace declarations) across many
+    // nodes and parameters; the copy keeps it shared instead of copying it for each.
+    shared: struct { source: []const model.Attribute = &.{}, copy: []const model.Attribute = &.{} } = .{},
 
     pub fn alloc(self: *Copier, comptime T: type, count: usize) Error![]T {
         const bytes = std.math.mul(usize, @sizeOf(T), count) catch return error.LimitExceeded;
@@ -67,8 +70,10 @@ pub const Copier = struct {
     }
 
     fn attributes(self: *Copier, source: []const model.Attribute) Error![]const model.Attribute {
+        if (source.len != 0 and source.ptr == self.shared.source.ptr and source.len == self.shared.source.len) return self.shared.copy;
         const result = try self.alloc(model.Attribute, source.len);
         for (source, result) |attr, *copy| copy.* = try self.attribute(attr);
+        self.shared = .{ .source = source, .copy = result };
         return result;
     }
 

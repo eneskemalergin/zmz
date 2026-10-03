@@ -265,6 +265,38 @@ test "[failure] - [mzML decoded arrays]: retained decoding reports what decoded 
     try std.testing.expectEqual(null, output.diagnostic());
 }
 
+test "[regression] - [mzML namespaces]: parameters share their scope's declarations instead of copying them" {
+    const allocator = std.testing.allocator;
+    var source: std.Io.Writer.Allocating = .init(allocator);
+    defer source.deinit();
+    // 60 prefixes with 16,000-byte URIs on the root: about 1 MB of declarations in scope.
+    try source.writer.writeAll("<mzML xmlns='http://psi.hupo.org/ms/mzml'");
+    for (0..60) |k| {
+        try source.writer.print(" xmlns:p{d}='urn:", .{k});
+        try source.writer.splatByteAll('a' + @as(u8, @intCast(k % 26)), 16_000);
+        try source.writer.writeAll("'");
+    }
+    try source.writer.writeAll(support.HEADER["<mzML xmlns='http://psi.hupo.org/ms/mzml'".len..]);
+    try source.writer.writeAll("<spectrumList count='1' defaultDataProcessingRef='dp'><spectrum id='s' index='0' defaultArrayLength='0'>");
+    for (0..1_000) |_| try source.writer.writeAll("<cvParam cvRef='MS' accession='MS:1000511' name='ms level' value='1'/>");
+    try source.writer.writeAll("</spectrum></spectrumList></run></mzML>");
+
+    var input = std.Io.Reader.fixed(source.written());
+    var reader = try mzml.StreamReader.init(allocator, &input, .{});
+    defer reader.deinit();
+    _ = try reader.readHeader();
+    const record = (try reader.nextRecord()).?;
+    try std.testing.expectEqual(@as(usize, 1_000), record.node.params.len);
+    const first = record.node.params[0].cv.xml.?.attributes;
+    try std.testing.expectEqual(@as(usize, 60 + 1), first.len);
+    for (record.node.params) |param| try std.testing.expectEqual(first.ptr, param.cv.xml.?.attributes.ptr);
+    // An owned copy keeps them shared, so it stays within the default copy limit.
+    var copy = try mzml.owned.Record.init(allocator, record, .{});
+    defer copy.deinit();
+    const copied = copy.value.node.params[0].cv.xml.?.attributes;
+    for (copy.value.node.params) |param| try std.testing.expectEqual(copied.ptr, param.cv.xml.?.attributes.ptr);
+}
+
 fn expectSameValues(expected: mzml.StreamReader.DecodedArrays.Values, actual: mzml.StreamReader.DecodedArrays.Values) !void {
     try std.testing.expectEqual(std.meta.activeTag(expected), std.meta.activeTag(actual));
     switch (expected) {

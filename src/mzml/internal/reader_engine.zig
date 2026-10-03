@@ -104,6 +104,8 @@ list_scopes: [2]?Scope = .{ null, null },
 child_scratch: std.ArrayList(model.Node) = .empty,
 param_scratch: std.ArrayList(cv.Entry) = .empty,
 decoded_arrays: ?*DecodedArrays = null,
+// The in-scope namespace declarations built for one scope and storage (scopeDeclarations).
+scope_declarations: struct { storage: ?*const Storage = null, resets: usize = 0, scope: u64 = 0, attributes: []const model.Attribute = &.{} } = .{},
 // The decoded record's defaultArrayLength, for its arrays.
 record_default_length: ?usize = null,
 // A call is in progress. Caller code runs inside it (selection callbacks, the input reader,
@@ -1121,7 +1123,36 @@ const FragmentBuffer = struct {
     }
 };
 
+// The in-scope declarations, then the element's own attributes (a parameter's fields excluded).
+// Nodes and parameters in one scope share the declarations, copied once into storage.
 fn copyForeignAttributes(self: *StreamReader, storage: *Storage, start: xml.StartElement, parameter: ?u2) Error![]const model.Attribute {
+    const scope = try self.scopeDeclarations(storage);
+    var own: usize = 0;
+    for (start.attributes) |attribute| {
+        if (parameter) |selected| if (parameterAttribute(attribute.name.expanded, selected) != null) continue;
+        own += 1;
+    }
+    if (own == 0) return scope;
+    const result = try storage.alloc(model.Attribute, scope.len + own);
+    @memcpy(result[0..scope.len], scope);
+    var i = scope.len;
+    for (start.attributes) |attribute| {
+        if (parameter) |selected| if (parameterAttribute(attribute.name.expanded, selected) != null) continue;
+        result[i] = .{
+            .name = try storage.copy(u8, attribute.name.raw),
+            .namespace_uri = if (attribute.name.expanded.namespace_uri) |uri| try storage.copy(u8, uri) else null,
+            .value = try storage.copy(u8, attribute.value),
+        };
+        i += 1;
+    }
+    return result;
+}
+
+// Every in-scope binding as an `xmlns` attribute, with `xmlns=""` when no default is bound.
+fn scopeDeclarations(self: *StreamReader, storage: *Storage) Error![]const model.Attribute {
+    const cache = &self.scope_declarations;
+    if (cache.storage == storage and cache.resets == storage.resets and cache.scope == self.cursor.namespace_scope)
+        return cache.attributes;
     var count: usize = 0;
     var position: usize = 0;
     var has_default = false;
@@ -1130,10 +1161,6 @@ fn copyForeignAttributes(self: *StreamReader, storage: *Storage, start: xml.Star
         has_default = has_default or binding.prefix.len == 0;
     }
     if (!has_default) count += 1;
-    for (start.attributes) |attribute| {
-        if (parameter) |selected| if (parameterAttribute(attribute.name.expanded, selected) != null) continue;
-        count += 1;
-    }
     const result = try storage.alloc(model.Attribute, count);
     position = 0;
     var i: usize = 0;
@@ -1147,19 +1174,8 @@ fn copyForeignAttributes(self: *StreamReader, storage: *Storage, start: xml.Star
         result[i] = .{ .name = name, .namespace_uri = xml.XMLNS_NAMESPACE, .value = try storage.copy(u8, binding.uri) };
         i += 1;
     }
-    if (!has_default) {
-        result[i] = .{ .name = "xmlns", .namespace_uri = xml.XMLNS_NAMESPACE, .value = "" };
-        i += 1;
-    }
-    for (start.attributes) |attribute| {
-        if (parameter) |selected| if (parameterAttribute(attribute.name.expanded, selected) != null) continue;
-        result[i] = .{
-            .name = try storage.copy(u8, attribute.name.raw),
-            .namespace_uri = if (attribute.name.expanded.namespace_uri) |uri| try storage.copy(u8, uri) else null,
-            .value = try storage.copy(u8, attribute.value),
-        };
-        i += 1;
-    }
+    if (!has_default) result[i] = .{ .name = "xmlns", .namespace_uri = xml.XMLNS_NAMESPACE, .value = "" };
+    cache.* = .{ .storage = storage, .resets = storage.resets, .scope = self.cursor.namespace_scope, .attributes = result };
     return result;
 }
 
@@ -1172,6 +1188,8 @@ const Storage = struct {
     exceeded: bool = false,
     // The bytes the failed request would have needed, when known.
     needed: ?usize = null,
+    // Counts resets, so a slice cached from this storage is not reused after one.
+    resets: usize = 0,
 
     fn init(allocator: std.mem.Allocator, limit: usize) Storage {
         return .{ .arena = .init(allocator), .limit = limit };
@@ -1184,6 +1202,7 @@ const Storage = struct {
         self.arrays = 0;
         self.exceeded = false;
         self.needed = null;
+        self.resets +%= 1;
     }
 
     fn charge(self: *Storage, comptime T: type, count: usize) Error!void {
