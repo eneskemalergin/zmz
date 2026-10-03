@@ -242,6 +242,16 @@ pub fn reencoding(self: *Builder, source: model.Header, targets: []const model.E
     const total = std.math.add(usize, source_groups.len, count) catch return error.LimitExceeded;
     const groups = try copier.alloc(cv.Group, total);
     @memcpy(groups[0..source_groups.len], source_groups);
+    // Every group ID in use, including those of extra group lists, so each new ID is checked once.
+    var used_ids: std.heap.ArenaAllocator = .init(self.arena.child_allocator);
+    defer used_ids.deinit();
+    var used: std.StringHashMapUnmanaged(void) = .empty;
+    for (source_groups) |group| try used.put(used_ids.allocator(), cv.idKey(group.id), {});
+    addExtraGroupIds(used_ids.allocator(), header_copy, &used) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.LimitExceeded => return error.LimitExceeded,
+        else => return error.InvalidStructure,
+    };
     for (@constCast(header_copy.document.children)) |*list_node| {
         if (list_node.kind != .referenceable_param_group_list) continue;
         const original_nodes = list_node.children;
@@ -255,19 +265,10 @@ pub fn reencoding(self: *Builder, source: model.Header, targets: []const model.E
             const id = while (true) {
                 const candidate = std.fmt.bufPrint(&id_buffer, "zmz-reencoded-{d}", .{serial}) catch return error.LimitExceeded;
                 serial = std.math.add(usize, serial, 1) catch return error.LimitExceeded;
-                var collision = false;
-                for (groups[0..next]) |existing| {
-                    if (cv.sameId(candidate, existing.id)) {
-                        collision = true;
-                        break;
-                    }
-                }
-                if (!collision) collision = extraGroupIdUsed(self.arena.child_allocator, header_copy, candidate) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    error.LimitExceeded => return error.LimitExceeded,
-                    else => return error.InvalidStructure,
-                };
-                if (!collision) break try copier.text(candidate);
+                if (used.contains(candidate)) continue;
+                const chosen = try copier.text(candidate);
+                try used.put(used_ids.allocator(), chosen, {});
+                break chosen;
             };
             var node_copy = group_node;
             const attributes = try copier.alloc(model.Attribute, group_node.attributes.len);
@@ -316,8 +317,8 @@ const GroupEncoding = struct { primitive: ?model.Primitive = null, pipeline: ?ar
 const GroupReplacement = struct { source_id: []const u8, encoding: GroupEncoding, id: []const u8 };
 
 // Extra group lists are not expanded, but their IDs must not be reused.
-fn extraGroupIdUsed(allocator: std.mem.Allocator, header_value: model.Header, id: []const u8) xml.Error!bool {
-    const content = header_value.document.content orelse return false;
+fn addExtraGroupIds(allocator: std.mem.Allocator, header_value: model.Header, used: *std.StringHashMapUnmanaged(void)) xml.Error!void {
+    const content = header_value.document.content orelse return;
     for (content.items) |item| {
         if (item != .xml) continue;
         var input = std.Io.Reader.fixed(item.xml);
@@ -332,10 +333,9 @@ fn extraGroupIdUsed(allocator: std.mem.Allocator, header_value: model.Header, id
             if (event.data != .start_element or cursor.depth != 2) continue;
             const start = event.data.start_element;
             if (!start.name.eql(header_value.namespace_uri, "referenceableParamGroup")) continue;
-            if (start.attribute(null, "id")) |attribute| if (cv.sameId(attribute.value, id)) return true;
+            if (start.attribute(null, "id")) |attribute| try used.put(allocator, try allocator.dupe(u8, cv.idKey(attribute.value)), {});
         }
     }
-    return false;
 }
 
 fn changedGroupEncoding(entries: []const cv.Entry, target: model.Encoding) ?GroupEncoding {
