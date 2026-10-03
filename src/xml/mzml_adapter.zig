@@ -730,14 +730,16 @@ pub const Cursor = struct {
                     remaining_nodes.* -= 1;
                     nesting += 1;
                     try output.startElement(start.name.raw);
-                    var position: usize = 0;
+                    // The fragment's root declares every binding in scope; nested elements then
+                    // inherit them and declare only their own, as the source did.
+                    var position: usize = if (nesting == 1) 0 else self.frames[self.depth - 1].binding_start;
                     var default_seen = false;
                     while (self.namespaceAt(&position)) |binding| {
                         default_seen = default_seen or binding.prefix.len == 0;
                         if (!optionalSliceEql(output.namespaceUri(binding.prefix), binding.uri))
                             try output.namespace(if (binding.prefix.len == 0) null else binding.prefix, binding.uri);
                     }
-                    if (!default_seen and !optionalSliceEql(output.namespaceUri(""), "")) try output.namespace(null, "");
+                    if (nesting == 1 and !default_seen and !optionalSliceEql(output.namespaceUri(""), "")) try output.namespace(null, "");
                     for (start.attributes) |attribute| try output.attribute(attribute.name.raw, attribute.value);
                 },
                 .end_element => {
@@ -1750,9 +1752,8 @@ const WriterFrame = struct {
     name_start: usize,
     name_len: usize,
     attribute_start: usize,
-    namespace_start: usize,
-    default_uri_start: usize,
-    default_uri_len: usize,
+    binding_start: usize,
+    namespace_bytes_start: usize,
 };
 
 /// Buffered XML emission for mzML and retained metadata fragments.
@@ -1771,9 +1772,9 @@ pub const Writer = struct {
     frame_count: usize = 0,
     open_names: std.ArrayList(u8) = .empty,
     attribute_names: std.ArrayList(u8) = .empty,
-    namespace_names: std.ArrayList(u8) = .empty,
-    default_uri_start: usize = 0,
-    default_uri_len: usize = 0,
+    // In-scope declarations, innermost last, so a lookup searches backward and stops early.
+    namespace_bindings: std.ArrayList(NamespaceBinding) = .empty,
+    namespace_bytes: std.ArrayList(u8) = .empty,
     text_brackets: u2 = 0,
     // Binary bytes waiting for a whole Base64 group between binaryPart calls.
     binary_carry: [3]u8 = undefined,
@@ -1788,7 +1789,8 @@ pub const Writer = struct {
     pub fn deinit(self: *Writer) void {
         self.open_names.deinit(self.allocator);
         self.attribute_names.deinit(self.allocator);
-        self.namespace_names.deinit(self.allocator);
+        self.namespace_bindings.deinit(self.allocator);
+        self.namespace_bytes.deinit(self.allocator);
     }
 
     /// Whether bytes share memory with the buffers the writer writes into.
@@ -1842,9 +1844,8 @@ pub const Writer = struct {
             .name_start = name_start,
             .name_len = name.len,
             .attribute_start = self.attribute_names.items.len,
-            .namespace_start = self.namespace_names.items.len,
-            .default_uri_start = self.default_uri_start,
-            .default_uri_len = self.default_uri_len,
+            .binding_start = self.namespace_bindings.items.len,
+            .namespace_bytes_start = self.namespace_bytes.items.len,
         };
         self.frame_count += 1;
         if (self.frame_count == 1) self.root_written = true;
@@ -1867,20 +1868,20 @@ pub const Writer = struct {
         if (std.mem.eql(u8, uri, XMLNS_NAMESPACE) or (prefix == null and std.mem.eql(u8, uri, XML_NAMESPACE))) return self.fail(error.InvalidNamespace);
         const frame = &self.frames[self.frame_count - 1];
         const actual_prefix = prefix orelse "";
-        var position = frame.namespace_start;
-        while (position < self.namespace_names.items.len) {
-            const end = std.mem.indexOfScalarPos(u8, self.namespace_names.items, position, 0) orelse self.namespace_names.items.len;
-            if (std.mem.eql(u8, self.namespace_names.items[position..end], actual_prefix)) return self.fail(error.DuplicateAttribute);
-            position = std.mem.indexOfScalarPos(u8, self.namespace_names.items, end + 1, 0).? + 1;
+        for (self.namespace_bindings.items[frame.binding_start..]) |binding| {
+            if (std.mem.eql(u8, self.namespace_bytes.items[binding.prefix_start..][0..binding.prefix_len], actual_prefix))
+                return self.fail(error.DuplicateAttribute);
         }
-        self.namespace_names.appendSlice(self.allocator, actual_prefix) catch return self.fail(error.OutOfMemory);
-        self.namespace_names.append(self.allocator, 0) catch return self.fail(error.OutOfMemory);
-        if (prefix == null) {
-            self.default_uri_start = self.namespace_names.items.len;
-            self.default_uri_len = uri.len;
-        }
-        self.namespace_names.appendSlice(self.allocator, uri) catch return self.fail(error.OutOfMemory);
-        self.namespace_names.append(self.allocator, 0) catch return self.fail(error.OutOfMemory);
+        const prefix_start = self.namespace_bytes.items.len;
+        self.namespace_bytes.appendSlice(self.allocator, actual_prefix) catch return self.fail(error.OutOfMemory);
+        const uri_start = self.namespace_bytes.items.len;
+        self.namespace_bytes.appendSlice(self.allocator, uri) catch return self.fail(error.OutOfMemory);
+        self.namespace_bindings.append(self.allocator, .{
+            .prefix_start = prefix_start,
+            .prefix_len = actual_prefix.len,
+            .uri_start = uri_start,
+            .uri_len = uri.len,
+        }) catch return self.fail(error.OutOfMemory);
         try self.writeByte(' ');
         try self.writeBytes(if (prefix == null) "xmlns=\"" else "xmlns:");
         if (prefix) |value| {
@@ -2036,9 +2037,8 @@ pub const Writer = struct {
         self.frame_count -= 1;
         self.open_names.items.len = frame.name_start;
         self.attribute_names.items.len = frame.attribute_start;
-        self.namespace_names.items.len = frame.namespace_start;
-        self.default_uri_start = frame.default_uri_start;
-        self.default_uri_len = frame.default_uri_len;
+        self.namespace_bindings.items.len = frame.binding_start;
+        self.namespace_bytes.items.len = frame.namespace_bytes_start;
         self.text_brackets = 0;
         self.state = if (self.frame_count == 0) .epilog else .content;
     }
@@ -2066,18 +2066,18 @@ pub const Writer = struct {
         if (self.binary_carry_len != 0) return self.fail(error.InvalidState);
     }
 
+    /// Returns the URI bound to prefix in the current scope ("" for the default namespace when
+    /// none is declared), or null for an unbound prefix.
     pub fn namespaceUri(self: *const Writer, prefix: []const u8) ?[]const u8 {
-        if (prefix.len == 0) return if (self.default_uri_len == 0) "" else self.namespace_names.items[self.default_uri_start..][0..self.default_uri_len];
         if (std.mem.eql(u8, prefix, "xml")) return XML_NAMESPACE;
-        var result: ?[]const u8 = null;
-        var position: usize = 0;
-        while (position < self.namespace_names.items.len) {
-            const end = std.mem.indexOfScalarPos(u8, self.namespace_names.items, position, 0).?;
-            const uri_end = std.mem.indexOfScalarPos(u8, self.namespace_names.items, end + 1, 0).?;
-            if (std.mem.eql(u8, self.namespace_names.items[position..end], prefix)) result = self.namespace_names.items[end + 1 .. uri_end];
-            position = uri_end + 1;
+        var index = self.namespace_bindings.items.len;
+        while (index != 0) {
+            index -= 1;
+            const binding = self.namespace_bindings.items[index];
+            if (std.mem.eql(u8, self.namespace_bytes.items[binding.prefix_start..][0..binding.prefix_len], prefix))
+                return self.namespace_bytes.items[binding.uri_start..][0..binding.uri_len];
         }
-        return result;
+        return if (prefix.len == 0) "" else null;
     }
 
     fn checkOpeningName(self: *Writer) WriterError!void {
@@ -2296,6 +2296,25 @@ test "[unit] - [mzML XML cursor]: skips declarations, comments, processing instr
     try std.testing.expectEqualStrings("p:mzML", cursor.current.?.data.end_element.name.raw);
     try cursor.advance(false);
     try std.testing.expectEqual(@as(?Event, null), cursor.current);
+}
+
+test "[unit] - [mzML XML cursor]: a written fragment declares its scope once and nested elements their own" {
+    const source = "<r xmlns='urn:d' xmlns:a='urn:a'><f xmlns:b='urn:b'><a:x b:y='1' a:y='2'>" ++
+        "<c xmlns='' xmlns:a='urn:a2'><a:z/></c><d xmlns:b='urn:b'/></a:x></f></r>";
+    var input = std.Io.Reader.fixed(source);
+    var cursor = try Cursor.init(std.testing.allocator, &input, 64, 1024);
+    defer cursor.deinit();
+    try cursor.advanceFragment(false);
+    try cursor.advanceFragment(false);
+    var buffer: [512]u8 = undefined;
+    var sink = std.Io.Writer.fixed(&buffer);
+    var output = try Writer.init(std.testing.allocator, &sink, .{ .fragment = true });
+    defer output.deinit();
+    var remaining: usize = 100;
+    try cursor.writeElement(&output, &remaining);
+    // Redundant and inherited bindings are not repeated; shadowing and undeclaring are kept.
+    try std.testing.expectEqualStrings("<f xmlns=\"urn:d\" xmlns:a=\"urn:a\" xmlns:b=\"urn:b\"><a:x b:y=\"1\" a:y=\"2\">" ++
+        "<c xmlns=\"\" xmlns:a=\"urn:a2\"><a:z/></c><d/></a:x></f>", sink.buffered());
 }
 
 test "[property] - [mzML XML cursor]: decodes Latin-1 attributes text and CDATA across refills" {
