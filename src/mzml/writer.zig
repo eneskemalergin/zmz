@@ -85,8 +85,15 @@ source_text_length: usize = 0,
 // A call is in progress; the sink's drain runs inside it and must not call the writer.
 active: bool = false,
 
-/// Bounds retained index entries and ID bytes, including historical native/spot IDs.
-pub const IndexLimits = struct { records: usize = 1_000_000, id_bytes: usize = 64 * 1024 * 1024 };
+/// Indexed output: bounds on retained index entries and ID bytes (including historical
+/// native/spot IDs), and the indexedmzML element's attributes.
+pub const IndexOptions = struct {
+    records: usize = 1_000_000,
+    id_bytes: usize = 64 * 1024 * 1024,
+    /// Namespaced attributes for indexedmzML, such as the index schema's `xsi:schemaLocation`,
+    /// written and checked as on the mzML root; borrowed until writeHeader. None by default.
+    wrapper_attributes: []const model.Attribute = &.{},
+};
 
 /// Call deinit even after a failure; do not copy the writer.
 pub fn init(allocator: std.mem.Allocator, sink: *std.Io.Writer, limits: Limits) Error!Writer {
@@ -94,26 +101,27 @@ pub fn init(allocator: std.mem.Allocator, sink: *std.Io.Writer, limits: Limits) 
     return .{ .engine = try xml.Writer.init(allocator, sink, .{}), .allocator = allocator, .limits = limits };
 }
 
-/// Writes indexedmzML, keeping each record's ID and offset (within index_limits) until deinit.
-pub fn initIndexed(allocator: std.mem.Allocator, sink: *std.Io.Writer, limits: Limits, index_limits: IndexLimits) Error!Writer {
+/// Writes indexedmzML, keeping each record's ID and offset (within index_options) until deinit.
+pub fn initIndexed(allocator: std.mem.Allocator, sink: *std.Io.Writer, limits: Limits, index_options: IndexOptions) Error!Writer {
     try schema.checkLimits(limits);
+    for (index_options.wrapper_attributes) |attr| if (attr.namespace_uri == null) return error.InvalidOptions;
     const state = try allocator.create(IndexState);
     errdefer allocator.destroy(state);
     const chunk = try allocator.alloc(u8, CHUNK_BYTES);
     errdefer allocator.free(chunk);
-    state.* = .{ .allocator = allocator, .hashed = .init(sink, chunk), .arena = .init(allocator), .limits = index_limits };
+    state.* = .{ .allocator = allocator, .hashed = .init(sink, chunk), .arena = .init(allocator), .options = index_options };
     var engine = try xml.Writer.init(allocator, &state.hashed.writer, .{});
     engine.guard = sink;
     return .{ .engine = engine, .allocator = allocator, .limits = limits, .index_state = state };
 }
 
 /// Writes to a positional file writer at offset zero on an empty file; nothing else may write
-/// through it until finish. List counts may be null. Null index_limits selects plain mzML;
+/// through it until finish. List counts may be null. Null index_options selects plain mzML;
 /// indexed output needs a readable file, whose prefix finish rereads for the checksum.
-pub fn initFile(allocator: std.mem.Allocator, sink: *std.Io.File.Writer, limits: Limits, index_limits: ?IndexLimits) Error!Writer {
+pub fn initFile(allocator: std.mem.Allocator, sink: *std.Io.File.Writer, limits: Limits, index_options: ?IndexOptions) Error!Writer {
     if (sink.logicalPos() != 0 or (sink.mode != .positional and sink.mode != .positional_simple))
         return error.InvalidOptions;
-    var writer = if (index_limits) |index|
+    var writer = if (index_options) |index|
         try initIndexed(allocator, &sink.interface, limits, index)
     else
         try init(allocator, &sink.interface, limits);
@@ -183,7 +191,7 @@ fn ioFailure(self: *Writer, err: Error) Error!noreturn {
 
 fn copyId(self: *Writer, state: *IndexState, id: []const u8) Error![]const u8 {
     return state.copyId(id) catch |err| {
-        self.capture(err, .index, if (err == error.LimitExceeded) .{ .limit = .{ .name = .id_bytes, .maximum = state.limits.id_bytes, .needed = state.id_bytes +| id.len } } else .none);
+        self.capture(err, .index, if (err == error.LimitExceeded) .{ .limit = .{ .name = .id_bytes, .maximum = state.options.id_bytes, .needed = state.id_bytes +| id.len } } else .none);
         return @as(Error![]const u8, err);
     };
 }
@@ -202,8 +210,9 @@ pub fn writeHeader(self: *Writer, header: model.Header) Error!void {
     try self.engine.startDocument();
     if (self.index_state) |state| {
         state.historical = std.mem.eql(u8, header.namespace_uri, xml.NAMESPACE_1_0);
-        try self.engine.startElement("indexedmzML");
-        try self.engine.namespace(null, header.namespace_uri);
+        try self.checkParts(.{state.options.wrapper_attributes});
+        try self.startKnown("indexedmzML", state.options.wrapper_attributes, true);
+        try self.writeAttributes(state.options.wrapper_attributes);
     }
     try self.startKnown("mzML", header.document.attributes, true);
     if (self.engine.namespaceUri("xsi") == null) try self.engine.namespace("xsi", xml.XSI);
@@ -370,7 +379,7 @@ fn writeRecordInner(self: *Writer, node: model.Node, comptime replace_arrays: bo
             self.capture(error.MissingAttribute, .index, .{ .attribute = .id });
             return error.MissingAttribute;
         };
-        if (state.entries.items.len == state.limits.records) return try self.limitError(.records, state.limits.records, null);
+        if (state.entries.items.len == state.options.records) return try self.limitError(.records, state.options.records, null);
         const copied = try self.copyId(state, id);
         const found = try state.ids[if (node.kind == .spectrum) @as(usize, 0) else 1].getOrPutContextAdapted(
             state.allocator,
@@ -904,7 +913,7 @@ const IndexState = struct {
     // Hashes and forwards streamed output in whole chunks; file output rereads the file instead.
     hashed: std.Io.Writer.Hashed(Sha1),
     arena: std.heap.ArenaAllocator,
-    limits: IndexLimits,
+    options: IndexOptions,
     entries: std.ArrayList(IndexEntry) = .empty,
     historical: bool = false,
     historical_ids: std.ArrayList(struct { native_id: ?[]const u8, spot_id: ?[]const u8 }) = .empty,
@@ -922,7 +931,7 @@ const IndexState = struct {
     }
 
     fn copyId(self: *IndexState, text: []const u8) Error![]const u8 {
-        if (text.len > self.limits.id_bytes -| self.id_bytes) return error.LimitExceeded;
+        if (text.len > self.options.id_bytes -| self.id_bytes) return error.LimitExceeded;
         const result = try self.arena.allocator().dupe(u8, text);
         self.id_bytes += text.len;
         return result;
