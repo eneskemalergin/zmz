@@ -451,7 +451,7 @@ test "[integration] - [mzML extensions]: selected decoding keeps unfamiliar meta
         try compareDecoded(support.EXTENSIONS, chunk);
         try compareDecodedWithSelection(support.EXTENSIONS, chunk, true);
     }
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, readDecodedRecord, .{ support.EXTENSIONS, mzml.StreamReader.DecodedArrays.Limits{} });
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, readDecodedRecord, .{ support.EXTENSIONS, mzml.StreamReader.DecodedArrays.Options{} });
 }
 
 test "[integration] - [mzML children]: keeps misplaced known names out of metadata and decoding" {
@@ -489,7 +489,7 @@ test "[integration] - [mzML children]: keeps misplaced known names out of metada
         try compareDecoded(support.KNOWN_CHILDREN, chunk);
         try compareDecodedWithSelection(support.KNOWN_CHILDREN, chunk, true);
     }
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, readDecodedRecord, .{ support.KNOWN_CHILDREN, mzml.StreamReader.DecodedArrays.Limits{} });
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, readDecodedRecord, .{ support.KNOWN_CHILDREN, mzml.StreamReader.DecodedArrays.Options{} });
 }
 
 test "[integration] - [mzML containers]: retains later occurrences without merging their contents" {
@@ -530,7 +530,7 @@ test "[integration] - [mzML containers]: retains later occurrences without mergi
         try compareDecoded(support.REPEATED_CONTAINERS, chunk);
         try compareDecodedWithSelection(support.REPEATED_CONTAINERS, chunk, true);
     }
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, readDecodedRecord, .{ support.REPEATED_CONTAINERS, mzml.StreamReader.DecodedArrays.Limits{} });
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, readDecodedRecord, .{ support.REPEATED_CONTAINERS, mzml.StreamReader.DecodedArrays.Options{} });
 }
 
 test "[failure] - [mzML containers]: bounds extra XML and leaves extra group definitions unexpanded" {
@@ -664,7 +664,7 @@ fn expectSelectedNode(expected: mzml.model.Node, actual: mzml.model.Node) !void 
     for (expected.children, actual.children) |left, right| try expectSelectedNode(left, right);
 }
 
-fn readDecoded(allocator: std.mem.Allocator, source: []const u8, limits: mzml.StreamReader.DecodedArrays.Limits) !void {
+fn readDecoded(allocator: std.mem.Allocator, source: []const u8, limits: mzml.StreamReader.DecodedArrays.Options) !void {
     var input = std.Io.Reader.fixed(source);
     var reader = try mzml.StreamReader.init(allocator, &input, .{});
     defer reader.deinit();
@@ -675,7 +675,7 @@ fn readDecoded(allocator: std.mem.Allocator, source: []const u8, limits: mzml.St
     try std.testing.expectEqual(null, output.get(0));
 }
 
-fn readDecodedRecord(allocator: std.mem.Allocator, source: []const u8, limits: mzml.StreamReader.DecodedArrays.Limits) !void {
+fn readDecodedRecord(allocator: std.mem.Allocator, source: []const u8, limits: mzml.StreamReader.DecodedArrays.Options) !void {
     var input = std.Io.Reader.fixed(source);
     var reader = try mzml.StreamReader.init(allocator, &input, .{});
     defer reader.deinit();
@@ -837,7 +837,7 @@ test "[integration] - [mzML parameters]: preserves parent parameters between chi
     try expectSelectedNode(record.node, fetched.value.node);
     try std.testing.expectEqual(@as(usize, 2), output.len());
     for (0..output.len()) |i| try std.testing.expectEqualSlices(f64, &.{1}, output.get(i).?.values.float64);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, readDecodedRecord, .{ source, mzml.StreamReader.DecodedArrays.Limits{} });
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, readDecodedRecord, .{ source, mzml.StreamReader.DecodedArrays.Options{} });
     try support.readAll(std.testing.allocator, source, .{ .limits = .{ .list_entries = 4 } });
     try std.testing.expectError(error.LimitExceeded, support.readAll(std.testing.allocator, source, .{ .limits = .{ .list_entries = 3 } }));
     try std.testing.expectError(error.LimitExceeded, mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = source }, .{ .policy = .rebuild, .reader = .{ .limits = .{ .list_entries = 3 } } }));
@@ -1186,11 +1186,11 @@ test "[failure] - [mzML decoded reading]: stops at the first error and clears fa
 }
 
 test "[failure] - [mzML decoded reading]: bounds storage and releases failed allocations" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, readDecoded, .{ support.DOCUMENT, mzml.StreamReader.DecodedArrays.Limits{} });
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, readDecoded, .{ support.DOCUMENT, mzml.StreamReader.DecodedArrays.Options{} });
     var storage: [32768]u8 = undefined;
     var compressed = std.Io.Writer.fixed(&storage);
     try support.constructFixture(std.testing.allocator, &compressed, false, std.meta.tags(mzml.arrays.Pipeline));
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, readDecoded, .{ compressed.buffered(), mzml.StreamReader.DecodedArrays.Limits{} });
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, readDecoded, .{ compressed.buffered(), mzml.StreamReader.DecodedArrays.Options{} });
     try std.testing.expectError(error.LimitExceeded, readDecoded(std.testing.allocator, support.DOCUMENT, .{ .array_bytes = 7 }));
     const text = "!" ++ "A" ** 70000;
     const source = try decodedDocument(std.testing.allocator, text, text.len, 1, "MS:1000576");
@@ -1257,7 +1257,7 @@ test "[integration] - [mzML decoded reading]: decodes zlib text across fragments
     const source = try decodedDocument(std.testing.allocator, fragments.written(), text.len, values.len, "MS:1000574");
     defer std.testing.allocator.free(source);
     try compareDecoded(source, 7);
-    const limits: mzml.StreamReader.DecodedArrays.Limits = .{ .array_bytes = @sizeOf(@TypeOf(values)) };
+    const limits: mzml.StreamReader.DecodedArrays.Options = .{ .array_bytes = @sizeOf(@TypeOf(values)) };
     // EOF can attempt optional arena consolidation, whose allocation failure is recoverable.
     try std.testing.checkAllAllocationFailures(std.testing.allocator, readDecodedRecord, .{ source, limits });
     for ([_]mzml.Diagnostic.Limit{ .array_bytes, .binary_text_bytes }) |name| {
@@ -1536,7 +1536,7 @@ test "[integration] - [mzML children]: reads present metadata without schema ord
     try std.testing.expectEqual(@as(usize, 2), fetched.value.scans().len);
     try std.testing.expectEqual(@as(usize, 2), output.len());
     for (0..output.len()) |i| try std.testing.expectEqualSlices(f64, &.{1}, output.get(i).?.values.float64);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, readDecodedRecord, .{ source, mzml.StreamReader.DecodedArrays.Limits{} });
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, readDecodedRecord, .{ source, mzml.StreamReader.DecodedArrays.Options{} });
 }
 
 test "[integration] - [mzML children]: distinguishes missing payloads from repeated payloads" {
@@ -1611,7 +1611,7 @@ test "[integration] - [mzML header]: preserves present sections without requirin
         try std.testing.expectEqualStrings("native=a&b", fetched.value.id);
         try std.testing.expectEqual(@as(usize, 2), output.len());
         for (0..output.len()) |i| try std.testing.expectEqualSlices(f64, &.{1}, output.get(i).?.values.float64);
-        try std.testing.checkAllAllocationFailures(std.testing.allocator, readDecodedRecord, .{ source, mzml.StreamReader.DecodedArrays.Limits{} });
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, readDecodedRecord, .{ source, mzml.StreamReader.DecodedArrays.Options{} });
     }
     const opening = "<mzML xmlns='http://psi.hupo.org/ms/mzml' version='1.1.0'>";
     try support.readAll(std.testing.allocator, opening ++ group ++ group ++ "<run/></mzML>", .{});
