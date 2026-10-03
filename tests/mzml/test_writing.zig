@@ -568,6 +568,22 @@ test "[failure] - [mzML lists]: attribute errors leave the writer failed" {
     }
 }
 
+test "[failure] - [mzML writer]: a parameter attribute repeating a fixed field is a duplicate" {
+    const extra = mzml.cv.ParameterXml{ .attributes = &.{.{ .name = "accession", .value = "MS:2" }} };
+    var bytes: [4096]u8 = undefined;
+    var sink = std.Io.Writer.fixed(&bytes);
+    var writer = try mzml.Writer.init(std.testing.allocator, &sink, .{});
+    defer writer.deinit();
+    try writer.writeHeader(.{ .document = .{ .kind = .mzml }, .run = .{ .kind = .run } });
+    try writer.beginList(.spectrum_list, 1, "dp");
+    try std.testing.expectError(error.DuplicateAttribute, writer.writeRecord(.{
+        .kind = .spectrum,
+        .attributes = &.{ .{ .name = "id", .value = "scan=1" }, .{ .name = "index", .value = "0" } },
+        .params = &.{.{ .cv = .{ .cv_ref = "MS", .accession = .{ .raw = "MS:1" }, .name = "term", .xml = &extra } }},
+    }));
+    try std.testing.expectError(error.FailedState, writer.endList());
+}
+
 test "[integration] - [mzML writer]: preserves metadata and records through a plain rewrite" {
     var bytes: [8192]u8 = undefined;
     var sink = std.Io.Writer.fixed(&bytes);

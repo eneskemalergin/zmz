@@ -1747,11 +1747,17 @@ pub const Writer = struct {
 
     /// Opens an element; any prefix must have a declaration before its content is written.
     pub fn startElement(self: *Writer, name: []const u8) WriterError!void {
-        try self.checkContent();
         try self.checkInput(name);
+        validateQName(name) catch |err| return self.fail(err);
+        return self.startElementTrusted(name);
+    }
+
+    /// startElement for a name the mzML writer supplies from its own tables, which is a valid
+    /// name and not caller memory, so it skips those two checks.
+    pub fn startElementTrusted(self: *Writer, name: []const u8) WriterError!void {
+        try self.checkContent();
         if (self.state == .epilog and self.root_written) return self.fail(error.InvalidState);
         if (self.state != .epilog and self.state != .content and self.state != .start_tag) return self.fail(error.InvalidState);
-        validateQName(name) catch |err| return self.fail(err);
         if (self.frame_count == MAX_DEPTH) return self.fail(error.LimitExceeded);
         if (self.state == .start_tag) {
             try self.checkOpeningName();
@@ -1809,6 +1815,22 @@ pub const Writer = struct {
             try self.writeBytes("=\"");
         }
         try self.writeEscapedAttribute(uri);
+        try self.writeByte('"');
+    }
+
+    /// attribute for an unprefixed name the mzML writer supplies from its own tables (cvParam's
+    /// fields and the like): a valid name, not caller memory, written before any caller-supplied
+    /// attribute of the element and once each. It is still recorded, so a caller's attribute of
+    /// the same name is a duplicate; the value is checked and escaped as always.
+    pub fn attributeTrusted(self: *Writer, name: []const u8, value: []const u8) WriterError!void {
+        try self.check(.start_tag);
+        try self.checkInput(value);
+        self.attribute_names.appendSlice(self.allocator, std.mem.asBytes(&name.len)) catch return self.fail(error.OutOfMemory);
+        self.attribute_names.appendSlice(self.allocator, name) catch return self.fail(error.OutOfMemory);
+        try self.writeByte(' ');
+        try self.writeBytes(name);
+        try self.writeBytes("=\"");
+        try self.writeEscapedAttribute(value);
         try self.writeByte('"');
     }
 
@@ -2021,6 +2043,12 @@ pub const Writer = struct {
         var plain_start: usize = 0;
         var index: usize = 0;
         while (index < value.len) {
+            // Printable ASCII other than `"`, `&`, and `<` needs neither escaping nor decoding.
+            const length = ordinaryAttributeRun(value[index..], '"');
+            if (length != 0) {
+                index += length;
+                continue;
+            }
             const start = index;
             const codepoint = decodeValue(value, &index) catch |err| return self.fail(err);
             if (!isXmlChar(codepoint)) return self.fail(error.InvalidCharacter);

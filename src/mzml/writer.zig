@@ -813,10 +813,10 @@ fn startKnown(self: *Writer, name: []const u8, attrs: []const model.Attribute, r
             qualified[selected.len] = ':';
             @memcpy(qualified[selected.len + 1 ..], name);
             try self.engine.startElement(qualified);
-        } else try self.engine.startElement(name);
+        } else try self.engine.startElementTrusted(name);
     } else {
         const declare = root or !std.mem.eql(u8, self.engine.namespaceUri("") orelse "", self.namespace_uri);
-        try self.engine.startElement(name);
+        try self.engine.startElementTrusted(name);
         if (declare) try self.engine.namespace(null, self.namespace_uri);
         if (!has_namespaces) return;
     }
@@ -887,8 +887,10 @@ fn writeUnit(self: *Writer, unit: cv.Unit) Error!void {
     try self.optionalAttribute("unitName", unit.name);
 }
 
+// The fixed fields of parameters and units, written before any of the parameter's own XML
+// attributes.
 fn optionalAttribute(self: *Writer, name: []const u8, value: ?[]const u8) Error!void {
-    if (value) |text| try self.engine.attribute(name, text);
+    if (value) |text| try self.engine.attributeTrusted(name, text);
 }
 
 const IndexEntry = struct { id: []const u8, offset: u64 };
