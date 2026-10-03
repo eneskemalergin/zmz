@@ -166,26 +166,36 @@ pub fn declared(accession: []const u8) ?Declared {
 /// Classifies the reviewed primitive and compression terms. A missing term is an error, and
 /// repeated terms must agree.
 pub fn classify(params: []const cv.Entry, groups: []const cv.Group) Error!Descriptor {
-    var primitive: ?Primitive = null;
-    var pipeline: ?Pipeline = null;
-    var iterator: cv.EffectiveIterator = .{ .entries = params, .groups = groups };
-    while (try iterator.next()) |entry| {
-        if (entry != .cv) continue;
-        const accession = entry.cv.accession orelse continue;
-        switch (declared(accession.raw) orelse continue) {
-            .primitive => |selected| {
-                if (primitive != null and primitive.? != selected) return error.ConflictingPrimitive;
-                primitive = selected;
-            },
-            .compression => |selected| {
-                if (pipeline != null and pipeline.? != selected) return error.ConflictingCompression;
-                pipeline = selected;
-            },
-            .unsupported => return error.UnsupportedEncoding,
-        }
-    }
-    return .{
-        .primitive = primitive orelse return error.MissingPrimitive,
-        .pipeline = pipeline orelse return error.MissingCompression,
-    };
+    var terms: Terms = .{};
+    return terms.add(params, groups);
 }
+
+/// The terms classified so far, for a parameter list read in runs: `add` classifies one more
+/// run and returns what `classify` returns for every run added, without revisiting the others.
+pub const Terms = struct {
+    primitive: ?Primitive = null,
+    pipeline: ?Pipeline = null,
+
+    pub fn add(self: *Terms, params: []const cv.Entry, groups: []const cv.Group) Error!Descriptor {
+        var iterator: cv.EffectiveIterator = .{ .entries = params, .groups = groups };
+        while (try iterator.next()) |entry| {
+            if (entry != .cv) continue;
+            const accession = entry.cv.accession orelse continue;
+            switch (declared(accession.raw) orelse continue) {
+                .primitive => |selected| {
+                    if (self.primitive != null and self.primitive.? != selected) return error.ConflictingPrimitive;
+                    self.primitive = selected;
+                },
+                .compression => |selected| {
+                    if (self.pipeline != null and self.pipeline.? != selected) return error.ConflictingCompression;
+                    self.pipeline = selected;
+                },
+                .unsupported => return error.UnsupportedEncoding,
+            }
+        }
+        return .{
+            .primitive = self.primitive orelse return error.MissingPrimitive,
+            .pipeline = self.pipeline orelse return error.MissingCompression,
+        };
+    }
+};

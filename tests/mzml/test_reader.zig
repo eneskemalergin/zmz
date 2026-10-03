@@ -977,6 +977,29 @@ test "[integration] - [mzML parameters]: retains late array declarations without
     }
 }
 
+test "[integration] - [mzML parameters]: checks every run of late declarations against the decoded bytes" {
+    const runs = "<cvParam accession='MS:1000523'/><x xmlns='urn:x'/>" ** 3;
+    const source = support.HEADER ++ "<spectrumList count='1'><spectrum id='s' index='0' defaultArrayLength='1'>" ++
+        "<binaryDataArrayList><binaryDataArray><referenceableParamGroupRef ref='encoding'/>" ++
+        "<binary>AAAAAAAA8D8=</binary>" ++ runs ++ "<cvParam accession='X:end'/></binaryDataArray>" ++
+        "</binaryDataArrayList></spectrum></spectrumList></run></mzML>";
+    var output = mzml.StreamReader.DecodedArrays.init(std.testing.allocator, .{});
+    defer output.deinit();
+    var input = std.Io.Reader.fixed(source);
+    var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+    defer reader.deinit();
+    _ = (try reader.nextDecodedRecord(&output)).?;
+    try std.testing.expectEqualSlices(f64, &.{1}, output.get(0).?.values.float64);
+    // A conflict in the third run is found as when every run is classified again.
+    const conflicting = try std.mem.replaceOwned(u8, std.testing.allocator, source, "<cvParam accession='X:end'/>", "<cvParam accession='MS:1000574'/>");
+    defer std.testing.allocator.free(conflicting);
+    var conflicting_input = std.Io.Reader.fixed(conflicting);
+    var conflicting_reader = try mzml.StreamReader.init(std.testing.allocator, &conflicting_input, .{});
+    defer conflicting_reader.deinit();
+    try std.testing.expectError(error.ConflictingCompression, conflicting_reader.nextDecodedRecord(&output));
+    try std.testing.expectEqual(.binary_data_array, conflicting_reader.diagnostic().?.element.?);
+}
+
 test "[integration] - [mzML arrays]: retains repeated encoding terms across numeric reads" {
     const declarations = "<cvParam accession='MS:1000523' name='source primitive label' extra='keep'/>" ++
         "<cvParam accession='MS:1000576' name='source codec label'><note xmlns='urn:producer'>keep</note></cvParam>";

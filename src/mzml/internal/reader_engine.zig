@@ -3,6 +3,7 @@
 const std = @import("std");
 const cv = @import("../../cv/source.zig");
 const model = @import("../model.zig");
+const encoding = @import("../../binary/encoding.zig");
 const schema = @import("../schema.zig");
 const xml = @import("../../xml/mzml_adapter.zig");
 const owned = @import("../owned.zig");
@@ -811,19 +812,27 @@ fn parseNodeFor(self: *StreamReader, storage: *Storage, depth: usize, advance_af
                 (storage.limit -| storage.used) / @sizeOf(model.Node),
             ));
         var child_count: usize = 0;
+        // The array's encoding terms classified so far, so each later run is classified once.
+        var array_terms: ?encoding.Terms = null;
         while (self.cursor.current) |event| {
             if (event.data == .end_element) break;
             if (event.data == .start_element and self.paramKind(event.data.start_element) != null) {
                 if (retention == .tree and child_count != 0 and content.items.len == 0)
                     try self.startContent(&content, param_count, child_count);
                 const before = param_count;
+                const run_start = self.param_scratch.items.len;
                 try self.parseParams(storage, retention == .tree, &param_count);
                 if (retention == .tree and content.items.len != 0)
                     try content.append(self.allocator, .{ .params = param_count - before });
                 if (decode_array) {
                     node.params = self.param_scratch.items[params_start..];
-                    // Late declarations must agree with the bytes already decoded.
-                    _ = model.arrayEncoding(node, self.header.groups) catch |err| {
+                    // Late declarations must agree with the bytes already decoded. The terms before
+                    // the first late run decoded the array, so they classify completely.
+                    if (array_terms == null) {
+                        array_terms = .{};
+                        _ = array_terms.?.add(self.param_scratch.items[params_start..run_start], self.header.groups) catch {};
+                    }
+                    _ = array_terms.?.add(self.param_scratch.items[run_start..], self.header.groups) catch |err| {
                         self.capture(err, .array, .none);
                         self.failure.?.element = .binary_data_array;
                         return @as(Error!model.Node, err);
