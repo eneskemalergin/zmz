@@ -209,6 +209,62 @@ test "[failure] - [mzML diagnostics]: reports a zlib array longer than declared 
     try std.testing.expectEqual(.decoded_size_mismatch, report.id);
 }
 
+test "[failure] - [mzML decoded arrays]: retained decoding reports what decoded reading reports" {
+    inline for (decoding_failures) |case| {
+        const source = try decodedDocument(std.testing.allocator, case[0], case[1], case[2], case[3]);
+        defer std.testing.allocator.free(source);
+        var decoded_input = std.Io.Reader.fixed(source);
+        var decoded_reader = try mzml.StreamReader.init(std.testing.allocator, &decoded_input, .{});
+        defer decoded_reader.deinit();
+        var output = mzml.StreamReader.DecodedArrays.init(std.testing.allocator, .{});
+        defer output.deinit();
+        try std.testing.expectError(case[4], decoded_reader.nextDecodedRecord(&output));
+        const expected = decoded_reader.diagnostic().?;
+        try std.testing.expectEqual(null, output.diagnostic());
+
+        var input = std.Io.Reader.fixed(source);
+        var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+        defer reader.deinit();
+        const header = try reader.readHeader();
+        // Broken XML after the payload fails the plain read itself; only the decoding is compared.
+        if (reader.nextRecord()) |found| {
+            const record = found.?;
+            try std.testing.expectError(case[4], output.decodeRecord(record, header.groups));
+            const report = output.diagnostic().?;
+            try std.testing.expectEqual(.decode_array, report.operation);
+            try std.testing.expectEqual(expected.id, report.id);
+            try std.testing.expectEqual(expected.code, report.code);
+            try std.testing.expectEqual(expected.stage, report.stage);
+            try std.testing.expectEqual(expected.array_position, report.array_position);
+            try std.testing.expectEqualDeep(expected.detail, report.detail);
+            try std.testing.expectError(case[4], output.decodeArray(record.binaryArrays()[0], record.default_array_length, header.groups));
+            try std.testing.expectEqualDeep(expected.detail, output.diagnostic().?.detail);
+        } else |_| {}
+    }
+    // A caller's source error is reported as an I/O failure; a success clears the report.
+    const Failing = struct {
+        pub fn next(_: *@This()) error{ReadFailed}!?[]const u8 {
+            return error.ReadFailed;
+        }
+    };
+    var output = mzml.StreamReader.DecodedArrays.init(std.testing.allocator, .{});
+    defer output.deinit();
+    var failing: Failing = .{};
+    const encoding: mzml.model.Encoding = .{ .primitive = .float64, .pipeline = .none };
+    try std.testing.expectError(error.ReadFailed, output.decodeArrayText(encoding, 1, &failing));
+    try std.testing.expectEqual(.io_failed, output.diagnostic().?.id);
+    var text = std.mem.splitScalar(u8, "AAAAAAAA8D8=", 0);
+    const Runs = struct {
+        parts: *std.mem.SplitIterator(u8, .scalar),
+        pub fn next(self: *@This()) error{}!?[]const u8 {
+            return self.parts.next();
+        }
+    };
+    var runs: Runs = .{ .parts = &text };
+    _ = try output.decodeArrayText(encoding, 1, &runs);
+    try std.testing.expectEqual(null, output.diagnostic());
+}
+
 fn expectSameValues(expected: mzml.StreamReader.DecodedArrays.Values, actual: mzml.StreamReader.DecodedArrays.Values) !void {
     try std.testing.expectEqual(std.meta.activeTag(expected), std.meta.activeTag(actual));
     switch (expected) {
@@ -1145,19 +1201,21 @@ test "[failure] - [mzML reader]: returns completed results before a broken next 
     }
 }
 
+// Payload, encodedLength, defaultArrayLength, compression term, and the expected error.
+const decoding_failures = .{
+    .{ "!AAAAAAA8D8=", 12, 1, "MS:1000576", error.InvalidCharacter },
+    .{ "!AAAAAAA8D8=", 11, 1, "MS:1000576", error.InvalidCharacter },
+    .{ "!AAAAAAA8D8=</broken>", 12, 1, "MS:1000576", error.InvalidCharacter },
+    .{ "AAAAAAAA8D8=", 12, 0, "MS:1000576", error.DecodedSizeMismatch },
+    .{ "AAAAAAAA8D8=!AAA", 16, 0, "MS:1000576", error.DecodedSizeMismatch },
+    .{ "AAAAAAAA8D8", 11, 1, "MS:1000576", error.TruncatedInput },
+    .{ "AB==", 4, 0, "MS:1000576", error.NonCanonicalTail },
+    .{ "AA=A", 4, 0, "MS:1000576", error.InvalidPadding },
+    .{ "AAAAAAAA8D8=", 12, 1, "X:unknown", error.MissingCompression },
+};
+
 test "[failure] - [mzML decoded reading]: stops at the first error and clears failed output" {
-    const cases = .{
-        .{ "!AAAAAAA8D8=", 12, 1, "MS:1000576", error.InvalidCharacter },
-        .{ "!AAAAAAA8D8=", 11, 1, "MS:1000576", error.InvalidCharacter },
-        .{ "!AAAAAAA8D8=</broken>", 12, 1, "MS:1000576", error.InvalidCharacter },
-        .{ "AAAAAAAA8D8=", 12, 0, "MS:1000576", error.DecodedSizeMismatch },
-        .{ "AAAAAAAA8D8=!AAA", 16, 0, "MS:1000576", error.DecodedSizeMismatch },
-        .{ "AAAAAAAA8D8", 11, 1, "MS:1000576", error.TruncatedInput },
-        .{ "AB==", 4, 0, "MS:1000576", error.NonCanonicalTail },
-        .{ "AA=A", 4, 0, "MS:1000576", error.InvalidPadding },
-        .{ "AAAAAAAA8D8=", 12, 1, "X:unknown", error.MissingCompression },
-    };
-    inline for (cases) |case| {
+    inline for (decoding_failures) |case| {
         const source = try decodedDocument(std.testing.allocator, case[0], case[1], case[2], case[3]);
         defer std.testing.allocator.free(source);
         var input = std.Io.Reader.fixed(source);

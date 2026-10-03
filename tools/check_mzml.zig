@@ -87,7 +87,10 @@ fn checkFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Totals
         }
         totals.records += 1;
         try checkMetadata(record, header.groups, resolver, &totals);
-        try decoded.decodeRecord(record, header.groups);
+        decoded.decodeRecord(record, header.groups) catch |err| {
+            if (decoded.diagnostic()) |report| std.debug.print("array diagnostic: {f}\n", .{report});
+            return err;
+        };
         for (0..decoded.len()) |position| {
             const values = switch (decoded.get(position).?.values) {
                 inline else => |numbers| numbers.len,
