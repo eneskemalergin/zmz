@@ -76,6 +76,21 @@ test "[failure] - [mzML diagnostics]: translates fresh and reused UTF-16 lookup 
     }
 }
 
+test "[regression] - [mzML indexes]: decoy offset tags after the index are passed over cheaply" {
+    const allocator = std.testing.allocator;
+    var sink: std.Io.Writer.Allocating = .init(allocator);
+    defer sink.deinit();
+    try support.constructFixture(allocator, &sink.writer, true, &.{.none});
+    // Bare tags, then a complete footer, inside a comment after the document.
+    try sink.writer.writeAll("<!--" ++ " <indexListOffset" ** 2_000);
+    try sink.writer.writeAll("<indexListOffset>1</indexListOffset><fileChecksum>0</fileChecksum></indexedmzML>-->");
+    var index = try mzml.IndexedReader.build(allocator, .{ .bytes = sink.written() }, .{ .policy = .open_embedded });
+    defer index.deinit();
+    var record = (try index.at(allocator, .spectrum, 0)).?;
+    defer record.deinit();
+    try std.testing.expectEqualStrings("scan=none", record.value.id);
+}
+
 test "[integration] - [mzML 1.0 indexes]: retains IDs offsets and selected values in every lookup" {
     const Check = struct {
         fn select(_: ?*anyopaque, view: mzml.StreamReader.Selection) mzml.model.MetadataError!mzml.StreamReader.Payload {
