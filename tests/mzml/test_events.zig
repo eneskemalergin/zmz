@@ -180,7 +180,8 @@ test "[unit] - [mzML events]: name modeled elements in both mzML namespaces only
 test "[unit] - [mzML events]: classify encoding terms with the readers' table" {
     try std.testing.expectEqual(mzml.model.EncodingTerm{ .primitive = .float64 }, mzml.model.encodingTerm("MS:1000523").?);
     try std.testing.expectEqual(mzml.model.EncodingTerm{ .compression = .slof_zlib }, mzml.model.encodingTerm("MS:1002748").?);
-    try std.testing.expectEqual(mzml.model.EncodingTerm.unsupported, mzml.model.encodingTerm("MS:1003780").?);
+    try std.testing.expectEqual(mzml.model.EncodingTerm{ .unsupported = .compression }, mzml.model.encodingTerm("MS:1003780").?);
+    try std.testing.expectEqual(mzml.model.EncodingTerm{ .unsupported = .primitive }, mzml.model.encodingTerm("MS:1001479").?);
     try std.testing.expectEqual(null, mzml.model.encodingTerm("MS:1000514"));
     // Every current binary data type and compression type term is classified, so none is
     // silently ignored, and nothing else is.
@@ -190,13 +191,23 @@ test "[unit] - [mzML events]: classify encoding terms with the readers' table" {
     var classified: usize = 0;
     for (ms.terms) |term| {
         if (term.obsolete) continue;
-        const encoding_term = (try ms.isA(term.id, "MS:1000518", 1000) or try ms.isA(term.id, "MS:1000572", 1000)) and
-            !std.mem.eql(u8, term.id, "MS:1000518") and !std.mem.eql(u8, term.id, "MS:1000572");
-        std.testing.expectEqual(encoding_term, mzml.model.encodingTerm(term.id) != null) catch |err| {
+        const data_type = try ms.isA(term.id, "MS:1000518", 1000) and !std.mem.eql(u8, term.id, "MS:1000518");
+        const compression = try ms.isA(term.id, "MS:1000572", 1000) and !std.mem.eql(u8, term.id, "MS:1000572");
+        const Declaration = enum { primitive, compression };
+        const expected: ?Declaration = if (data_type) .primitive else if (compression) .compression else null;
+        const kind: ?Declaration = if (mzml.model.encodingTerm(term.id)) |found| switch (found) {
+            .primitive => .primitive,
+            .compression => .compression,
+            .unsupported => |declaration| switch (declaration) {
+                .primitive => .primitive,
+                .compression => .compression,
+            },
+        } else null;
+        std.testing.expectEqual(expected, kind) catch |err| {
             std.debug.print("{s} {s}\n", .{ term.id, term.name });
             return err;
         };
-        classified += @intFromBool(encoding_term);
+        classified += @intFromBool(kind != null);
     }
     try std.testing.expect(classified >= 20);
 }

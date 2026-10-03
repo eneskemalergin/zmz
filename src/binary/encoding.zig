@@ -137,21 +137,28 @@ pub const Error = cv.ExpansionError || error{
     UnsupportedEncoding,
 };
 
-/// What one CV accession declares about an array's encoding.
-pub const Declared = union(enum) { primitive: Primitive, compression: Pipeline, unsupported };
+/// What one CV accession declares about an array's encoding. An unsupported term says which
+/// declaration it is: a binary data type or a compression.
+pub const Declared = union(enum) {
+    primitive: Primitive,
+    compression: Pipeline,
+    unsupported: enum { primitive, compression },
+};
 
 /// The encoding meaning of one accession, or null when it says nothing about encoding. Recognized
-/// but unsupported encodings (zstd, byte shuffling, other Numpress forms, coordinate grids) are
-/// `unsupported`; tests check every current PSI-MS binary data and compression type is covered.
+/// but unsupported encodings (16-bit floats, ASCII strings, zstd, byte shuffling, truncation,
+/// coordinate grids) are `unsupported`; tests check every current PSI-MS binary data and
+/// compression type is covered.
 pub fn declared(accession: []const u8) ?Declared {
     if (primitiveFromAccession(accession)) |primitive| return .{ .primitive = primitive };
     if (codecFromAccession(accession)) |pipeline| return .{ .compression = pipeline };
+    if (std.mem.eql(u8, accession, "MS:1000520") or std.mem.eql(u8, accession, "MS:1001479"))
+        return .{ .unsupported = .primitive };
     inline for (.{
-        "MS:1000520", "MS:1001479", "MS:1003088", "MS:1003089", "MS:1003090",
-        "MS:1003780", "MS:1003781", "MS:1003782", "MS:1003783", "MS:1003784",
-        "MS:1003785", "MS:1003826",
+        "MS:1003088", "MS:1003089", "MS:1003090", "MS:1003780", "MS:1003781",
+        "MS:1003782", "MS:1003783", "MS:1003784", "MS:1003785", "MS:1003826",
     }) |unsupported| {
-        if (std.mem.eql(u8, accession, unsupported)) return .unsupported;
+        if (std.mem.eql(u8, accession, unsupported)) return .{ .unsupported = .compression };
     }
     return null;
 }
