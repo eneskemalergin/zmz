@@ -31,15 +31,13 @@ pub fn main(init: std.process.Init) !void {
     defer reader.deinit();
     errdefer if (reader.diagnostic()) |report| std.debug.print("{s}: {f}\n", .{ args[1], report });
     const header = try reader.readHeader();
-    const destination = try dir.createFile(init.io, args[2], .{ .exclusive = true, .read = ms1 });
+    // Indexed file output rereads the file for its checksum.
+    const destination = try dir.createFile(init.io, args[2], .{ .exclusive = true, .read = true });
     errdefer dir.deleteFile(init.io, args[2]) catch {};
     defer destination.close(init.io);
     var output_buffer: [64 * 1024]u8 = undefined;
     var output = destination.writer(init.io, &output_buffer);
-    var writer = if (ms1)
-        try mzml.Writer.initFile(init.gpa, &output, .{}, .{})
-    else
-        try mzml.Writer.initIndexed(init.gpa, &output.interface, .{}, .{});
+    var writer = try mzml.Writer.initFile(init.gpa, &output, .{}, .{});
     defer writer.deinit();
     errdefer if (writer.diagnostic()) |report| std.debug.print("{s}: {f}\n", .{ args[2], report });
     var attributes: std.ArrayList(mzml.model.Attribute) = .empty;

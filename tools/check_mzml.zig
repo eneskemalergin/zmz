@@ -69,7 +69,7 @@ fn checkFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Totals
     const declarations = try header.cvDeclarations(allocator);
     defer allocator.free(declarations);
     const resolver = mzml.cv.Resolver.init(declarations);
-    const count = index.entries().len;
+    const count = index.entryCount();
     var totals: Totals = .{};
     var decoded = mzml.DecodedArrays.init(allocator, .{});
     defer decoded.deinit();

@@ -13,7 +13,7 @@ const StreamReader = @import("stream_reader.zig").StreamReader;
 const DecodedArrays = @import("decoded_arrays.zig");
 const Diagnostic = @import("diagnostic.zig");
 const Engine = @import("internal/reader_engine.zig");
-const Ids = @import("internal/id_index.zig").IdIndex(Entry);
+const Ids = @import("internal/id_index.zig").IdIndex(Stored);
 
 const IndexedReader = @This();
 
@@ -60,7 +60,10 @@ options: Options,
 size: u64,
 stamp: ?std.Io.File.Stat = null,
 remaining: usize,
-entry_list: std.ArrayList(Entry) = .empty,
+entry_list: std.ArrayList(Stored) = .empty,
+id_list: std.ArrayList(u8) = .empty,
+// The embedded index listed chromatograms before spectra, so its entries are rotated.
+chromatograms_first: bool = false,
 ids: [2]Ids.Map = .{ .empty, .empty },
 metadata: ?owned.Header = null,
 contexts: [2]?FragmentAncestors = .{ null, null },
@@ -86,6 +89,9 @@ pub fn buildWithDiagnostic(allocator: std.mem.Allocator, source: Source, options
         failure.*.?.operation = if (options.policy == .rebuild) .rebuild_index else .open_index;
     }
     if (options.policy == .open_embedded and options.tail_bytes == 0)
+        return error.InvalidOptions;
+    // Entry positions and ID offsets are 32 bits.
+    if (options.records > std.math.maxInt(u32) or options.index_bytes > std.math.maxInt(u32))
         return error.InvalidOptions;
     const stamp = switch (source) {
         .bytes => null,
@@ -153,14 +159,28 @@ pub fn deinit(self: *IndexedReader) void {
     if (self.lookup_reader) |*reader| reader.deinit();
     if (self.metadata) |*metadata| metadata.deinit();
     self.entry_list.deinit(self.allocator);
+    self.id_list.deinit(self.allocator);
     for (&self.ids) |*ids| ids.deinit(self.allocator);
     self.arena.deinit();
     self.* = undefined;
 }
 
-/// Returns every entry, spectra first, valid until deinit.
-pub fn entries(self: *const IndexedReader) []const Entry {
-    return self.entry_list.items;
+/// Returns how many entries the index holds, spectra first.
+pub fn entryCount(self: *const IndexedReader) usize {
+    return self.entry_list.items.len;
+}
+
+/// Returns the entry at a position below `entryCount`; its ID is valid until deinit.
+pub fn entryAt(self: *const IndexedReader, position: usize) Entry {
+    const stored = self.entry_list.items[position];
+    const chromatogram = position >= self.counts[0];
+    return .{
+        .kind = if (chromatogram) .chromatogram else .spectrum,
+        .id = Ids.idOf(stored, self.id_list.items),
+        .ordinal = if (chromatogram) position - self.counts[0] else position,
+        .start = stored.start,
+        .end = stored.end,
+    };
 }
 
 /// Returns the header, valid until deinit. With `open_embedded`, list observed counts stay zero;
@@ -206,17 +226,22 @@ pub fn atDecoded(
     return self.lookup(allocator, .{ .ordinal = .{ .kind = kind, .ordinal = ordinal } }, output);
 }
 
-fn entryId(self: *IndexedReader, id: []const u8) Error![]const u8 {
+fn entryId(self: *IndexedReader, id: []const u8) Error!Stored {
     if (self.entry_list.items.len == self.options.records) return try self.limitError(.records, self.options.records, null);
-    try self.charge(@sizeOf(Entry) + @sizeOf(usize) * 4);
-    return self.copy(id);
+    try self.charge(@sizeOf(Stored) + @sizeOf(u32) * 4 + id.len);
+    const id_start = self.id_list.items.len;
+    try self.id_list.appendSlice(self.allocator, id);
+    return .{ .id_start = @intCast(id_start), .id_len = @intCast(id.len), .start = 0, .end = 0 };
 }
 
 // Adds an entry whose ID entryId copied, unique within its kind.
-fn addEntry(self: *IndexedReader, kind: model.Kind, copied: []const u8, start: u64, end: u64) Error!void {
+fn addEntry(self: *IndexedReader, kind: model.Kind, copied: Stored, start: u64, end: u64) Error!void {
     const k = kindIndex(kind);
-    const entry: Entry = .{ .kind = kind, .id = copied, .ordinal = self.counts[k], .start = start, .end = end };
-    try Ids.insert(&self.ids[k], self.allocator, &self.entry_list, entry);
+    if (self.entry_list.items.len == 0) self.chromatograms_first = kind == .chromatogram;
+    var entry = copied;
+    entry.start = start;
+    entry.end = end;
+    try Ids.insert(&self.ids[k], self.allocator, &self.entry_list, self.id_list.items, entry);
     self.counts[k] += 1;
 }
 
@@ -255,6 +280,9 @@ fn captureAncestors(self: *IndexedReader, reader: *Engine, k: usize) Error!Fragm
     }
     return .{ .prefix = prefix, .suffix = try self.copy(suffix.written()), .ancestors = count };
 }
+
+// An entry as stored: its ID addressed in id_list; kind and ordinal follow from its position.
+const Stored = struct { id_start: u32, id_len: u32, start: u64, end: u64 };
 
 const FragmentAncestors = struct { prefix: []const u8, suffix: []const u8, ancestors: usize };
 
@@ -439,13 +467,13 @@ fn readEmbeddedEntries(
     try indexEnd(&cursor, .indexed_mzml);
     if (cursor.current != null) return error.InvalidStructure;
     // Each kind is already ordered. Rotate only when the two index elements are reversed.
-    if (self.counts[0] != 0 and self.counts[1] != 0 and self.entry_list.items[0].kind == .chromatogram) {
-        std.mem.rotate(Entry, self.entry_list.items, self.counts[1]);
+    if (self.counts[0] != 0 and self.counts[1] != 0 and self.chromatograms_first) {
+        std.mem.rotate(Stored, self.entry_list.items, self.counts[1]);
         // Move positions with their entries so each stored hash still names the same ID.
         var spectra = self.ids[0].keyIterator();
-        while (spectra.next()) |position| position.* -= self.counts[1];
+        while (spectra.next()) |position| position.* -= @intCast(self.counts[1]);
         var chromatograms = self.ids[1].keyIterator();
-        while (chromatograms.next()) |position| position.* += self.counts[0];
+        while (chromatograms.next()) |position| position.* += @intCast(self.counts[0]);
     }
 }
 
@@ -643,17 +671,17 @@ fn lookup(self: *IndexedReader, allocator: std.mem.Allocator, target: Target, ou
         .id => |id| self.idPosition(id),
         .ordinal => |ordinal| self.ordinalPosition(ordinal.kind, ordinal.ordinal),
     } orelse return null;
-    const entry = self.entry_list.items[position];
+    const entry = self.entryAt(position);
     return try if (output) |decoded| self.readDecodedEntry(allocator, entry, decoded) else self.readEntry(allocator, entry, null);
 }
 
 fn idPosition(self: *IndexedReader, id: []const u8) Error!?usize {
     try self.checkSource();
-    const query: Ids.Query = .{ .entries = self.entry_list.items };
+    const query: Ids.Query = .{ .entries = self.entry_list.items, .ids = self.id_list.items };
     const spectrum = self.ids[0].getKeyAdapted(id, query);
     const chromatogram = self.ids[1].getKeyAdapted(id, query);
     if (spectrum != null and chromatogram != null) return error.AmbiguousId;
-    return spectrum orelse chromatogram;
+    return spectrum orelse chromatogram orelse null;
 }
 
 fn ordinalPosition(self: *IndexedReader, kind: model.Kind, ordinal: usize) Error!?usize {

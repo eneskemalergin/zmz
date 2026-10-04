@@ -1889,7 +1889,7 @@ test "[integration] - [mzML lists]: reads absent and empty lists without requiri
         try readDecoded(std.testing.allocator, source, .{});
         var index = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = source }, .{ .policy = .rebuild });
         defer index.deinit();
-        try std.testing.expectEqual(@as(usize, 0), index.entries().len);
+        try std.testing.expectEqual(@as(usize, 0), index.entryCount());
         try std.testing.expectEqual(null, try index.at(std.testing.allocator, .chromatogram, 0));
     }
     const prefix = "<indexedmzML xmlns='http://psi.hupo.org/ms/mzml'><mzML version='1.1.0'>" ++
@@ -1912,7 +1912,7 @@ test "[integration] - [mzML lists]: reads absent and empty lists without requiri
             for (std.enums.values(mzml.IndexedReader.Policy)) |policy| {
                 var index = try mzml.IndexedReader.build(std.testing.allocator, source, .{ .policy = policy, .records = 0 });
                 defer index.deinit();
-                try std.testing.expectEqual(@as(usize, 0), index.entries().len);
+                try std.testing.expectEqual(@as(usize, 0), index.entryCount());
                 try std.testing.expectEqualDeep([_]usize{ 0, 0 }, index.counts);
                 try std.testing.expectEqual(@as(usize, 0), index.header().chromatogram_list.?.declared_count);
                 try std.testing.expectEqual(null, try index.byId(std.testing.allocator, "missing"));

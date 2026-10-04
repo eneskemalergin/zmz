@@ -226,7 +226,8 @@ test "[integration] - [mzML children]: copies retained XML without indexing nest
             try std.testing.expectEqual(null, try index.byId(allocator, "not-a-record"));
             var decoded = mzml.DecodedArrays.init(allocator, .{});
             defer decoded.deinit();
-            for (index.entries()) |entry| {
+            for (0..index.entryCount()) |entry_position| {
+                const entry = index.entryAt(entry_position);
                 var retained = (try index.byId(allocator, entry.id)).?;
                 defer retained.deinit();
                 var numeric = (try index.atDecoded(allocator, entry.kind, entry.ordinal, &decoded)).?;
@@ -826,7 +827,7 @@ test "[integration] - [mzML prepared writing]: preserves primitive bytes across 
                     if (indexed) {
                         var index = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = rewritten.buffered() }, .{});
                         defer index.deinit();
-                        try std.testing.expectEqual(@as(usize, 1), index.entries().len);
+                        try std.testing.expectEqual(@as(usize, 1), index.entryCount());
                         var fetched = (try index.atDecoded(std.testing.allocator, .spectrum, 0, &decoded_arrays)).?;
                         defer fetched.deinit();
                         try std.testing.expectEqual(@as(usize, 2), decoded_arrays.len());
@@ -1228,7 +1229,8 @@ test "[integration] - [mzML file writer]: patches counts without changing record
                 var index = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = bytes }, .{ .policy = .open_embedded });
                 defer index.deinit();
                 try std.testing.expectEqualDeep(case.counts, index.counts);
-                for (index.entries()) |entry| {
+                for (0..index.entryCount()) |position| {
+                    const entry = index.entryAt(position);
                     var found = (try index.byId(std.testing.allocator, entry.id)).?;
                     defer found.deinit();
                     try std.testing.expectEqual(entry.start, found.value.node.start_offset);
@@ -1335,10 +1337,12 @@ test "[failure] - [mzML file writer]: unknown counts need a file and do not bypa
     try std.testing.expectError(error.InvalidOptions, mzml.Writer.initFile(std.testing.allocator, &streaming, .{}, null));
 }
 
-test "[failure] - [mzML writer]: refuses a node limit of zero" {
+test "[failure] - [mzML writer]: refuses a node limit of zero and index limits past 32 bits" {
     var discard: std.Io.Writer.Discarding = .init(&.{});
     try std.testing.expectError(error.InvalidOptions, mzml.Writer.init(std.testing.allocator, &discard.writer, .{ .nodes = 0 }));
     try std.testing.expectError(error.InvalidOptions, mzml.Writer.initIndexed(std.testing.allocator, &discard.writer, .{ .nodes = 0 }, .{}));
+    try std.testing.expectError(error.InvalidOptions, mzml.Writer.initIndexed(std.testing.allocator, &discard.writer, .{}, .{ .records = 1 << 32 }));
+    try std.testing.expectError(error.InvalidOptions, mzml.Writer.initIndexed(std.testing.allocator, &discard.writer, .{}, .{ .id_bytes = 1 << 32 }));
 }
 
 test "[failure] - [mzML file writer]: flush, count patch, and checksum read failures remain sticky" {
@@ -1592,7 +1596,7 @@ test "[property] - [mzML streamed writing]: every pipeline round trips through s
                     try std.testing.expectEqualStrings(&std.fmt.bytesToHex(digest, .lower), bytes[end..][0..40]);
                     var index = try mzml.IndexedReader.build(allocator, .{ .bytes = bytes }, .{});
                     defer index.deinit();
-                    try std.testing.expectEqual(@as(usize, 1), index.entries().len);
+                    try std.testing.expectEqual(@as(usize, 1), index.entryCount());
                 }
                 var read_input = std.Io.Reader.fixed(bytes);
                 var reader = try mzml.StreamReader.init(allocator, &read_input, .{});

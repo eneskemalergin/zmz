@@ -1067,6 +1067,16 @@ fn encodeAllocated(allocator: std.mem.Allocator) !void {
     _ = try encoder.encode(f64, &.{ 1, 2, 3 }, .{ .pipeline = .linear, .fixed_point = 1000 });
 }
 
+test "[failure] - [array encoder]: refuses bad options before allocating" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var encoder = arrays.Encoder.init(failing.allocator(), .fast);
+    defer encoder.deinit();
+    try std.testing.expectError(error.MissingFixedPoint, encoder.encode(f64, &.{1}, .{ .pipeline = .linear_zlib }));
+    try std.testing.expectError(error.MissingFixedPoint, encoder.encode(f64, &.{1}, .{ .pipeline = .linear }));
+    try std.testing.expectError(error.TypeMismatch, encoder.encode(i32, &.{1}, .{ .pipeline = .pic_zlib }));
+    try std.testing.expectEqual(0, failing.allocations);
+}
+
 test "[failure] - [array encoder]: releases storage after allocation failures" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, encodeAllocated, .{});
 }

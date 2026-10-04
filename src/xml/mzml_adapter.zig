@@ -179,6 +179,8 @@ pub const Cursor = struct {
     additional_namespaces: ?bool = null,
     // Changes whenever the in-scope bindings do, so a reader can reuse what it built for a scope.
     namespace_scope: u64 = 0,
+    // Requested text still leaves out whitespace-only runs, through the readers' buffered skip.
+    skip_whitespace_text: bool = false,
     failure: ?Error = null,
     limit_failure: ?enum { depth, attributes, attribute_bytes, nodes, declaration_bytes } = null,
     // The rule broken by the input when failure is InvalidXml.
@@ -262,6 +264,7 @@ pub const Cursor = struct {
         self.depth = saved.depth;
         self.open_names.items = self.open_names.allocatedSlice()[0..saved.names];
         self.namespace_bytes.items = self.namespace_bytes.allocatedSlice()[0..saved.namespace_bytes];
+        if (self.namespace_bindings.items.len > saved.bindings) self.truncateBindings(saved.bindings);
         self.namespace_bindings.items = self.namespace_bindings.allocatedSlice()[0..saved.bindings];
         self.mzml_namespace = saved.mzml_namespace;
         self.pending_empty = saved.pending_empty;
@@ -295,11 +298,11 @@ pub const Cursor = struct {
         while (position.* < self.namespace_bindings.items.len) {
             const binding = self.namespace_bindings.items[position.*];
             position.* += 1;
+            if (binding.shadowed) continue;
             const prefix = self.namespace_bytes.items[binding.prefix_start..][0..binding.prefix_len];
-            const uri = self.namespace_bytes.items[binding.uri_start..][0..binding.uri_len];
-            const active = self.resolveNamespace(if (prefix.len == 0) null else prefix) orelse continue;
-            if (active.ptr != uri.ptr) continue;
-            return .{ .prefix = prefix, .uri = uri };
+            // resolveNamespace answers the xml prefix itself, so its bindings are never listed.
+            if (std.mem.eql(u8, prefix, "xml")) continue;
+            return .{ .prefix = prefix, .uri = self.namespace_bytes.items[binding.uri_start..][0..binding.uri_len] };
         }
         return null;
     }
@@ -408,7 +411,7 @@ pub const Cursor = struct {
         self.current = null;
         const ended_before = self.document_ended;
         while (true) {
-            const maybe_event = self.nextEvent(!text) catch |err| {
+            const maybe_event = self.nextEvent(!text or self.skip_whitespace_text) catch |err| {
                 self.offset = self.failedAt(err);
                 if (err == error.EndOfStream) self.xml_rule = .unexpected_end;
                 return switch (err) {
@@ -440,13 +443,14 @@ pub const Cursor = struct {
                 .text => |value| {
                     // Text outside the root element must be whitespace and is never returned.
                     if (text and self.depth != 0) {
+                        if (self.skip_whitespace_text and isXmlWhitespaceRun(value.bytes)) continue;
                         self.current = event;
                         return;
                     }
-                    for (value.bytes) |byte| if (!isXmlWhitespace(byte)) {
+                    if (!isXmlWhitespaceRun(value.bytes)) {
                         self.xml_rule = .unexpected_text;
                         return error.InvalidXml;
-                    };
+                    }
                 },
             }
         }
@@ -493,6 +497,26 @@ pub const Cursor = struct {
                 continue;
             }
             if (ignore_whitespace) self.skipBufferedWhitespace();
+            if (self.source.bytesAreCharacters()) if (self.source.reader) |reader| {
+                // A start or end tag opening in the buffer skips the codepoint reads; comments,
+                // processing instructions, and CDATA keep them.
+                const bytes = reader.buffered();
+                if (bytes.len >= 2 and bytes[0] == '<' and (isAsciiNameStart(bytes[1]) or bytes[1] == '/')) {
+                    const opening_start = self.source.position;
+                    self.normal_text_brackets = 0;
+                    if (bytes[1] == '/') {
+                        reader.toss(2);
+                        try self.source.addPosition(2);
+                        self.source.last_start = opening_start + 1;
+                        return try self.readEndElement(opening_start);
+                    }
+                    reader.toss(1);
+                    try self.source.addPosition(1);
+                    self.source.last_start = opening_start;
+                    if (try self.readBufferedStartElement(opening_start)) |event| return event;
+                    return try self.readStartElement(opening_start);
+                }
+            };
             const first = self.source.peekCodepoint() catch |err| switch (err) {
                 error.EndOfStream => {
                     if (self.root_seen and self.root_closed and self.depth == 0) {
@@ -946,11 +970,13 @@ pub const Cursor = struct {
             if (attribute_range.namespace_declaration) continue;
             const attribute_name = try self.makeName(bytes, attribute_range.name, true, attribute_range.offset);
             const expanded = attribute_name.expanded;
-            for (self.attributes.items) |previous| {
-                if (previous.name.eql(expanded.namespace_uri, expanded.local))
+            // Raw names are unique by now and an unprefixed name has no namespace, so only two
+            // prefixed names can expand to the same name.
+            if (expanded.prefix != null) for (self.attributes.items) |previous| {
+                if (previous.name.expanded.prefix != null and previous.name.eql(expanded.namespace_uri, expanded.local))
                     return self.malformedAt(.duplicate_attribute, attribute_range.offset);
-            }
-            try self.attributes.append(self.allocator, .{
+            };
+            self.attributes.appendAssumeCapacity(.{
                 .name = attribute_name,
                 .value = bytes[attribute_range.value.start..][0..attribute_range.value.len],
                 .offset = attribute_range.offset,
@@ -980,15 +1006,19 @@ pub const Cursor = struct {
             }
             if (std.mem.eql(u8, uri, XMLNS_NAMESPACE)) return self.malformedAt(.invalid_namespace_declaration, declaration.offset);
             if (prefix.len != 0 and uri.len == 0) return self.malformedAt(.invalid_namespace_declaration, declaration.offset);
+            try self.namespace_bindings.ensureUnusedCapacity(self.allocator, 1);
+            const shadows = self.bindingIndex(prefix);
             const prefix_start = self.namespace_bytes.items.len;
             try self.namespace_bytes.appendSlice(self.allocator, prefix);
             const uri_start = self.namespace_bytes.items.len;
             try self.namespace_bytes.appendSlice(self.allocator, uri);
-            try self.namespace_bindings.append(self.allocator, .{
+            if (shadows) |index| self.namespace_bindings.items[index].shadowed = true;
+            self.namespace_bindings.appendAssumeCapacity(.{
                 .prefix_start = prefix_start,
                 .prefix_len = prefix.len,
                 .uri_start = uri_start,
                 .uri_len = uri.len,
+                .shadows = shadows,
             });
         }
     }
@@ -997,6 +1027,26 @@ pub const Cursor = struct {
     fn defaultNamespace(self: *const Cursor) ?[]const u8 {
         const uri = self.resolveNamespace(null) orelse return null;
         return if (uri.len == 0) null else uri;
+    }
+
+    fn bindingIndex(self: *const Cursor, prefix: []const u8) ?usize {
+        var index = self.namespace_bindings.items.len;
+        while (index != 0) {
+            index -= 1;
+            const binding = self.namespace_bindings.items[index];
+            if (std.mem.eql(u8, self.namespace_bytes.items[binding.prefix_start..][0..binding.prefix_len], prefix)) return index;
+        }
+        return null;
+    }
+
+    // Drops the bindings from length on, showing again the ones they hid.
+    fn truncateBindings(self: *Cursor, length: usize) void {
+        var index = self.namespace_bindings.items.len;
+        while (index > length) {
+            index -= 1;
+            if (self.namespace_bindings.items[index].shadows) |hidden| self.namespace_bindings.items[hidden].shadowed = false;
+        }
+        self.namespace_bindings.items.len = length;
     }
 
     fn resolveNamespace(self: *const Cursor, prefix: ?[]const u8) ?[]const u8 {
@@ -1037,22 +1087,41 @@ pub const Cursor = struct {
     fn popFrame(self: *Cursor, frame: Frame) void {
         self.depth -= 1;
         self.open_names.items.len = frame.name_start;
-        if (self.namespace_bindings.items.len != frame.binding_start) self.scopeChanged();
-        self.namespace_bindings.items.len = frame.binding_start;
+        if (self.namespace_bindings.items.len != frame.binding_start) {
+            self.scopeChanged();
+            self.truncateBindings(frame.binding_start);
+        }
         self.namespace_bytes.items.len = frame.namespace_bytes_start;
         if (self.depth == 0) self.root_closed = true;
     }
 
     fn readEndElement(self: *Cursor, start_offset: u64) ParserError!Event {
         if (self.depth == 0) return self.malformedAt(.mismatched_end_tag, start_offset);
+        const frame = self.frames[self.depth - 1];
+        const expected = self.open_names.items[frame.name_start..][0..frame.name_len];
+        if (self.source.bytesAreCharacters()) if (self.source.reader) |reader| {
+            // The open element's name and `>` already in the buffer close it in place; every
+            // other shape, including whitespace before `>`, takes the checked path below.
+            const bytes = reader.buffered();
+            if (bytes.len > expected.len and bytes[expected.len] == '>' and std.mem.eql(u8, bytes[0..expected.len], expected)) {
+                const name_offset = self.source.position;
+                reader.toss(expected.len + 1);
+                try self.source.addPosition(expected.len + 1);
+                // As for a synthetic end, the open name's bytes outlive this event.
+                const name = try self.makeName(self.open_names.items, .{ .start = frame.name_start, .len = frame.name_len, .prefix_len = frame.prefix_len }, false, name_offset);
+                self.popFrame(frame);
+                return .{
+                    .span = .{ .start = start_offset, .end = self.source.position },
+                    .data = .{ .end_element = .{ .name = name } },
+                };
+            }
+        };
         const name_offset = self.source.currentOffset();
         const name_range = try self.parseQName();
         try self.skipWhitespace();
         const close = try self.requiredCodepoint();
         if (close.value != '>') return self.malformed(.malformed_tag);
-        const frame = self.frames[self.depth - 1];
         const raw = self.event_bytes.items[name_range.start..][0..name_range.len];
-        const expected = self.open_names.items[frame.name_start..][0..frame.name_len];
         if (!std.mem.eql(u8, raw, expected)) return self.malformedAt(.mismatched_end_tag, start_offset);
         const name = try self.makeName(self.event_bytes.items, name_range, false, name_offset);
         self.popFrame(frame);
@@ -1065,11 +1134,11 @@ pub const Cursor = struct {
     fn syntheticEnd(self: *Cursor) AdvanceError!Event {
         if (!self.pending_empty or self.depth == 0) return error.InvalidState;
         const frame = self.frames[self.depth - 1];
-        self.event_bytes.clearRetainingCapacity();
-        try self.event_bytes.appendSlice(self.allocator, self.open_names.items[frame.name_start..][0..frame.name_len]);
+        // The open name's bytes stay in place after the pop until the next start tag, which is
+        // after this event's lifetime.
         const name = try self.makeName(
-            self.event_bytes.items,
-            .{ .start = 0, .len = self.event_bytes.items.len, .prefix_len = frame.prefix_len },
+            self.open_names.items,
+            .{ .start = frame.name_start, .len = frame.name_len, .prefix_len = frame.prefix_len },
             false,
             frame.opening_end,
         );
@@ -1392,6 +1461,11 @@ fn isXmlWhitespace(value: u21) bool {
     return value == ' ' or value == '\t' or value == '\r' or value == '\n';
 }
 
+fn isXmlWhitespaceRun(bytes: []const u8) bool {
+    for (bytes) |byte| if (!isXmlWhitespace(byte)) return false;
+    return true;
+}
+
 fn isXmlChar(value: u21) bool {
     return value == 0x9 or value == 0xA or value == 0xD or
         (value >= 0x20 and value <= 0xD7FF) or
@@ -1671,6 +1745,10 @@ const NamespaceBinding = struct {
     prefix_len: usize,
     uri_start: usize,
     uri_len: usize,
+    // The cursor marks a binding that a later declaration of its prefix hides, and records in
+    // that declaration which binding it hid, so listing bindings needs no prefix lookup.
+    shadowed: bool = false,
+    shadows: ?usize = null,
 };
 
 const Frame = struct {
@@ -1840,18 +1918,13 @@ pub const Writer = struct {
 
     // For an unprefixed name the mzML writer supplies from its own tables (cvParam's fields and
     // the like): a valid name, not caller memory, written before any caller-supplied attribute
-    // of the element and once each. It is still recorded, so a caller's attribute of the same
-    // name is a duplicate; the value is checked and escaped as always.
-    pub fn attributeTrusted(self: *Writer, name: []const u8, value: []const u8) WriterError!void {
+    // of the element and once each. With record, a caller's later attribute of the same name is
+    // a duplicate; without it the caller promises none follows. The value is checked and
+    // escaped as always.
+    pub fn attributeTrusted(self: *Writer, name: []const u8, value: []const u8, record: bool) WriterError!void {
         try self.check(.start_tag);
         try self.checkInput(value);
-        self.attribute_names.appendSlice(self.allocator, std.mem.asBytes(&name.len)) catch return self.fail(error.OutOfMemory);
-        self.attribute_names.appendSlice(self.allocator, name) catch return self.fail(error.OutOfMemory);
-        try self.writeByte(' ');
-        try self.writeBytes(name);
-        try self.writeBytes("=\"");
-        try self.writeEscapedAttribute(value);
-        try self.writeByte('"');
+        try self.writeAttribute(name, value, record);
     }
 
     // Any prefix is resolved in the current namespace bindings.
@@ -1877,13 +1950,7 @@ pub const Writer = struct {
                 return self.fail(error.DuplicateAttribute);
             position = end;
         }
-        self.attribute_names.appendSlice(self.allocator, std.mem.asBytes(&name.len)) catch return self.fail(error.OutOfMemory);
-        self.attribute_names.appendSlice(self.allocator, name) catch return self.fail(error.OutOfMemory);
-        try self.writeByte(' ');
-        try self.writeBytes(name);
-        try self.writeBytes("=\"");
-        try self.writeEscapedAttribute(value);
-        try self.writeByte('"');
+        try self.writeAttribute(name, value, true);
     }
 
     pub fn text(self: *Writer, value: []const u8) WriterError!void {
@@ -2034,6 +2101,18 @@ pub const Writer = struct {
         if (std.mem.indexOfScalar(u8, name, ':')) |colon| {
             if (self.namespaceUri(name[0..colon]) == null) return self.fail(error.InvalidNamespace);
         }
+    }
+
+    fn writeAttribute(self: *Writer, name: []const u8, value: []const u8, record: bool) WriterError!void {
+        if (record) {
+            self.attribute_names.appendSlice(self.allocator, std.mem.asBytes(&name.len)) catch return self.fail(error.OutOfMemory);
+            self.attribute_names.appendSlice(self.allocator, name) catch return self.fail(error.OutOfMemory);
+        }
+        try self.writeByte(' ');
+        try self.writeBytes(name);
+        try self.writeBytes("=\"");
+        try self.writeEscapedAttribute(value);
+        try self.writeByte('"');
     }
 
     fn sameAttribute(self: *const Writer, a: []const u8, b: []const u8, b_colon: usize) bool {

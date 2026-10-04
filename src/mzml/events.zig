@@ -42,6 +42,10 @@ pub const Options = struct {
     attributes: usize = 64,
     /// Bytes of one start tag's names and values after decoding.
     attribute_bytes: usize = 1024 * 1024,
+    /// Drops text events that hold only XML whitespace, such as indentation between tags. Off by
+    /// default, since byte-exact and whitespace-checking callers need every event. A text run is
+    /// at most 64 KiB, so whitespace that long before other text is dropped too.
+    skip_whitespace_text: bool = false,
 };
 
 cursor: xml.Cursor,
@@ -52,7 +56,9 @@ failure: ?Diagnostic = null,
 /// Checks the options without consuming input; nothing is allocated until the first read.
 /// Streaming input needs buffer capacity for peekGreedy(1), otherwise InvalidOptions.
 pub fn init(allocator: std.mem.Allocator, input: *std.Io.Reader, options: Options) error{InvalidOptions}!Events {
-    return .{ .cursor = try xml.Cursor.init(allocator, input, options.attributes, options.attribute_bytes) };
+    var cursor = try xml.Cursor.init(allocator, input, options.attributes, options.attribute_bytes);
+    cursor.skip_whitespace_text = options.skip_whitespace_text;
+    return .{ .cursor = cursor };
 }
 
 /// Leaves the input open.

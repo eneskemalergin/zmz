@@ -1,6 +1,7 @@
 //! Constructs one example spectrum from numeric values and writes plain or indexed mzML.
-//! The values and the encoder stay borrowed until writeRecordWithArrays returns; the writer
-//! encodes each array while writing it.
+//! The values and the encoder stay borrowed until writeRecordWithArrays returns. File output
+//! streams each array through the encoder's compressor into the file and patches its
+//! encodedLength afterwards, so no buffer holds a compressed array whole.
 //! Output creation is exclusive; failed writes remove only the new partial file.
 
 const std = @import("std");
@@ -14,16 +15,15 @@ pub fn main(init: std.process.Init) !void {
         return error.InvalidArguments;
     }
     const dir = std.Io.Dir.cwd();
-    const file = try dir.createFile(init.io, args[1], .{ .exclusive = true });
+    // Indexed output rereads the file for its checksum.
+    const file = try dir.createFile(init.io, args[1], .{ .exclusive = true, .read = indexed });
     errdefer dir.deleteFile(init.io, args[1]) catch {};
     defer file.close(init.io);
     var output_buffer: [64 * 1024]u8 = undefined;
     var output = file.writer(init.io, &output_buffer);
-    var writer = if (indexed)
-        try mzml.Writer.initIndexed(init.gpa, &output.interface, .{}, .{})
-    else
-        try mzml.Writer.init(init.gpa, &output.interface, .{});
+    var writer = try mzml.Writer.initFile(init.gpa, &output, .{}, if (indexed) .{} else null);
     defer writer.deinit();
+    errdefer if (writer.diagnostic()) |report| std.debug.print("{s}: {f}\n", .{ args[1], report });
     var builder = mzml.Builder.init(init.gpa, .{});
     defer builder.deinit();
     try writer.writeHeader(try makeHeader(&builder));

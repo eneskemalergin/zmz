@@ -102,6 +102,9 @@ pub fn initIndexed(
     index_options: IndexOptions,
 ) (std.mem.Allocator.Error || error{InvalidOptions})!Writer {
     if (limits.nodes == 0) return error.InvalidOptions;
+    // Entry positions and ID offsets are 32 bits.
+    if (index_options.records > std.math.maxInt(u32) or index_options.id_bytes > std.math.maxInt(u32))
+        return error.InvalidOptions;
     for (index_options.wrapper_attributes) |attr| if (attr.namespace_uri == null) return error.InvalidOptions;
     const state = try allocator.create(Index);
     errdefer allocator.destroy(state);
@@ -447,7 +450,7 @@ fn writeRecordInner(self: *Writer, node: model.Node, comptime replace_arrays: bo
             return error.MissingAttribute;
         };
         if (state.entries.items.len == state.options.records) return try self.limitError(.index, .records, state.options.records, null);
-        const copied = try self.copyId(state, id);
+        const id_start = try self.listId(state, id);
         // Historical IDs are copied and reserved first, so they stay parallel to the entries.
         var native_id: ?[]const u8 = null;
         var spot_id: ?[]const u8 = null;
@@ -457,7 +460,7 @@ fn writeRecordInner(self: *Writer, node: model.Node, comptime replace_arrays: bo
             try state.historical_ids.ensureUnusedCapacity(state.allocator, 1);
         }
         const ids = &state.ids[if (node.kind == .spectrum) @as(usize, 0) else 1];
-        try Ids.insert(ids, state.allocator, &state.entries, .{ .id = copied, .offset = offset });
+        try Ids.insert(ids, state.allocator, &state.entries, state.id_list.items, .{ .id_start = id_start, .id_len = @intCast(id.len), .offset = offset });
         if (state.historical) state.historical_ids.appendAssumeCapacity(.{ .native_id = native_id, .spot_id = spot_id });
         if (node.kind == .spectrum) state.spectra += 1;
     }
@@ -783,8 +786,10 @@ fn startKnown(self: *Writer, name: []const u8, attrs: []const model.Attribute, r
                 if (candidate.len != 0 and std.mem.eql(u8, attr.value, self.namespace_uri)) prefix = candidate;
             };
             const selected = prefix orelse return error.InvalidNamespace;
-            const qualified = try self.allocator.alloc(u8, selected.len + 1 + name.len);
-            defer self.allocator.free(qualified);
+            var fallback = std.heap.stackFallback(128, self.allocator);
+            const allocator = fallback.get();
+            const qualified = try allocator.alloc(u8, selected.len + 1 + name.len);
+            defer allocator.free(qualified);
             @memcpy(qualified[0..selected.len], selected);
             qualified[selected.len] = ':';
             @memcpy(qualified[selected.len + 1 ..], name);
@@ -824,25 +829,26 @@ fn writeParams(self: *Writer, params: []const cv.Entry, budget: *usize) Error!vo
         };
         if (extra) |value| try self.checkParts(.{ std.mem.asBytes(value), value.attributes, value.content });
         const attrs = if (extra) |value| value.attributes else &.{};
+        const record = attrs.len != 0;
         switch (entry) {
             .group_ref => |ref| {
                 try self.startKnown("referenceableParamGroupRef", attrs, false);
-                try self.optionalAttribute("ref", ref.ref);
+                try self.optionalAttribute("ref", ref.ref, record);
             },
             .cv => |param| {
                 try self.startKnown("cvParam", attrs, false);
-                try self.optionalAttribute("cvRef", param.cv_ref);
-                try self.optionalAttribute("accession", if (param.accession) |accession| accession.raw else null);
-                try self.optionalAttribute("name", param.name);
-                try self.optionalAttribute("value", param.value);
-                try self.writeUnit(param.unit);
+                try self.optionalAttribute("cvRef", param.cv_ref, record);
+                try self.optionalAttribute("accession", if (param.accession) |accession| accession.raw else null, record);
+                try self.optionalAttribute("name", param.name, record);
+                try self.optionalAttribute("value", param.value, record);
+                try self.writeUnit(param.unit, record);
             },
             .user => |param| {
                 try self.startKnown("userParam", attrs, false);
-                try self.optionalAttribute("name", param.name);
-                try self.optionalAttribute("value", param.value);
-                try self.optionalAttribute("type", param.value_type);
-                try self.writeUnit(param.unit);
+                try self.optionalAttribute("name", param.name, record);
+                try self.optionalAttribute("value", param.value, record);
+                try self.optionalAttribute("type", param.value_type, record);
+                try self.writeUnit(param.unit, record);
             },
         }
         try self.writeAttributes(attrs);
@@ -858,27 +864,43 @@ fn writeParams(self: *Writer, params: []const cv.Entry, budget: *usize) Error!vo
     }
 }
 
-fn writeUnit(self: *Writer, unit: cv.Unit) Error!void {
-    try self.optionalAttribute("unitCvRef", unit.cv_ref);
-    try self.optionalAttribute("unitAccession", if (unit.accession) |a| a.raw else null);
-    try self.optionalAttribute("unitName", unit.name);
+fn writeUnit(self: *Writer, unit: cv.Unit, record: bool) Error!void {
+    try self.optionalAttribute("unitCvRef", unit.cv_ref, record);
+    try self.optionalAttribute("unitAccession", if (unit.accession) |a| a.raw else null, record);
+    try self.optionalAttribute("unitName", unit.name, record);
 }
 
 // The fixed fields of parameters and units, written before any of the parameter's own XML
-// attributes.
-fn optionalAttribute(self: *Writer, name: []const u8, value: ?[]const u8) Error!void {
-    if (value) |text| try self.engine.attributeTrusted(name, text);
+// attributes; record when such attributes follow, so a repeated name is a duplicate.
+fn optionalAttribute(self: *Writer, name: []const u8, value: ?[]const u8, record: bool) Error!void {
+    if (value) |text| try self.engine.attributeTrusted(name, text, record);
+}
+
+// Copies a record's ID into the index's ID list and returns where it starts.
+fn listId(self: *Writer, state: *Index, id: []const u8) Error!u32 {
+    try self.chargeId(state, id.len);
+    const start = state.id_list.items.len;
+    state.id_list.appendSlice(state.allocator, id) catch |err| {
+        self.capture(err, .index, .none);
+        return err;
+    };
+    state.id_bytes += id.len;
+    return @intCast(start);
 }
 
 fn copyId(self: *Writer, state: *Index, id: []const u8) Error![]const u8 {
-    if (id.len > state.options.id_bytes -| state.id_bytes)
-        return try self.limitError(.index, .id_bytes, state.options.id_bytes, state.id_bytes +| id.len);
+    try self.chargeId(state, id.len);
     const result = state.arena.allocator().dupe(u8, id) catch |err| {
         self.capture(err, .index, .none);
         return err;
     };
     state.id_bytes += id.len;
     return result;
+}
+
+fn chargeId(self: *Writer, state: *Index, length: usize) Error!void {
+    if (length > state.options.id_bytes -| state.id_bytes)
+        return try self.limitError(.index, .id_bytes, state.options.id_bytes, state.id_bytes +| length);
 }
 
 // Buffered bytes that fail to reach the sink have no accepted output position.
@@ -905,10 +927,10 @@ fn writeIndex(self: *Writer, state: *Index) Error!void {
             const entries = if (kind == .spectrum) state.entries.items[0..state.spectra] else state.entries.items[state.spectra..];
             for (entries, if (kind == .spectrum) @as(usize, 0) else state.spectra..) |entry, i| {
                 try self.engine.startElement("offset");
-                try self.engine.attribute("idRef", entry.id);
+                try self.engine.attribute("idRef", Ids.idOf(entry, state.id_list.items));
                 if (state.historical) {
-                    try self.optionalAttribute("nativeID", state.historical_ids.items[i].native_id);
-                    try self.optionalAttribute("spotID", state.historical_ids.items[i].spot_id);
+                    try self.optionalAttribute("nativeID", state.historical_ids.items[i].native_id, false);
+                    try self.optionalAttribute("spotID", state.historical_ids.items[i].spot_id, false);
                 }
                 var text: [32]u8 = undefined;
                 try self.engine.text(text[0..std.fmt.printInt(&text, entry.offset, 10, .lower, .{})]);
@@ -949,7 +971,7 @@ fn writeIndex(self: *Writer, state: *Index) Error!void {
     try self.engine.endElement();
 }
 
-const IndexEntry = struct { id: []const u8, offset: u64 };
+const IndexEntry = struct { id_start: u32, id_len: u32, offset: u64 };
 
 // Indexed stream output is hashed and forwarded, and file output reread, in chunks of this
 // size. Rewrite time was flat from 8 to 256 KiB; 16 KiB kept peak RSS at the unhashed level.
@@ -962,6 +984,7 @@ const Index = struct {
     arena: std.heap.ArenaAllocator,
     options: IndexOptions,
     entries: std.ArrayList(IndexEntry) = .empty,
+    id_list: std.ArrayList(u8) = .empty,
     historical: bool = false,
     historical_ids: std.ArrayList(struct { native_id: ?[]const u8, spot_id: ?[]const u8 }) = .empty,
     ids: [2]Ids.Map = .{ .empty, .empty },
@@ -970,6 +993,7 @@ const Index = struct {
 
     fn deinit(self: *Index) void {
         self.entries.deinit(self.allocator);
+        self.id_list.deinit(self.allocator);
         self.historical_ids.deinit(self.allocator);
         for (&self.ids) |*ids| ids.deinit(self.allocator);
         self.arena.deinit();

@@ -136,6 +136,8 @@ pub const Encoder = struct {
         values: []const T,
         options: EncodeOptions,
     ) (EncodeError || std.mem.Allocator.Error)![]const u8 {
+        // Bad options fail before the compressor or an output slot is allocated.
+        try checkOptions(T, values.len, options, true);
         const bound = try wireBound(T, values.len, options.pipeline);
         const transformed = options.pipeline.isNumpress() or
             builtin.cpu.arch.endian() == .big;

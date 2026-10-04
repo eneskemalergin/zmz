@@ -87,6 +87,26 @@ test "[unit] - [mzML events]: give attributes decoded and namespaces resolved" {
     try std.testing.expect(child.empty_element_syntax);
 }
 
+test "[unit] - [mzML events]: list in-scope bindings without shadowed ones, restoring them after the shadowing element" {
+    var input = std.Io.Reader.fixed("<r xmlns='urn:d' xmlns:p='urn:p' xmlns:xml='http://www.w3.org/XML/1998/namespace'>" ++
+        "<c xmlns:p='urn:q' xmlns=''><e/></c><f/></r>");
+    var events = try mzml.Events.init(std.testing.allocator, &input, .{});
+    defer events.deinit();
+    // Expected per start tag, outermost first; the xml prefix is never listed.
+    const expected = [_][]const u8{ "=urn:d;p=urn:p;", "p=urn:q;=;", "p=urn:q;=;", "=urn:d;p=urn:p;" };
+    var starts: usize = 0;
+    while (try events.next()) |event| {
+        if (event.data != .start_element) continue;
+        var listed: [64]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&listed);
+        var position: usize = 0;
+        while (events.namespaceAt(&position)) |binding| try writer.print("{s}={s};", .{ binding.prefix, binding.uri });
+        try std.testing.expectEqualStrings(expected[starts], writer.buffered());
+        starts += 1;
+    }
+    try std.testing.expectEqual(expected.len, starts);
+}
+
 test "[unit] - [mzML events]: stream long text in bounded runs" {
     const payload_len = 200 * 1024 + 3;
     const source = try std.testing.allocator.alloc(u8, payload_len + "<b></b>".len);
@@ -155,6 +175,92 @@ test "[failure] - [mzML events]: name the broken rule and where, keep the first 
             try std.testing.expectEqual(mzml.Diagnostic.Detail{ .xml = case[1] }, report.detail);
             try std.testing.expectEqual(@as(u64, case[2]), report.location.?.input_event);
             try std.testing.expectError(error.FailedState, events.next());
+        }
+    }
+}
+
+// Writes every event, then the failure if any, with names, spans, attribute offsets, and the
+// broken rule and its offset.
+fn trace(allocator: std.mem.Allocator, input: *std.Io.Reader, out: *std.Io.Writer) !void {
+    return traceWith(allocator, input, out, .{}, false);
+}
+
+// As trace; with drop_blank, leaves out text events that hold only XML whitespace.
+fn traceWith(allocator: std.mem.Allocator, input: *std.Io.Reader, out: *std.Io.Writer, options: mzml.Events.Options, drop_blank: bool) !void {
+    var events = try mzml.Events.init(allocator, input, options);
+    defer events.deinit();
+    while (true) {
+        const event = (events.next() catch |err| {
+            const report = events.diagnostic().?;
+            try out.print("{s} {any} {any}\n", .{ @errorName(err), report.detail, report.location });
+            return;
+        }) orelse return;
+        if (drop_blank and event.data == .text and std.mem.trim(u8, event.data.text.bytes, " \t\r\n").len == 0) continue;
+        try out.print("{d}-{d} ", .{ event.span.start, event.span.end });
+        switch (event.data) {
+            .start_element => |start| {
+                try out.print("<{s} {}", .{ start.name.raw, start.empty_element_syntax });
+                for (start.attributes) |attribute| try out.print(" {s}@{d}", .{ attribute.name.raw, attribute.offset });
+            },
+            .end_element => |end| try out.print("</{s}", .{end.name.raw}),
+            .text => |run| try out.print("'{s}'", .{run.bytes}),
+        }
+        try out.writeByte('\n');
+    }
+}
+
+test "[property] - [mzML events]: every input split gives the same tags, spans, and failures" {
+    const document = "<r xmlns:p='urn:p'><a/><a></a><b x='1' y='2'></b ><p:c p:z='3'></p:c>" ++
+        "<d>t</d><!-- c --><?pi x?><e><![CDATA[<]]></e><f\n/><g><?pi y?></g></r>";
+    const cases = [_][]const u8{
+        document,
+        "<r><a></ab></r>",
+        "<r><ab></a></r>",
+        "<r><a></a",
+        "<r><a></",
+        "<r></r></r>",
+        "<r><a/ ></r>",
+        "<r><p:a></p:a></r>",
+    };
+    for (cases) |source| {
+        var whole: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer whole.deinit();
+        var fixed = std.Io.Reader.fixed(source);
+        try trace(std.testing.allocator, &fixed, &whole.writer);
+        try std.testing.expectEqual(source.ptr != document.ptr, std.mem.indexOf(u8, whole.written(), "InvalidXml") != null);
+        var buffer: [256]u8 = undefined;
+        for (1..source.len + 1) |size| {
+            var split: std.Io.Writer.Allocating = .init(std.testing.allocator);
+            defer split.deinit();
+            var input: std.testing.Reader = .init(buffer[0..size], &.{.{ .buffer = source }});
+            input.artificial_limit = .limited(size);
+            try trace(std.testing.allocator, &input.interface, &split.writer);
+            try std.testing.expectEqualStrings(whole.written(), split.written());
+        }
+    }
+}
+
+test "[property] - [mzML events]: skipping whitespace text drops exactly the blank text events at every split" {
+    const cases = [_][]const u8{
+        "<r>\n  <a x='1'/>\r\n\t<b>  t u  </b>\n  <c><![CDATA[ ]]></c> <d> </d>\n</r>\n",
+        "<r>   <a/>  t  <b/>   </r>",
+        "<r>\n  <a></b>\n</r>",
+        "<r> x </r> y",
+    };
+    for (cases) |source| {
+        var buffer: [128]u8 = undefined;
+        for (1..source.len + 1) |size| {
+            var expected: std.Io.Writer.Allocating = .init(std.testing.allocator);
+            defer expected.deinit();
+            var all: std.testing.Reader = .init(buffer[0..size], &.{.{ .buffer = source }});
+            all.artificial_limit = .limited(size);
+            try traceWith(std.testing.allocator, &all.interface, &expected.writer, .{}, true);
+            var actual: std.Io.Writer.Allocating = .init(std.testing.allocator);
+            defer actual.deinit();
+            var skipping: std.testing.Reader = .init(buffer[0..size], &.{.{ .buffer = source }});
+            skipping.artificial_limit = .limited(size);
+            try traceWith(std.testing.allocator, &skipping.interface, &actual.writer, .{ .skip_whitespace_text = true }, false);
+            try std.testing.expectEqualStrings(expected.written(), actual.written());
         }
     }
 }
