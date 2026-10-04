@@ -5,11 +5,50 @@ const mzml = @import("zmz").mzml;
 const options = @import("example_test_options");
 const support = @import("support.zig");
 
-test "[cli] - [mzML reencoding]: preserves XML on array group references" {
+fn run(dir: std.Io.Dir, executable: []const u8, args: []const []const u8) ![]u8 {
+    const result = try runProcess(dir, executable, args);
+    defer std.testing.allocator.free(result.stderr);
+    errdefer std.testing.allocator.free(result.stdout);
+    if (!std.meta.eql(std.process.Child.Term{ .exited = 0 }, result.term))
+        std.debug.print("{s}: {s}\n", .{ executable, result.stderr });
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqualStrings("", result.stderr);
+    return result.stdout;
+}
+
+// A failing example exits with 1, prints nothing to stdout, and names its error on a stderr line.
+// With report_path, stderr starts with the saved diagnostic for that file. Debug builds add an
+// error trace, so the rest of stderr is not compared.
+fn runFailing(dir: std.Io.Dir, executable: []const u8, args: []const []const u8, comptime err: anyerror, report_path: ?[]const u8) !void {
+    const result = try runProcess(dir, executable, args);
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+    errdefer std.debug.print("{s}: {s}\n", .{ executable, result.stderr });
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, result.term);
+    try std.testing.expectEqualStrings("", result.stdout);
+    const line = "error: " ++ @errorName(err) ++ "\n";
+    try std.testing.expect(std.mem.startsWith(u8, result.stderr, line) or std.mem.indexOf(u8, result.stderr, "\n" ++ line) != null);
+    if (report_path) |path| {
+        const prefix = try std.fmt.allocPrint(std.testing.allocator, "{s}: [ZMZ", .{path});
+        defer std.testing.allocator.free(prefix);
+        try std.testing.expect(std.mem.startsWith(u8, result.stderr, prefix));
+    }
+}
+
+fn runProcess(dir: std.Io.Dir, executable: []const u8, args: []const []const u8) !std.process.RunResult {
+    const allocator = std.testing.allocator;
+    const path = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, executable, allocator);
+    defer allocator.free(path);
+    const argv = try std.mem.concat(allocator, []const u8, &.{ &.{path}, args });
+    defer allocator.free(argv);
+    return std.process.run(allocator, std.testing.io, .{ .argv = argv, .cwd = .{ .dir = dir } });
+}
+
+test "[cli] - [mzml-rewrite]: preserves XML on array group references" {
     var dir = std.testing.tmpDir(.{});
     defer dir.cleanup();
     try dir.dir.writeFile(std.testing.io, .{ .sub_path = "input.mzML", .data = support.EXTENSIONS });
-    const rewritten = try run(dir.dir, options.rewrite, &.{ "input.mzML", "zlib.mzML", "--zlib" }, 0);
+    const rewritten = try run(dir.dir, options.rewrite, &.{ "input.mzML", "zlib.mzML", "--zlib" });
     defer std.testing.allocator.free(rewritten);
     const file = try dir.dir.openFile(std.testing.io, "zlib.mzML", .{});
     defer file.close(std.testing.io);
@@ -40,14 +79,14 @@ test "[cli] - [mzML reencoding]: preserves XML on array group references" {
     try std.testing.expectEqualSlices(f64, &.{ 3, 4 }, decoded.get(1).?.values.float64);
 }
 
-test "[integration] - [mzML 1.0 examples]: selects and reencodes through the ordinary API" {
+test "[cli] - [mzML 1.0 examples]: selects and reencodes through the ordinary API" {
     var dir = std.testing.tmpDir(.{});
     defer dir.cleanup();
     try dir.dir.writeFile(std.testing.io, .{ .sub_path = "input.mzML", .data = support.HISTORICAL });
-    const selected = try run(dir.dir, options.select, &.{ "input.mzML", "MS:1000515", "--ms1" }, 0);
+    const selected = try run(dir.dir, options.select, &.{ "input.mzML", "MS:1000515", "--ms1" });
     defer std.testing.allocator.free(selected);
     try std.testing.expectEqualStrings("S19 MS:1000515 type=f64 count=2 first=3\n", selected);
-    const rewritten = try run(dir.dir, options.rewrite, &.{ "input.mzML", "zlib.mzML", "--zlib" }, 0);
+    const rewritten = try run(dir.dir, options.rewrite, &.{ "input.mzML", "zlib.mzML", "--zlib" });
     defer std.testing.allocator.free(rewritten);
     const file = try dir.dir.openFile(std.testing.io, "zlib.mzML", .{});
     defer file.close(std.testing.io);
@@ -68,48 +107,32 @@ test "[integration] - [mzML 1.0 examples]: selects and reencodes through the ord
     try std.testing.expectEqual(@as(usize, 2), second.value.node.child(.spectrum_description).?.child(.acquisition_list).?.children.len);
 }
 
-fn run(dir: std.Io.Dir, executable: []const u8, args: []const []const u8, exit_code: u8) ![]u8 {
-    const allocator = std.testing.allocator;
-    const path = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, executable, allocator);
-    defer allocator.free(path);
-    const argv = try std.mem.concat(allocator, []const u8, &.{ &.{path}, args });
-    defer allocator.free(argv);
-    const result = try std.process.run(allocator, std.testing.io, .{ .argv = argv, .cwd = .{ .dir = dir } });
-    defer allocator.free(result.stderr);
-    errdefer allocator.free(result.stdout);
-    if (!std.meta.eql(std.process.Child.Term{ .exited = exit_code }, result.term))
-        std.debug.print("{s}: {s}\n", .{ executable, result.stderr });
-    try std.testing.expectEqual(std.process.Child.Term{ .exited = exit_code }, result.term);
-    if (exit_code == 0) try std.testing.expectEqualStrings("", result.stderr);
-    return result.stdout;
-}
-
-test "[integration] - [mzML examples]: streams all codecs and retains group-based metadata after EOF" {
+test "[cli] - [mzML examples]: streams all codecs and retains group-based metadata after EOF" {
     var dir = std.testing.tmpDir(.{});
     defer dir.cleanup();
     const source = try std.mem.replaceOwned(u8, std.testing.allocator, @embedFile("data/writer_plain.mzML"), "<spectrumList count=\"8\"", "<spectrumList count=\"1\"");
     defer std.testing.allocator.free(source);
     try dir.dir.writeFile(std.testing.io, .{ .sub_path = "input.mzML", .data = source });
-    const decoded = try run(dir.dir, options.stream, &.{"input.mzML"}, 0);
+    const decoded = try run(dir.dir, options.stream, &.{"input.mzML"});
     defer std.testing.allocator.free(decoded);
     try std.testing.expect(std.mem.indexOf(u8, decoded, "spectra: declared=1 observed=8\n") != null);
     try std.testing.expect(std.mem.endsWith(u8, decoded, "retained: scan=none ms_level=1\nrecords=16 values=96\n"));
-    const metadata = try run(dir.dir, options.stream, &.{ "input.mzML", "--metadata" }, 0);
+    const metadata = try run(dir.dir, options.stream, &.{ "input.mzML", "--metadata" });
     defer std.testing.allocator.free(metadata);
     try std.testing.expect(std.mem.indexOf(u8, metadata, "  array=") == null);
     try std.testing.expect(std.mem.endsWith(u8, metadata, "records=16 values=0\n"));
-    const selected = try run(dir.dir, options.select, &.{ "input.mzML", "MS:1000514" }, 0);
+    const selected = try run(dir.dir, options.select, &.{ "input.mzML", "MS:1000514" });
     defer std.testing.allocator.free(selected);
     try std.testing.expectEqual(@as(usize, 8), std.mem.count(u8, selected, "type=f64 count=3"));
     try std.testing.expect(std.mem.indexOf(u8, selected, "chromatogram=") == null);
     for ([_][]const u8{ "--stream", "--ms1" }) |mode| {
-        const streamed = try run(dir.dir, options.select, &.{ "input.mzML", "MS:1000514", mode }, 0);
+        const streamed = try run(dir.dir, options.select, &.{ "input.mzML", "MS:1000514", mode });
         defer std.testing.allocator.free(streamed);
         try std.testing.expectEqualStrings(selected, streamed);
     }
 }
 
-test "[integration] - [mzML examples]: selected decoding leaves unrequested codecs uninterpreted" {
+test "[cli] - [mzML examples]: selected decoding leaves unrequested codecs uninterpreted" {
     var dir = std.testing.tmpDir(.{});
     defer dir.cleanup();
     const source = support.HEADER ++ "<spectrumList count='1' defaultDataProcessingRef='dp'>" ++
@@ -120,15 +143,14 @@ test "[integration] - [mzML examples]: selected decoding leaves unrequested code
         "<cvParam cvRef='MS' accession='MS:1003089' name='zstd compression'/><binary>AAAA</binary></binaryDataArray>" ++
         "</binaryDataArrayList></spectrum></spectrumList></run></mzML>";
     try dir.dir.writeFile(std.testing.io, .{ .sub_path = "input.mzML", .data = source });
-    const selected = try run(dir.dir, options.select, &.{ "input.mzML", "MS:1000514" }, 0);
+    const selected = try run(dir.dir, options.select, &.{ "input.mzML", "MS:1000514" });
     defer std.testing.allocator.free(selected);
     try std.testing.expectEqualStrings("scan=1 MS:1000514 type=f64 count=1 first=1\n", selected);
-    const failed = try run(dir.dir, options.stream, &.{"input.mzML"}, 1);
-    defer std.testing.allocator.free(failed);
-    const missing = try run(dir.dir, options.select, &.{ "input.mzML", "MS:1000595" }, 0);
+    try runFailing(dir.dir, options.stream, &.{"input.mzML"}, error.UnsupportedEncoding, "input.mzML");
+    const missing = try run(dir.dir, options.select, &.{ "input.mzML", "MS:1000595" });
     defer std.testing.allocator.free(missing);
     try std.testing.expectEqualStrings("", missing);
-    const rewritten = try run(dir.dir, options.rewrite, &.{ "input.mzML", "copy.mzML" }, 0);
+    const rewritten = try run(dir.dir, options.rewrite, &.{ "input.mzML", "copy.mzML" });
     defer std.testing.allocator.free(rewritten);
     const file = try dir.dir.openFile(std.testing.io, "copy.mzML", .{});
     defer file.close(std.testing.io);
@@ -137,18 +159,18 @@ test "[integration] - [mzML examples]: selected decoding leaves unrequested code
     var record = (try index.byId(std.testing.allocator, "scan=1")).?;
     defer record.deinit();
     try std.testing.expectEqualStrings("AAAA", record.value.binaryArrays()[1].child(.binary).?.text.?);
-    const late = try run(dir.dir, options.select, &.{ "input.mzML", "MS:1000514", "--stream" }, 0);
+    const late = try run(dir.dir, options.select, &.{ "input.mzML", "MS:1000514", "--stream" });
     defer std.testing.allocator.free(late);
     try std.testing.expectEqualStrings("", late);
     const leading = try std.mem.replaceOwned(u8, std.testing.allocator, source, "<binary>AAAAAAAA8D8=</binary><cvParam cvRef='MS' accession='MS:1000514' name='m/z array'/>", "<cvParam cvRef='MS' accession='MS:1000514' name='m/z array'/><binary>AAAAAAAA8D8=</binary>");
     defer std.testing.allocator.free(leading);
     try dir.dir.writeFile(std.testing.io, .{ .sub_path = "leading.mzML", .data = leading });
-    const streamed = try run(dir.dir, options.select, &.{ "leading.mzML", "MS:1000514", "--stream" }, 0);
+    const streamed = try run(dir.dir, options.select, &.{ "leading.mzML", "MS:1000514", "--stream" });
     defer std.testing.allocator.free(streamed);
     try std.testing.expectEqualStrings(selected, streamed);
 }
 
-test "[integration] - [mzML examples]: selects integer arrays and empty arrays with explicit types" {
+test "[cli] - [mzML examples]: selects integer arrays and empty arrays with explicit types" {
     var dir = std.testing.tmpDir(.{});
     defer dir.cleanup();
     inline for (.{
@@ -164,27 +186,27 @@ test "[integration] - [mzML examples]: selects integer arrays and empty arrays w
             "<cvParam cvRef='MS' accession='MS:1000576' name='no compression'/><binary>" ++ case[2] ++ "</binary>" ++
             "</binaryDataArray></binaryDataArrayList></spectrum></spectrumList></run></mzML>";
         try dir.dir.writeFile(std.testing.io, .{ .sub_path = "input.mzML", .data = source });
-        const selected = try run(dir.dir, options.select, &.{ "input.mzML", "MS:1000514" }, 0);
+        const selected = try run(dir.dir, options.select, &.{ "input.mzML", "MS:1000514" });
         defer std.testing.allocator.free(selected);
         try std.testing.expectEqualStrings("scan=1 MS:1000514 " ++ case[5], selected);
-        const streamed = try run(dir.dir, options.select, &.{ "input.mzML", "MS:1000514", "--stream" }, 0);
+        const streamed = try run(dir.dir, options.select, &.{ "input.mzML", "MS:1000514", "--stream" });
         defer std.testing.allocator.free(streamed);
         try std.testing.expectEqualStrings(selected, streamed);
-        const rewritten = try run(dir.dir, options.rewrite, &.{ "input.mzML", "zlib.mzML", "--zlib" }, 0);
+        const rewritten = try run(dir.dir, options.rewrite, &.{ "input.mzML", "zlib.mzML", "--zlib" });
         defer std.testing.allocator.free(rewritten);
-        const fetched = try run(dir.dir, options.select, &.{ "zlib.mzML", "MS:1000514", "--stream" }, 0);
+        const fetched = try run(dir.dir, options.select, &.{ "zlib.mzML", "MS:1000514", "--stream" });
         defer std.testing.allocator.free(fetched);
         try std.testing.expectEqualStrings(selected, fetched);
         try dir.dir.deleteFile(std.testing.io, "zlib.mzML");
     }
 }
 
-test "[integration] - [mzML examples]: writes mixed primitive arrays and retrieves them under both index policies" {
+test "[cli] - [mzML examples]: writes mixed primitive arrays and retrieves them under both index policies" {
     var dir = std.testing.tmpDir(.{});
     defer dir.cleanup();
     inline for (.{ false, true }) |indexed| {
         const path = if (indexed) "indexed.mzML" else "plain.mzML";
-        const written = try run(dir.dir, options.write, if (indexed) &.{ path, "--indexed" } else &.{path}, 0);
+        const written = try run(dir.dir, options.write, if (indexed) &.{ path, "--indexed" } else &.{path});
         defer std.testing.allocator.free(written);
         const file = try dir.dir.openFile(std.testing.io, path, .{});
         defer file.close(std.testing.io);
@@ -196,31 +218,29 @@ test "[integration] - [mzML examples]: writes mixed primitive arrays and retriev
         defer record.deinit();
         try std.testing.expectEqualSlices(f64, &.{ 100, 200, 300 }, decoded.get(0).?.values.float64);
         try std.testing.expectEqualSlices(f32, &.{ 10, 20, 30 }, decoded.get(1).?.values.float32);
-        const retrieved = try run(dir.dir, options.indexed, if (indexed) &.{ path, "scan=1" } else &.{ path, "scan=1", "--rebuild" }, 0);
+        const retrieved = try run(dir.dir, options.indexed, if (indexed) &.{ path, "scan=1" } else &.{ path, "scan=1", "--rebuild" });
         defer std.testing.allocator.free(retrieved);
         try std.testing.expectEqualStrings("spectrum scan=1 arrays=2\n  array=0 type=float64 count=3 first=100\n  array=1 type=float32 count=3 first=10\n", retrieved);
-        const selected = try run(dir.dir, options.select, &.{ path, "MS:1000515" }, 0);
+        const selected = try run(dir.dir, options.select, &.{ path, "MS:1000515" });
         defer std.testing.allocator.free(selected);
         try std.testing.expectEqualStrings("scan=1 MS:1000515 type=f32 count=3 first=10\n", selected);
-        const streamed = try run(dir.dir, options.select, &.{ path, "MS:1000515", "--stream" }, 0);
+        const streamed = try run(dir.dir, options.select, &.{ path, "MS:1000515", "--stream" });
         defer std.testing.allocator.free(streamed);
         try std.testing.expectEqualStrings(selected, streamed);
     }
-    const missing = try run(dir.dir, options.indexed, &.{ "indexed.mzML", "missing" }, 0);
+    const missing = try run(dir.dir, options.indexed, &.{ "indexed.mzML", "missing" });
     defer std.testing.allocator.free(missing);
     try std.testing.expectEqualStrings("not found: missing\n", missing);
-    const no_index = try run(dir.dir, options.indexed, &.{ "plain.mzML", "scan=1" }, 1);
-    defer std.testing.allocator.free(no_index);
+    try runFailing(dir.dir, options.indexed, &.{ "plain.mzML", "scan=1" }, error.MissingIndex, "plain.mzML");
     const original = try dir.dir.readFileAlloc(std.testing.io, "plain.mzML", std.testing.allocator, .limited(16 * 1024));
     defer std.testing.allocator.free(original);
-    const failed = try run(dir.dir, options.write, &.{"plain.mzML"}, 1);
-    defer std.testing.allocator.free(failed);
+    try runFailing(dir.dir, options.write, &.{"plain.mzML"}, error.PathAlreadyExists, null);
     const after = try dir.dir.readFileAlloc(std.testing.io, "plain.mzML", std.testing.allocator, .limited(16 * 1024));
     defer std.testing.allocator.free(after);
     try std.testing.expectEqualStrings(original, after);
 }
 
-test "[cli] - [mzML examples]: rewrites list attributes and records without decoding payloads" {
+test "[cli] - [mzml-rewrite]: rewrites list attributes and records without decoding payloads" {
     var dir = std.testing.tmpDir(.{});
     defer dir.cleanup();
     inline for (.{
@@ -237,7 +257,7 @@ test "[cli] - [mzML examples]: rewrites list attributes and records without deco
     }, 0..) |source, i| {
         try dir.dir.writeFile(std.testing.io, .{ .sub_path = "input.mzML", .data = source });
         const path = std.fmt.comptimePrint("copy{d}.mzML", .{i});
-        const rewritten = try run(dir.dir, options.rewrite, &.{ "input.mzML", path }, 0);
+        const rewritten = try run(dir.dir, options.rewrite, &.{ "input.mzML", path });
         defer std.testing.allocator.free(rewritten);
         const bytes = try dir.dir.readFileAlloc(std.testing.io, path, std.testing.allocator, .limited(16 * 1024));
         defer std.testing.allocator.free(bytes);
@@ -263,13 +283,13 @@ test "[cli] - [mzML examples]: rewrites list attributes and records without deco
     }
 }
 
-test "[cli] - [mzML examples]: filtering and reencoding retain surrounding XML" {
+test "[cli] - [mzml-rewrite]: filtering and reencoding retain surrounding XML" {
     var dir = std.testing.tmpDir(.{});
     defer dir.cleanup();
     try dir.dir.writeFile(std.testing.io, .{ .sub_path = "input.mzML", .data = support.STREAM_EXTENSIONS });
     inline for (.{ "--ms1", "--zlib" }, 0..) |mode, i| {
         const path = std.fmt.comptimePrint("mode{d}.mzML", .{i});
-        const result = try run(dir.dir, options.rewrite, &.{ "input.mzML", path, mode }, 0);
+        const result = try run(dir.dir, options.rewrite, &.{ "input.mzML", path, mode });
         defer std.testing.allocator.free(result);
         const bytes = try dir.dir.readFileAlloc(std.testing.io, path, std.testing.allocator, .limited(16 * 1024));
         defer std.testing.allocator.free(bytes);
@@ -298,7 +318,7 @@ test "[cli] - [mzML examples]: filtering and reencoding retain surrounding XML" 
     }
 }
 
-test "[cli] - [mzML metadata editing]: replaces and removes ordered record parameters without changing other XML" {
+test "[cli] - [mzml-rewrite]: replaces and removes ordered record parameters without changing other XML" {
     var dir = std.testing.tmpDir(.{});
     defer dir.cleanup();
     const source = @embedFile("data/ordered_metadata.mzML");
@@ -332,7 +352,7 @@ test "[cli] - [mzML metadata editing]: replaces and removes ordered record param
         }
         const args = try std.mem.concat(std.testing.allocator, []const u8, &.{ &.{ "input.mzML", "edited.mzML" }, case.args });
         defer std.testing.allocator.free(args);
-        const stdout = try run(dir.dir, options.rewrite, args, 0);
+        const stdout = try run(dir.dir, options.rewrite, args);
         defer std.testing.allocator.free(stdout);
         try std.testing.expectEqualStrings("", stdout);
         const bytes = try dir.dir.readFileAlloc(std.testing.io, "edited.mzML", std.testing.allocator, .limited(16 * 1024));
@@ -360,38 +380,40 @@ test "[cli] - [mzML metadata editing]: replaces and removes ordered record param
     }
 }
 
-test "[cli] - [mzML examples]: failed rewrites remove partial output and never overwrite input" {
+test "[cli] - [mzml-rewrite]: failed rewrites remove partial output and never overwrite input" {
     var dir = std.testing.tmpDir(.{});
     defer dir.cleanup();
     const source = support.HEADER ++ "<spectrumList count='1' defaultDataProcessingRef='dp'/></run></mzML>";
     try dir.dir.writeFile(std.testing.io, .{ .sub_path = "input.mzML", .data = source });
+    // The source declares one spectrum and holds none, so every valid rewrite fails at the list end.
     for ([_][]const []const u8{
         &.{ "input.mzML", "failed.mzML" },
         &.{ "input.mzML", "failed.mzML", "--replace-user-param", "note", "value" },
         &.{ "input.mzML", "failed.mzML", "--remove-user-param", "note" },
+    }) |args| {
+        try runFailing(dir.dir, options.rewrite, args, error.CountMismatch, "failed.mzML");
+        try std.testing.expectError(error.FileNotFound, dir.dir.openFile(std.testing.io, "failed.mzML", .{}));
+    }
+    for ([_][]const []const u8{
         &.{ "input.mzML", "failed.mzML", "--replace-user-param", "note" },
         &.{ "input.mzML", "failed.mzML", "--remove-user-param" },
         &.{ "input.mzML", "failed.mzML", "--remove-user-param", "note", "extra" },
     }) |args| {
-        const failed = try run(dir.dir, options.rewrite, args, 1);
-        defer std.testing.allocator.free(failed);
-        try std.testing.expectEqualStrings("", failed);
+        try runFailing(dir.dir, options.rewrite, args, error.InvalidArguments, null);
         try std.testing.expectError(error.FileNotFound, dir.dir.openFile(std.testing.io, "failed.mzML", .{}));
     }
-    const same_path = try run(dir.dir, options.rewrite, &.{ "input.mzML", "input.mzML" }, 1);
-    defer std.testing.allocator.free(same_path);
+    try runFailing(dir.dir, options.rewrite, &.{ "input.mzML", "input.mzML" }, error.PathAlreadyExists, null);
     var buffer: [4096]u8 = undefined;
     try std.testing.expectEqualStrings(source, try dir.dir.readFile(std.testing.io, "input.mzML", &buffer));
     try dir.dir.writeFile(std.testing.io, .{ .sub_path = "bad.mzML", .data = support.HEADER ++
         "<spectrumList count='1' defaultDataProcessingRef='dp'><spectrum index='0' id='scan=1' defaultArrayLength='1'>" ++
         "<binaryDataArrayList count='1'><binaryDataArray encodedLength='4'><referenceableParamGroupRef ref='encoding'/>" ++
         "<binary>!!!!</binary></binaryDataArray></binaryDataArrayList></spectrum></spectrumList></run></mzML>" });
-    const bad = try run(dir.dir, options.rewrite, &.{ "bad.mzML", "failed.mzML", "--zlib" }, 1);
-    defer std.testing.allocator.free(bad);
+    try runFailing(dir.dir, options.rewrite, &.{ "bad.mzML", "failed.mzML", "--zlib" }, error.InvalidCharacter, "bad.mzML");
     try std.testing.expectError(error.FileNotFound, dir.dir.openFile(std.testing.io, "failed.mzML", .{}));
 }
 
-test "[cli] - [mzML examples]: reencodes all codecs without changing values or record metadata" {
+test "[cli] - [mzml-rewrite]: reencodes all codecs without changing values or record metadata" {
     var dir = std.testing.tmpDir(.{});
     defer dir.cleanup();
     const repeated = try std.mem.replaceOwned(u8, std.testing.allocator, support.REFERENCED_DOCUMENT, "<referenceableParamGroupRef ref='encoding'/>", "<referenceableParamGroupRef ref='encoding'/><cvParam accession='MS:1000523' name='source label'/>" ++
@@ -405,7 +427,7 @@ test "[cli] - [mzML examples]: reencodes all codecs without changing values or r
             "</spectrumList><chromatogramList count='0' defaultDataProcessingRef=''/></run></mzML>",
     }) |source| {
         try dir.dir.writeFile(std.testing.io, .{ .sub_path = "input.mzML", .data = source });
-        const stdout = try run(dir.dir, options.rewrite, &.{ "input.mzML", "zlib.mzML", "--zlib" }, 0);
+        const stdout = try run(dir.dir, options.rewrite, &.{ "input.mzML", "zlib.mzML", "--zlib" });
         defer std.testing.allocator.free(stdout);
         try std.testing.expectEqualStrings("", stdout);
         const bytes = try dir.dir.readFileAlloc(std.testing.io, "zlib.mzML", std.testing.allocator, .limited(64 * 1024));
@@ -512,7 +534,7 @@ test "[cli] - [mzML examples]: reencodes all codecs without changing values or r
     }
 }
 
-test "[cli] - [mzML examples]: filtering assigns missing indexes and retains attributes and references" {
+test "[cli] - [mzml-rewrite]: filtering assigns missing indexes and retains attributes and references" {
     var dir = std.testing.tmpDir(.{});
     defer dir.cleanup();
     const indexed_source = support.HEADER ++ "<spectrumList count='3' sourceNote='A&amp;B'>" ++
@@ -527,11 +549,9 @@ test "[cli] - [mzML examples]: filtering assigns missing indexes and retains att
     const source = try std.mem.replaceOwned(u8, std.testing.allocator, indexed_source, " index='2'", "");
     defer std.testing.allocator.free(source);
     try dir.dir.writeFile(std.testing.io, .{ .sub_path = "input.mzML", .data = source });
-    const failed_copy = try run(dir.dir, options.rewrite, &.{ "input.mzML", "copy.mzML" }, 1);
-    defer std.testing.allocator.free(failed_copy);
-    try std.testing.expectEqualStrings("", failed_copy);
+    try runFailing(dir.dir, options.rewrite, &.{ "input.mzML", "copy.mzML" }, error.MissingAttribute, "copy.mzML");
     try std.testing.expectError(error.FileNotFound, dir.dir.openFile(std.testing.io, "copy.mzML", .{}));
-    const stdout = try run(dir.dir, options.rewrite, &.{ "input.mzML", "ms1.mzML", "--ms1" }, 0);
+    const stdout = try run(dir.dir, options.rewrite, &.{ "input.mzML", "ms1.mzML", "--ms1" });
     defer std.testing.allocator.free(stdout);
     try std.testing.expectEqualStrings("", stdout);
     const bytes = try dir.dir.readFileAlloc(std.testing.io, "ms1.mzML", std.testing.allocator, .limited(16 * 1024));

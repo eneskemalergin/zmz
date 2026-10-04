@@ -6,14 +6,9 @@
 const std = @import("std");
 const cv = @import("source.zig");
 const Vocabulary = @import("vocabulary.zig");
-const Resolver = @This();
+const generated_data = @import("generated_data.zig");
 
-resources: []const Vocabulary,
-declarations: []const cv.Declaration,
-bindings: []const Binding = &.{},
-known_versions: []const KnownVersion = &.{},
-/// Bounds declaration, resource, binding, and version comparisons per operation.
-max_work: usize = 100_000,
+const Resolver = @This();
 
 /// Explicit association for a local declaration ID, including stale or custom declarations.
 pub const Binding = struct { declaration_id: []const u8, resource_key: []const u8 };
@@ -84,9 +79,17 @@ pub fn Quantity(comptime T: type) type {
 pub const Error = error{ LimitExceeded, DuplicateDeclaration, InvalidBinding, AmbiguousResource, ConflictingVersion };
 
 /// The bundled current vocabulary snapshots. Historical snapshots are not bundled.
-pub const BUNDLED: []const Vocabulary = @import("generated_data.zig").RESOURCES;
+pub const BUNDLED: []const Vocabulary = generated_data.RESOURCES;
 
-/// Resolves against BUNDLED; `declarations` must outlive every resolution.
+resources: []const Vocabulary,
+declarations: []const cv.Declaration,
+bindings: []const Binding = &.{},
+known_versions: []const KnownVersion = &.{},
+/// Bounds declaration, resource, binding, and version comparisons per operation.
+max_work: usize = 100_000,
+
+/// Resolves against `BUNDLED` and treats a psi-ms 4.1.248 declaration as `historical`; setting
+/// `known_versions` replaces that entry. Every resolution borrows `declarations`.
 pub fn init(declarations: []const cv.Declaration) Resolver {
     return .{
         .resources = BUNDLED,
@@ -100,7 +103,10 @@ pub fn init(declarations: []const cv.Declaration) Resolver {
 pub fn resolve(self: Resolver, parameter: cv.Param) Error!Parameter {
     var remaining = self.max_work;
     const term = try self.find(parameter.cv_ref, parameter.accession, parameter.name, &remaining);
-    const unit = if (parameter.unit.isAbsent()) Resolution{} else try self.find(parameter.unit.cv_ref, parameter.unit.accession, parameter.unit.name, &remaining);
+    const unit = if (parameter.unit.isAbsent())
+        Resolution{}
+    else
+        try self.find(parameter.unit.cv_ref, parameter.unit.accession, parameter.unit.name, &remaining);
     var result: Parameter = .{
         .source = parameter,
         .term = term,

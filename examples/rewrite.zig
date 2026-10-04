@@ -112,6 +112,7 @@ const ParameterEditor = struct {
     fn deinit(self: *ParameterEditor, allocator: std.mem.Allocator) void {
         self.params.deinit(allocator);
         self.items.deinit(allocator);
+        self.* = undefined;
     }
 
     fn apply(self: *ParameterEditor, allocator: std.mem.Allocator, source: mzml.model.Node) !mzml.model.Node {
@@ -169,6 +170,7 @@ const Reencoder = struct {
         self.payloads.deinit(self.allocator);
         self.encoder.deinit();
         self.builder.deinit();
+        self.* = undefined;
     }
 
     fn write(self: *Reencoder, writer: *mzml.Writer, source: mzml.model.Node, decoded: *const mzml.DecodedArrays) !void {

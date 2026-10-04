@@ -1,15 +1,15 @@
 //! Exposes the XML events every zmz reader is built on, for callers that need exact source
 //! positions or their own interpretation of the document.
 //!
-//! `Events` reads start, end, and text events from a forward byte stream it borrows until
-//! `deinit`; copy neither the input nor the reader. It checks XML well-formedness (names,
-//! quoting, nesting, entities and references, characters, namespace bindings, the declaration)
-//! and nothing about mzML: any root element, any structure. Input in UTF-8, UTF-16, or declared
-//! ISO-8859-1 is returned as UTF-8; spans count source bytes. Comments, processing
-//! instructions, and the XML declaration produce no events. Each event's slices last until the
-//! next call. The first failure sets `diagnostic()` and later calls return `FailedState`; a
-//! call made while another runs, as from the input reader or the allocator, returns
-//! `InvalidState` and leaves it unharmed.
+//! `Events` reads start, end, and text events from a forward byte stream it borrows until `deinit`.
+//! Neither may be copied or moved: the reader keeps a pointer to the input, and a copied reader
+//! would free its storage twice. It checks XML well-formedness (names, quoting, nesting, entities
+//! and references, characters, namespace bindings, the declaration) and nothing about mzML: any
+//! root element, any structure. Input in UTF-8, UTF-16, or declared ISO-8859-1 is returned as
+//! UTF-8; spans count source bytes. Comments, processing instructions, and the XML declaration
+//! produce no events. Each event's slices last until the next call. The first failure sets
+//! `diagnostic()` and later calls return `FailedState`; a call made while another runs, as from the
+//! input reader or the allocator, returns `InvalidState` and leaves it unharmed.
 //!
 //! An `Event` is an element's start or end, or a run of its text. Start spans run from `<`
 //! through `>` (an empty element also yields an end event with an empty span just after its
@@ -81,7 +81,7 @@ pub fn next(self: *Events) Error!?Event {
     };
 }
 
-/// The modeled kind of an element in either mzML namespace (1.1 or 1.0), from the table the
+/// Returns the modeled kind of an element in either mzML namespace (1.1 or 1.0), from the table the
 /// readers use; null for other namespaces and for elements zmz does not model.
 pub fn kindOf(name: Name) ?model.Kind {
     const uri = name.expanded.namespace_uri orelse return null;

@@ -1,81 +1,8 @@
-//! Defines the zmz package module, compiled examples, and test steps.
+//! Defines the zmz module and its `-Dkernel_backend` option (`dispatch` also builds a separate
+//! x86-64-v3 zlib decoder object), the example programs, the `check-mzml` and `vocabulary` tool
+//! steps, and the test steps.
 
 const std = @import("std");
-
-const KernelBackend = enum { dispatch, portable };
-/// How the x86-64-v3 zlib decoder reaches a build: the target already has the features (the
-/// module's own decoder is that fast), a separate object chosen at run time, or not at all.
-const FastZlib = enum { direct, object, absent };
-const V3_FEATURES = [_]std.Target.x86.Feature{ .avx, .avx2, .bmi, .bmi2, .f16c, .fma, .lzcnt, .movbe };
-const LibraryTest = struct {
-    root_source_file: []const u8,
-    add_gates_support: bool = false,
-};
-const library_test_specs = [_]LibraryTest{
-    .{ .root_source_file = "tests/binary/test_numpress.zig" },
-    .{ .root_source_file = "tests/binary/test_codecs.zig" },
-    .{ .root_source_file = "tests/cv/test_cv.zig" },
-    .{ .root_source_file = "tests/mzml/test_metadata.zig" },
-    .{ .root_source_file = "tests/mzml/test_construction.zig" },
-    .{ .root_source_file = "tests/mzml/test_indexing.zig" },
-    .{ .root_source_file = "tests/mzml/test_ownership.zig" },
-    .{ .root_source_file = "tests/mzml/test_writing.zig" },
-    .{ .root_source_file = "tests/mzml/test_reader.zig", .add_gates_support = true },
-    .{ .root_source_file = "tests/mzml/test_events.zig" },
-};
-
-const Kernels = struct {
-    options: *std.Build.Step.Options,
-    zipir: *std.Build.Module,
-    fast_zlib: ?*std.Build.Step.Compile,
-};
-
-fn configureLibraryModule(module: *std.Build.Module, library_kernels: Kernels) void {
-    module.addImport("zipir", library_kernels.zipir);
-    module.addOptions("kernel_options", library_kernels.options);
-    if (library_kernels.fast_zlib) |object| module.addObject(object);
-}
-
-/// One option for every CPU-specific path: Base64's AVX2, SHA-1's SHA extensions, zipir's
-/// checksum kernels, and the x86-64-v3 zlib decoder, each chosen at run time under `dispatch`.
-fn buildKernels(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, backend: KernelBackend) Kernels {
-    const zipir = b.dependency("zipir", .{ .target = target, .optimize = optimize, .@"kernel-backend" = backend }).module("zipir");
-    const fast_zlib: FastZlib = if (backend == .portable or target.result.cpu.arch != .x86_64)
-        .absent
-    else if (std.Target.x86.featureSetHasAll(target.result.cpu.features, V3_FEATURES))
-        .direct
-    else
-        .object;
-    const options = b.addOptions();
-    options.addOption(bool, "dispatch", backend == .dispatch);
-    options.addOption(FastZlib, "zlib_fast", fast_zlib);
-    options.addOption(bool, "as_object", false);
-    var object: ?*std.Build.Step.Compile = null;
-    if (fast_zlib == .object) {
-        var query = target.query;
-        query.cpu_model = .{ .explicit = &std.Target.x86.cpu.x86_64_v3 };
-        // PCLMUL (on every x86-64-v3 CPU) keeps zipir's CRC-32 kernel inside this instance, so
-        // its exported symbols are not linked twice.
-        query.cpu_features_add = std.Target.x86.featureSet(&.{.pclmul});
-        query.cpu_features_sub = .empty;
-        const v3_target = b.resolveTargetQuery(query);
-        // zlib.zig again, built for x86-64-v3, exporting its fast decoder (see zlib.zig).
-        const object_options = b.addOptions();
-        object_options.addOption(bool, "dispatch", true);
-        object_options.addOption(FastZlib, "zlib_fast", .absent);
-        object_options.addOption(bool, "as_object", true);
-        const module = b.createModule(.{
-            .root_source_file = b.path("src/binary/zlib.zig"),
-            .target = v3_target,
-            .optimize = optimize,
-            .single_threaded = true,
-        });
-        module.addImport("zipir", b.dependency("zipir", .{ .target = v3_target, .optimize = optimize, .@"kernel-backend" = backend }).module("zipir"));
-        module.addOptions("kernel_options", object_options);
-        object = b.addObject(.{ .name = "zmz_zlib_fast", .root_module = module, .use_llvm = true });
-    }
-    return .{ .options = options, .zipir = zipir, .fast_zlib = object };
-}
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{ .default_target = .{ .cpu_model = .baseline } });
@@ -93,22 +20,17 @@ pub fn build(b: *std.Build) void {
     });
     configureLibraryModule(zmz, library_kernels);
 
-    const test_step = b.step("test", "Run library tests");
-    const gates_test_support = b.createModule(.{
-        .root_source_file = b.path("tests/data/gates/support.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    for (library_test_specs) |test_spec| {
+    const test_step = b.step("test", "Run the library, example, and tool tests");
+    const empty_run = b.path("tests/data/gates/empty_run.mzML");
+    for (LIBRARY_TESTS) |root_source_file| {
         const test_module = b.createModule(.{
-            .root_source_file = b.path(test_spec.root_source_file),
+            .root_source_file = b.path(root_source_file),
             .target = target,
             .optimize = optimize,
             .strip = strip,
         });
         test_module.addImport("zmz", zmz);
-        if (test_spec.add_gates_support)
-            test_module.addImport("gates_test_support", gates_test_support);
+        test_module.addAnonymousImport("empty_run", .{ .root_source_file = empty_run });
         const library_test_artifact = b.addTest(.{ .root_module = test_module });
         test_step.dependOn(&b.addRunArtifact(library_test_artifact).step);
     }
@@ -181,7 +103,7 @@ pub fn build(b: *std.Build) void {
     const vocabulary = b.addExecutable(.{ .name = "vocabulary", .root_module = vocabulary_module });
     const vocabulary_run = b.addRunArtifact(vocabulary);
     if (b.args) |args| vocabulary_run.addArgs(args);
-    b.step("vocabulary", "Generate or review explicit local vocabulary resources offline").dependOn(&vocabulary_run.step);
+    b.step("vocabulary", "Inspect, review, or generate vocabulary resources, or scan explicit mzML files, offline").dependOn(&vocabulary_run.step);
     const vocabulary_tests = b.addTest(.{ .root_module = vocabulary_module });
     test_step.dependOn(&b.addRunArtifact(vocabulary_tests).step);
 
@@ -194,7 +116,78 @@ pub fn build(b: *std.Build) void {
         .strip = strip,
         .imports = &.{.{ .name = "vocabulary_test_options", .module = vocabulary_test_options.createModule() }},
     });
-    vocabulary_cli_test_module.addImport("gates_test_support", gates_test_support);
+    vocabulary_cli_test_module.addAnonymousImport("empty_run", .{ .root_source_file = empty_run });
     const vocabulary_cli_tests = b.addTest(.{ .root_module = vocabulary_cli_test_module });
     test_step.dependOn(&b.addRunArtifact(vocabulary_cli_tests).step);
+}
+
+const KernelBackend = enum { dispatch, portable };
+// How the x86-64-v3 zlib decoder reaches a build: the target already has the features (the
+// module's own decoder is that fast), a separate object chosen at run time, or not at all.
+const FastZlib = enum { direct, object, absent };
+const V3_FEATURES = [_]std.Target.x86.Feature{ .avx, .avx2, .bmi, .bmi2, .f16c, .fma, .lzcnt, .movbe };
+const LIBRARY_TESTS = [_][]const u8{
+    "tests/binary/test_numpress.zig",
+    "tests/binary/test_codecs.zig",
+    "tests/cv/test_cv.zig",
+    "tests/mzml/test_metadata.zig",
+    "tests/mzml/test_construction.zig",
+    "tests/mzml/test_indexing.zig",
+    "tests/mzml/test_ownership.zig",
+    "tests/mzml/test_writing.zig",
+    "tests/mzml/test_reader.zig",
+    "tests/mzml/test_events.zig",
+};
+
+const Kernels = struct {
+    options: *std.Build.Step.Options,
+    zipir: *std.Build.Module,
+    fast_zlib: ?*std.Build.Step.Compile,
+};
+
+fn configureLibraryModule(module: *std.Build.Module, library_kernels: Kernels) void {
+    module.addImport("zipir", library_kernels.zipir);
+    module.addOptions("kernel_options", library_kernels.options);
+    if (library_kernels.fast_zlib) |object| module.addObject(object);
+}
+
+// One option for every CPU-specific path: Base64's AVX2, SHA-1's SHA extensions, zipir's
+// checksum kernels, and the x86-64-v3 zlib decoder, each chosen at run time under dispatch.
+fn buildKernels(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, backend: KernelBackend) Kernels {
+    const zipir = b.dependency("zipir", .{ .target = target, .optimize = optimize, .@"kernel-backend" = backend }).module("zipir");
+    const fast_zlib: FastZlib = if (backend == .portable or target.result.cpu.arch != .x86_64)
+        .absent
+    else if (std.Target.x86.featureSetHasAll(target.result.cpu.features, V3_FEATURES))
+        .direct
+    else
+        .object;
+    const options = b.addOptions();
+    options.addOption(bool, "dispatch", backend == .dispatch);
+    options.addOption(FastZlib, "zlib_fast", fast_zlib);
+    options.addOption(bool, "as_object", false);
+    var object: ?*std.Build.Step.Compile = null;
+    if (fast_zlib == .object) {
+        var query = target.query;
+        query.cpu_model = .{ .explicit = &std.Target.x86.cpu.x86_64_v3 };
+        // PCLMUL (on every x86-64-v3 CPU) keeps zipir's CRC-32 kernel inside this instance, so
+        // its exported symbols are not linked twice.
+        query.cpu_features_add = std.Target.x86.featureSet(&.{.pclmul});
+        query.cpu_features_sub = .empty;
+        const v3_target = b.resolveTargetQuery(query);
+        // zlib.zig again, built for x86-64-v3, exporting its fast decoder (see zlib.zig).
+        const object_options = b.addOptions();
+        object_options.addOption(bool, "dispatch", true);
+        object_options.addOption(FastZlib, "zlib_fast", .absent);
+        object_options.addOption(bool, "as_object", true);
+        const module = b.createModule(.{
+            .root_source_file = b.path("src/binary/zlib.zig"),
+            .target = v3_target,
+            .optimize = optimize,
+            .single_threaded = true,
+        });
+        module.addImport("zipir", b.dependency("zipir", .{ .target = v3_target, .optimize = optimize, .@"kernel-backend" = backend }).module("zipir"));
+        module.addOptions("kernel_options", object_options);
+        object = b.addObject(.{ .name = "zmz_zlib_fast", .root_module = module, .use_llvm = true });
+    }
+    return .{ .options = options, .zipir = zipir, .fast_zlib = object };
 }

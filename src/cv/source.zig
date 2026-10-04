@@ -1,20 +1,12 @@
 //! Defines source vocabulary identities, ordered parameters, and lexical values. Every slice
 //! borrows from its owner, and text keeps its source spelling.
+//!
+//! `XML_WHITESPACE`, `sameId`, and `idKey` are internal: the readers, the builder, and the resolver
+//! match group and declaration IDs with them.
 
 const std = @import("std");
 
-/// XML whitespace: space, tab, carriage return, and line feed.
 pub const XML_WHITESPACE = " \t\r\n";
-
-/// Compares ID or IDREF values after collapsing surrounding XML whitespace.
-pub fn sameId(a: []const u8, b: []const u8) bool {
-    return std.mem.eql(u8, idKey(a), idKey(b));
-}
-
-/// An ID or IDREF value with surrounding XML whitespace removed, as `sameId` compares it.
-pub fn idKey(id: []const u8) []const u8 {
-    return std.mem.trim(u8, id, XML_WHITESPACE);
-}
 
 /// Attribute text after XML normalization. Names may include a source prefix;
 /// namespace_uri identifies its namespace. Declarations use the XMLNS URI.
@@ -27,9 +19,10 @@ pub const Attribute = struct {
 /// Extra attributes, namespace declarations, and ordered parameter content.
 /// Text is normalized UTF-8; XML parts include their namespace bindings.
 pub const ParameterXml = struct {
+    pub const Part = union(enum) { text: []const u8, xml: []const u8 };
+
     attributes: []const Attribute,
     content: []const Part = &.{},
-    pub const Part = union(enum) { text: []const u8, xml: []const u8 };
 };
 
 /// An accession in its exact source spelling.
@@ -43,7 +36,6 @@ pub const Accession = struct {
         return .{ .prefix = self.raw[0..colon], .local = self.raw[colon + 1 ..] };
     }
 
-    /// Compares exact case-sensitive accession bytes.
     pub fn eql(self: Accession, other: Accession) bool {
         return std.mem.eql(u8, self.raw, other.raw);
     }
@@ -58,7 +50,8 @@ pub const Curie = struct {
     pub fn numericLocal(self: Curie, comptime T: type) error{Overflow}!?T {
         if (@typeInfo(T) != .int or @typeInfo(T).int.signedness != .unsigned)
             @compileError("numericLocal requires an unsigned integer type");
-        if (!allDigits(self.local)) return null;
+        if (self.local.len == 0) return null;
+        for (self.local) |byte| if (!std.ascii.isDigit(byte)) return null;
         return std.fmt.parseInt(T, self.local, 10) catch return error.Overflow;
     }
 };
@@ -77,7 +70,6 @@ pub const Unit = struct {
     accession: ?Accession = null,
     name: ?[]const u8 = null,
 
-    /// Reports whether no unit attributes were supplied.
     pub fn isAbsent(self: Unit) bool {
         return self.cv_ref == null and self.accession == null and self.name == null;
     }
@@ -204,6 +196,19 @@ pub const EffectiveIterator = struct {
 /// The matches for one accession: none, one, or repeated.
 pub const Match = union(enum) { missing, one: Param, repeated };
 
+/// Lexical failures: a missing, empty, invalid, or out-of-range value.
+pub const ValueError = error{ MissingValue, EmptyValue, InvalidValue, Overflow };
+
+// IDs and IDREFs compare after collapsing surrounding XML whitespace.
+pub fn sameId(a: []const u8, b: []const u8) bool {
+    return std.mem.eql(u8, idKey(a), idKey(b));
+}
+
+// The key sameId compares.
+pub fn idKey(id: []const u8) []const u8 {
+    return std.mem.trim(u8, id, XML_WHITESPACE);
+}
+
 /// Searches an effective sequence by exact accession bytes with bounded expansion.
 pub fn findOne(entries: []const Entry, groups: []const Group, accession: Accession) ExpansionError!Match {
     var iterator: EffectiveIterator = .{ .entries = entries, .groups = groups };
@@ -217,9 +222,6 @@ pub fn findOne(entries: []const Entry, groups: []const Group, accession: Accessi
     return result;
 }
 
-/// Lexical failures: a missing, empty, invalid, or out-of-range value.
-pub const ValueError = error{ MissingValue, EmptyValue, InvalidValue, Overflow };
-
 /// Parses XML Schema boolean spellings after XML whitespace collapse.
 pub fn parseBoolean(value: ?[]const u8) ValueError!bool {
     const bytes = try lexical(value);
@@ -228,18 +230,12 @@ pub fn parseBoolean(value: ?[]const u8) ValueError!bool {
     return error.InvalidValue;
 }
 
-// Whether bytes is a nonempty run of ASCII decimal digits.
-fn allDigits(bytes: []const u8) bool {
-    if (bytes.len == 0) return false;
-    for (bytes) |byte| if (!std.ascii.isDigit(byte)) return false;
-    return true;
-}
-
 /// Parses a decimal integer; out of range is Overflow.
 pub fn parseInteger(comptime T: type, value: ?[]const u8) ValueError!T {
     const bytes = try lexical(value);
     const digits = if (bytes[0] == '+' or bytes[0] == '-') bytes[1..] else bytes;
-    if (!allDigits(digits)) return error.InvalidValue;
+    if (digits.len == 0) return error.InvalidValue;
+    for (digits) |byte| if (!std.ascii.isDigit(byte)) return error.InvalidValue;
     return std.fmt.parseInt(T, bytes, 10) catch |failure| switch (failure) {
         error.Overflow => error.Overflow,
         error.InvalidCharacter => error.InvalidValue,

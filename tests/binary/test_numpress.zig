@@ -210,7 +210,7 @@ test "[failure] - [numpress exact decode]: rejects fewer and extra values" {
     );
 }
 
-test "[failure] - [numpress encoders]: reject invalid values, scales, and capacities" {
+test "[failure] - [numpress encoders]: reject invalid values, scales, capacities, and overlapping buffers" {
     var output: [128]u8 = undefined;
     try std.testing.expectError(error.InvalidValue, numpress.encodeLinear(&.{-1}, 1, &output));
     try std.testing.expectError(error.InvalidFixedPoint, numpress.encodeLinear(&.{1}, 0, &output));
@@ -245,6 +245,23 @@ test "[failure] - [numpress encoders]: reject invalid values, scales, and capaci
         try std.testing.expectError(error.OverlappingBuffers, numpress.encodeSlof(&shared, 1, shared_bytes[0..len]));
         try std.testing.expectEqualSlices(f64, &.{ 1, 2, 3, 4 }, &shared);
     }
+    // Values inside the writer's buffer are refused the same way.
+    var buffer: [64]f64 = undefined;
+    @memset(&buffer, 1);
+    var writer = std.Io.Writer.fixed(std.mem.sliceAsBytes(&buffer));
+    const values = buffer[32..40];
+    try std.testing.expectError(error.OverlappingBuffers, numpress.encodePicTo(values, &writer));
+    try std.testing.expectError(error.OverlappingBuffers, numpress.encodeLinearTo(values, 1, &writer));
+    try std.testing.expectError(error.OverlappingBuffers, numpress.encodeSlofTo(values, 1, &writer));
+    try std.testing.expectEqual(@as(usize, 0), writer.end);
+}
+
+fn decodeCount(transform: numpress.Transform, input: []const u8, output: []f64) numpress.DecodeError!usize {
+    return switch (transform) {
+        .linear => numpress.decodeLinear(input, output),
+        .pic => numpress.decodePic(input, output),
+        .slof => numpress.decodeSlof(input, output),
+    };
 }
 
 test "[failure] - [numpress decoders]: reject malformed bytes and short destinations" {
@@ -279,7 +296,7 @@ test "[failure] - [numpress decoders]: reject malformed bytes and short destinat
     var decoded: [4]f64 = undefined;
     const payload = std.mem.sliceAsBytes(&decoded)[0..16];
     for ([_]numpress.Transform{ .linear, .pic, .slof }) |transform| {
-        try std.testing.expectError(error.OverlappingBuffers, numpress.decode(transform, payload, &decoded));
+        try std.testing.expectError(error.OverlappingBuffers, decodeCount(transform, payload, &decoded));
         try std.testing.expectError(error.OverlappingBuffers, numpress.decodeExact(transform, payload, &decoded));
         var decoder = numpress.Decoder.init(transform, &decoded);
         try std.testing.expectError(error.OverlappingBuffers, decoder.update(payload[0..3]));
@@ -674,7 +691,7 @@ fn fillAscending(values: []f64, source: std.Random) void {
 }
 
 fn decodeWhole(transform: numpress.Transform, exact: bool, input: []const u8, output: []f64) numpress.DecodeError!usize {
-    if (!exact) return numpress.decode(transform, input, output);
+    if (!exact) return decodeCount(transform, input, output);
     try numpress.decodeExact(transform, input, output);
     return output.len;
 }

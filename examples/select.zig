@@ -7,20 +7,6 @@
 const std = @import("std");
 const mzml = @import("zmz").mzml;
 
-const Selection = struct {
-    role: mzml.cv.Accession,
-
-    fn array(data: ?*anyopaque, view: mzml.StreamReader.Selection) mzml.model.MetadataError!mzml.StreamReader.Payload {
-        const self: *@This() = @ptrCast(@alignCast(data.?));
-        return if (try view.node.parameter(view.groups, self.role) != null) .retain else .skip;
-    }
-
-    fn ms1(_: ?*anyopaque, view: mzml.StreamReader.Selection) mzml.model.MetadataError!mzml.StreamReader.Payload {
-        if (view.node.kind != .spectrum) return .skip;
-        return if (try view.node.integer(i32, view.groups, mzml.model.Terms.MS_LEVEL) == 1) .retain else .skip;
-    }
-};
-
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     if ((args.len != 3 and args.len != 4) or
@@ -43,9 +29,11 @@ pub fn main(init: std.process.Init) !void {
         } else null,
     });
     defer reader.deinit();
+    errdefer if (reader.diagnostic()) |report| std.debug.print("{s}: {f}\n", .{ args[1], report });
     const header = try reader.readHeader();
     var decoded = mzml.DecodedArrays.init(init.gpa, .{});
     defer decoded.deinit();
+    errdefer if (decoded.diagnostic()) |report| std.debug.print("{s}: {f}\n", .{ args[1], report });
     var output_buffer: [4096]u8 = undefined;
     var output = std.Io.File.stdout().writer(init.io, &output_buffer);
     while (if (streaming) try reader.nextDecodedRecord(&decoded) else try reader.nextRecord()) |record| {
@@ -66,6 +54,20 @@ pub fn main(init: std.process.Init) !void {
     }
     try output.interface.flush();
 }
+
+const Selection = struct {
+    role: mzml.cv.Accession,
+
+    fn array(data: ?*anyopaque, view: mzml.StreamReader.Selection) mzml.model.MetadataError!mzml.StreamReader.Payload {
+        const self: *@This() = @ptrCast(@alignCast(data.?));
+        return if (try view.node.parameter(view.groups, self.role) != null) .retain else .skip;
+    }
+
+    fn ms1(_: ?*anyopaque, view: mzml.StreamReader.Selection) mzml.model.MetadataError!mzml.StreamReader.Payload {
+        if (view.node.kind != .spectrum) return .skip;
+        return if (try view.node.integer(i32, view.groups, mzml.model.Terms.MS_LEVEL) == 1) .retain else .skip;
+    }
+};
 
 fn printNumbers(comptime T: type, numbers: []const T, output: *std.Io.Writer) !void {
     try output.print("type={s} count={d}", .{ @typeName(T), numbers.len });

@@ -1,22 +1,22 @@
 //! Small XML scanner and writer for the XML constructs used by mzML.
+//!
+//! The module is internal. Its event types (`Event` and the types it is built from),
+//! `Cursor.Namespace`, `ReadError`, `Rule`, and `MAX_DEPTH` reach callers through `mzml.Events`,
+//! `Diagnostic`, and `mzml.MAX_DEPTH`; the cursor and the writer serve the readers and the mzML
+//! writer only.
 
 const std = @import("std");
 const base64 = @import("../binary/base64.zig");
 const overlaps = @import("../binary/core.zig").overlaps;
 
-/// Stable mzML namespace used by reader and writer paths.
 pub const NAMESPACE = "http://psi.hupo.org/ms/mzml";
 pub const NAMESPACE_1_0 = "http://psi.hupo.org/schema_revision/mzML_1.0.0";
 pub const XSI = "http://www.w3.org/2001/XMLSchema-instance";
-const XML_NAMESPACE = "http://www.w3.org/XML/1998/namespace";
 pub const XMLNS_NAMESPACE = "http://www.w3.org/2000/xmlns/";
-const TEXT_CHUNK_BYTES = 64 * 1024;
-/// Deepest element nesting the cursor and writer support, counting the root.
+/// Deepest element nesting, counting the root, that readers, writers, copies, and builders accept.
 pub const MAX_DEPTH = 64;
-/// Longest XML declaration the cursor reads.
 pub const MAX_DECLARATION_BYTES = 4096;
 
-/// XML cursor failures, including malformed input and bounded-storage failures.
 pub const ReadError = error{
     InvalidXml,
     InvalidEncoding,
@@ -58,41 +58,14 @@ pub const Rule = enum {
     invalid_character,
 };
 
-/// Cursor construction failures caused by invalid limits or input setup.
 pub const InitError = error{InvalidOptions};
-/// Errors returned by the mzML XML cursor.
 pub const Error = ReadError || std.mem.Allocator.Error || error{
     WrongNamespace,
     UnexpectedEnd,
 };
-/// What a fragment advance can return: it never checks the root's namespace, and after the
-/// document ends it leaves `current` null again instead of failing.
+// What a fragment advance can return: it never checks the root's namespace, and after the
+// document ends it leaves current null again instead of failing.
 pub const AdvanceError = ReadError || std.mem.Allocator.Error;
-const ParserError = AdvanceError || error{EndOfStream};
-
-const Encoding = enum {
-    utf8,
-    latin1,
-    utf16_le,
-    utf16_be,
-};
-
-const Range = struct {
-    start: usize,
-    len: usize,
-};
-
-const NameRange = struct {
-    start: usize,
-    len: usize,
-    prefix_len: usize,
-};
-
-const Codepoint = struct {
-    value: u21,
-    start: u64,
-    end: u64,
-};
 
 /// A parsed QName with its resolved namespace URI.
 pub const ExpandedName = struct {
@@ -164,6 +137,1252 @@ pub const Event = struct {
     data: EventData,
 };
 
+pub const Ancestors = struct {
+    depth: usize,
+    names: usize,
+    namespace_bytes: usize,
+    bindings: usize,
+    encoding: Encoding,
+    mzml_namespace: []const u8,
+    pending_empty: bool,
+};
+
+pub const Cursor = struct {
+    pub const Namespace = struct { prefix: []const u8, uri: []const u8 };
+
+    allocator: std.mem.Allocator,
+    source: Source,
+    max_attributes: usize,
+    max_attribute_bytes: usize,
+    current: ?Event = null,
+    offset: u64 = 0,
+    document_started: bool = false,
+    document_ended: bool = false,
+    root_seen: bool = false,
+    root_closed: bool = false,
+    depth: usize = 0,
+    in_cdata: bool = false,
+    cdata_brackets: u2 = 0,
+    normal_text_brackets: u2 = 0,
+    mzml_namespace: []const u8 = NAMESPACE,
+    frames: [MAX_DEPTH]Frame = undefined,
+    pending_empty: bool = false,
+    event_bytes: std.ArrayList(u8) = .empty,
+    text_bytes: std.ArrayList(u8) = .empty,
+    declaration_bytes: std.ArrayList(u8) = .empty,
+    attribute_ranges: std.ArrayList(AttributeRange) = .empty,
+    namespace_declarations: std.ArrayList(NamespaceDeclaration) = .empty,
+    attributes: std.ArrayList(Attribute) = .empty,
+    open_names: std.ArrayList(u8) = .empty,
+    namespace_bytes: std.ArrayList(u8) = .empty,
+    namespace_bindings: std.ArrayList(NamespaceBinding) = .empty,
+    additional_namespaces: ?bool = null,
+    // Changes whenever the in-scope bindings do, so a reader can reuse what it built for a scope.
+    namespace_scope: u64 = 0,
+    failure: ?Error = null,
+    limit_failure: ?enum { depth, attributes, attribute_bytes, nodes, declaration_bytes } = null,
+    // The rule broken by the input when failure is InvalidXml.
+    xml_rule: ?Rule = null,
+    // Where the input broke a rule or its declared encoding, reported as offset.
+    failure_offset: ?u64 = null,
+    // Source offset of the XML declaration's first byte after the <?xml opener.
+    declaration_start: u64 = 0,
+    // The bytes an over-limit attribute value needed, when known.
+    limit_needed: ?usize = null,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        input: *std.Io.Reader,
+        max_attributes: usize,
+        max_attribute_bytes: usize,
+    ) InitError!Cursor {
+        if (max_attributes == 0 or max_attribute_bytes == 0) {
+            return error.InvalidOptions;
+        }
+        if (input.buffer.len == 0 and input.vtable != std.Io.Reader.ending.vtable) return error.InvalidOptions;
+        return .{
+            .allocator = allocator,
+            .source = Source.init(input),
+            .max_attributes = max_attributes,
+            .max_attribute_bytes = max_attribute_bytes,
+        };
+    }
+
+    pub fn deinit(self: *Cursor) void {
+        self.event_bytes.deinit(self.allocator);
+        self.text_bytes.deinit(self.allocator);
+        self.declaration_bytes.deinit(self.allocator);
+        self.attribute_ranges.deinit(self.allocator);
+        self.namespace_declarations.deinit(self.allocator);
+        self.attributes.deinit(self.allocator);
+        self.open_names.deinit(self.allocator);
+        self.namespace_bytes.deinit(self.allocator);
+        self.namespace_bindings.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    pub fn reset(self: *Cursor, input: *std.Io.Reader) void {
+        self.source.reset(input);
+        self.resetState(false);
+    }
+
+    pub fn resetEmpty(self: *Cursor) void {
+        self.source.resetEmpty();
+        self.resetState(false);
+    }
+
+    pub fn detachFragment(self: *Cursor) void {
+        self.source.resetEmpty();
+        self.resetState(true);
+    }
+
+    pub fn ancestors(self: *const Cursor) Ancestors {
+        return .{
+            .depth = self.depth,
+            .names = self.open_names.items.len,
+            .namespace_bytes = self.namespace_bytes.items.len,
+            .bindings = self.namespace_bindings.items.len,
+            .encoding = self.source.encoding,
+            .mzml_namespace = self.mzml_namespace,
+            .pending_empty = self.pending_empty,
+        };
+    }
+
+    // Restores ancestor storage left intact by a successful fragment read. A failed read or a
+    // different prefix requires parsing those ancestors again.
+    pub fn resetToAncestors(self: *Cursor, input: *std.Io.Reader, saved: Ancestors, prefix_length: usize) void {
+        self.source.reset(input);
+        self.resetState(true);
+        self.source.detected = true;
+        self.source.encoding = saved.encoding;
+        self.source.position = prefix_length;
+        self.offset = prefix_length;
+        self.document_started = true;
+        self.root_seen = true;
+        self.depth = saved.depth;
+        self.open_names.items = self.open_names.allocatedSlice()[0..saved.names];
+        self.namespace_bytes.items = self.namespace_bytes.allocatedSlice()[0..saved.namespace_bytes];
+        self.namespace_bindings.items = self.namespace_bindings.allocatedSlice()[0..saved.bindings];
+        self.mzml_namespace = saved.mzml_namespace;
+        self.pending_empty = saved.pending_empty;
+    }
+
+    pub fn advance(self: *Cursor, text: bool) Error!void {
+        return self.advanceInner(text, true);
+    }
+
+    pub fn advanceFragment(self: *Cursor, text: bool) AdvanceError!void {
+        return self.advanceInner(text, false);
+    }
+
+    pub fn hasAdditionalNamespaces(self: *Cursor) bool {
+        if (self.additional_namespaces) |value| return value;
+        for (self.namespace_bindings.items) |binding| {
+            const prefix = self.namespace_bytes.items[binding.prefix_start..][0..binding.prefix_len];
+            const uri = self.namespace_bytes.items[binding.uri_start..][0..binding.uri_len];
+            if (prefix.len == 0 and std.mem.eql(u8, uri, self.mzml_namespace)) continue;
+            if (std.mem.eql(u8, prefix, "xsi") and std.mem.eql(u8, uri, XSI)) continue;
+            if (std.mem.eql(u8, prefix, "xml") and std.mem.eql(u8, uri, XML_NAMESPACE)) continue;
+            self.additional_namespaces = true;
+            return true;
+        }
+        self.additional_namespaces = false;
+        return false;
+    }
+
+    // Skips shadowed declarations. Views expire on advance.
+    pub fn namespaceAt(self: *const Cursor, position: *usize) ?Namespace {
+        while (position.* < self.namespace_bindings.items.len) {
+            const binding = self.namespace_bindings.items[position.*];
+            position.* += 1;
+            const prefix = self.namespace_bytes.items[binding.prefix_start..][0..binding.prefix_len];
+            const uri = self.namespace_bytes.items[binding.uri_start..][0..binding.uri_len];
+            const active = self.resolveNamespace(if (prefix.len == 0) null else prefix) orelse continue;
+            if (active.ptr != uri.ptr) continue;
+            return .{ .prefix = prefix, .uri = uri };
+        }
+        return null;
+    }
+
+    // Leaves the subtree's end event current. Namespace bindings make the emitted fragment
+    // independent of its former ancestors.
+    pub fn writeElement(
+        self: *Cursor,
+        output: *Writer,
+        remaining_nodes: *usize,
+    ) (AdvanceError || WriterError || error{UnexpectedEnd})!void {
+        if ((self.current orelse return error.InvalidState).data != .start_element) return error.InvalidState;
+        var nesting: usize = 0;
+        while (self.current) |event| {
+            switch (event.data) {
+                .start_element => |start| {
+                    if (remaining_nodes.* == 0) return self.limitError(.nodes);
+                    remaining_nodes.* -= 1;
+                    nesting += 1;
+                    try output.startElement(start.name.raw);
+                    // The fragment's root declares every binding in scope; nested elements then
+                    // inherit them and declare only their own, as the source did.
+                    var position: usize = if (nesting == 1) 0 else self.frames[self.depth - 1].binding_start;
+                    var default_seen = false;
+                    while (self.namespaceAt(&position)) |binding| {
+                        default_seen = default_seen or binding.prefix.len == 0;
+                        if (!optionalSliceEql(output.namespaceUri(binding.prefix), binding.uri))
+                            try output.namespace(if (binding.prefix.len == 0) null else binding.prefix, binding.uri);
+                    }
+                    if (nesting == 1 and !default_seen and !optionalSliceEql(output.namespaceUri(""), "")) try output.namespace(null, "");
+                    for (start.attributes) |attribute| try output.attribute(attribute.name.raw, attribute.value);
+                },
+                .end_element => {
+                    try output.endElement();
+                    nesting -= 1;
+                    if (nesting == 0) return;
+                },
+                .text => |value| try output.text(value.bytes),
+            }
+            try self.advanceFragment(true);
+        }
+        return error.UnexpectedEnd;
+    }
+
+    // Leaves the subtree's end event current.
+    pub fn skipElement(self: *Cursor, remaining_nodes: *usize) (AdvanceError || error{UnexpectedEnd})!void {
+        if ((self.current orelse return error.InvalidState).data != .start_element) return error.InvalidState;
+        var nesting: usize = 0;
+        while (self.current) |event| {
+            switch (event.data) {
+                .start_element => {
+                    if (remaining_nodes.* == 0) return self.limitError(.nodes);
+                    remaining_nodes.* -= 1;
+                    nesting += 1;
+                },
+                .end_element => {
+                    nesting -= 1;
+                    if (nesting == 0) return;
+                },
+                .text => {},
+            }
+            try self.advanceFragment(true);
+        }
+        return error.UnexpectedEnd;
+    }
+
+    fn resetState(self: *Cursor, keep_ancestors: bool) void {
+        self.failure = null;
+        self.limit_failure = null;
+        self.limit_needed = null;
+        self.xml_rule = null;
+        self.failure_offset = null;
+        self.current = null;
+        self.offset = 0;
+        self.document_started = false;
+        self.document_ended = false;
+        self.root_seen = false;
+        self.root_closed = false;
+        self.depth = 0;
+        self.in_cdata = false;
+        self.cdata_brackets = 0;
+        self.normal_text_brackets = 0;
+        self.mzml_namespace = NAMESPACE;
+        self.scopeChanged();
+        self.pending_empty = false;
+        self.event_bytes.clearRetainingCapacity();
+        self.text_bytes.clearRetainingCapacity();
+        self.declaration_bytes.clearRetainingCapacity();
+        self.attribute_ranges.clearRetainingCapacity();
+        self.namespace_declarations.clearRetainingCapacity();
+        self.attributes.clearRetainingCapacity();
+        // Successful fragments leave their ancestor prefixes initialized for reuse.
+        if (!keep_ancestors) {
+            self.open_names.clearRetainingCapacity();
+            self.namespace_bytes.clearRetainingCapacity();
+            self.namespace_bindings.clearRetainingCapacity();
+        }
+    }
+
+    fn advanceInner(
+        self: *Cursor,
+        text: bool,
+        comptime mzml_root: bool,
+    ) (if (mzml_root) Error else AdvanceError)!void {
+        errdefer |err| self.failure = err;
+        self.current = null;
+        const ended_before = self.document_ended;
+        while (true) {
+            const maybe_event = self.nextEvent(!text) catch |err| {
+                self.offset = self.failedAt(err);
+                if (err == error.EndOfStream) self.xml_rule = .unexpected_end;
+                return switch (err) {
+                    error.EndOfStream => error.InvalidXml,
+                    else => |other| other,
+                };
+            };
+            // The document's end leaves no event; advancing again past it is an error only for
+            // the mzML root walk.
+            const event = maybe_event orelse {
+                self.offset = self.source.currentOffset();
+                if (mzml_root and ended_before) return error.UnexpectedEnd;
+                return;
+            };
+            self.offset = event.span.start;
+            switch (event.data) {
+                .start_element => |start| {
+                    if (self.depth == 1 and optionalSliceEql(start.name.expanded.namespace_uri, NAMESPACE_1_0))
+                        self.mzml_namespace = NAMESPACE_1_0;
+                    if (mzml_root and self.depth == 1 and
+                        !optionalSliceEql(start.name.expanded.namespace_uri, self.mzml_namespace)) return error.WrongNamespace;
+                    self.current = event;
+                    return;
+                },
+                .end_element => {
+                    self.current = event;
+                    return;
+                },
+                .text => |value| {
+                    // Text outside the root element must be whitespace and is never returned.
+                    if (text and self.depth != 0) {
+                        self.current = event;
+                        return;
+                    }
+                    for (value.bytes) |byte| if (!isXmlWhitespace(byte)) {
+                        self.xml_rule = .unexpected_text;
+                        return error.InvalidXml;
+                    };
+                },
+            }
+        }
+    }
+
+    fn beginEvent(self: *Cursor) AdvanceError!void {
+        try self.source.commitBorrowed();
+        self.event_bytes.clearRetainingCapacity();
+        self.text_bytes.clearRetainingCapacity();
+        self.declaration_bytes.clearRetainingCapacity();
+        self.attribute_ranges.clearRetainingCapacity();
+        self.namespace_declarations.clearRetainingCapacity();
+        self.attributes.clearRetainingCapacity();
+    }
+
+    fn skipBufferedWhitespace(self: *Cursor) void {
+        if (!self.source.bytesAreCharacters()) return;
+        const reader = self.source.reader orelse return;
+        const bytes = reader.buffered();
+        const bound = @min(bytes.len, TEXT_CHUNK_BYTES);
+        var length: usize = 0;
+        while (length < bound and isXmlWhitespace(bytes[length])) : (length += 1) {}
+        // A complete run preserves the original text event's failure order.
+        if (length == 0 or length == bound or bytes[length] != '<') return;
+        const end = std.math.add(u64, self.source.position, length) catch return;
+        reader.toss(length);
+        self.source.position = end;
+        self.normal_text_brackets = 0;
+    }
+
+    fn nextEvent(self: *Cursor, ignore_whitespace: bool) ParserError!?Event {
+        try self.beginEvent();
+        if (self.document_ended) return null;
+        if (!self.document_started) {
+            try self.prepareDocument();
+            self.document_started = true;
+        }
+
+        if (self.pending_empty) return try self.syntheticEnd();
+
+        while (true) {
+            if (self.in_cdata) {
+                if (try self.readTextEvent()) |event| return event;
+                continue;
+            }
+            if (ignore_whitespace) self.skipBufferedWhitespace();
+            const first = self.source.peekCodepoint() catch |err| switch (err) {
+                error.EndOfStream => {
+                    if (self.root_seen and self.root_closed and self.depth == 0) {
+                        self.document_ended = true;
+                        return null;
+                    }
+                    return self.malformed(.unexpected_end);
+                },
+                else => |other| return other,
+            };
+            if (first.value != '<') {
+                if (try self.readTextEvent()) |event| return event;
+                continue;
+            }
+            self.normal_text_brackets = 0;
+
+            const opening = try self.requiredCodepoint();
+            if (try self.readBufferedStartElement(opening.start)) |event| return event;
+            const marker = try self.requiredCodepoint();
+            switch (marker.value) {
+                '/' => return try self.readEndElement(opening.start),
+                '?' => {
+                    try self.readProcessingInstruction(false);
+                    continue;
+                },
+                '!' => {
+                    const declaration_marker = try self.requiredCodepoint();
+                    if (declaration_marker.value == '-') {
+                        const second_dash = try self.requiredCodepoint();
+                        if (second_dash.value != '-') return self.malformed(.malformed_markup);
+                        try self.readComment();
+                        continue;
+                    }
+                    if (declaration_marker.value == '[') {
+                        try self.readCdataStart(opening.start);
+                        continue;
+                    }
+                    return error.DtdForbidden;
+                },
+                else => {
+                    try self.source.unread(marker);
+                    return try self.readStartElement(opening.start);
+                },
+            }
+        }
+    }
+
+    fn prepareDocument(self: *Cursor) ParserError!void {
+        const first = self.source.peekCodepoint() catch |err| switch (err) {
+            error.EndOfStream => return,
+            else => |other| return other,
+        };
+        if (first.value != '<') return;
+
+        const opening = try self.requiredCodepoint();
+        const marker = self.source.peekCodepoint() catch |err| switch (err) {
+            error.EndOfStream => {
+                try self.source.unread(opening);
+                return;
+            },
+            else => |other| return other,
+        };
+        if (marker.value != '?') {
+            try self.source.unread(opening);
+            return;
+        }
+        _ = try self.requiredCodepoint();
+        try self.readProcessingInstruction(true);
+    }
+
+    // A line feed right after a carriage return belongs to the same line end.
+    fn skipLineFeed(self: *Cursor) AdvanceError!void {
+        const next = self.source.peekCodepoint() catch |err| switch (err) {
+            error.EndOfStream => return,
+            else => |other| return other,
+        };
+        if (next.value == '\n') _ = try self.requiredCodepoint();
+    }
+
+    fn requiredCodepoint(self: *Cursor) AdvanceError!Codepoint {
+        return self.source.readCodepoint() catch |err| switch (err) {
+            error.EndOfStream => self.malformed(.unexpected_end),
+            else => |other| other,
+        };
+    }
+
+    fn appendEventByte(self: *Cursor, value: u8) AdvanceError!void {
+        return self.appendEventSlice(&.{value});
+    }
+
+    fn appendEventSlice(self: *Cursor, value: []const u8) AdvanceError!void {
+        const next_length = std.math.add(usize, self.event_bytes.items.len, value.len) catch return error.LimitExceeded;
+        if (next_length > self.max_attribute_bytes) {
+            self.limit_needed = next_length;
+            return self.limitError(.attribute_bytes);
+        }
+        try self.event_bytes.appendSlice(self.allocator, value);
+    }
+
+    fn appendCodepoint(self: *Cursor, value: u21) AdvanceError!void {
+        var encoded: [4]u8 = undefined;
+        try self.appendEventSlice(encodeChar(value, &encoded) orelse return self.malformed(.invalid_character));
+    }
+
+    // Callers check the chunk has room first, so text ends a chunk instead of failing.
+    fn appendTextCodepoint(self: *Cursor, value: u21) AdvanceError!void {
+        var encoded: [4]u8 = undefined;
+        const bytes = encodeChar(value, &encoded) orelse return self.malformed(.invalid_character);
+        std.debug.assert(bytes.len <= TEXT_CHUNK_BYTES - self.text_bytes.items.len);
+        try self.text_bytes.appendSlice(self.allocator, bytes);
+    }
+
+    fn skipWhitespace(self: *Cursor) ParserError!void {
+        while (true) {
+            if (try self.source.peekSingleByte()) |bytes| {
+                var length: usize = 0;
+                while (length < bytes.len and isXmlWhitespace(bytes[length])) : (length += 1) {}
+                if (length != 0) {
+                    self.source.borrowed_len = length;
+                    try self.source.commitBorrowed();
+                }
+                if (length < bytes.len) return;
+                continue;
+            }
+            const value = self.source.peekCodepoint() catch |err| return switch (err) {
+                error.EndOfStream => {},
+                else => |other| other,
+            };
+            if (!isXmlWhitespace(value.value)) return;
+            _ = try self.requiredCodepoint();
+        }
+    }
+
+    fn parseQName(self: *Cursor) ParserError!NameRange {
+        const start = self.event_bytes.items.len;
+        var have_character = false;
+        var prefix_len: usize = 0;
+        var segment_start = true;
+        while (true) {
+            if (have_character and !segment_start) {
+                if (try self.source.peekSingleByte()) |bytes| {
+                    const bound = @min(bytes.len, self.max_attribute_bytes -| self.event_bytes.items.len);
+                    var length: usize = 0;
+                    while (length < bound and isAsciiNameChar(bytes[length])) : (length += 1) {}
+                    const finished = length < bytes.len and isNameDelimiter(bytes[length]);
+                    if (length != 0) {
+                        try self.appendEventSlice(bytes[0..length]);
+                        self.source.borrowed_len = length;
+                        try self.source.commitBorrowed();
+                    }
+                    if (finished) break;
+                    if (length != 0) continue;
+                }
+            }
+            const value = try self.requiredCodepoint();
+            if (value.value > 0x7F) return self.malformed(.invalid_name);
+            const byte: u8 = @intCast(value.value);
+            if (!have_character) {
+                if (!isAsciiNameStart(byte)) return self.malformed(.invalid_name);
+                have_character = true;
+                segment_start = false;
+                try self.appendEventByte(byte);
+                continue;
+            }
+            if (byte == ':') {
+                if (prefix_len != 0 or segment_start) return self.malformed(.invalid_name);
+                prefix_len = self.event_bytes.items.len - start;
+                segment_start = true;
+                try self.appendEventByte(byte);
+                continue;
+            }
+            if (segment_start) {
+                if (!isAsciiNameStart(byte)) return self.malformed(.invalid_name);
+                segment_start = false;
+                try self.appendEventByte(byte);
+                continue;
+            }
+            if (isAsciiNameChar(byte)) {
+                try self.appendEventByte(byte);
+                continue;
+            }
+            if (isNameDelimiter(value.value)) {
+                try self.source.unread(value);
+                break;
+            }
+            return self.malformed(.invalid_name);
+        }
+        return .{ .start = start, .len = self.event_bytes.items.len - start, .prefix_len = prefix_len };
+    }
+
+    fn parseAttributeValue(self: *Cursor, quote: u21) ParserError!Range {
+        const start = self.event_bytes.items.len;
+        while (true) {
+            if (try self.source.peekSingleByte()) |bytes| {
+                const bound = @min(bytes.len, self.max_attribute_bytes -| self.event_bytes.items.len);
+                const length = ordinaryAttributeRun(bytes[0..bound], @intCast(quote));
+                if (length != 0) {
+                    try self.appendEventSlice(bytes[0..length]);
+                    self.source.borrowed_len = length;
+                    try self.source.commitBorrowed();
+                    continue;
+                }
+            }
+            const value = try self.requiredCodepoint();
+            if (value.value == quote) break;
+            if (value.value == '<') return self.malformed(.less_than_in_attribute);
+            if (value.value == '&') {
+                try self.appendCodepoint(try self.readEntity());
+                continue;
+            }
+            if (value.value == '\r' or value.value == '\n' or value.value == '\t') {
+                if (value.value == '\r') try self.skipLineFeed();
+                try self.appendEventByte(' ');
+            } else {
+                try self.appendCodepoint(value.value);
+            }
+        }
+        return .{ .start = start, .len = self.event_bytes.items.len - start };
+    }
+
+    // Digits stream, so any number of leading zeros is accepted.
+    fn readEntity(self: *Cursor) AdvanceError!u21 {
+        const start = self.source.last_start;
+        const first = (try self.requiredCodepoint()).value;
+        if (first != '#') {
+            var name: [4]u8 = undefined;
+            var length: usize = 0;
+            var value = first;
+            while (value != ';') : (value = (try self.requiredCodepoint()).value) {
+                if (value > 0x7F or length == name.len) return self.malformedAt(.unknown_entity, start);
+                name[length] = @intCast(value);
+                length += 1;
+            }
+            const entities = [_]struct { []const u8, u21 }{
+                .{ "amp", '&' }, .{ "lt", '<' }, .{ "gt", '>' }, .{ "apos", '\'' }, .{ "quot", '"' },
+            };
+            for (entities) |entity| {
+                if (std.mem.eql(u8, name[0..length], entity[0])) return entity[1];
+            }
+            return self.malformedAt(.unknown_entity, start);
+        }
+
+        var value = (try self.requiredCodepoint()).value;
+        var base: u32 = 10;
+        if (value == 'x') {
+            base = 16;
+            value = (try self.requiredCodepoint()).value;
+        }
+        var number: u32 = 0;
+        var digits: usize = 0;
+        while (value != ';') : (value = (try self.requiredCodepoint()).value) {
+            if (value > 0x7F) return self.malformedAt(.invalid_character_reference, start);
+            const digit = digitValue(@intCast(value), base) orelse return self.malformedAt(.invalid_character_reference, start);
+            number = number * base + digit;
+            if (number > 0x10FFFF) return self.malformedAt(.invalid_character_reference, start);
+            digits += 1;
+        }
+        if (digits == 0 or !isXmlChar(@intCast(number))) return self.malformedAt(.invalid_character_reference, start);
+        return @intCast(number);
+    }
+
+    fn bufferedName(self: *Cursor, bytes: []const u8, position: *usize, used: *usize) ?NameRange {
+        const start = position.*;
+        if (start == bytes.len or !isAsciiNameStart(bytes[start])) return null;
+        var end = start + 1;
+        while (end < bytes.len and isAsciiNameChar(bytes[end])) : (end += 1) {}
+        if (end == bytes.len or !isNameDelimiter(bytes[end])) return null;
+        const length = end - start;
+        const capacity = @min(self.max_attribute_bytes, self.event_bytes.capacity);
+        if (length > capacity -| used.*) return null;
+        const result: NameRange = .{ .start = start, .len = length, .prefix_len = 0 };
+        used.* += length;
+        position.* = end;
+        return result;
+    }
+
+    fn hasAttribute(self: *const Cursor, bytes: []const u8, name: NameRange) bool {
+        const raw = bytes[name.start..][0..name.len];
+        for (self.attribute_ranges.items) |previous| {
+            if (std.mem.eql(u8, bytes[previous.name.start..][0..previous.name.len], raw)) return true;
+        }
+        return false;
+    }
+
+    fn readBufferedStartElement(self: *Cursor, start_offset: u64) AdvanceError!?Event {
+        if (!self.source.bytesAreCharacters()) return null;
+        const reader = self.source.reader orelse return null;
+        const bytes = reader.buffered();
+        if (bytes.len == 0 or !isAsciiNameStart(bytes[0])) return null;
+        self.event_bytes.clearRetainingCapacity();
+        self.attribute_ranges.clearRetainingCapacity();
+        self.namespace_declarations.clearRetainingCapacity();
+        self.attributes.clearRetainingCapacity();
+        var position: usize = 0;
+        var used: usize = 0;
+        const name_range = self.bufferedName(bytes, &position, &used) orelse return null;
+        var empty = false;
+
+        // Do not consume input or grow storage until the complete tag is known.
+        // The incremental parser preserves failure order on every declined tag.
+        while (true) {
+            while (position < bytes.len and isXmlWhitespace(bytes[position])) : (position += 1) {}
+            if (position == bytes.len) return null;
+            if (bytes[position] == '>') {
+                position += 1;
+                break;
+            }
+            if (bytes[position] == '/') {
+                if (bytes.len - position < 2 or bytes[position + 1] != '>') return null;
+                position += 2;
+                empty = true;
+                break;
+            }
+            if (self.attribute_ranges.items.len == @min(self.max_attributes, self.attribute_ranges.capacity)) return null;
+            const name = self.bufferedName(bytes, &position, &used) orelse return null;
+            if (std.mem.eql(u8, bytes[name.start..][0..name.len], "xmlns")) return null;
+            while (position < bytes.len and isXmlWhitespace(bytes[position])) : (position += 1) {}
+            if (position == bytes.len or bytes[position] != '=') return null;
+            position += 1;
+            while (position < bytes.len and isXmlWhitespace(bytes[position])) : (position += 1) {}
+            if (position == bytes.len) return null;
+            const quote = bytes[position];
+            if (quote != '\'' and quote != '"') return null;
+            position += 1;
+            const start = position;
+            position += ordinaryAttributeRun(bytes[position..], quote);
+            if (position == bytes.len or bytes[position] != quote) return null;
+            const length = position - start;
+            const capacity = @min(self.max_attribute_bytes, self.event_bytes.capacity);
+            if (length > capacity -| used) return null;
+            const value: Range = .{ .start = start, .len = length };
+            used += length;
+            position += 1;
+            if (self.hasAttribute(bytes, name)) return null;
+            self.attribute_ranges.appendAssumeCapacity(.{
+                .name = name,
+                .value = value,
+                .namespace_declaration = false,
+                .offset = self.source.position + name.start,
+            });
+        }
+
+        const name_offset = self.source.position;
+        const end = std.math.add(u64, self.source.position, position) catch return null;
+        reader.toss(position);
+        self.source.position = end;
+        return try self.finishStartElement(bytes, start_offset, name_offset, name_range, empty);
+    }
+
+    fn readStartElement(self: *Cursor, start_offset: u64) ParserError!Event {
+        self.event_bytes.clearRetainingCapacity();
+        self.attribute_ranges.clearRetainingCapacity();
+        self.namespace_declarations.clearRetainingCapacity();
+        self.attributes.clearRetainingCapacity();
+        const name_offset = self.source.currentOffset();
+        const name_range = try self.parseQName();
+        var empty = false;
+
+        while (true) {
+            try self.skipWhitespace();
+            const marker = try self.requiredCodepoint();
+            if (marker.value == '>') break;
+            if (marker.value == '/') {
+                const close = try self.requiredCodepoint();
+                if (close.value != '>') return self.malformed(.malformed_tag);
+                empty = true;
+                break;
+            }
+            try self.source.unread(marker);
+
+            if (self.attribute_ranges.items.len == self.max_attributes) return self.limitError(.attributes);
+            const attribute_offset = self.source.currentOffset();
+            const attribute_name = try self.parseQName();
+            const quote: u21 = opening: {
+                if (try self.source.peekSingleByte()) |bytes| {
+                    if (bytes.len >= 2 and bytes[0] == '=' and (bytes[1] == '\'' or bytes[1] == '"')) {
+                        const value = bytes[1];
+                        self.source.borrowed_len = 2;
+                        try self.source.commitBorrowed();
+                        break :opening value;
+                    }
+                }
+                try self.skipWhitespace();
+                const equals = try self.requiredCodepoint();
+                if (equals.value != '=') return self.malformed(.malformed_tag);
+                try self.skipWhitespace();
+                const value = try self.requiredCodepoint();
+                if (value.value != '\'' and value.value != '"') return self.malformed(.malformed_tag);
+                break :opening value.value;
+            };
+            const attribute_value = try self.parseAttributeValue(quote);
+            if (self.hasAttribute(self.event_bytes.items, attribute_name)) return self.malformedAt(.duplicate_attribute, attribute_offset);
+            const raw_name = self.event_bytes.items[attribute_name.start..][0..attribute_name.len];
+            const namespace_declaration = std.mem.eql(u8, raw_name, "xmlns") or
+                (std.mem.startsWith(u8, raw_name, "xmlns:") and raw_name.len > 6);
+            if (namespace_declaration) {
+                const prefix = if (std.mem.eql(u8, raw_name, "xmlns"))
+                    Range{ .start = attribute_name.start, .len = 0 }
+                else
+                    Range{ .start = attribute_name.start + 6, .len = attribute_name.len - 6 };
+                try self.namespace_declarations.append(
+                    self.allocator,
+                    .{ .prefix = prefix, .uri = attribute_value, .offset = attribute_offset },
+                );
+            }
+            try self.attribute_ranges.append(self.allocator, .{
+                .name = attribute_name,
+                .value = attribute_value,
+                .namespace_declaration = namespace_declaration,
+                .offset = attribute_offset,
+            });
+        }
+
+        return self.finishStartElement(self.event_bytes.items, start_offset, name_offset, name_range, empty);
+    }
+
+    fn finishStartElement(
+        self: *Cursor,
+        bytes: []const u8,
+        start_offset: u64,
+        name_offset: u64,
+        name_range: NameRange,
+        empty: bool,
+    ) AdvanceError!Event {
+        if (self.depth == 0) {
+            if (self.root_closed) return self.malformedAt(.content_after_root, start_offset);
+            self.root_seen = true;
+        }
+        if (self.depth == MAX_DEPTH) return self.limitError(.depth);
+
+        const binding_start = self.namespace_bindings.items.len;
+        const namespace_bytes_start = self.namespace_bytes.items.len;
+        try self.installNamespaces();
+        const element_name = try self.makeName(bytes, name_range, false, name_offset);
+
+        const frame_name_start = self.open_names.items.len;
+        try self.open_names.appendSlice(self.allocator, bytes[name_range.start..][0..name_range.len]);
+        self.frames[self.depth] = .{
+            .name_start = frame_name_start,
+            .name_len = name_range.len,
+            .prefix_len = name_range.prefix_len,
+            .binding_start = binding_start,
+            .namespace_bytes_start = namespace_bytes_start,
+            .opening_end = self.source.position,
+        };
+        self.depth += 1;
+        self.pending_empty = empty;
+
+        try self.attributes.ensureTotalCapacityPrecise(self.allocator, self.attribute_ranges.items.len);
+        for (self.attribute_ranges.items) |attribute_range| {
+            if (attribute_range.namespace_declaration) continue;
+            const attribute_name = try self.makeName(bytes, attribute_range.name, true, attribute_range.offset);
+            const expanded = attribute_name.expanded;
+            for (self.attributes.items) |previous| {
+                if (previous.name.eql(expanded.namespace_uri, expanded.local))
+                    return self.malformedAt(.duplicate_attribute, attribute_range.offset);
+            }
+            try self.attributes.append(self.allocator, .{
+                .name = attribute_name,
+                .value = bytes[attribute_range.value.start..][0..attribute_range.value.len],
+                .offset = attribute_range.offset,
+            });
+        }
+        return .{
+            .span = .{ .start = start_offset, .end = self.source.position },
+            .data = .{ .start_element = .{
+                .name = element_name,
+                .attributes = self.attributes.items,
+                .empty_element_syntax = empty,
+            } },
+        };
+    }
+
+    // Raw attribute names are unique, so each prefix is declared once per element.
+    fn installNamespaces(self: *Cursor) AdvanceError!void {
+        if (self.namespace_declarations.items.len != 0) self.scopeChanged();
+        for (self.namespace_declarations.items) |declaration| {
+            const prefix = self.event_bytes.items[declaration.prefix.start..][0..declaration.prefix.len];
+            const uri = self.event_bytes.items[declaration.uri.start..][0..declaration.uri.len];
+            if (std.mem.eql(u8, prefix, "xmlns")) return self.malformedAt(.invalid_namespace_declaration, declaration.offset);
+            if (std.mem.eql(u8, prefix, "xml")) {
+                if (!std.mem.eql(u8, uri, XML_NAMESPACE)) return self.malformedAt(.invalid_namespace_declaration, declaration.offset);
+            } else if (std.mem.eql(u8, uri, XML_NAMESPACE)) {
+                return self.malformedAt(.invalid_namespace_declaration, declaration.offset);
+            }
+            if (std.mem.eql(u8, uri, XMLNS_NAMESPACE)) return self.malformedAt(.invalid_namespace_declaration, declaration.offset);
+            if (prefix.len != 0 and uri.len == 0) return self.malformedAt(.invalid_namespace_declaration, declaration.offset);
+            const prefix_start = self.namespace_bytes.items.len;
+            try self.namespace_bytes.appendSlice(self.allocator, prefix);
+            const uri_start = self.namespace_bytes.items.len;
+            try self.namespace_bytes.appendSlice(self.allocator, uri);
+            try self.namespace_bindings.append(self.allocator, .{
+                .prefix_start = prefix_start,
+                .prefix_len = prefix.len,
+                .uri_start = uri_start,
+                .uri_len = uri.len,
+            });
+        }
+    }
+
+    // xmlns="" undeclares the default namespace: no namespace, as when none is bound.
+    fn defaultNamespace(self: *const Cursor) ?[]const u8 {
+        const uri = self.resolveNamespace(null) orelse return null;
+        return if (uri.len == 0) null else uri;
+    }
+
+    fn resolveNamespace(self: *const Cursor, prefix: ?[]const u8) ?[]const u8 {
+        if (prefix) |value| if (std.mem.eql(u8, value, "xml")) return XML_NAMESPACE;
+        const wanted = prefix orelse "";
+        var index = self.namespace_bindings.items.len;
+        while (index != 0) {
+            index -= 1;
+            const binding = self.namespace_bindings.items[index];
+            const bound_prefix = self.namespace_bytes.items[binding.prefix_start..][0..binding.prefix_len];
+            if (std.mem.eql(u8, bound_prefix, wanted)) {
+                return self.namespace_bytes.items[binding.uri_start..][0..binding.uri_len];
+            }
+        }
+        return null;
+    }
+
+    // An unprefixed attribute has no namespace; an unprefixed element has the default one.
+    fn makeName(self: *Cursor, bytes: []const u8, range: NameRange, comptime attribute: bool, offset: u64) AdvanceError!Name {
+        const raw = bytes[range.start..][0..range.len];
+        const prefix = if (range.prefix_len == 0) null else raw[0..range.prefix_len];
+        const local = if (range.prefix_len == 0) raw else raw[range.prefix_len + 1 ..];
+        const namespace_uri = if (prefix) |value|
+            self.resolveNamespace(value) orelse return self.malformedAt(.unbound_prefix, offset)
+        else if (attribute) null else self.defaultNamespace();
+        return .{ .raw = raw, .expanded = .{
+            .prefix = prefix,
+            .local = local,
+            .namespace_uri = namespace_uri,
+        } };
+    }
+
+    fn scopeChanged(self: *Cursor) void {
+        self.additional_namespaces = null;
+        self.namespace_scope +%= 1;
+    }
+
+    fn popFrame(self: *Cursor, frame: Frame) void {
+        self.depth -= 1;
+        self.open_names.items.len = frame.name_start;
+        if (self.namespace_bindings.items.len != frame.binding_start) self.scopeChanged();
+        self.namespace_bindings.items.len = frame.binding_start;
+        self.namespace_bytes.items.len = frame.namespace_bytes_start;
+        if (self.depth == 0) self.root_closed = true;
+    }
+
+    fn readEndElement(self: *Cursor, start_offset: u64) ParserError!Event {
+        if (self.depth == 0) return self.malformedAt(.mismatched_end_tag, start_offset);
+        const name_offset = self.source.currentOffset();
+        const name_range = try self.parseQName();
+        try self.skipWhitespace();
+        const close = try self.requiredCodepoint();
+        if (close.value != '>') return self.malformed(.malformed_tag);
+        const frame = self.frames[self.depth - 1];
+        const raw = self.event_bytes.items[name_range.start..][0..name_range.len];
+        const expected = self.open_names.items[frame.name_start..][0..frame.name_len];
+        if (!std.mem.eql(u8, raw, expected)) return self.malformedAt(.mismatched_end_tag, start_offset);
+        const name = try self.makeName(self.event_bytes.items, name_range, false, name_offset);
+        self.popFrame(frame);
+        return .{
+            .span = .{ .start = start_offset, .end = self.source.position },
+            .data = .{ .end_element = .{ .name = name } },
+        };
+    }
+
+    fn syntheticEnd(self: *Cursor) AdvanceError!Event {
+        if (!self.pending_empty or self.depth == 0) return error.InvalidState;
+        const frame = self.frames[self.depth - 1];
+        self.event_bytes.clearRetainingCapacity();
+        try self.event_bytes.appendSlice(self.allocator, self.open_names.items[frame.name_start..][0..frame.name_len]);
+        const name = try self.makeName(
+            self.event_bytes.items,
+            .{ .start = 0, .len = self.event_bytes.items.len, .prefix_len = frame.prefix_len },
+            false,
+            frame.opening_end,
+        );
+        self.pending_empty = false;
+        self.popFrame(frame);
+        return .{
+            .span = .{ .start = frame.opening_end, .end = frame.opening_end },
+            .data = .{ .end_element = .{ .name = name } },
+        };
+    }
+
+    // Null when the run held no text: ignored whitespace, or markup that produced none.
+    fn readTextEvent(self: *Cursor) ParserError!?Event {
+        if (self.in_cdata) return self.readCdataText();
+        return self.readScalarText();
+    }
+
+    fn readScalarText(self: *Cursor) ParserError!?Event {
+        const start = self.source.currentOffset();
+        while (self.text_bytes.items.len < TEXT_CHUNK_BYTES) {
+            if (self.normal_text_brackets == 0) {
+                if (try self.source.peekSingleByte()) |bytes| {
+                    const length = ordinaryTextRun(bytes, TEXT_CHUNK_BYTES - self.text_bytes.items.len);
+                    if (length != 0) {
+                        // Keep logical text chunks unchanged across input refills.
+                        try self.text_bytes.appendSlice(self.allocator, bytes[0..length]);
+                        self.source.borrowed_len = length;
+                        try self.source.commitBorrowed();
+                        continue;
+                    }
+                }
+            }
+            const value = self.source.peekCodepoint() catch |err| switch (err) {
+                error.EndOfStream => break,
+                else => |other| return other,
+            };
+            if (value.value == '<') break;
+            if (value.value == '&') {
+                if (self.text_bytes.items.len != 0) break;
+                _ = try self.requiredCodepoint();
+                try self.appendTextCodepoint(try self.readEntity());
+                self.normal_text_brackets = 0;
+                continue;
+            }
+            const encoded_len = std.unicode.utf8CodepointSequenceLength(value.value) catch return self.malformed(.invalid_character);
+            if (encoded_len > TEXT_CHUNK_BYTES - self.text_bytes.items.len) break;
+            _ = try self.requiredCodepoint();
+            if (value.value == ']') {
+                if (self.normal_text_brackets < 2) self.normal_text_brackets += 1;
+                try self.appendTextCodepoint(value.value);
+            } else if (value.value == '>' and self.normal_text_brackets == 2) {
+                return self.malformedAt(.malformed_markup, value.start - 2 * self.source.unitWidth());
+            } else if (value.value == '\r') {
+                self.normal_text_brackets = 0;
+                try self.skipLineFeed();
+                try self.appendTextCodepoint('\n');
+            } else {
+                self.normal_text_brackets = 0;
+                try self.appendTextCodepoint(value.value);
+            }
+        }
+        if (self.text_bytes.items.len == 0) return null;
+        return .{
+            .span = .{ .start = start, .end = self.source.currentOffset() },
+            .data = .{ .text = .{ .bytes = self.text_bytes.items } },
+        };
+    }
+
+    fn readCdataStart(self: *Cursor, start_offset: u64) AdvanceError!void {
+        if (self.depth == 0) return self.malformedAt(.malformed_markup, start_offset);
+        for ("CDATA[") |expected| {
+            const value = try self.requiredCodepoint();
+            if (value.value != expected) return self.malformed(.malformed_markup);
+        }
+        self.in_cdata = true;
+        self.cdata_brackets = 0;
+    }
+
+    fn readCdataText(self: *Cursor) ParserError!?Event {
+        const start = self.source.currentOffset();
+        while (self.text_bytes.items.len < TEXT_CHUNK_BYTES) {
+            const value = self.source.peekCodepoint() catch |err| switch (err) {
+                error.EndOfStream => return self.malformed(.unexpected_end),
+                else => |other| return other,
+            };
+            const output_length = if (value.value == ']')
+                if (self.cdata_brackets == 2) @as(usize, 1) else 0
+            else if (value.value == '>' and self.cdata_brackets == 2)
+                0
+            else
+                (if (value.value == '\r') 1 else std.unicode.utf8CodepointSequenceLength(value.value) catch return self.malformed(.invalid_character)) +
+                    @as(usize, self.cdata_brackets);
+            if (output_length > TEXT_CHUNK_BYTES - self.text_bytes.items.len) break;
+            _ = try self.source.readCodepoint();
+            if (value.value == ']') {
+                if (self.cdata_brackets < 2) {
+                    self.cdata_brackets += 1;
+                } else {
+                    try self.appendTextCodepoint(']');
+                }
+                continue;
+            }
+            if (value.value == '>' and self.cdata_brackets == 2) {
+                self.cdata_brackets = 0;
+                self.in_cdata = false;
+                break;
+            }
+            while (self.cdata_brackets != 0) : (self.cdata_brackets -= 1) {
+                try self.appendTextCodepoint(']');
+            }
+            if (value.value == '\r') {
+                try self.skipLineFeed();
+                try self.appendTextCodepoint('\n');
+            } else {
+                try self.appendTextCodepoint(value.value);
+            }
+        }
+        if (self.text_bytes.items.len == 0) return null;
+        return .{
+            .span = .{ .start = start, .end = self.source.currentOffset() },
+            .data = .{ .text = .{ .bytes = self.text_bytes.items } },
+        };
+    }
+
+    fn readComment(self: *Cursor) AdvanceError!void {
+        var dashes: u2 = 0;
+        while (true) {
+            const value = try self.requiredCodepoint();
+            if (value.value == '-') {
+                if (dashes == 1) {
+                    const close = try self.requiredCodepoint();
+                    if (close.value != '>') return self.malformed(.malformed_markup);
+                    return;
+                }
+                dashes = 1;
+            } else {
+                dashes = 0;
+                if (!isXmlChar(value.value)) return self.malformed(.invalid_character);
+            }
+        }
+    }
+
+    fn readProcessingInstruction(self: *Cursor, initial: bool) ParserError!void {
+        self.event_bytes.clearRetainingCapacity();
+        const target_offset = self.source.currentOffset();
+        const target = try self.parseQName();
+        const target_bytes = self.event_bytes.items[target.start..][0..target.len];
+        const separator = try self.requiredCodepoint();
+        if (!isXmlWhitespace(separator.value) and separator.value != '?') return self.malformed(.malformed_markup);
+        const declaration = initial and std.mem.eql(u8, target_bytes, "xml");
+        if (std.ascii.eqlIgnoreCase(target_bytes, "xml") and !declaration) return self.malformedAt(.malformed_markup, target_offset);
+        self.declaration_bytes.clearRetainingCapacity();
+        self.declaration_start = self.source.currentOffset();
+        if (separator.value == '?') {
+            const close = try self.requiredCodepoint();
+            if (close.value != '>') return self.malformed(.malformed_markup);
+        } else {
+            while (true) {
+                const value = try self.requiredCodepoint();
+                if (value.value == '?') {
+                    const following = try self.requiredCodepoint();
+                    if (following.value == '>') break;
+                    if (declaration) try self.appendDeclarationByte('?');
+                    try self.source.unread(following);
+                    continue;
+                }
+                if (!isXmlChar(value.value)) return self.malformed(.invalid_character);
+                if (declaration) {
+                    if (value.value > 0x7F) return self.malformed(.malformed_declaration);
+                    try self.appendDeclarationByte(@intCast(value.value));
+                }
+            }
+        }
+        if (declaration) try self.parseXmlDeclaration();
+    }
+
+    fn appendDeclarationByte(self: *Cursor, value: u8) AdvanceError!void {
+        if (self.declaration_bytes.items.len == MAX_DECLARATION_BYTES) return self.limitError(.declaration_bytes);
+        try self.declaration_bytes.append(self.allocator, value);
+    }
+
+    // The rule's offending character is the last one read, except at the end of input.
+    fn malformed(self: *Cursor, rule: Rule) AdvanceError {
+        return self.malformedAt(rule, if (rule == .unexpected_end) self.source.currentOffset() else self.source.last_start);
+    }
+
+    fn malformedAt(self: *Cursor, rule: Rule, offset: u64) AdvanceError {
+        self.xml_rule = rule;
+        self.failure_offset = offset;
+        self.offset = offset;
+        return error.InvalidXml;
+    }
+
+    // Declaration bytes are ASCII, one character each.
+    fn declarationError(self: *Cursor, position: usize, err: AdvanceError) AdvanceError {
+        const offset = self.declaration_start + position * self.source.unitWidth();
+        if (err == error.InvalidXml) return self.malformedAt(.malformed_declaration, offset);
+        self.failure_offset = offset;
+        self.offset = offset;
+        return err;
+    }
+
+    // A failure's offset: the offending character for broken rules and encodings, otherwise
+    // the next unread byte.
+    fn failedAt(self: *const Cursor, err: ParserError) u64 {
+        if (self.failure_offset) |offset| return offset;
+        if (err == error.InvalidEncoding) return self.source.last_start;
+        return self.source.currentOffset();
+    }
+
+    fn limitError(self: *Cursor, limit: @TypeOf(self.limit_failure.?)) AdvanceError {
+        self.limit_failure = limit;
+        return error.LimitExceeded;
+    }
+
+    fn parseXmlDeclaration(self: *Cursor) AdvanceError!void {
+        const bytes = self.declaration_bytes.items;
+        var position: usize = 0;
+        var version: ?[]const u8 = null;
+        var version_at: usize = 0;
+        var encoding: ?[]const u8 = null;
+        var encoding_at: usize = 0;
+        var order: u2 = 0;
+        while (position < bytes.len and isXmlWhitespace(bytes[position])) position += 1;
+        while (true) {
+            if (position == bytes.len) break;
+            const name_start = position;
+            if (!isAsciiNameStart(bytes[position])) return self.declarationError(position, error.InvalidXml);
+            position += 1;
+            while (position < bytes.len and isAsciiNameChar(bytes[position])) position += 1;
+            const name = bytes[name_start..position];
+            while (position < bytes.len and isXmlWhitespace(bytes[position])) position += 1;
+            if (position == bytes.len or bytes[position] != '=') return self.declarationError(position, error.InvalidXml);
+            position += 1;
+            while (position < bytes.len and isXmlWhitespace(bytes[position])) position += 1;
+            if (position == bytes.len) return self.declarationError(position, error.InvalidXml);
+            const quote = bytes[position];
+            if (quote != '\'' and quote != '"') return self.declarationError(position, error.InvalidXml);
+            position += 1;
+            const value_start = position;
+            while (position < bytes.len and bytes[position] != quote) position += 1;
+            if (position == bytes.len) return self.declarationError(position, error.InvalidXml);
+            const value = bytes[value_start..position];
+            position += 1;
+            if (std.mem.eql(u8, name, "version")) {
+                if (version != null or order != 0) return self.declarationError(name_start, error.InvalidXml);
+                version = value;
+                version_at = value_start;
+            } else if (std.mem.eql(u8, name, "encoding")) {
+                if (version == null or encoding != null or order > 0) return self.declarationError(name_start, error.InvalidXml);
+                encoding = value;
+                encoding_at = value_start;
+                order = 1;
+            } else if (std.mem.eql(u8, name, "standalone")) {
+                if (version == null or order > 1) return self.declarationError(name_start, error.InvalidXml);
+                if (!std.mem.eql(u8, value, "yes") and !std.mem.eql(u8, value, "no"))
+                    return self.declarationError(value_start, error.InvalidXml);
+                order = 2;
+            } else {
+                return self.declarationError(name_start, error.InvalidXml);
+            }
+            if (position == bytes.len) break;
+            if (!isXmlWhitespace(bytes[position])) return self.declarationError(position, error.InvalidXml);
+            while (position < bytes.len and isXmlWhitespace(bytes[position])) position += 1;
+        }
+        const version_value = version orelse return self.declarationError(0, error.InvalidXml);
+        if (!std.mem.eql(u8, version_value, "1.0")) return self.declarationError(version_at, error.UnsupportedVersion);
+        if (encoding) |value| {
+            if (std.ascii.eqlIgnoreCase(value, "UTF-8")) {
+                if (self.source.encoding != .utf8) return self.declarationError(encoding_at, error.InvalidEncoding);
+            } else if (std.ascii.eqlIgnoreCase(value, "UTF-16")) {
+                if (self.source.encoding != .utf16_le and self.source.encoding != .utf16_be)
+                    return self.declarationError(encoding_at, error.InvalidEncoding);
+            } else if (std.ascii.eqlIgnoreCase(value, "ISO-8859-1")) {
+                if (self.source.encoding != .utf8 or
+                    std.mem.startsWith(u8, self.source.probe[0..self.source.probe_len], "\xef\xbb\xbf")) return self.declarationError(encoding_at, error.InvalidEncoding);
+                self.source.encoding = .latin1;
+            } else {
+                return self.declarationError(encoding_at, error.UnsupportedEncoding);
+            }
+        }
+    }
+};
+
+const XML_NAMESPACE = "http://www.w3.org/XML/1998/namespace";
+const TEXT_CHUNK_BYTES = 64 * 1024;
+
+const ParserError = AdvanceError || error{EndOfStream};
+
+const Encoding = enum {
+    utf8,
+    latin1,
+    utf16_le,
+    utf16_be,
+};
+
+const Range = struct {
+    start: usize,
+    len: usize,
+};
+
+const NameRange = struct {
+    start: usize,
+    len: usize,
+    prefix_len: usize,
+};
+
+const Codepoint = struct {
+    value: u21,
+    start: u64,
+    end: u64,
+};
+
 fn optionalSliceEql(left: ?[]const u8, right: ?[]const u8) bool {
     if (left == null or right == null) return left == null and right == null;
     return std.mem.eql(u8, left.?, right.?);
@@ -205,7 +1424,6 @@ fn ordinaryAttributeRun(bytes: []const u8, quote: u8) usize {
     return ordinaryRun(16, bytes, .{ quote, '&', '<' });
 }
 
-// The length of the leading bytes that are printable ASCII and none of stops.
 fn ordinaryRun(comptime max_width: usize, bytes: []const u8, stops: [3]u8) usize {
     const width = @min(max_width, std.simd.suggestVectorLength(u8) orelse 16);
     const Vector = @Vector(width, u8);
@@ -464,1260 +1682,26 @@ const Frame = struct {
     opening_end: u64,
 };
 
-pub const Ancestors = struct {
-    depth: usize,
-    names: usize,
-    namespace_bytes: usize,
-    bindings: usize,
-    encoding: Encoding,
-    mzml_namespace: []const u8,
-    pending_empty: bool,
-};
-
-/// Bounded streaming XML cursor for the mzML reader and indexed fragments.
-pub const Cursor = struct {
-    allocator: std.mem.Allocator,
-    source: Source,
-    max_attributes: usize,
-    max_attribute_bytes: usize,
-    current: ?Event = null,
-    offset: u64 = 0,
-    document_started: bool = false,
-    document_ended: bool = false,
-    root_seen: bool = false,
-    root_closed: bool = false,
-    depth: usize = 0,
-    in_cdata: bool = false,
-    cdata_brackets: u2 = 0,
-    normal_text_brackets: u2 = 0,
-    mzml_namespace: []const u8 = NAMESPACE,
-    frames: [MAX_DEPTH]Frame = undefined,
-    pending_empty: bool = false,
-    event_bytes: std.ArrayList(u8) = .empty,
-    text_bytes: std.ArrayList(u8) = .empty,
-    declaration_bytes: std.ArrayList(u8) = .empty,
-    attribute_ranges: std.ArrayList(AttributeRange) = .empty,
-    namespace_declarations: std.ArrayList(NamespaceDeclaration) = .empty,
-    attributes: std.ArrayList(Attribute) = .empty,
-    open_names: std.ArrayList(u8) = .empty,
-    namespace_bytes: std.ArrayList(u8) = .empty,
-    namespace_bindings: std.ArrayList(NamespaceBinding) = .empty,
-    additional_namespaces: ?bool = null,
-    /// Changes whenever the in-scope bindings do, so a reader can reuse what it built for a scope.
-    namespace_scope: u64 = 0,
-    failure: ?Error = null,
-    limit_failure: ?enum { depth, attributes, attribute_bytes, nodes, declaration_bytes } = null,
-    // The rule broken by the input when `failure` is `InvalidXml`.
-    xml_rule: ?Rule = null,
-    // Where the input broke a rule or its declared encoding, reported as `offset`.
-    failure_offset: ?u64 = null,
-    // Source offset of the XML declaration's first byte after `<?xml `.
-    declaration_start: u64 = 0,
-    // The bytes an over-limit attribute value needed, when known.
-    limit_needed: ?usize = null,
-
-    /// Initializes a cursor without consuming the input.
-    pub fn init(
-        allocator: std.mem.Allocator,
-        input: *std.Io.Reader,
-        max_attributes: usize,
-        max_attribute_bytes: usize,
-    ) InitError!Cursor {
-        if (max_attributes == 0 or max_attribute_bytes == 0) {
-            return error.InvalidOptions;
-        }
-        if (input.buffer.len == 0 and input.vtable != std.Io.Reader.ending.vtable) return error.InvalidOptions;
-        return .{
-            .allocator = allocator,
-            .source = Source.init(input),
-            .max_attributes = max_attributes,
-            .max_attribute_bytes = max_attribute_bytes,
-        };
-    }
-
-    /// Releases retained parser scratch and borrowed-event storage.
-    pub fn deinit(self: *Cursor) void {
-        self.event_bytes.deinit(self.allocator);
-        self.text_bytes.deinit(self.allocator);
-        self.declaration_bytes.deinit(self.allocator);
-        self.attribute_ranges.deinit(self.allocator);
-        self.namespace_declarations.deinit(self.allocator);
-        self.attributes.deinit(self.allocator);
-        self.open_names.deinit(self.allocator);
-        self.namespace_bytes.deinit(self.allocator);
-        self.namespace_bindings.deinit(self.allocator);
-    }
-
-    /// Reuses the cursor with a new input stream and clears parser state.
-    pub fn reset(self: *Cursor, input: *std.Io.Reader) void {
-        self.source.reset(input);
-        self.resetState(false);
-    }
-
-    /// Clears the input reference and parser state after fragment use.
-    pub fn resetEmpty(self: *Cursor) void {
-        self.source.resetEmpty();
-        self.resetState(false);
-    }
-
-    pub fn detachFragment(self: *Cursor) void {
-        self.source.resetEmpty();
-        self.resetState(true);
-    }
-
-    pub fn ancestors(self: *const Cursor) Ancestors {
-        return .{
-            .depth = self.depth,
-            .names = self.open_names.items.len,
-            .namespace_bytes = self.namespace_bytes.items.len,
-            .bindings = self.namespace_bindings.items.len,
-            .encoding = self.source.encoding,
-            .mzml_namespace = self.mzml_namespace,
-            .pending_empty = self.pending_empty,
-        };
-    }
-
-    /// Restores ancestor storage left intact by a successful fragment read.
-    /// A failed read or a different prefix requires parsing those ancestors again.
-    pub fn resetToAncestors(self: *Cursor, input: *std.Io.Reader, saved: Ancestors, prefix_length: usize) void {
-        self.source.reset(input);
-        self.resetState(true);
-        self.source.detected = true;
-        self.source.encoding = saved.encoding;
-        self.source.position = prefix_length;
-        self.offset = prefix_length;
-        self.document_started = true;
-        self.root_seen = true;
-        self.depth = saved.depth;
-        self.open_names.items = self.open_names.allocatedSlice()[0..saved.names];
-        self.namespace_bytes.items = self.namespace_bytes.allocatedSlice()[0..saved.namespace_bytes];
-        self.namespace_bindings.items = self.namespace_bindings.allocatedSlice()[0..saved.bindings];
-        self.mzml_namespace = saved.mzml_namespace;
-        self.pending_empty = saved.pending_empty;
-    }
-
-    fn resetState(self: *Cursor, keep_ancestors: bool) void {
-        self.failure = null;
-        self.limit_failure = null;
-        self.limit_needed = null;
-        self.xml_rule = null;
-        self.failure_offset = null;
-        self.current = null;
-        self.offset = 0;
-        self.document_started = false;
-        self.document_ended = false;
-        self.root_seen = false;
-        self.root_closed = false;
-        self.depth = 0;
-        self.in_cdata = false;
-        self.cdata_brackets = 0;
-        self.normal_text_brackets = 0;
-        self.mzml_namespace = NAMESPACE;
-        self.scopeChanged();
-        self.pending_empty = false;
-        self.event_bytes.clearRetainingCapacity();
-        self.text_bytes.clearRetainingCapacity();
-        self.declaration_bytes.clearRetainingCapacity();
-        self.attribute_ranges.clearRetainingCapacity();
-        self.namespace_declarations.clearRetainingCapacity();
-        self.attributes.clearRetainingCapacity();
-        // Successful fragments leave their ancestor prefixes initialized for reuse.
-        if (!keep_ancestors) {
-            self.open_names.clearRetainingCapacity();
-            self.namespace_bytes.clearRetainingCapacity();
-            self.namespace_bindings.clearRetainingCapacity();
-        }
-    }
-
-    /// Advances to the next significant event, optionally returning text.
-    pub fn advance(self: *Cursor, text: bool) Error!void {
-        return self.advanceInner(text, true);
-    }
-
-    pub fn advanceFragment(self: *Cursor, text: bool) AdvanceError!void {
-        return self.advanceInner(text, false);
-    }
-
-    fn advanceInner(
-        self: *Cursor,
-        text: bool,
-        comptime mzml_root: bool,
-    ) (if (mzml_root) Error else AdvanceError)!void {
-        errdefer |err| self.failure = err;
-        self.current = null;
-        const ended_before = self.document_ended;
-        while (true) {
-            const maybe_event = self.nextEvent(!text) catch |err| {
-                self.offset = self.failedAt(err);
-                if (err == error.EndOfStream) self.xml_rule = .unexpected_end;
-                return switch (err) {
-                    error.EndOfStream => error.InvalidXml,
-                    else => |other| other,
-                };
-            };
-            // The document's end leaves no event; advancing again past it is an error only for
-            // the mzML root walk.
-            const event = maybe_event orelse {
-                self.offset = self.source.currentOffset();
-                if (mzml_root and ended_before) return error.UnexpectedEnd;
-                return;
-            };
-            self.offset = event.span.start;
-            switch (event.data) {
-                .start_element => |start| {
-                    if (self.depth == 1 and optionalSliceEql(start.name.expanded.namespace_uri, NAMESPACE_1_0))
-                        self.mzml_namespace = NAMESPACE_1_0;
-                    if (mzml_root and self.depth == 1 and !optionalSliceEql(start.name.expanded.namespace_uri, self.mzml_namespace)) return error.WrongNamespace;
-                    self.current = event;
-                    return;
-                },
-                .end_element => {
-                    self.current = event;
-                    return;
-                },
-                .text => |value| {
-                    // Text outside the root element must be whitespace and is never returned.
-                    if (text and self.depth != 0) {
-                        self.current = event;
-                        return;
-                    }
-                    for (value.bytes) |byte| if (!isXmlWhitespace(byte)) {
-                        self.xml_rule = .unexpected_text;
-                        return error.InvalidXml;
-                    };
-                },
-            }
-        }
-    }
-
-    pub const Namespace = struct { prefix: []const u8, uri: []const u8 };
-
-    pub fn hasAdditionalNamespaces(self: *Cursor) bool {
-        if (self.additional_namespaces) |value| return value;
-        for (self.namespace_bindings.items) |binding| {
-            const prefix = self.namespace_bytes.items[binding.prefix_start..][0..binding.prefix_len];
-            const uri = self.namespace_bytes.items[binding.uri_start..][0..binding.uri_len];
-            if (prefix.len == 0 and std.mem.eql(u8, uri, self.mzml_namespace)) continue;
-            if (std.mem.eql(u8, prefix, "xsi") and std.mem.eql(u8, uri, XSI)) continue;
-            if (std.mem.eql(u8, prefix, "xml") and std.mem.eql(u8, uri, XML_NAMESPACE)) continue;
-            self.additional_namespaces = true;
-            return true;
-        }
-        self.additional_namespaces = false;
-        return false;
-    }
-
-    /// Iterates active bindings, excluding shadowed declarations. Views expire on advance.
-    pub fn namespaceAt(self: *const Cursor, position: *usize) ?Namespace {
-        while (position.* < self.namespace_bindings.items.len) {
-            const binding = self.namespace_bindings.items[position.*];
-            position.* += 1;
-            const prefix = self.namespace_bytes.items[binding.prefix_start..][0..binding.prefix_len];
-            const uri = self.namespace_bytes.items[binding.uri_start..][0..binding.uri_len];
-            const active = self.resolveNamespace(if (prefix.len == 0) null else prefix) orelse continue;
-            if (active.ptr != uri.ptr) continue;
-            return .{ .prefix = prefix, .uri = uri };
-        }
-        return null;
-    }
-
-    /// Copies the current subtree without interpreting its contents, leaving its end event.
-    /// Namespace bindings make the emitted fragment independent of its former ancestors.
-    pub fn writeElement(
-        self: *Cursor,
-        output: *Writer,
-        remaining_nodes: *usize,
-    ) (AdvanceError || WriterError || error{UnexpectedEnd})!void {
-        if ((self.current orelse return error.InvalidState).data != .start_element) return error.InvalidState;
-        var nesting: usize = 0;
-        while (self.current) |event| {
-            switch (event.data) {
-                .start_element => |start| {
-                    if (remaining_nodes.* == 0) return self.limitError(.nodes);
-                    remaining_nodes.* -= 1;
-                    nesting += 1;
-                    try output.startElement(start.name.raw);
-                    // The fragment's root declares every binding in scope; nested elements then
-                    // inherit them and declare only their own, as the source did.
-                    var position: usize = if (nesting == 1) 0 else self.frames[self.depth - 1].binding_start;
-                    var default_seen = false;
-                    while (self.namespaceAt(&position)) |binding| {
-                        default_seen = default_seen or binding.prefix.len == 0;
-                        if (!optionalSliceEql(output.namespaceUri(binding.prefix), binding.uri))
-                            try output.namespace(if (binding.prefix.len == 0) null else binding.prefix, binding.uri);
-                    }
-                    if (nesting == 1 and !default_seen and !optionalSliceEql(output.namespaceUri(""), "")) try output.namespace(null, "");
-                    for (start.attributes) |attribute| try output.attribute(attribute.name.raw, attribute.value);
-                },
-                .end_element => {
-                    try output.endElement();
-                    nesting -= 1;
-                    if (nesting == 0) return;
-                },
-                .text => |value| try output.text(value.bytes),
-            }
-            try self.advanceFragment(true);
-        }
-        return error.UnexpectedEnd;
-    }
-
-    /// Discards the current subtree within the node budget, leaving its end event.
-    pub fn skipElement(self: *Cursor, remaining_nodes: *usize) (AdvanceError || error{UnexpectedEnd})!void {
-        if ((self.current orelse return error.InvalidState).data != .start_element) return error.InvalidState;
-        var nesting: usize = 0;
-        while (self.current) |event| {
-            switch (event.data) {
-                .start_element => {
-                    if (remaining_nodes.* == 0) return self.limitError(.nodes);
-                    remaining_nodes.* -= 1;
-                    nesting += 1;
-                },
-                .end_element => {
-                    nesting -= 1;
-                    if (nesting == 0) return;
-                },
-                .text => {},
-            }
-            try self.advanceFragment(true);
-        }
-        return error.UnexpectedEnd;
-    }
-
-    /// Checks and skips the current start-element subtree.
-    pub fn skip(self: *Cursor) Error!void {
-        errdefer |err| self.failure = err;
-        const start = self.current orelse return error.InvalidState;
-        switch (start.data) {
-            .start_element => {},
-            else => return error.InvalidState,
-        }
-        var nested: usize = 1;
-        while (nested != 0) {
-            const event = (self.nextEvent(false) catch |err| {
-                self.offset = self.failedAt(err);
-                return switch (err) {
-                    error.EndOfStream => error.UnexpectedEnd,
-                    else => |other| other,
-                };
-            }) orelse return error.UnexpectedEnd;
-            switch (event.data) {
-                .start_element => nested += 1,
-                .end_element => nested -= 1,
-                else => {},
-            }
-        }
-        try self.advance(false);
-    }
-
-    fn beginEvent(self: *Cursor) AdvanceError!void {
-        try self.source.commitBorrowed();
-        self.event_bytes.clearRetainingCapacity();
-        self.text_bytes.clearRetainingCapacity();
-        self.declaration_bytes.clearRetainingCapacity();
-        self.attribute_ranges.clearRetainingCapacity();
-        self.namespace_declarations.clearRetainingCapacity();
-        self.attributes.clearRetainingCapacity();
-    }
-
-    fn skipBufferedWhitespace(self: *Cursor) void {
-        if (!self.source.bytesAreCharacters()) return;
-        const reader = self.source.reader orelse return;
-        const bytes = reader.buffered();
-        const bound = @min(bytes.len, TEXT_CHUNK_BYTES);
-        var length: usize = 0;
-        while (length < bound and isXmlWhitespace(bytes[length])) : (length += 1) {}
-        // A complete run preserves the original text event's failure order.
-        if (length == 0 or length == bound or bytes[length] != '<') return;
-        const end = std.math.add(u64, self.source.position, length) catch return;
-        reader.toss(length);
-        self.source.position = end;
-        self.normal_text_brackets = 0;
-    }
-
-    fn nextEvent(self: *Cursor, ignore_whitespace: bool) ParserError!?Event {
-        try self.beginEvent();
-        if (self.document_ended) return null;
-        if (!self.document_started) {
-            try self.prepareDocument();
-            self.document_started = true;
-        }
-
-        if (self.pending_empty) return try self.syntheticEnd();
-
-        while (true) {
-            if (self.in_cdata) {
-                if (try self.readTextEvent()) |event| return event;
-                continue;
-            }
-            if (ignore_whitespace) self.skipBufferedWhitespace();
-            const first = self.source.peekCodepoint() catch |err| switch (err) {
-                error.EndOfStream => {
-                    if (self.root_seen and self.root_closed and self.depth == 0) {
-                        self.document_ended = true;
-                        return null;
-                    }
-                    return self.malformed(.unexpected_end);
-                },
-                else => |other| return other,
-            };
-            if (first.value != '<') {
-                if (try self.readTextEvent()) |event| return event;
-                continue;
-            }
-            self.normal_text_brackets = 0;
-
-            const opening = try self.requiredCodepoint();
-            if (try self.readBufferedStartElement(opening.start)) |event| return event;
-            const marker = try self.requiredCodepoint();
-            switch (marker.value) {
-                '/' => return try self.readEndElement(opening.start),
-                '?' => {
-                    try self.readProcessingInstruction(false);
-                    continue;
-                },
-                '!' => {
-                    const declaration_marker = try self.requiredCodepoint();
-                    if (declaration_marker.value == '-') {
-                        const second_dash = try self.requiredCodepoint();
-                        if (second_dash.value != '-') return self.malformed(.malformed_markup);
-                        try self.readComment();
-                        continue;
-                    }
-                    if (declaration_marker.value == '[') {
-                        try self.readCdataStart(opening.start);
-                        continue;
-                    }
-                    return error.DtdForbidden;
-                },
-                else => {
-                    try self.source.unread(marker);
-                    return try self.readStartElement(opening.start);
-                },
-            }
-        }
-    }
-
-    fn prepareDocument(self: *Cursor) ParserError!void {
-        const first = self.source.peekCodepoint() catch |err| switch (err) {
-            error.EndOfStream => return,
-            else => |other| return other,
-        };
-        if (first.value != '<') return;
-
-        const opening = try self.requiredCodepoint();
-        const marker = self.source.peekCodepoint() catch |err| switch (err) {
-            error.EndOfStream => {
-                try self.source.unread(opening);
-                return;
-            },
-            else => |other| return other,
-        };
-        if (marker.value != '?') {
-            try self.source.unread(opening);
-            return;
-        }
-        _ = try self.requiredCodepoint();
-        try self.readProcessingInstruction(true);
-    }
-
-    fn requiredCodepoint(self: *Cursor) AdvanceError!Codepoint {
-        return self.source.readCodepoint() catch |err| switch (err) {
-            error.EndOfStream => self.malformed(.unexpected_end),
-            else => |other| other,
-        };
-    }
-
-    fn appendEventByte(self: *Cursor, value: u8) AdvanceError!void {
-        return self.appendEventSlice(&.{value});
-    }
-
-    fn appendEventSlice(self: *Cursor, value: []const u8) AdvanceError!void {
-        const next_length = std.math.add(usize, self.event_bytes.items.len, value.len) catch return error.LimitExceeded;
-        if (next_length > self.max_attribute_bytes) {
-            self.limit_needed = next_length;
-            return self.limitError(.attribute_bytes);
-        }
-        try self.event_bytes.appendSlice(self.allocator, value);
-    }
-
-    fn appendCodepoint(self: *Cursor, value: u21) AdvanceError!void {
-        var encoded: [4]u8 = undefined;
-        try self.appendEventSlice(encodeChar(value, &encoded) orelse return self.malformed(.invalid_character));
-    }
-
-    // Callers check the chunk has room first, so text ends a chunk instead of failing.
-    fn appendTextCodepoint(self: *Cursor, value: u21) AdvanceError!void {
-        var encoded: [4]u8 = undefined;
-        const bytes = encodeChar(value, &encoded) orelse return self.malformed(.invalid_character);
-        std.debug.assert(bytes.len <= TEXT_CHUNK_BYTES - self.text_bytes.items.len);
-        try self.text_bytes.appendSlice(self.allocator, bytes);
-    }
-
-    fn skipWhitespace(self: *Cursor) ParserError!void {
-        while (true) {
-            if (try self.source.peekSingleByte()) |bytes| {
-                var length: usize = 0;
-                while (length < bytes.len and isXmlWhitespace(bytes[length])) : (length += 1) {}
-                if (length != 0) {
-                    self.source.borrowed_len = length;
-                    try self.source.commitBorrowed();
-                }
-                if (length < bytes.len) return;
-                continue;
-            }
-            const value = self.source.peekCodepoint() catch |err| return switch (err) {
-                error.EndOfStream => {},
-                else => |other| other,
-            };
-            if (!isXmlWhitespace(value.value)) return;
-            _ = try self.requiredCodepoint();
-        }
-    }
-
-    fn parseQName(self: *Cursor) ParserError!NameRange {
-        const start = self.event_bytes.items.len;
-        var have_character = false;
-        var prefix_len: usize = 0;
-        var segment_start = true;
-        while (true) {
-            if (have_character and !segment_start) {
-                if (try self.source.peekSingleByte()) |bytes| {
-                    const bound = @min(bytes.len, self.max_attribute_bytes -| self.event_bytes.items.len);
-                    var length: usize = 0;
-                    while (length < bound and isAsciiNameChar(bytes[length])) : (length += 1) {}
-                    const finished = length < bytes.len and isNameDelimiter(bytes[length]);
-                    if (length != 0) {
-                        try self.appendEventSlice(bytes[0..length]);
-                        self.source.borrowed_len = length;
-                        try self.source.commitBorrowed();
-                    }
-                    if (finished) break;
-                    if (length != 0) continue;
-                }
-            }
-            const value = try self.requiredCodepoint();
-            if (value.value > 0x7F) return self.malformed(.invalid_name);
-            const byte: u8 = @intCast(value.value);
-            if (!have_character) {
-                if (!isAsciiNameStart(byte)) return self.malformed(.invalid_name);
-                have_character = true;
-                segment_start = false;
-                try self.appendEventByte(byte);
-                continue;
-            }
-            if (byte == ':') {
-                if (prefix_len != 0 or segment_start) return self.malformed(.invalid_name);
-                prefix_len = self.event_bytes.items.len - start;
-                segment_start = true;
-                try self.appendEventByte(byte);
-                continue;
-            }
-            if (segment_start) {
-                if (!isAsciiNameStart(byte)) return self.malformed(.invalid_name);
-                segment_start = false;
-                try self.appendEventByte(byte);
-                continue;
-            }
-            if (isAsciiNameChar(byte)) {
-                try self.appendEventByte(byte);
-                continue;
-            }
-            if (isNameDelimiter(value.value)) {
-                try self.source.unread(value);
-                break;
-            }
-            return self.malformed(.invalid_name);
-        }
-        return .{ .start = start, .len = self.event_bytes.items.len - start, .prefix_len = prefix_len };
-    }
-
-    fn parseAttributeValue(self: *Cursor, quote: u21) ParserError!Range {
-        const start = self.event_bytes.items.len;
-        while (true) {
-            if (try self.source.peekSingleByte()) |bytes| {
-                const bound = @min(bytes.len, self.max_attribute_bytes -| self.event_bytes.items.len);
-                const length = ordinaryAttributeRun(bytes[0..bound], @intCast(quote));
-                if (length != 0) {
-                    try self.appendEventSlice(bytes[0..length]);
-                    self.source.borrowed_len = length;
-                    try self.source.commitBorrowed();
-                    continue;
-                }
-            }
-            const value = try self.requiredCodepoint();
-            if (value.value == quote) break;
-            if (value.value == '<') return self.malformed(.less_than_in_attribute);
-            if (value.value == '&') {
-                try self.appendCodepoint(try self.readEntity());
-                continue;
-            }
-            if (value.value == '\r' or value.value == '\n' or value.value == '\t') {
-                if (value.value == '\r') {
-                    const next = self.source.peekCodepoint() catch |err| switch (err) {
-                        error.EndOfStream => null,
-                        else => |other| return other,
-                    };
-                    if (next) |following| {
-                        if (following.value == '\n') _ = try self.requiredCodepoint();
-                    }
-                }
-                try self.appendEventByte(' ');
-            } else {
-                try self.appendCodepoint(value.value);
-            }
-        }
-        return .{ .start = start, .len = self.event_bytes.items.len - start };
-    }
-
-    /// Reads an entity or character reference after '&' through its ';'.
-    /// Digits stream, so any number of leading zeros is accepted.
-    fn readEntity(self: *Cursor) AdvanceError!u21 {
-        const start = self.source.last_start;
-        const first = (try self.requiredCodepoint()).value;
-        if (first != '#') {
-            var name: [4]u8 = undefined;
-            var length: usize = 0;
-            var value = first;
-            while (value != ';') : (value = (try self.requiredCodepoint()).value) {
-                if (value > 0x7F or length == name.len) return self.malformedAt(.unknown_entity, start);
-                name[length] = @intCast(value);
-                length += 1;
-            }
-            const entities = [_]struct { []const u8, u21 }{
-                .{ "amp", '&' }, .{ "lt", '<' }, .{ "gt", '>' }, .{ "apos", '\'' }, .{ "quot", '"' },
-            };
-            for (entities) |entity| {
-                if (std.mem.eql(u8, name[0..length], entity[0])) return entity[1];
-            }
-            return self.malformedAt(.unknown_entity, start);
-        }
-
-        var value = (try self.requiredCodepoint()).value;
-        var base: u32 = 10;
-        if (value == 'x') {
-            base = 16;
-            value = (try self.requiredCodepoint()).value;
-        }
-        var number: u32 = 0;
-        var digits: usize = 0;
-        while (value != ';') : (value = (try self.requiredCodepoint()).value) {
-            if (value > 0x7F) return self.malformedAt(.invalid_character_reference, start);
-            const digit = digitValue(@intCast(value), base) orelse return self.malformedAt(.invalid_character_reference, start);
-            number = number * base + digit;
-            if (number > 0x10FFFF) return self.malformedAt(.invalid_character_reference, start);
-            digits += 1;
-        }
-        if (digits == 0 or !isXmlChar(@intCast(number))) return self.malformedAt(.invalid_character_reference, start);
-        return @intCast(number);
-    }
-
-    fn bufferedName(self: *Cursor, bytes: []const u8, position: *usize, used: *usize) ?NameRange {
-        const start = position.*;
-        if (start == bytes.len or !isAsciiNameStart(bytes[start])) return null;
-        var end = start + 1;
-        while (end < bytes.len and isAsciiNameChar(bytes[end])) : (end += 1) {}
-        if (end == bytes.len or !isNameDelimiter(bytes[end])) return null;
-        const length = end - start;
-        const capacity = @min(self.max_attribute_bytes, self.event_bytes.capacity);
-        if (length > capacity -| used.*) return null;
-        const result: NameRange = .{ .start = start, .len = length, .prefix_len = 0 };
-        used.* += length;
-        position.* = end;
-        return result;
-    }
-
-    fn hasAttribute(self: *const Cursor, bytes: []const u8, name: NameRange) bool {
-        const raw = bytes[name.start..][0..name.len];
-        for (self.attribute_ranges.items) |previous| {
-            if (std.mem.eql(u8, bytes[previous.name.start..][0..previous.name.len], raw)) return true;
-        }
-        return false;
-    }
-
-    fn readBufferedStartElement(self: *Cursor, start_offset: u64) AdvanceError!?Event {
-        if (!self.source.bytesAreCharacters()) return null;
-        const reader = self.source.reader orelse return null;
-        const bytes = reader.buffered();
-        if (bytes.len == 0 or !isAsciiNameStart(bytes[0])) return null;
-        self.event_bytes.clearRetainingCapacity();
-        self.attribute_ranges.clearRetainingCapacity();
-        self.namespace_declarations.clearRetainingCapacity();
-        self.attributes.clearRetainingCapacity();
-        var position: usize = 0;
-        var used: usize = 0;
-        const name_range = self.bufferedName(bytes, &position, &used) orelse return null;
-        var empty = false;
-
-        // Do not consume input or grow storage until the complete tag is known.
-        // The incremental parser preserves failure order on every declined tag.
-        while (true) {
-            while (position < bytes.len and isXmlWhitespace(bytes[position])) : (position += 1) {}
-            if (position == bytes.len) return null;
-            if (bytes[position] == '>') {
-                position += 1;
-                break;
-            }
-            if (bytes[position] == '/') {
-                if (bytes.len - position < 2 or bytes[position + 1] != '>') return null;
-                position += 2;
-                empty = true;
-                break;
-            }
-            if (self.attribute_ranges.items.len == @min(self.max_attributes, self.attribute_ranges.capacity)) return null;
-            const name = self.bufferedName(bytes, &position, &used) orelse return null;
-            if (std.mem.eql(u8, bytes[name.start..][0..name.len], "xmlns")) return null;
-            while (position < bytes.len and isXmlWhitespace(bytes[position])) : (position += 1) {}
-            if (position == bytes.len or bytes[position] != '=') return null;
-            position += 1;
-            while (position < bytes.len and isXmlWhitespace(bytes[position])) : (position += 1) {}
-            if (position == bytes.len) return null;
-            const quote = bytes[position];
-            if (quote != '\'' and quote != '"') return null;
-            position += 1;
-            const start = position;
-            position += ordinaryAttributeRun(bytes[position..], quote);
-            if (position == bytes.len or bytes[position] != quote) return null;
-            const length = position - start;
-            const capacity = @min(self.max_attribute_bytes, self.event_bytes.capacity);
-            if (length > capacity -| used) return null;
-            const value: Range = .{ .start = start, .len = length };
-            used += length;
-            position += 1;
-            if (self.hasAttribute(bytes, name)) return null;
-            self.attribute_ranges.appendAssumeCapacity(.{
-                .name = name,
-                .value = value,
-                .namespace_declaration = false,
-                .offset = self.source.position + name.start,
-            });
-        }
-
-        const name_offset = self.source.position;
-        const end = std.math.add(u64, self.source.position, position) catch return null;
-        reader.toss(position);
-        self.source.position = end;
-        return try self.finishStartElement(bytes, start_offset, name_offset, name_range, empty);
-    }
-
-    fn readStartElement(self: *Cursor, start_offset: u64) ParserError!Event {
-        self.event_bytes.clearRetainingCapacity();
-        self.attribute_ranges.clearRetainingCapacity();
-        self.namespace_declarations.clearRetainingCapacity();
-        self.attributes.clearRetainingCapacity();
-        const name_offset = self.source.currentOffset();
-        const name_range = try self.parseQName();
-        var empty = false;
-
-        while (true) {
-            try self.skipWhitespace();
-            const marker = try self.requiredCodepoint();
-            if (marker.value == '>') break;
-            if (marker.value == '/') {
-                const close = try self.requiredCodepoint();
-                if (close.value != '>') return self.malformed(.malformed_tag);
-                empty = true;
-                break;
-            }
-            try self.source.unread(marker);
-
-            if (self.attribute_ranges.items.len == self.max_attributes) return self.limitError(.attributes);
-            const attribute_offset = self.source.currentOffset();
-            const attribute_name = try self.parseQName();
-            const quote: u21 = opening: {
-                if (try self.source.peekSingleByte()) |bytes| {
-                    if (bytes.len >= 2 and bytes[0] == '=' and (bytes[1] == '\'' or bytes[1] == '"')) {
-                        const value = bytes[1];
-                        self.source.borrowed_len = 2;
-                        try self.source.commitBorrowed();
-                        break :opening value;
-                    }
-                }
-                try self.skipWhitespace();
-                const equals = try self.requiredCodepoint();
-                if (equals.value != '=') return self.malformed(.malformed_tag);
-                try self.skipWhitespace();
-                const value = try self.requiredCodepoint();
-                if (value.value != '\'' and value.value != '"') return self.malformed(.malformed_tag);
-                break :opening value.value;
-            };
-            const attribute_value = try self.parseAttributeValue(quote);
-            if (self.hasAttribute(self.event_bytes.items, attribute_name)) return self.malformedAt(.duplicate_attribute, attribute_offset);
-            const raw_name = self.event_bytes.items[attribute_name.start..][0..attribute_name.len];
-            const namespace_declaration = std.mem.eql(u8, raw_name, "xmlns") or
-                (std.mem.startsWith(u8, raw_name, "xmlns:") and raw_name.len > 6);
-            if (namespace_declaration) {
-                const prefix = if (std.mem.eql(u8, raw_name, "xmlns"))
-                    Range{ .start = attribute_name.start, .len = 0 }
-                else
-                    Range{ .start = attribute_name.start + 6, .len = attribute_name.len - 6 };
-                try self.namespace_declarations.append(self.allocator, .{ .prefix = prefix, .uri = attribute_value, .offset = attribute_offset });
-            }
-            try self.attribute_ranges.append(self.allocator, .{
-                .name = attribute_name,
-                .value = attribute_value,
-                .namespace_declaration = namespace_declaration,
-                .offset = attribute_offset,
-            });
-        }
-
-        return self.finishStartElement(self.event_bytes.items, start_offset, name_offset, name_range, empty);
-    }
-
-    fn finishStartElement(self: *Cursor, bytes: []const u8, start_offset: u64, name_offset: u64, name_range: NameRange, empty: bool) AdvanceError!Event {
-        if (self.depth == 0) {
-            if (self.root_closed) return self.malformedAt(.content_after_root, start_offset);
-            self.root_seen = true;
-        }
-        if (self.depth == MAX_DEPTH) return self.limitError(.depth);
-
-        const binding_start = self.namespace_bindings.items.len;
-        const namespace_bytes_start = self.namespace_bytes.items.len;
-        try self.installNamespaces();
-        const element_name = try self.makeName(bytes, name_range, false, name_offset);
-
-        const frame_name_start = self.open_names.items.len;
-        try self.open_names.appendSlice(self.allocator, bytes[name_range.start..][0..name_range.len]);
-        self.frames[self.depth] = .{
-            .name_start = frame_name_start,
-            .name_len = name_range.len,
-            .prefix_len = name_range.prefix_len,
-            .binding_start = binding_start,
-            .namespace_bytes_start = namespace_bytes_start,
-            .opening_end = self.source.position,
-        };
-        self.depth += 1;
-        self.pending_empty = empty;
-
-        try self.attributes.ensureTotalCapacityPrecise(self.allocator, self.attribute_ranges.items.len);
-        for (self.attribute_ranges.items) |attribute_range| {
-            if (attribute_range.namespace_declaration) continue;
-            const attribute_name = try self.makeName(bytes, attribute_range.name, true, attribute_range.offset);
-            const expanded = attribute_name.expanded;
-            for (self.attributes.items) |previous| {
-                if (previous.name.eql(expanded.namespace_uri, expanded.local)) return self.malformedAt(.duplicate_attribute, attribute_range.offset);
-            }
-            try self.attributes.append(self.allocator, .{
-                .name = attribute_name,
-                .value = bytes[attribute_range.value.start..][0..attribute_range.value.len],
-                .offset = attribute_range.offset,
-            });
-        }
-        return .{
-            .span = .{ .start = start_offset, .end = self.source.position },
-            .data = .{ .start_element = .{
-                .name = element_name,
-                .attributes = self.attributes.items,
-                .empty_element_syntax = empty,
-            } },
-        };
-    }
-
-    // Raw attribute names are unique, so each prefix is declared once per element.
-    fn installNamespaces(self: *Cursor) AdvanceError!void {
-        if (self.namespace_declarations.items.len != 0) self.scopeChanged();
-        for (self.namespace_declarations.items) |declaration| {
-            const prefix = self.event_bytes.items[declaration.prefix.start..][0..declaration.prefix.len];
-            const uri = self.event_bytes.items[declaration.uri.start..][0..declaration.uri.len];
-            if (std.mem.eql(u8, prefix, "xmlns")) return self.malformedAt(.invalid_namespace_declaration, declaration.offset);
-            if (std.mem.eql(u8, prefix, "xml")) {
-                if (!std.mem.eql(u8, uri, XML_NAMESPACE)) return self.malformedAt(.invalid_namespace_declaration, declaration.offset);
-            } else if (std.mem.eql(u8, uri, XML_NAMESPACE)) {
-                return self.malformedAt(.invalid_namespace_declaration, declaration.offset);
-            }
-            if (std.mem.eql(u8, uri, XMLNS_NAMESPACE)) return self.malformedAt(.invalid_namespace_declaration, declaration.offset);
-            if (prefix.len != 0 and uri.len == 0) return self.malformedAt(.invalid_namespace_declaration, declaration.offset);
-            const prefix_start = self.namespace_bytes.items.len;
-            try self.namespace_bytes.appendSlice(self.allocator, prefix);
-            const uri_start = self.namespace_bytes.items.len;
-            try self.namespace_bytes.appendSlice(self.allocator, uri);
-            try self.namespace_bindings.append(self.allocator, .{
-                .prefix_start = prefix_start,
-                .prefix_len = prefix.len,
-                .uri_start = uri_start,
-                .uri_len = uri.len,
-            });
-        }
-    }
-
-    // `xmlns=""` undeclares the default namespace: no namespace, as when none is bound.
-    fn defaultNamespace(self: *const Cursor) ?[]const u8 {
-        const uri = self.resolveNamespace(null) orelse return null;
-        return if (uri.len == 0) null else uri;
-    }
-
-    fn resolveNamespace(self: *const Cursor, prefix: ?[]const u8) ?[]const u8 {
-        if (prefix) |value| if (std.mem.eql(u8, value, "xml")) return XML_NAMESPACE;
-        const wanted = prefix orelse "";
-        var index = self.namespace_bindings.items.len;
-        while (index != 0) {
-            index -= 1;
-            const binding = self.namespace_bindings.items[index];
-            const bound_prefix = self.namespace_bytes.items[binding.prefix_start..][0..binding.prefix_len];
-            if (std.mem.eql(u8, bound_prefix, wanted)) {
-                return self.namespace_bytes.items[binding.uri_start..][0..binding.uri_len];
-            }
-        }
-        return null;
-    }
-
-    // An unprefixed attribute has no namespace; an unprefixed element has the default one.
-    fn makeName(self: *Cursor, bytes: []const u8, range: NameRange, comptime attribute: bool, offset: u64) AdvanceError!Name {
-        const raw = bytes[range.start..][0..range.len];
-        const prefix = if (range.prefix_len == 0) null else raw[0..range.prefix_len];
-        const local = if (range.prefix_len == 0) raw else raw[range.prefix_len + 1 ..];
-        const namespace_uri = if (prefix) |value|
-            self.resolveNamespace(value) orelse return self.malformedAt(.unbound_prefix, offset)
-        else if (attribute) null else self.defaultNamespace();
-        return .{ .raw = raw, .expanded = .{
-            .prefix = prefix,
-            .local = local,
-            .namespace_uri = namespace_uri,
-        } };
-    }
-
-    fn scopeChanged(self: *Cursor) void {
-        self.additional_namespaces = null;
-        self.namespace_scope +%= 1;
-    }
-
-    fn popFrame(self: *Cursor, frame: Frame) void {
-        self.depth -= 1;
-        self.open_names.items.len = frame.name_start;
-        if (self.namespace_bindings.items.len != frame.binding_start) self.scopeChanged();
-        self.namespace_bindings.items.len = frame.binding_start;
-        self.namespace_bytes.items.len = frame.namespace_bytes_start;
-        if (self.depth == 0) self.root_closed = true;
-    }
-
-    fn readEndElement(self: *Cursor, start_offset: u64) ParserError!Event {
-        if (self.depth == 0) return self.malformedAt(.mismatched_end_tag, start_offset);
-        const name_offset = self.source.currentOffset();
-        const name_range = try self.parseQName();
-        try self.skipWhitespace();
-        const close = try self.requiredCodepoint();
-        if (close.value != '>') return self.malformed(.malformed_tag);
-        const frame = self.frames[self.depth - 1];
-        const raw = self.event_bytes.items[name_range.start..][0..name_range.len];
-        const expected = self.open_names.items[frame.name_start..][0..frame.name_len];
-        if (!std.mem.eql(u8, raw, expected)) return self.malformedAt(.mismatched_end_tag, start_offset);
-        const name = try self.makeName(self.event_bytes.items, name_range, false, name_offset);
-        self.popFrame(frame);
-        return .{
-            .span = .{ .start = start_offset, .end = self.source.position },
-            .data = .{ .end_element = .{ .name = name } },
-        };
-    }
-
-    fn syntheticEnd(self: *Cursor) AdvanceError!Event {
-        if (!self.pending_empty or self.depth == 0) return error.InvalidState;
-        const frame = self.frames[self.depth - 1];
-        self.event_bytes.clearRetainingCapacity();
-        try self.event_bytes.appendSlice(self.allocator, self.open_names.items[frame.name_start..][0..frame.name_len]);
-        const name = try self.makeName(self.event_bytes.items, .{ .start = 0, .len = self.event_bytes.items.len, .prefix_len = frame.prefix_len }, false, frame.opening_end);
-        self.pending_empty = false;
-        self.popFrame(frame);
-        return .{
-            .span = .{ .start = frame.opening_end, .end = frame.opening_end },
-            .data = .{ .end_element = .{ .name = name } },
-        };
-    }
-
-    // Null when the run held no text: ignored whitespace, or markup that produced none.
-    fn readTextEvent(self: *Cursor) ParserError!?Event {
-        if (self.in_cdata) return self.readCdataText();
-        return self.readScalarText();
-    }
-
-    fn readScalarText(self: *Cursor) ParserError!?Event {
-        const start = self.source.currentOffset();
-        while (self.text_bytes.items.len < TEXT_CHUNK_BYTES) {
-            if (self.normal_text_brackets == 0) {
-                if (try self.source.peekSingleByte()) |bytes| {
-                    const length = ordinaryTextRun(bytes, TEXT_CHUNK_BYTES - self.text_bytes.items.len);
-                    if (length != 0) {
-                        // Keep logical text chunks unchanged across input refills.
-                        try self.text_bytes.appendSlice(self.allocator, bytes[0..length]);
-                        self.source.borrowed_len = length;
-                        try self.source.commitBorrowed();
-                        continue;
-                    }
-                }
-            }
-            const value = self.source.peekCodepoint() catch |err| switch (err) {
-                error.EndOfStream => break,
-                else => |other| return other,
-            };
-            if (value.value == '<') break;
-            if (value.value == '&') {
-                if (self.text_bytes.items.len != 0) break;
-                _ = try self.requiredCodepoint();
-                try self.appendTextCodepoint(try self.readEntity());
-                self.normal_text_brackets = 0;
-                continue;
-            }
-            const encoded_len = std.unicode.utf8CodepointSequenceLength(value.value) catch return self.malformed(.invalid_character);
-            if (encoded_len > TEXT_CHUNK_BYTES - self.text_bytes.items.len) break;
-            _ = try self.requiredCodepoint();
-            if (value.value == ']') {
-                if (self.normal_text_brackets < 2) self.normal_text_brackets += 1;
-                try self.appendTextCodepoint(value.value);
-            } else if (value.value == '>' and self.normal_text_brackets == 2) {
-                return self.malformedAt(.malformed_markup, value.start - 2 * self.source.unitWidth());
-            } else if (value.value == '\r') {
-                self.normal_text_brackets = 0;
-                const next = self.source.peekCodepoint() catch |err| switch (err) {
-                    error.EndOfStream => null,
-                    else => |other| return other,
-                };
-                if (next) |following| {
-                    if (following.value == '\n') _ = try self.requiredCodepoint();
-                }
-                try self.appendTextCodepoint('\n');
-            } else {
-                self.normal_text_brackets = 0;
-                try self.appendTextCodepoint(value.value);
-            }
-        }
-        if (self.text_bytes.items.len == 0) return null;
-        return .{
-            .span = .{ .start = start, .end = self.source.currentOffset() },
-            .data = .{ .text = .{ .bytes = self.text_bytes.items } },
-        };
-    }
-
-    fn readCdataStart(self: *Cursor, start_offset: u64) AdvanceError!void {
-        if (self.depth == 0) return self.malformedAt(.malformed_markup, start_offset);
-        for ("CDATA[") |expected| {
-            const value = try self.requiredCodepoint();
-            if (value.value != expected) return self.malformed(.malformed_markup);
-        }
-        self.in_cdata = true;
-        self.cdata_brackets = 0;
-    }
-
-    fn readCdataText(self: *Cursor) ParserError!?Event {
-        const start = self.source.currentOffset();
-        while (self.text_bytes.items.len < TEXT_CHUNK_BYTES) {
-            const value = self.source.peekCodepoint() catch |err| switch (err) {
-                error.EndOfStream => return self.malformed(.unexpected_end),
-                else => |other| return other,
-            };
-            const output_length = if (value.value == ']')
-                if (self.cdata_brackets == 2) @as(usize, 1) else 0
-            else if (value.value == '>' and self.cdata_brackets == 2)
-                0
-            else
-                (if (value.value == '\r') 1 else std.unicode.utf8CodepointSequenceLength(value.value) catch return self.malformed(.invalid_character)) +
-                    @as(usize, self.cdata_brackets);
-            if (output_length > TEXT_CHUNK_BYTES - self.text_bytes.items.len) break;
-            _ = try self.source.readCodepoint();
-            if (value.value == ']') {
-                if (self.cdata_brackets < 2) {
-                    self.cdata_brackets += 1;
-                } else {
-                    try self.appendTextCodepoint(']');
-                }
-                continue;
-            }
-            if (value.value == '>' and self.cdata_brackets == 2) {
-                self.cdata_brackets = 0;
-                self.in_cdata = false;
-                break;
-            }
-            while (self.cdata_brackets != 0) : (self.cdata_brackets -= 1) {
-                try self.appendTextCodepoint(']');
-            }
-            if (value.value == '\r') {
-                const next = self.source.peekCodepoint() catch |err| switch (err) {
-                    error.EndOfStream => null,
-                    else => |other| return other,
-                };
-                if (next) |following| {
-                    if (following.value == '\n') _ = try self.requiredCodepoint();
-                }
-                try self.appendTextCodepoint('\n');
-            } else {
-                try self.appendTextCodepoint(value.value);
-            }
-        }
-        if (self.text_bytes.items.len == 0) return null;
-        return .{
-            .span = .{ .start = start, .end = self.source.currentOffset() },
-            .data = .{ .text = .{ .bytes = self.text_bytes.items } },
-        };
-    }
-
-    fn readComment(self: *Cursor) AdvanceError!void {
-        var dashes: u2 = 0;
-        while (true) {
-            const value = try self.requiredCodepoint();
-            if (value.value == '-') {
-                if (dashes == 1) {
-                    const close = try self.requiredCodepoint();
-                    if (close.value != '>') return self.malformed(.malformed_markup);
-                    return;
-                }
-                dashes = 1;
-            } else {
-                dashes = 0;
-                if (!isXmlChar(value.value)) return self.malformed(.invalid_character);
-            }
-        }
-    }
-
-    fn readProcessingInstruction(self: *Cursor, initial: bool) ParserError!void {
-        self.event_bytes.clearRetainingCapacity();
-        const target_offset = self.source.currentOffset();
-        const target = try self.parseQName();
-        const target_bytes = self.event_bytes.items[target.start..][0..target.len];
-        const separator = try self.requiredCodepoint();
-        if (!isXmlWhitespace(separator.value) and separator.value != '?') return self.malformed(.malformed_markup);
-        const declaration = initial and std.mem.eql(u8, target_bytes, "xml");
-        if (std.ascii.eqlIgnoreCase(target_bytes, "xml") and !declaration) return self.malformedAt(.malformed_markup, target_offset);
-        self.declaration_bytes.clearRetainingCapacity();
-        self.declaration_start = self.source.currentOffset();
-        if (separator.value == '?') {
-            const close = try self.requiredCodepoint();
-            if (close.value != '>') return self.malformed(.malformed_markup);
-        } else {
-            while (true) {
-                const value = try self.requiredCodepoint();
-                if (value.value == '?') {
-                    const following = try self.requiredCodepoint();
-                    if (following.value == '>') break;
-                    if (declaration) try self.appendDeclarationByte('?');
-                    try self.source.unread(following);
-                    continue;
-                }
-                if (!isXmlChar(value.value)) return self.malformed(.invalid_character);
-                if (declaration) {
-                    if (value.value > 0x7F) return self.malformed(.malformed_declaration);
-                    try self.appendDeclarationByte(@intCast(value.value));
-                }
-            }
-        }
-        if (declaration) try self.parseXmlDeclaration();
-    }
-
-    fn appendDeclarationByte(self: *Cursor, value: u8) AdvanceError!void {
-        if (self.declaration_bytes.items.len == MAX_DECLARATION_BYTES) return self.limitError(.declaration_bytes);
-        try self.declaration_bytes.append(self.allocator, value);
-    }
-
-    // The rule's offending character is the last one read, except at the end of input.
-    fn malformed(self: *Cursor, rule: Rule) AdvanceError {
-        return self.malformedAt(rule, if (rule == .unexpected_end) self.source.currentOffset() else self.source.last_start);
-    }
-
-    fn malformedAt(self: *Cursor, rule: Rule, offset: u64) AdvanceError {
-        self.xml_rule = rule;
-        self.failure_offset = offset;
-        self.offset = offset;
-        return error.InvalidXml;
-    }
-
-    // Declaration bytes are ASCII, one character each.
-    fn declarationError(self: *Cursor, position: usize, err: AdvanceError) AdvanceError {
-        const offset = self.declaration_start + position * self.source.unitWidth();
-        if (err == error.InvalidXml) return self.malformedAt(.malformed_declaration, offset);
-        self.failure_offset = offset;
-        self.offset = offset;
-        return err;
-    }
-
-    // A failure's offset: the offending character for broken rules and encodings, otherwise
-    // the next unread byte.
-    fn failedAt(self: *const Cursor, err: ParserError) u64 {
-        if (self.failure_offset) |offset| return offset;
-        if (err == error.InvalidEncoding) return self.source.last_start;
-        return self.source.currentOffset();
-    }
-
-    fn limitError(self: *Cursor, limit: @TypeOf(self.limit_failure.?)) AdvanceError {
-        self.limit_failure = limit;
-        return error.LimitExceeded;
-    }
-
-    fn parseXmlDeclaration(self: *Cursor) AdvanceError!void {
-        const bytes = self.declaration_bytes.items;
-        var position: usize = 0;
-        var version: ?[]const u8 = null;
-        var version_at: usize = 0;
-        var encoding: ?[]const u8 = null;
-        var encoding_at: usize = 0;
-        var order: u2 = 0;
-        while (position < bytes.len and isXmlWhitespace(bytes[position])) position += 1;
-        while (true) {
-            if (position == bytes.len) break;
-            const name_start = position;
-            if (!isAsciiNameStart(bytes[position])) return self.declarationError(position, error.InvalidXml);
-            position += 1;
-            while (position < bytes.len and isAsciiNameChar(bytes[position])) position += 1;
-            const name = bytes[name_start..position];
-            while (position < bytes.len and isXmlWhitespace(bytes[position])) position += 1;
-            if (position == bytes.len or bytes[position] != '=') return self.declarationError(position, error.InvalidXml);
-            position += 1;
-            while (position < bytes.len and isXmlWhitespace(bytes[position])) position += 1;
-            if (position == bytes.len) return self.declarationError(position, error.InvalidXml);
-            const quote = bytes[position];
-            if (quote != '\'' and quote != '"') return self.declarationError(position, error.InvalidXml);
-            position += 1;
-            const value_start = position;
-            while (position < bytes.len and bytes[position] != quote) position += 1;
-            if (position == bytes.len) return self.declarationError(position, error.InvalidXml);
-            const value = bytes[value_start..position];
-            position += 1;
-            if (std.mem.eql(u8, name, "version")) {
-                if (version != null or order != 0) return self.declarationError(name_start, error.InvalidXml);
-                version = value;
-                version_at = value_start;
-            } else if (std.mem.eql(u8, name, "encoding")) {
-                if (version == null or encoding != null or order > 0) return self.declarationError(name_start, error.InvalidXml);
-                encoding = value;
-                encoding_at = value_start;
-                order = 1;
-            } else if (std.mem.eql(u8, name, "standalone")) {
-                if (version == null or order > 1) return self.declarationError(name_start, error.InvalidXml);
-                if (!std.mem.eql(u8, value, "yes") and !std.mem.eql(u8, value, "no")) return self.declarationError(value_start, error.InvalidXml);
-                order = 2;
-            } else {
-                return self.declarationError(name_start, error.InvalidXml);
-            }
-            if (position == bytes.len) break;
-            if (!isXmlWhitespace(bytes[position])) return self.declarationError(position, error.InvalidXml);
-            while (position < bytes.len and isXmlWhitespace(bytes[position])) position += 1;
-        }
-        const version_value = version orelse return self.declarationError(0, error.InvalidXml);
-        if (!std.mem.eql(u8, version_value, "1.0")) return self.declarationError(version_at, error.UnsupportedVersion);
-        if (encoding) |value| {
-            if (std.ascii.eqlIgnoreCase(value, "UTF-8")) {
-                if (self.source.encoding != .utf8) return self.declarationError(encoding_at, error.InvalidEncoding);
-            } else if (std.ascii.eqlIgnoreCase(value, "UTF-16")) {
-                if (self.source.encoding != .utf16_le and self.source.encoding != .utf16_be) return self.declarationError(encoding_at, error.InvalidEncoding);
-            } else if (std.ascii.eqlIgnoreCase(value, "ISO-8859-1")) {
-                if (self.source.encoding != .utf8 or
-                    std.mem.startsWith(u8, self.source.probe[0..self.source.probe_len], "\xef\xbb\xbf")) return self.declarationError(encoding_at, error.InvalidEncoding);
-                self.source.encoding = .latin1;
-            } else {
-                return self.declarationError(encoding_at, error.UnsupportedEncoding);
-            }
-        }
-    }
-};
-
-// The UTF-8 bytes of an XML character.
 fn encodeChar(value: u21, buffer: *[4]u8) ?[]const u8 {
     if (!isXmlChar(value)) return null;
     return buffer[0 .. std.unicode.utf8Encode(value, buffer) catch return null];
 }
 
 fn digitValue(value: u8, base: u32) ?u32 {
-    const digit: u32 = if (value >= '0' and value <= '9') value - '0' else if (value >= 'a' and value <= 'f') value - 'a' + 10 else if (value >= 'A' and value <= 'F') value - 'A' + 10 else return null;
+    const digit: u32 = if (value >= '0' and value <= '9')
+        value - '0'
+    else if (value >= 'a' and value <= 'f')
+        value - 'a' + 10
+    else if (value >= 'A' and value <= 'F')
+        value - 'A' + 10
+    else
+        return null;
     if (digit >= base) return null;
     return digit;
 }
 
-/// Writer state, namespace, character, sink, and bound failures.
+// --- XML writing ---
+
 pub const WriterError = error{
     InvalidState,
     OverlappingBuffers,
@@ -1730,29 +1714,11 @@ pub const WriterError = error{
     OutOfMemory,
 };
 
-const WriterState = enum {
-    initial,
-    start_tag,
-    content,
-    epilog,
-    done,
-    failed,
-};
-
-const WriterFrame = struct {
-    name_start: usize,
-    name_len: usize,
-    attribute_start: usize,
-    binding_start: usize,
-    namespace_bytes_start: usize,
-};
-
-/// Buffered XML emission for mzML and retained metadata fragments.
 pub const Writer = struct {
     allocator: std.mem.Allocator,
     sink: *std.Io.Writer,
-    /// A writer the sink drains into, such as a hashing sink's destination. Written bytes may
-    /// overlap neither its buffer nor the sink's, read at each write since either can grow.
+    // A writer the sink drains into, such as a hashing sink's destination. Written bytes may
+    // overlap neither its buffer nor the sink's, read at each write since either can grow.
     guard: ?*const std.Io.Writer = null,
     state: WriterState = .initial,
     failure: ?WriterError = null,
@@ -1771,55 +1737,44 @@ pub const Writer = struct {
     binary_carry: [3]u8 = undefined,
     binary_carry_len: usize = 0,
 
-    /// Initializes a writer over a caller-owned sink.
     pub fn init(allocator: std.mem.Allocator, sink: *std.Io.Writer, options: struct { fragment: bool = false }) Writer {
         return .{ .allocator = allocator, .sink = sink, .state = if (options.fragment) .epilog else .initial };
     }
 
-    /// Releases retained name and namespace scratch.
     pub fn deinit(self: *Writer) void {
         self.open_names.deinit(self.allocator);
         self.attribute_names.deinit(self.allocator);
         self.namespace_bindings.deinit(self.allocator);
         self.namespace_bytes.deinit(self.allocator);
+        self.* = undefined;
     }
 
-    /// Whether bytes share memory with the buffers the writer writes into.
     pub fn overlapsOutput(self: *const Writer, bytes: []const u8) bool {
         const guard = if (self.guard) |writer| writer.buffer else &.{};
         return overlaps(self.sink.buffer, bytes) or overlaps(guard, bytes);
     }
 
-    // Caller bytes are copied into the sink's buffer, so they must not live there.
-    fn checkInput(self: *Writer, bytes: []const u8) WriterError!void {
-        if (self.overlapsOutput(bytes)) {
-            @branchHint(.cold);
-            return self.fail(error.OverlappingBuffers);
-        }
-    }
-
-    /// Returns the physical bytes accepted by the sink, or null after a write failure.
+    // Null after a write failure.
     pub fn byteOffset(self: *const Writer) ?u64 {
         if (!self.offset_valid) return null;
         return self.logical_offset;
     }
 
-    /// Writes the canonical UTF-8 XML declaration.
     pub fn startDocument(self: *Writer) WriterError!void {
         try self.check(.initial);
         try self.writeBytes("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
         self.state = .epilog;
     }
 
-    /// Opens an element; any prefix must have a declaration before its content is written.
+    // Any prefix must have a declaration before the element's content is written.
     pub fn startElement(self: *Writer, name: []const u8) WriterError!void {
         try self.checkInput(name);
         validateQName(name) catch |err| return self.fail(err);
         return self.startElementTrusted(name);
     }
 
-    /// startElement for a name the mzML writer supplies from its own tables, which is a valid
-    /// name and not caller memory, so it skips those two checks.
+    // For a name the mzML writer supplies from its own tables, which is a valid name and not
+    // caller memory, so it skips those two checks.
     pub fn startElementTrusted(self: *Writer, name: []const u8) WriterError!void {
         try self.checkContent();
         if (self.state == .epilog and self.root_written) return self.fail(error.InvalidState);
@@ -1845,7 +1800,6 @@ pub const Writer = struct {
         try self.writeBytes(name);
     }
 
-    /// Writes a namespace declaration on the current opening tag.
     pub fn namespace(self: *Writer, prefix: ?[]const u8, uri: []const u8) WriterError!void {
         try self.check(.start_tag);
         try self.checkInput(prefix orelse "");
@@ -1856,7 +1810,8 @@ pub const Writer = struct {
                 return self.fail(error.InvalidNamespace);
             if (std.mem.eql(u8, value, "xml") != std.mem.eql(u8, uri, XML_NAMESPACE)) return self.fail(error.InvalidNamespace);
         }
-        if (std.mem.eql(u8, uri, XMLNS_NAMESPACE) or (prefix == null and std.mem.eql(u8, uri, XML_NAMESPACE))) return self.fail(error.InvalidNamespace);
+        if (std.mem.eql(u8, uri, XMLNS_NAMESPACE) or (prefix == null and std.mem.eql(u8, uri, XML_NAMESPACE)))
+            return self.fail(error.InvalidNamespace);
         const frame = &self.frames[self.frame_count - 1];
         const actual_prefix = prefix orelse "";
         for (self.namespace_bindings.items[frame.binding_start..]) |binding| {
@@ -1883,10 +1838,10 @@ pub const Writer = struct {
         try self.writeByte('"');
     }
 
-    /// attribute for an unprefixed name the mzML writer supplies from its own tables (cvParam's
-    /// fields and the like): a valid name, not caller memory, written before any caller-supplied
-    /// attribute of the element and once each. It is still recorded, so a caller's attribute of
-    /// the same name is a duplicate; the value is checked and escaped as always.
+    // For an unprefixed name the mzML writer supplies from its own tables (cvParam's fields and
+    // the like): a valid name, not caller memory, written before any caller-supplied attribute
+    // of the element and once each. It is still recorded, so a caller's attribute of the same
+    // name is a duplicate; the value is checked and escaped as always.
     pub fn attributeTrusted(self: *Writer, name: []const u8, value: []const u8) WriterError!void {
         try self.check(.start_tag);
         try self.checkInput(value);
@@ -1899,7 +1854,7 @@ pub const Writer = struct {
         try self.writeByte('"');
     }
 
-    /// Writes an attribute with any prefix resolved in the current namespace bindings.
+    // Any prefix is resolved in the current namespace bindings.
     pub fn attribute(self: *Writer, name: []const u8, value: []const u8) WriterError!void {
         try self.check(.start_tag);
         try self.checkInput(name);
@@ -1931,7 +1886,6 @@ pub const Writer = struct {
         try self.writeByte('"');
     }
 
-    /// Writes XML text with character and delimiter-safe escaping.
     pub fn text(self: *Writer, value: []const u8) WriterError!void {
         try self.checkContent();
         try self.checkInput(value);
@@ -1949,9 +1903,9 @@ pub const Writer = struct {
         try self.binaryEnd();
     }
 
-    /// Writes binary content as Base64 one piece at a time; binaryEnd closes it. Up to two
-    /// bytes carry over between pieces, so any split gives the text binary gives for the whole.
-    /// While bytes carry, startElement, text and endElement fail with InvalidState.
+    // Base64 one piece at a time; binaryEnd closes it. Up to two bytes carry over between
+    // pieces, so any split gives the text binary gives for the whole. While bytes carry,
+    // startElement, text, and endElement fail with InvalidState.
     pub fn binaryPart(self: *Writer, wire: []const u8) WriterError!void {
         try self.checkAny();
         try self.checkInput(wire);
@@ -1977,12 +1931,61 @@ pub const Writer = struct {
         self.binary_carry_len = rest.len - whole;
     }
 
-    /// Writes the padded final group of binary content started with binaryPart.
     pub fn binaryEnd(self: *Writer) WriterError!void {
         try self.checkAny();
         const length = self.binary_carry_len;
         self.binary_carry_len = 0;
         try self.encodeBase64(self.binary_carry[0..length]);
+    }
+
+    pub fn endElement(self: *Writer) WriterError!void {
+        try self.checkContent();
+        if (self.state != .start_tag and self.state != .content) return self.fail(error.InvalidState);
+        if (self.frame_count == 0) return self.fail(error.InvalidState);
+        const frame = self.frames[self.frame_count - 1];
+        const name = self.open_names.items[frame.name_start..][0..frame.name_len];
+        if (self.state == .start_tag) {
+            try self.checkOpeningName();
+            try self.writeBytes("/>");
+        } else {
+            try self.writeBytes("</");
+            try self.writeBytes(name);
+            try self.writeByte('>');
+        }
+        self.frame_count -= 1;
+        self.open_names.items.len = frame.name_start;
+        self.attribute_names.items.len = frame.attribute_start;
+        self.namespace_bindings.items.len = frame.binding_start;
+        self.namespace_bytes.items.len = frame.namespace_bytes_start;
+        self.text_brackets = 0;
+        self.state = if (self.frame_count == 0) .epilog else .content;
+    }
+
+    pub fn endDocument(self: *Writer) WriterError!void {
+        try self.check(.epilog);
+        if (!self.root_written) return self.fail(error.InvalidState);
+        self.state = .done;
+    }
+
+    // "" for the default namespace when none is declared; null for an unbound prefix.
+    pub fn namespaceUri(self: *const Writer, prefix: []const u8) ?[]const u8 {
+        if (std.mem.eql(u8, prefix, "xml")) return XML_NAMESPACE;
+        var index = self.namespace_bindings.items.len;
+        while (index != 0) {
+            index -= 1;
+            const binding = self.namespace_bindings.items[index];
+            if (std.mem.eql(u8, self.namespace_bytes.items[binding.prefix_start..][0..binding.prefix_len], prefix))
+                return self.namespace_bytes.items[binding.uri_start..][0..binding.uri_len];
+        }
+        return if (prefix.len == 0) "" else null;
+    }
+
+    // Caller bytes are copied into the sink's buffer, so they must not live there.
+    fn checkInput(self: *Writer, bytes: []const u8) WriterError!void {
+        if (self.overlapsOutput(bytes)) {
+            @branchHint(.cold);
+            return self.fail(error.OverlappingBuffers);
+        }
     }
 
     // Base64 of whole groups, padded only for a final group shorter than three bytes.
@@ -2010,37 +2013,6 @@ pub const Writer = struct {
         if (wire.len != 0) self.text_brackets = 0;
     }
 
-    /// Closes the current element.
-    pub fn endElement(self: *Writer) WriterError!void {
-        try self.checkContent();
-        if (self.state != .start_tag and self.state != .content) return self.fail(error.InvalidState);
-        if (self.frame_count == 0) return self.fail(error.InvalidState);
-        const frame = self.frames[self.frame_count - 1];
-        const name = self.open_names.items[frame.name_start..][0..frame.name_len];
-        if (self.state == .start_tag) {
-            try self.checkOpeningName();
-            try self.writeBytes("/>");
-        } else {
-            try self.writeBytes("</");
-            try self.writeBytes(name);
-            try self.writeByte('>');
-        }
-        self.frame_count -= 1;
-        self.open_names.items.len = frame.name_start;
-        self.attribute_names.items.len = frame.attribute_start;
-        self.namespace_bindings.items.len = frame.binding_start;
-        self.namespace_bytes.items.len = frame.namespace_bytes_start;
-        self.text_brackets = 0;
-        self.state = if (self.frame_count == 0) .epilog else .content;
-    }
-
-    /// Marks a complete document after the root element closes.
-    pub fn endDocument(self: *Writer) WriterError!void {
-        try self.check(.epilog);
-        if (!self.root_written) return self.fail(error.InvalidState);
-        self.state = .done;
-    }
-
     fn check(self: *Writer, expected: WriterState) WriterError!void {
         try self.checkAny();
         if (self.state != expected) return self.fail(error.InvalidState);
@@ -2048,27 +2020,12 @@ pub const Writer = struct {
 
     fn checkAny(self: *Writer) WriterError!void {
         if (self.failure) |failure| return failure;
-        if (self.state == .failed) return error.WriteFailed;
     }
 
     // Other content would split a Base64 group that binaryPart left open.
     fn checkContent(self: *Writer) WriterError!void {
         try self.checkAny();
         if (self.binary_carry_len != 0) return self.fail(error.InvalidState);
-    }
-
-    /// Returns the URI bound to prefix in the current scope ("" for the default namespace when
-    /// none is declared), or null for an unbound prefix.
-    pub fn namespaceUri(self: *const Writer, prefix: []const u8) ?[]const u8 {
-        if (std.mem.eql(u8, prefix, "xml")) return XML_NAMESPACE;
-        var index = self.namespace_bindings.items.len;
-        while (index != 0) {
-            index -= 1;
-            const binding = self.namespace_bindings.items[index];
-            if (std.mem.eql(u8, self.namespace_bytes.items[binding.prefix_start..][0..binding.prefix_len], prefix))
-                return self.namespace_bytes.items[binding.uri_start..][0..binding.uri_len];
-        }
-        return if (prefix.len == 0) "" else null;
     }
 
     fn checkOpeningName(self: *Writer) WriterError!void {
@@ -2087,7 +2044,6 @@ pub const Writer = struct {
 
     fn fail(self: *Writer, failure: WriterError) WriterError {
         if (self.failure == null) self.failure = failure;
-        self.state = .failed;
         if (failure == error.WriteFailed) self.offset_valid = false;
         return failure;
     }
@@ -2107,7 +2063,7 @@ pub const Writer = struct {
         var plain_start: usize = 0;
         var index: usize = 0;
         while (index < value.len) {
-            // Printable ASCII other than `"`, `&`, and `<` needs neither escaping nor decoding.
+            // Printable ASCII other than ", &, and < needs neither escaping nor decoding.
             const length = ordinaryAttributeRun(value[index..], '"');
             if (length != 0) {
                 index += length;
@@ -2174,6 +2130,22 @@ pub const Writer = struct {
     }
 };
 
+const WriterState = enum {
+    initial,
+    start_tag,
+    content,
+    epilog,
+    done,
+};
+
+const WriterFrame = struct {
+    name_start: usize,
+    name_len: usize,
+    attribute_start: usize,
+    binding_start: usize,
+    namespace_bytes_start: usize,
+};
+
 fn validateQName(name: []const u8) WriterError!void {
     if (name.len == 0) return error.InvalidName;
     var colon_seen = false;
@@ -2208,6 +2180,8 @@ fn decodeValue(value: []const u8, index: *usize) WriterError!u21 {
     return codepoint;
 }
 
+// --- Tests ---
+
 fn writeBinaryCase(writer: *Writer, wire: []const u8, direct: bool, prefix: []const u8) WriterError!void {
     try writer.startDocument();
     try writer.startElement("binary");
@@ -2229,8 +2203,6 @@ fn writeBinaryCase(writer: *Writer, wire: []const u8, direct: bool, prefix: []co
     try writer.endElement();
     try writer.endDocument();
 }
-
-// --- Tests ---
 
 test "[property] - [mzML XML writer]: generated Base64 preserves text state, offsets, and sink failures" {
     var wire: [6145]u8 = undefined;
@@ -2313,7 +2285,7 @@ test "[unit] - [mzML XML cursor]: a written fragment declares its scope once and
     try std.testing.expectError(error.InvalidState, cursor.writeElement(&output, &remaining));
 }
 
-test "[property] - [mzML XML cursor]: decodes Latin-1 attributes text and CDATA across refills" {
+test "[property] - [mzML XML cursor]: decodes Latin-1 attributes, text, and CDATA across refills" {
     var latin1: [128]u8 = undefined;
     var utf8: [256]u8 = undefined;
     for (&latin1, 0..) |*byte, i| {
@@ -2369,47 +2341,7 @@ test "[failure] - [mzML XML cursor]: keeps encoding errors distinct from Latin-1
     }
 }
 
-test "[failure] - [mzML XML cursor]: names the XML rule malformed input breaks and where" {
-    // Each case's offset is the first byte of what broke the rule, or the end of input.
-    const cases = .{
-        .{ "<mzML><spectrum>", Rule.unexpected_end, true, 16 },
-        .{ "<mzML></spectrum>", Rule.mismatched_end_tag, true, 6 },
-        .{ "<mzML>text</mzML>", Rule.unexpected_text, false, 6 },
-        .{ "<mzML/><mzML/>", Rule.content_after_root, true, 7 },
-        .{ "<mzML a=1/>", Rule.malformed_tag, true, 8 },
-        .{ "<mzML a='<'/>", Rule.less_than_in_attribute, true, 9 },
-        .{ "<mzML><!-x--></mzML>", Rule.malformed_markup, true, 9 },
-        .{ "<mzML>]]></mzML>", Rule.malformed_markup, true, 6 },
-        .{ "<?xml version='1.0' size='1'?><mzML/>", Rule.malformed_declaration, true, 20 },
-        .{ "<1mzML/>", Rule.invalid_name, true, 1 },
-        .{ "<spec\x01trum/>", Rule.invalid_name, true, 5 },
-        .{ "<mzML a='1' a='2'/>", Rule.duplicate_attribute, true, 12 },
-        .{ "<mzML xmlns:p='u' xmlns:q='u' p:a='1' q:a='2'/>", Rule.duplicate_attribute, true, 38 },
-        .{ "<p:mzML/>", Rule.unbound_prefix, true, 1 },
-        .{ "<mzML q:a='1'/>", Rule.unbound_prefix, true, 6 },
-        .{ "<mzML xmlns:p=''/>", Rule.invalid_namespace_declaration, true, 6 },
-        .{ "<mzML>&nbsp;</mzML>", Rule.unknown_entity, true, 6 },
-        .{ "<mzML a='&#0;'/>", Rule.invalid_character_reference, true, 9 },
-        .{ "<mzML>\x01</mzML>", Rule.invalid_character, true, 6 },
-    };
-    // A one-byte buffer takes the character-by-character paths instead of the buffered scans.
-    for ([_]usize{ 0, 1 }) |buffer_size| {
-        inline for (cases) |case| {
-            var fixed = std.Io.Reader.fixed(case[0]);
-            var small: [1]u8 = undefined;
-            var limited = fixed.limited(.unlimited, &small);
-            const input = if (buffer_size == 0) &fixed else &limited.interface;
-            var cursor = try Cursor.init(std.testing.allocator, input, 64, 1024);
-            defer cursor.deinit();
-            const failure = while (true) {
-                cursor.advanceFragment(case[2]) catch |err| break err;
-                if (cursor.current == null) return error.TestUnexpectedResult;
-            };
-            try std.testing.expectEqual(error.InvalidXml, failure);
-            try std.testing.expectEqual(@as(?Rule, case[1]), cursor.xml_rule);
-            try std.testing.expectEqual(@as(u64, case[3]), cursor.offset);
-        }
-    }
+test "[failure] - [mzML XML cursor]: reports a broken encoding at the byte that cannot continue it" {
     // A broken encoding is reported at the first byte that cannot continue a well-formed
     // sequence (the end of input when cut off); in UTF-16, offsets count two bytes per unit.
     const encoded = .{
@@ -2483,7 +2415,7 @@ test "[unit] - [mzML XML cursor]: decodes UTF-8 at the bounds of every well-form
     }
 }
 
-test "[unit] - [mzML XML cursor]: rejects malformed names, namespace declarations, and XML targets" {
+test "[failure] - [mzML XML cursor]: rejects malformed names, namespace declarations, and XML targets" {
     const cases = .{
         .{ "<mzML xmlns='" ++ NAMESPACE ++ "'><p:1bad/></mzML>", 1 },
         .{ "<mzML xmlns='" ++ NAMESPACE ++ "' xmlns:p='one' xmlns:p='two'/>", 0 },
@@ -2550,7 +2482,10 @@ test "[property] - [mzML XML cursor]: preserves qualified names and namespace re
                     try std.testing.expectEqualStrings(([_][]const u8{ "one", "two", "three" })[child], attribute.value);
                     try std.testing.expectEqualStrings("a", attribute.name.expanded.prefix.?);
                     try std.testing.expectEqualStrings("value", attribute.name.expanded.local);
-                    try std.testing.expectEqualStrings(if (child == 1) "urn:inner" else "urn:outer", attribute.name.expanded.namespace_uri.?);
+                    try std.testing.expectEqualStrings(
+                        if (child == 1) "urn:inner" else "urn:outer",
+                        attribute.name.expanded.namespace_uri.?,
+                    );
                     child += 1;
                 }
             }
@@ -2605,7 +2540,10 @@ test "[property] - [mzML XML cursor]: quoted runs stop at the first exceptional 
                     for (0..256) |value| {
                         const byte: u8 = @intCast(value);
                         bytes[position] = byte;
-                        const expected = if (byte < 0x20 or byte >= 0x80 or byte == quote or byte == '&' or byte == '<') position else length;
+                        const expected = if (byte < 0x20 or byte >= 0x80 or byte == quote or byte == '&' or byte == '<')
+                            position
+                        else
+                            length;
                         try std.testing.expectEqual(expected, ordinaryAttributeRun(bytes, quote));
                     }
                     bytes[position] = 'x';
@@ -2759,7 +2697,10 @@ test "[unit] - [mzML XML cursor]: enforces expanded names, document CDATA, text 
     var cursor = try Cursor.init(std.testing.allocator, &input, 64, 1024);
     defer cursor.deinit();
     try cursor.advance(false);
-    try std.testing.expectEqualStrings(XML_NAMESPACE, cursor.current.?.data.start_element.attribute(XML_NAMESPACE, "lang").?.name.expanded.namespace_uri.?);
+    try std.testing.expectEqualStrings(
+        XML_NAMESPACE,
+        cursor.current.?.data.start_element.attribute(XML_NAMESPACE, "lang").?.name.expanded.namespace_uri.?,
+    );
 }
 
 test "[property] - [mzML XML cursor]: ignores only XML whitespace when text is not requested" {
@@ -2915,7 +2856,11 @@ test "[property] - [mzML XML writer]: preserves text runs, split brackets, and l
     const opening = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><binary";
     for ([_]usize{ 0, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 4095, 4096, 4097 }) |length| {
         const value = try std.fmt.bufPrint(&value_buffer, "{s}]]><&\r\xc2\xb5]]", .{ordinary[0..length]});
-        const expected = try std.fmt.bufPrint(&expected_buffer, opening ++ ">]]{s}]]&gt;&lt;&amp;&#xD;\xc2\xb5]]&gt;</binary>", .{ordinary[0..length]});
+        const expected = try std.fmt.bufPrint(
+            &expected_buffer,
+            opening ++ ">]]{s}]]&gt;&lt;&amp;&#xD;\xc2\xb5]]&gt;</binary>",
+            .{ordinary[0..length]},
+        );
         for ([_]usize{ 0, length / 2, length, length + 1, length + 2, length + 3, value.len }) |split| {
             var sink = std.Io.Writer.fixed(&output);
             var writer = Writer.init(std.testing.allocator, &sink, .{});
@@ -2940,7 +2885,11 @@ test "[property] - [mzML XML writer]: preserves text runs, split brackets, and l
                 try writer.startDocument();
                 try writer.startElement("binary");
                 try std.testing.expectError(error.InvalidCharacter, if (attribute) writer.attribute("id", bad) else writer.text(bad));
-                const partial = try std.fmt.bufPrint(&expected_buffer, opening ++ "{s}{s}&amp;", .{ if (attribute) " id=\"" else ">", ordinary[0..length] });
+                const partial = try std.fmt.bufPrint(
+                    &expected_buffer,
+                    opening ++ "{s}{s}&amp;",
+                    .{ if (attribute) " id=\"" else ">", ordinary[0..length] },
+                );
                 try std.testing.expectEqualStrings(partial, sink.buffered());
                 try std.testing.expectEqual(@as(?u64, partial.len), writer.byteOffset());
                 try std.testing.expectError(error.InvalidCharacter, writer.text("later"));
@@ -2970,7 +2919,7 @@ test "[unit] - [mzML XML writer]: emits escaped values and flushes empty text" {
     try std.testing.expectEqual(@as(?u64, sink.buffered().len), writer.byteOffset());
 }
 
-test "[unit] - [mzML XML writer]: keeps duplicate-attribute failures sticky" {
+test "[failure] - [mzML XML writer]: keeps duplicate-attribute failures sticky" {
     var output: [128]u8 = undefined;
     var sink = std.Io.Writer.fixed(&output);
     var writer = Writer.init(std.testing.allocator, &sink, .{});
@@ -3016,7 +2965,7 @@ test "[property] - [mzML XML writer]: copies attribute names and permits reuse o
     }
 }
 
-test "[unit] - [mzML XML writer]: rejects undeclared namespace names" {
+test "[failure] - [mzML XML writer]: rejects undeclared namespace names" {
     {
         var output: [256]u8 = undefined;
         var sink = std.Io.Writer.fixed(&output);
@@ -3069,7 +3018,10 @@ test "[failure] - [mzML XML cursor]: reports the attribute limit when an entity 
             defer cursor.deinit();
             // A limit that fits the attribute reaches the missing namespace instead.
             cursor.advance(false) catch |err| switch (err) {
-                error.LimitExceeded => try std.testing.expectEqual(@as(@TypeOf(cursor.limit_failure), .attribute_bytes), cursor.limit_failure),
+                error.LimitExceeded => try std.testing.expectEqual(
+                    @as(@TypeOf(cursor.limit_failure), .attribute_bytes),
+                    cursor.limit_failure,
+                ),
                 error.WrongNamespace => {},
                 else => return err,
             };
@@ -3079,7 +3031,9 @@ test "[failure] - [mzML XML cursor]: reports the attribute limit when an entity 
 
 test "[edge] - [mzML XML cursor]: decodes character references with many leading zeros" {
     const zeros = "0" ** 40;
-    var input = std.Io.Reader.fixed("<mzML a='&#" ++ zeros ++ "65;&#x" ++ zeros ++ "42;' xmlns='" ++ NAMESPACE ++ "'>&#" ++ zeros ++ "67;</mzML>");
+    var input = std.Io.Reader.fixed(
+        "<mzML a='&#" ++ zeros ++ "65;&#x" ++ zeros ++ "42;' xmlns='" ++ NAMESPACE ++ "'>&#" ++ zeros ++ "67;</mzML>",
+    );
     var cursor = try Cursor.init(std.testing.allocator, &input, 64, 1024);
     defer cursor.deinit();
     try cursor.advance(true);

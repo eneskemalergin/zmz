@@ -68,7 +68,7 @@ The local mzML reader inventory, reproducible installer, C++ and Rust MS-Numpres
 
 ## License
 
-The project license has not been selected yet. The bundled vocabulary resources retain their source terms and attribution requirements; see [`vocabularies/README.md`](vocabularies/README.md). zlib support uses zipir under the [MIT license](https://github.com/eneskemalergin/zipir/blob/main/LICENSE); include that notice with binary distributions.
+The project license has not been selected yet. The bundled vocabulary resources retain their source terms and attribution requirements; see [`vocabularies/README.md`](vocabularies/README.md). zlib support uses zipir under the [MIT license](https://github.com/eneskemalergin/zipir/blob/main/LICENSE), and SLOF's `exp` and `log` tables (`src/binary/libm_data.zig`) come from Arm's optimized-routines under the MIT license, with its notice in that file; include both notices with binary distributions.
 
 ---
 

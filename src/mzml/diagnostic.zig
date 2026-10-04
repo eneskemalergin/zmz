@@ -1,30 +1,21 @@
-//! Saved mzML failures contain values only and survive parser/output cleanup.
-//! Native Zig errors still control execution. IDs group related causes and keep
-//! explicit numbers; descriptions may change, but published IDs are not reused.
-//! Locations are optional physical byte offsets. Input events do not identify an
-//! exact bad decoded character; output offsets do not imply a successful flush.
-//! Formatting writes to the caller's sink without allocating or changing the report.
+//! Saved mzML failures contain values only and survive parser/output cleanup. Native Zig errors
+//! still control execution. IDs group related causes and keep explicit numbers; descriptions may
+//! change, but published IDs are not reused. Locations are optional physical byte offsets. Input
+//! events do not identify an exact bad decoded character; output offsets do not imply a successful
+//! flush. Formatting writes to the caller's sink without allocating or changing the report.
 //!
 //! `init`, `initAny`, `xmlDetail`, `translate`, and `RecordPosition.of` are internal: the
 //! readers, writer, and `DecodedArrays` build reports with them.
 
 const std = @import("std");
-const model = @import("model.zig");
-const xml = @import("../xml/mzml_adapter.zig");
 const cv = @import("../cv/source.zig");
+const xml = @import("../xml/mzml_adapter.zig");
+const model = @import("model.zig");
+const StreamReader = @import("stream_reader.zig").StreamReader;
+const IndexedReader = @import("indexed_reader.zig");
+const Writer = @import("writer.zig");
 
 const Diagnostic = @This();
-const Errors = @import("stream_reader.zig").StreamReader.Error || @import("indexed_reader.zig").Error || @import("writer.zig").Error;
-
-id: Id,
-code: anyerror,
-operation: Operation,
-stage: Stage,
-location: ?Location = null,
-element: ?model.Kind = null,
-record: ?RecordPosition = null,
-array_position: ?usize = null,
-detail: Detail = .none,
 
 pub const Id = enum(u16) {
     out_of_memory = 1,
@@ -56,7 +47,7 @@ pub const Id = enum(u16) {
     io_failed = 27,
     canceled = 28,
     count_mismatch = 29,
-    // 30 (encodedLength differs from the written text) is retired: the writer now sets it.
+    // 30 stays unused: IDs are stable.
 
     pub fn description(self: Id) []const u8 {
         return switch (self) {
@@ -93,14 +84,29 @@ pub const Id = enum(u16) {
     }
 };
 
-pub const Operation = enum { read_event, read_header, read_record, read_item, decode_array, open_index, rebuild_index, lookup_record, write_header, open_list, write_record, write_item, close_list, finish };
+pub const Operation = enum {
+    read_event,
+    read_header,
+    read_record,
+    read_item,
+    decode_array,
+    open_index,
+    rebuild_index,
+    lookup_record,
+    write_header,
+    open_list,
+    write_record,
+    write_item,
+    close_list,
+    finish,
+};
 pub const Stage = enum { xml, metadata, base64, array, index, output };
 pub const Location = union(enum) { input_event: u64, output_byte: u64 };
 pub const RecordPosition = struct {
     kind: enum { spectrum, chromatogram },
     ordinal: usize,
 
-    /// Positions a record; any kind other than spectrum counts as a chromatogram.
+    // Any kind other than spectrum counts as a chromatogram.
     pub fn of(kind: model.Kind, ordinal: usize) RecordPosition {
         return .{ .kind = if (kind == .spectrum) .spectrum else .chromatogram, .ordinal = ordinal };
     }
@@ -143,7 +149,6 @@ pub const Limit = enum {
     /// The fixed work budget of expanding one array's or node's parameter groups.
     expansion_work,
 };
-/// The XML rule malformed input broke.
 pub const XmlRule = xml.Rule;
 pub const Detail = union(enum) {
     none,
@@ -154,8 +159,16 @@ pub const Detail = union(enum) {
 };
 pub const SizeUnit = enum { bytes, records, arrays, index };
 
-/// Maps a typed operation error using its capture stage and any known limit.
-/// New errors must be assigned deliberately; generic I/O errors are listed explicitly.
+id: Id,
+code: anyerror,
+operation: Operation,
+stage: Stage,
+location: ?Location = null,
+element: ?model.Kind = null,
+record: ?RecordPosition = null,
+array_position: ?usize = null,
+detail: Detail = .none,
+
 pub fn init(code: Errors, operation: Operation, stage: Stage, detail: Detail) Diagnostic {
     const id: Id = switch (code) {
         error.OutOfMemory => .out_of_memory,
@@ -169,38 +182,87 @@ pub fn init(code: Errors, operation: Operation, stage: Stage, detail: Detail) Di
         error.DecodedSizeMismatch => .decoded_size_mismatch,
         error.InvalidIndex => .invalid_index,
         error.WriteFailed => .write_failed,
-        error.InvalidData, error.ChecksumMismatch, error.TrailingInput, error.UnsupportedDictionary, error.ValueOutOfRange => .array_decode_failed,
+        error.InvalidData,
+        error.ChecksumMismatch,
+        error.TrailingInput,
+        error.UnsupportedDictionary,
+        error.ValueOutOfRange,
+        => .array_decode_failed,
         // A fixed point or an unsupported type is the caller's option when writing and a
         // payload header or declaration when reading.
         error.InvalidFixedPoint => if (writing(operation)) .invalid_options else .array_decode_failed,
         error.TypeMismatch => if (writing(operation)) .invalid_options else .array_declaration_error,
         error.MissingFixedPoint, error.UnexpectedFixedPoint, error.MissingCompressor => .invalid_options,
-        error.InvalidXml, error.InvalidEncoding, error.UnsupportedVersion, error.DtdForbidden, error.WrongNamespace, error.UnexpectedEnd, error.InvalidName, error.InvalidNamespace, error.DuplicateAttribute => .invalid_xml,
+        error.InvalidXml,
+        error.InvalidEncoding,
+        error.UnsupportedVersion,
+        error.DtdForbidden,
+        error.WrongNamespace,
+        error.UnexpectedEnd,
+        error.InvalidName,
+        error.InvalidNamespace,
+        error.DuplicateAttribute,
+        => .invalid_xml,
         error.InvalidStructure, error.UnknownAttribute, error.UnexpectedElement => .invalid_structure,
-        error.EmptyValue, error.InvalidValue, error.Overflow, error.RepeatedParameter, error.RepeatedArray, error.ConflictingParameter => .invalid_value,
+        error.EmptyValue,
+        error.InvalidValue,
+        error.Overflow,
+        error.RepeatedParameter,
+        error.RepeatedArray,
+        error.ConflictingParameter,
+        => .invalid_value,
         error.InvalidState, error.FailedState, error.AlreadyFinished => .invalid_state,
         error.InvalidOptions => .invalid_options,
         error.LengthOverflow => .size_overflow,
         error.OutputTooSmall, error.OverlappingBuffers => .buffer_error,
         error.PayloadNotRetained => .missing_payload,
         error.MissingGroup, error.DuplicateGroup, error.NestedGroup => .group_error,
-        error.ExpansionLimit => return .{ .id = .limit_exceeded, .code = code, .operation = operation, .stage = stage, .detail = .{ .limit = .{ .name = .expansion_work, .maximum = cv.EXPANSION_WORK } } },
-        error.MissingPrimitive, error.MissingCompression, error.ConflictingPrimitive, error.ConflictingCompression => .array_declaration_error,
+        error.ExpansionLimit => return .{
+            .id = .limit_exceeded,
+            .code = code,
+            .operation = operation,
+            .stage = stage,
+            .detail = .{ .limit = .{ .name = .expansion_work, .maximum = cv.EXPANSION_WORK } },
+        },
+        error.MissingPrimitive,
+        error.MissingCompression,
+        error.ConflictingPrimitive,
+        error.ConflictingCompression,
+        => .array_declaration_error,
         error.MissingIndex => .missing_index,
         error.DuplicateId => .duplicate_id,
         error.AmbiguousId => .ambiguous_id,
         error.StaleSource => .source_changed,
         error.UnsupportedSource => .unsupported_source,
         error.TruncatedSource => .truncated_source,
-        error.ReadFailed, error.AccessDenied, error.PermissionDenied, error.InputOutput, error.IsDir, error.LockViolation, error.NotOpenForReading, error.Streaming, error.SystemResources, error.Unexpected, error.Unseekable, error.WouldBlock, error.BrokenPipe, error.DeviceBusy, error.DiskQuota, error.FileBusy, error.FileTooBig, error.NoDevice, error.NoSpaceLeft, error.NotOpenForWriting => .io_failed,
+        error.ReadFailed,
+        error.AccessDenied,
+        error.PermissionDenied,
+        error.InputOutput,
+        error.IsDir,
+        error.LockViolation,
+        error.NotOpenForReading,
+        error.Streaming,
+        error.SystemResources,
+        error.Unexpected,
+        error.Unseekable,
+        error.WouldBlock,
+        error.BrokenPipe,
+        error.DeviceBusy,
+        error.DiskQuota,
+        error.FileBusy,
+        error.FileTooBig,
+        error.NoDevice,
+        error.NoSpaceLeft,
+        error.NotOpenForWriting,
+        => .io_failed,
         error.Canceled => .canceled,
         error.CountMismatch => .count_mismatch,
     };
     return .{ .id = id, .code = code, .operation = operation, .stage = stage, .detail = detail };
 }
 
-/// Like init for any error, including a caller's own (such as a text source's), which is
-/// reported as an I/O failure.
+// An error outside the known sets, such as a text source's own, is reported as an I/O failure.
 pub fn initAny(code: anyerror, operation: Operation, stage: Stage, detail: Detail) Diagnostic {
     inline for (@typeInfo(Errors).error_set.?) |known| {
         if (code == @field(anyerror, known.name)) return init(@field(Errors, known.name), operation, stage, detail);
@@ -208,15 +270,8 @@ pub fn initAny(code: anyerror, operation: Operation, stage: Stage, detail: Detai
     return .{ .id = .io_failed, .code = code, .operation = operation, .stage = stage, .detail = detail };
 }
 
-fn writing(operation: Operation) bool {
-    return switch (operation) {
-        .write_header, .open_list, .write_record, .write_item, .close_list, .finish => true,
-        else => false,
-    };
-}
-
-/// The cursor's limit failure or broken XML rule as detail. The node budget belongs to the
-/// caller, which reports it with its own maximum, so it gives no detail here.
+// The node budget belongs to the caller, which reports it with its own maximum, so it gives no
+// detail here.
 pub fn xmlDetail(cursor: *const xml.Cursor) Detail {
     if (cursor.xml_rule) |rule| if (cursor.failure) |failure| if (failure == error.InvalidXml) return .{ .xml = rule };
     const limit = cursor.limit_failure orelse return .none;
@@ -229,7 +284,7 @@ pub fn xmlDetail(cursor: *const xml.Cursor) Detail {
     } };
 }
 
-/// Translates only events inside the source portion of an indexed fragment.
+// Only events inside the source portion of an indexed fragment are translated.
 pub fn translate(self: *Diagnostic, start: u64, length: u64, prefix: usize) void {
     const location = self.location orelse return;
     self.location = switch (location) {
@@ -261,4 +316,13 @@ pub fn format(self: Diagnostic, writer: *std.Io.Writer) std.Io.Writer.Error!void
         },
         .size => |size| try writer.print("; expected={d}; actual={d}; unit={s}", .{ size.expected, size.actual, @tagName(size.unit) }),
     }
+}
+
+const Errors = StreamReader.Error || IndexedReader.Error || Writer.Error;
+
+fn writing(operation: Operation) bool {
+    return switch (operation) {
+        .write_header, .open_list, .write_record, .write_item, .close_list, .finish => true,
+        else => false,
+    };
 }

@@ -87,7 +87,7 @@ test "[integration] - [mzML 1.0 metadata]: reads historical fields without movin
     try std.testing.expectEqual(null, try reader.nextRecord());
 }
 
-test "[property] - [mzML scientific metadata]: distinguishes absent repeated and contradictory record fields" {
+test "[failure] - [mzML scientific metadata]: distinguishes absent, repeated, and contradictory record fields" {
     const model = mzml.model;
     var record: model.Record = .{ .node = .{ .kind = .spectrum }, .id = "scan=1", .index = 0, .default_array_length = 0 };
     try std.testing.expectEqual(null, try record.msLevel(&.{}));
@@ -208,7 +208,7 @@ test "[integration] - [mzML field access]: preserves source units and rejects am
     try std.testing.expectError(error.RepeatedParameter, record.arrayByRole(&.{}, role));
 }
 
-test "[integration] - [mzML scientific metadata]: keeps all scans ions and windows across ownership writing and indexed lookup" {
+test "[integration] - [mzML scientific metadata]: keeps all scans, ions, and windows across ownership, writing, and indexed lookup" {
     const source = @embedFile("data/scientific_metadata.mzML");
     var header: mzml.owned.Header = undefined;
     var spectrum: mzml.owned.Record = undefined;

@@ -1,4 +1,8 @@
 //! Exercises metadata access, array decoding, and indexed lookups on explicit mzML files.
+//!
+//! For each file it rebuilds the index (policy `rebuild`), streams every record, resolving its
+//! metadata and decoding its arrays, compares the first, middle, and last record with their indexed
+//! lookups, and prints the totals. It stops at the first failing file and reports its error.
 
 const std = @import("std");
 const mzml = @import("zmz").mzml;
@@ -82,7 +86,7 @@ fn checkFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Totals
         if (totals.records == 0 or totals.records == count / 2 or totals.records == count -| 1) {
             var found = (try index.at(allocator, record.node.kind, ordinal)) orelse return error.MissingIndexedRecord;
             defer found.deinit();
-            if (!sameNode(record.node, found.value.node)) return error.IndexedRecordMismatch;
+            std.testing.expectEqualDeep(record.node, found.value.node) catch return error.IndexedRecordMismatch;
             totals.lookups += 1;
         }
         totals.records += 1;
@@ -152,78 +156,4 @@ fn checkQuantity(number: ?mzml.model.Number, resolver: mzml.cv.Resolver, totals:
     totals.quantities += 1;
     if (quantity.parameter.unit_allowed == .unresolved) totals.unresolved_units += 1;
     if (quantity.parameter.unit_allowed == .disallowed) totals.disallowed_units += 1;
-}
-
-fn sameNode(a: mzml.model.Node, b: mzml.model.Node) bool {
-    if (a.kind != b.kind or a.start_offset != b.start_offset or
-        a.content_offset != b.content_offset or a.end_offset != b.end_offset or
-        a.attributes.len != b.attributes.len or a.params.len != b.params.len or
-        a.children.len != b.children.len or !sameText(a.text, b.text)) return false;
-    if (a.content) |content| {
-        const other = b.content orelse return false;
-        if (content.items.len != other.items.len) return false;
-        for (content.items, other.items) |left, right| {
-            if (std.meta.activeTag(left) != std.meta.activeTag(right)) return false;
-            switch (left) {
-                .xml => |bytes| if (!std.mem.eql(u8, bytes, right.xml)) return false,
-                .params => |count| if (count != right.params) return false,
-                .children => |count| if (count != right.children) return false,
-            }
-        }
-    } else if (b.content != null) return false;
-    for (a.attributes, b.attributes) |left, right| {
-        if (!sameText(left.name, right.name) or !sameText(left.value, right.value) or
-            !sameText(left.namespace_uri, right.namespace_uri)) return false;
-    }
-    for (a.params, b.params) |left, right| {
-        if (std.meta.activeTag(left) != std.meta.activeTag(right)) return false;
-        switch (left) {
-            .group_ref => |ref| if (!sameText(ref.ref, right.group_ref.ref) or !sameXmlAttributes(ref.xml, right.group_ref.xml)) return false,
-            .cv => |param| {
-                const other = right.cv;
-                if (!sameText(param.cv_ref, other.cv_ref) or !sameText(param.name, other.name) or
-                    !sameText(param.value, other.value) or !sameAccession(param.accession, other.accession) or
-                    !sameUnit(param.unit, other.unit) or !sameXmlAttributes(param.xml, other.xml)) return false;
-            },
-            .user => |param| {
-                const other = right.user;
-                if (!sameText(param.name, other.name) or !sameText(param.value, other.value) or
-                    !sameText(param.value_type, other.value_type) or !sameUnit(param.unit, other.unit) or
-                    !sameXmlAttributes(param.xml, other.xml)) return false;
-            },
-        }
-    }
-    for (a.children, b.children) |left, right| if (!sameNode(left, right)) return false;
-    return true;
-}
-
-fn sameXmlAttributes(a: ?*const mzml.cv.ParameterXml, b: ?*const mzml.cv.ParameterXml) bool {
-    const left = a orelse return b == null;
-    const right = b orelse return false;
-    if (left.attributes.len != right.attributes.len) return false;
-    for (left.attributes, right.attributes) |x, y| {
-        if (!sameText(x.name, y.name) or !sameText(x.value, y.value) or !sameText(x.namespace_uri, y.namespace_uri)) return false;
-    }
-    if (left.content.len != right.content.len) return false;
-    for (left.content, right.content) |x, y| {
-        if (std.meta.activeTag(x) != std.meta.activeTag(y)) return false;
-        switch (x) {
-            .text => |bytes| if (!sameText(bytes, y.text)) return false,
-            .xml => |bytes| if (!sameText(bytes, y.xml)) return false,
-        }
-    }
-    return true;
-}
-
-fn sameUnit(a: mzml.cv.Unit, b: mzml.cv.Unit) bool {
-    return sameText(a.cv_ref, b.cv_ref) and sameText(a.name, b.name) and sameAccession(a.accession, b.accession);
-}
-
-fn sameAccession(a: ?mzml.cv.Accession, b: ?mzml.cv.Accession) bool {
-    return sameText(if (a) |term| term.raw else null, if (b) |term| term.raw else null);
-}
-
-fn sameText(a: ?[]const u8, b: ?[]const u8) bool {
-    if (a) |left| return if (b) |right| std.mem.eql(u8, left, right) else false;
-    return b == null;
 }

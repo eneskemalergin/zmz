@@ -3,9 +3,8 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const kernel = @import("kernel_options");
 const core = @import("core.zig");
-
-const USE_SHA_NI = builtin.cpu.arch == .x86_64 and builtin.zig_backend == .stage2_llvm and @import("kernel_options").dispatch;
 
 /// Streaming SHA-1 with std's update and finalResult. It keeps std's state, partial block,
 /// and padding; only whole blocks take the SHA extension path.
@@ -38,6 +37,10 @@ pub const Sha1 = struct {
     }
 };
 
+// HACK: Zig's self-hosted x86 backend cannot assemble vector memory operands; drop the
+// stage2_llvm check when it can.
+const USE_SHA_NI = builtin.cpu.arch == .x86_64 and builtin.zig_backend == .stage2_llvm and kernel.dispatch;
+
 // pshufb mask reversing 16 bytes, so four big-endian words load with W0 in lane 3.
 const REVERSE: [16]u8 align(16) = .{ 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0 };
 
@@ -61,7 +64,7 @@ const ROUNDS = rounds: {
     break :rounds text;
 };
 
-/// Compresses whole 64-byte blocks. The CPU must have SHA and SSSE3 (core.hasSha).
+// The CPU must have SHA and SSSE3 (core.hasSha).
 noinline fn compress(state: *[5]u32, data: []const u8) void {
     var abcd: [4]u32 align(16) = state[0..4].*;
     var e: [4]u32 align(16) = .{ 0, 0, 0, state[4] };
@@ -107,6 +110,8 @@ noinline fn compress(state: *[5]u32, data: []const u8) void {
     state[0..4].* = abcd;
     state[4] = e[3];
 }
+
+// --- Tests ---
 
 // Without SHA extensions update is std's own, so this checks the extension path where the CPU
 // has it.

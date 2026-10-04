@@ -112,30 +112,50 @@ test "[unit] - [mzML events]: stream long text in bounded runs" {
     try std.testing.expect(runs >= 4);
 }
 
-test "[failure] - [mzML events]: name the broken rule, keep the first failure, and refuse reuse" {
+test "[failure] - [mzML events]: name the broken rule and where, keep the first failure, and refuse reuse" {
+    // Each case's offset is the first byte of what broke the rule, or the end of input.
+    const Rule = mzml.Diagnostic.XmlRule;
     const cases = .{
-        .{ "<root><a></b></root>", mzml.Diagnostic.XmlRule.mismatched_end_tag },
-        .{ "<root>&bogus;</root>", mzml.Diagnostic.XmlRule.unknown_entity },
-        .{ "<root a='1' a='2'/>", mzml.Diagnostic.XmlRule.duplicate_attribute },
-        .{ "<root><a>", mzml.Diagnostic.XmlRule.unexpected_end },
-        .{ "text<root/>", mzml.Diagnostic.XmlRule.unexpected_text },
-        .{ "<root/>text", mzml.Diagnostic.XmlRule.unexpected_text },
-        .{ "<root/> <!-- c --> <?pi?> &amp;", mzml.Diagnostic.XmlRule.unexpected_text },
-        .{ "<root/><root/>", mzml.Diagnostic.XmlRule.content_after_root },
+        .{ "<mzML><spectrum>", Rule.unexpected_end, 16 },
+        .{ "<mzML></spectrum>", Rule.mismatched_end_tag, 6 },
+        .{ "text<root/>", Rule.unexpected_text, 0 },
+        .{ "<root/>text", Rule.unexpected_text, 7 },
+        .{ "<root/> <!-- c --> <?pi?> &amp;", Rule.unexpected_text, 26 },
+        .{ "<mzML/><mzML/>", Rule.content_after_root, 7 },
+        .{ "<mzML a=1/>", Rule.malformed_tag, 8 },
+        .{ "<mzML a='<'/>", Rule.less_than_in_attribute, 9 },
+        .{ "<mzML><!-x--></mzML>", Rule.malformed_markup, 9 },
+        .{ "<mzML>]]></mzML>", Rule.malformed_markup, 6 },
+        .{ "<?xml version='1.0' size='1'?><mzML/>", Rule.malformed_declaration, 20 },
+        .{ "<1mzML/>", Rule.invalid_name, 1 },
+        .{ "<spec\x01trum/>", Rule.invalid_name, 5 },
+        .{ "<mzML a='1' a='2'/>", Rule.duplicate_attribute, 12 },
+        .{ "<mzML xmlns:p='u' xmlns:q='u' p:a='1' q:a='2'/>", Rule.duplicate_attribute, 38 },
+        .{ "<p:mzML/>", Rule.unbound_prefix, 1 },
+        .{ "<mzML q:a='1'/>", Rule.unbound_prefix, 6 },
+        .{ "<mzML xmlns:p=''/>", Rule.invalid_namespace_declaration, 6 },
+        .{ "<mzML>&nbsp;</mzML>", Rule.unknown_entity, 6 },
+        .{ "<mzML a='&#0;'/>", Rule.invalid_character_reference, 9 },
+        .{ "<mzML>\x01</mzML>", Rule.invalid_character, 6 },
     };
-    inline for (cases) |case| {
-        var input = std.Io.Reader.fixed(case[0]);
-        var events = try mzml.Events.init(std.testing.allocator, &input, .{});
-        defer events.deinit();
-        const failure = while (true) {
-            _ = (events.next() catch |err| break err) orelse return error.TestUnexpectedResult;
-        };
-        try std.testing.expectEqual(error.InvalidXml, failure);
-        const report = events.diagnostic().?;
-        try std.testing.expectEqual(mzml.Diagnostic.Operation.read_event, report.operation);
-        try std.testing.expectEqual(mzml.Diagnostic.Detail{ .xml = case[1] }, report.detail);
-        try std.testing.expect(report.location != null);
-        try std.testing.expectError(error.FailedState, events.next());
+    // A one-byte buffer takes the character-by-character paths instead of the buffered scans.
+    for ([_]usize{ 0, 1 }) |buffer_size| {
+        inline for (cases) |case| {
+            var fixed = std.Io.Reader.fixed(case[0]);
+            var small: [1]u8 = undefined;
+            var limited = fixed.limited(.unlimited, &small);
+            var events = try mzml.Events.init(std.testing.allocator, if (buffer_size == 0) &fixed else &limited.interface, .{});
+            defer events.deinit();
+            const failure = while (true) {
+                _ = (events.next() catch |err| break err) orelse return error.TestUnexpectedResult;
+            };
+            try std.testing.expectEqual(error.InvalidXml, failure);
+            const report = events.diagnostic().?;
+            try std.testing.expectEqual(mzml.Diagnostic.Operation.read_event, report.operation);
+            try std.testing.expectEqual(mzml.Diagnostic.Detail{ .xml = case[1] }, report.detail);
+            try std.testing.expectEqual(@as(u64, case[2]), report.location.?.input_event);
+            try std.testing.expectError(error.FailedState, events.next());
+        }
     }
 }
 
@@ -189,7 +209,7 @@ test "[unit] - [mzML events]: name modeled elements in both mzML namespaces only
     try std.testing.expectEqual(expected.len, position);
 }
 
-test "[unit] - [mzML events]: classify encoding terms with the readers' table" {
+test "[property] - [mzML encoding terms]: classify encoding terms with the readers' table" {
     try std.testing.expectEqual(mzml.model.EncodingTerm{ .primitive = .float64 }, mzml.model.encodingTerm("MS:1000523").?);
     try std.testing.expectEqual(mzml.model.EncodingTerm{ .compression = .slof_zlib }, mzml.model.encodingTerm("MS:1002748").?);
     try std.testing.expectEqual(mzml.model.EncodingTerm{ .unsupported = .compression }, mzml.model.encodingTerm("MS:1003780").?);

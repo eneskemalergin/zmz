@@ -1,17 +1,12 @@
 //! Provides immutable vocabulary lookup and bounded ontology queries.
 //!
-//! Tables and returned text borrow from their resource owner. Generated resources
-//! have static lifetime; caller-supplied tables must remain sorted and unchanged.
+//! Tables and returned text borrow from their resource owner. Generated resources have static
+//! lifetime. Caller-supplied tables must stay sorted and unchanged; this is unchecked, and an
+//! unsorted table makes lookups miss terms.
 
 const std = @import("std");
-const Vocabulary = @This();
 
-identity: Identity,
-headers: []const Field = &.{},
-/// Sorted by exact accession bytes, with no duplicate primary or alternate IDs.
-terms: []const Term,
-/// Sorted by alternate accession bytes; indexes refer to `terms`.
-aliases: []const Alias = &.{},
+const Vocabulary = @This();
 
 /// Provenance of the resource actually used, not a document's version claim.
 pub const Identity = struct {
@@ -110,6 +105,16 @@ pub const Alias = struct { id: []const u8, term_index: usize };
 /// The canonical metadata and the identity basis used to find it.
 pub const Match = struct { term: *const Term, alternate_id: bool };
 
+/// Graph failures are distinct from a completed negative ancestry query.
+pub const GraphError = error{ UnknownTerm, Cycle, TraversalLimit, OutputTooSmall };
+
+identity: Identity,
+headers: []const Field = &.{},
+/// Sorted by exact accession bytes, with no duplicate primary or alternate IDs.
+terms: []const Term,
+/// Sorted by alternate accession bytes; indexes refer to `terms`.
+aliases: []const Alias = &.{},
+
 /// Finds a term by exact primary or alternate accession.
 pub fn lookup(self: Vocabulary, accession: []const u8) ?Match {
     if (search(Term, self.terms, accession)) |index| return .{ .term = &self.terms[index], .alternate_id = false };
@@ -118,24 +123,6 @@ pub fn lookup(self: Vocabulary, accession: []const u8) ?Match {
     if (index >= self.terms.len) return null;
     return .{ .term = &self.terms[index], .alternate_id = true };
 }
-
-/// Binary search over items sorted by exact id bytes.
-fn search(comptime T: type, items: []const T, id: []const u8) ?usize {
-    var low: usize = 0;
-    var high = items.len;
-    while (low < high) {
-        const mid = low + (high - low) / 2;
-        switch (std.mem.order(u8, id, items[mid].id)) {
-            .lt => high = mid,
-            .gt => low = mid + 1,
-            .eq => return mid,
-        }
-    }
-    return null;
-}
-
-/// Graph failures are distinct from a completed negative ancestry query.
-pub const GraphError = error{ UnknownTerm, Cycle, TraversalLimit, OutputTooSmall };
 
 /// Tests reflexive ancestry within this resource, including alternate IDs.
 /// Limits edge and node visits; nesting is additionally capped at 64 terms.
@@ -160,6 +147,21 @@ pub fn valueTypes(
     var count: usize = 0;
     try walk.types(term.term.id, output, &count, 0, true);
     return output[0..count];
+}
+
+// Items are sorted by exact id bytes.
+fn search(comptime T: type, items: []const T, id: []const u8) ?usize {
+    var low: usize = 0;
+    var high = items.len;
+    while (low < high) {
+        const mid = low + (high - low) / 2;
+        switch (std.mem.order(u8, id, items[mid].id)) {
+            .lt => high = mid,
+            .gt => low = mid + 1,
+            .eq => return mid,
+        }
+    }
+    return null;
 }
 
 const Walk = struct {

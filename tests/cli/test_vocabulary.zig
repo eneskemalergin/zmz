@@ -2,7 +2,6 @@
 
 const std = @import("std");
 const options = @import("vocabulary_test_options");
-const gates = @import("gates_test_support");
 
 test "[cli] - [vocabulary]: rejects bad arguments and unreadable inputs without creating output" {
     var dir = std.testing.tmpDir(.{ .iterate = true });
@@ -36,40 +35,46 @@ test "[cli] - [vocabulary]: rejects bad arguments and unreadable inputs without 
     try std.testing.expectEqual(null, try entries.next(std.testing.io));
 }
 
-test "[cli] - [vocabulary scan]: reports unresolved source metadata without modifying the file" {
+test "[cli] - [vocabulary scan]: reports source metadata, with or without CV declarations, without modifying the file" {
     var dir = std.testing.tmpDir(.{});
     defer dir.cleanup();
     const executable = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, options.executable, std.testing.allocator);
     defer std.testing.allocator.free(executable);
-    const xml = gates.EMPTY_RUN;
-    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "input.mzML", .data = xml });
-    const result = try std.process.run(std.testing.allocator, std.testing.io, .{
-        .argv = &.{ executable, "scan", "input.mzML" },
-        .cwd = .{ .dir = dir.dir },
-    });
-    defer std.testing.allocator.free(result.stdout);
-    defer std.testing.allocator.free(result.stderr);
-    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
-    try std.testing.expectEqualStrings("", result.stderr);
-    try std.testing.expectEqualStrings("{\"format_version\":2,\"kind\":\"declaration\",\"resource\":\"input.mzML\",\"accession\":\"MS\",\"before\":{\"id\":\"MS\",\"full_name\":\"PSI-MS\",\"uri\":\"urn:test\",\"version\":null},\"after\":{\"resource\":\"psi-ms\",\"used_version\":\"4.1.258\",\"version_relationship\":\"absent\"}}\n" ++
-        "{\"format_version\":2,\"kind\":\"scan\",\"resource\":\"\",\"accession\":\"input.mzML\",\"before\":null,\"after\":{\"records\":0,\"parameters\":1,\"resolved\":0,\"missing_references\":0,\"unknown_resources\":0,\"unknown_accessions\":1,\"stale_names\":0,\"obsolete\":0,\"units\":1,\"resolved_units\":0,\"partial_units\":1,\"disallowed_units\":0}}\n", result.stdout);
-    var buffer: [2048]u8 = undefined;
-    try std.testing.expectEqualStrings(xml, try dir.dir.readFile(std.testing.io, "input.mzML", &buffer));
+    const cases = .{
+        .{ @embedFile("empty_run"), "{\"format_version\":2,\"kind\":\"declaration\",\"resource\":\"input.mzML\",\"accession\":\"MS\",\"before\":{\"id\":\"MS\",\"full_name\":\"PSI-MS\",\"uri\":\"urn:test\",\"version\":null},\"after\":{\"resource\":\"psi-ms\",\"used_version\":\"4.1.258\",\"version_relationship\":\"absent\"}}\n" ++
+            "{\"format_version\":2,\"kind\":\"scan\",\"resource\":\"\",\"accession\":\"input.mzML\",\"before\":null,\"after\":{\"records\":0,\"parameters\":1,\"resolved\":0,\"missing_references\":0,\"unknown_resources\":0,\"unknown_accessions\":1,\"stale_names\":0,\"obsolete\":0,\"units\":1,\"resolved_units\":0,\"partial_units\":1,\"disallowed_units\":0}}\n" },
+        .{ "<mzML xmlns='http://psi.hupo.org/ms/mzml' version='1.1.0'><run/></mzML>", "{\"format_version\":2,\"kind\":\"scan\",\"resource\":\"\",\"accession\":\"input.mzML\",\"before\":null,\"after\":{\"records\":0,\"parameters\":0,\"resolved\":0,\"missing_references\":0,\"unknown_resources\":0,\"unknown_accessions\":0,\"stale_names\":0,\"obsolete\":0,\"units\":0,\"resolved_units\":0,\"partial_units\":0,\"disallowed_units\":0}}\n" },
+    };
+    inline for (cases) |case| {
+        try dir.dir.writeFile(std.testing.io, .{ .sub_path = "input.mzML", .data = case[0] });
+        const result = try std.process.run(std.testing.allocator, std.testing.io, .{
+            .argv = &.{ executable, "scan", "input.mzML" },
+            .cwd = .{ .dir = dir.dir },
+        });
+        defer std.testing.allocator.free(result.stdout);
+        defer std.testing.allocator.free(result.stderr);
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+        try std.testing.expectEqualStrings("", result.stderr);
+        try std.testing.expectEqualStrings(case[1], result.stdout);
+        var buffer: [2048]u8 = undefined;
+        try std.testing.expectEqualStrings(case[0], try dir.dir.readFile(std.testing.io, "input.mzML", &buffer));
+    }
 }
 
-test "[cli] - [vocabulary scan]: reads a header without CV declarations" {
+test "[cli] - [vocabulary scan]: reports where an unreadable file broke and exits with status 1" {
     var dir = std.testing.tmpDir(.{});
     defer dir.cleanup();
     const executable = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, options.executable, std.testing.allocator);
     defer std.testing.allocator.free(executable);
-    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "input.mzML", .data = "<mzML xmlns='http://psi.hupo.org/ms/mzml' version='1.1.0'><run/></mzML>" });
+    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "input.mzML", .data = "<mzML xmlns='http://psi.hupo.org/ms/mzml'><run><broken" });
     const result = try std.process.run(std.testing.allocator, std.testing.io, .{
         .argv = &.{ executable, "scan", "input.mzML" },
         .cwd = .{ .dir = dir.dir },
     });
     defer std.testing.allocator.free(result.stdout);
     defer std.testing.allocator.free(result.stderr);
-    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
-    try std.testing.expectEqualStrings("", result.stderr);
-    try std.testing.expectEqualStrings("{\"format_version\":2,\"kind\":\"scan\",\"resource\":\"\",\"accession\":\"input.mzML\",\"before\":null,\"after\":{\"records\":0,\"parameters\":0,\"resolved\":0,\"missing_references\":0,\"unknown_resources\":0,\"unknown_accessions\":0,\"stale_names\":0,\"obsolete\":0,\"units\":0,\"resolved_units\":0,\"partial_units\":0,\"disallowed_units\":0}}\n", result.stdout);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, result.term);
+    try std.testing.expectEqualStrings("", result.stdout);
+    try std.testing.expect(std.mem.startsWith(u8, result.stderr, "input.mzML: "));
+    try std.testing.expect(std.mem.endsWith(u8, result.stderr, "\nvocabulary: InvalidXml\n"));
 }

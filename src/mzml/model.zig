@@ -1,15 +1,13 @@
 //! Preserves the mzML element hierarchy and source parameters without XML parser types.
 //!
 //! Slices borrow from their owner. Reader records and XML items expire on the next traversal call;
-//! reader headers remain valid until reader deinitialization. Explicit owned copies
-//! remain valid until their owner's deinit.
+//! reader headers remain valid until reader deinitialization. Explicit owned copies remain valid
+//! until their owner's deinit.
 
 const std = @import("std");
-const encoding = @import("../binary/encoding.zig");
 const cv = @import("../cv/source.zig");
+const encoding = @import("../binary/encoding.zig");
 const arrays = @import("../binary/arrays.zig");
-
-// --- Source hierarchy ---
 
 /// mzML element identities; cvParam, userParam, and group references live in Node.params.
 pub const Kind = enum {
@@ -98,12 +96,14 @@ pub const Item = union(enum) {
     run_end,
 };
 
-/// Runs of parameters/children and self-contained UTF-8 XML, in source order.
-/// Null Node.content means parameters precede children. Counts consume those slices
-/// consecutively; callers changing their lengths must update the runs too.
+/// Runs of parameters/children and self-contained UTF-8 XML, in source order. A null
+/// `Node.content` means parameters precede children. Counts consume those slices consecutively;
+/// callers changing their lengths must update the runs too (writing runs that do not match is
+/// `InvalidStructure`).
 pub const Content = struct {
-    items: []const Content.Item,
     pub const Item = union(enum) { params: usize, children: usize, xml: []const u8 };
+
+    items: []const Content.Item,
 };
 
 /// An mzML node from header metadata or one record, keeping parameter order and multiplicity.
@@ -117,7 +117,7 @@ pub const Node = struct {
     content: ?*const Content = null,
     /// Null when text was deliberately skipped; retained empty text is an empty slice.
     text: ?[]const u8 = null,
-    /// Physical source byte offsets covering the element, including its tags.
+    /// Physical offset of the element's `<`; zero for constructed nodes.
     start_offset: u64 = 0,
     /// Physical byte immediately after the opening tag, or zero for constructed nodes.
     content_offset: u64 = 0,
@@ -275,8 +275,12 @@ pub const Header = struct {
     spectrum_list: ?RecordList = null,
     chromatogram_list: ?RecordList = null,
 
-    /// The cvList declarations in order, for cv.Resolver.init. The caller frees the slice.
-    pub fn cvDeclarations(self: Header, allocator: std.mem.Allocator) (std.mem.Allocator.Error || error{UnexpectedElement})![]cv.Declaration {
+    /// Returns the cvList declarations in order, for `cv.Resolver.init`. The caller frees the
+    /// slice.
+    pub fn cvDeclarations(
+        self: Header,
+        allocator: std.mem.Allocator,
+    ) (std.mem.Allocator.Error || error{UnexpectedElement})![]cv.Declaration {
         const nodes = if (self.document.child(.cv_list)) |list| list.children else &.{};
         const declarations = try allocator.alloc(cv.Declaration, nodes.len);
         errdefer allocator.free(declarations);
@@ -373,26 +377,13 @@ pub const Record = struct {
     }
 };
 
-// --- Binary arrays ---
-
 pub const Primitive = encoding.Primitive;
 pub const Encoding = encoding.Descriptor;
-/// What one CV accession declares about an array's encoding: a primitive, a compression, or an
-/// unsupported encoding; null when it declares nothing. `arrayEncoding` and every reader use it.
 pub const EncodingTerm = encoding.Declared;
 pub const encodingTerm = encoding.declared;
 /// What an array holds, from its array-type term.
 pub const ArrayRole = enum { mz, intensity, time, other };
 
-/// The role of a binary array node: m/z, intensity, or time by their terms (also through groups,
-/// checked in that order, a repeated term counting once), otherwise other.
-pub fn arrayRole(node: Node, groups: []const cv.Group) cv.ExpansionError!ArrayRole {
-    const roles = .{ .{ Terms.MZ_ARRAY, ArrayRole.mz }, .{ Terms.INTENSITY_ARRAY, ArrayRole.intensity }, .{ Terms.TIME_ARRAY, ArrayRole.time } };
-    inline for (roles) |role| if (try cv.findOne(node.params, groups, role[0]) != .missing) return role[1];
-    return .other;
-}
-
-/// encoding.Error, and the failures of reading a modeled array node.
 pub const EncodingError = encoding.Error || error{UnexpectedElement};
 
 /// A binary array node with its classified encoding and value count.
@@ -458,6 +449,18 @@ pub const BinaryArrayIterator = struct {
     }
 };
 
+/// Returns the role of a binary array node: m/z, intensity, or time by their terms (also through
+/// groups, checked in that order, a repeated term counting once), otherwise other.
+pub fn arrayRole(node: Node, groups: []const cv.Group) cv.ExpansionError!ArrayRole {
+    const roles = .{
+        .{ Terms.MZ_ARRAY, ArrayRole.mz },
+        .{ Terms.INTENSITY_ARRAY, ArrayRole.intensity },
+        .{ Terms.TIME_ARRAY, ArrayRole.time },
+    };
+    inline for (roles) |role| if (try cv.findOne(node.params, groups, role[0]) != .missing) return role[1];
+    return .other;
+}
+
 /// Classifies a binary array's primitive and compression terms; a missing term is an error.
 pub fn arrayEncoding(node: Node, groups: []const cv.Group) EncodingError!Encoding {
     if (node.kind != .binary_data_array) return error.UnexpectedElement;
@@ -503,7 +506,6 @@ fn recordChildren(node: Node, list_kind: Kind, item_kind: Kind) []const Node {
     return firstChild(node, item_kind);
 }
 
-/// The first child of this kind as a one-element slice, or an empty slice.
 fn firstChild(node: Node, kind: Kind) []const Node {
     for (node.children, 0..) |child, i|
         if (child.kind == kind) return node.children[i .. i + 1];

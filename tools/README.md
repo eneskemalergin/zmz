@@ -59,6 +59,8 @@ Cargo compile concurrency is capped at four jobs by default. Set `TOOL_JOBS=N` w
 
 The tracked layout is intentionally small: `install.sh` builds and checks peers, `versions.sh` holds source pins, `manifest.json` describes the inventory, `peer.sh` dispatches the isolated Python readers, `mzml_peer.py` normalizes their output, `bench.sh` runs all comparisons and timings, and `wrappers/` contains the two Rust binaries and the C++ Numpress wrapper.
 
+Three files here are zmz's own tools rather than peers: `check_mzml.zig` and `vocabulary.zig`, built by `zig build check-mzml` and `zig build vocabulary`, and `libm_data.py`, which regenerates `src/binary/libm_data.zig` from a musl source tree's copies of Arm's optimized-routines tables.
+
 ## Common commands
 
 Every enabled peer accepts these commands:

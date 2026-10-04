@@ -50,9 +50,7 @@ pub const REFERENCED_DOCUMENT = HEADER ++ "<spectrumList count='2' defaultDataPr
     "<precursor spectrumRef='scan=1'><activation/></precursor>" ++ ARRAYS ++
     "</chromatogram></chromatogramList></run></mzML>";
 
-// --- Shared helpers ---
-
-/// Links nodes into one chain, each the only child of the one before, and returns the outermost.
+// Links nodes into one chain, each the only child of the one before, and returns the outermost.
 pub fn nest(nodes: []mzml.model.Node) mzml.model.Node {
     var index = nodes.len - 1;
     nodes[index] = .{ .kind = .scan };
@@ -70,30 +68,18 @@ pub fn expectItem(expected: mzml.model.Item, actual: mzml.model.Item) !void {
     }
 }
 
+// Writes source as UTF-16 with a byte-order mark into output[0 .. 2 + 2 * source.len].
+pub fn utf16(output: []u8, source: []const u8, endian: std.builtin.Endian) void {
+    std.mem.writeInt(u16, output[0..2], 0xfeff, endian);
+    for (source, 0..) |byte, i| std.mem.writeInt(u16, output[2 + 2 * i ..][0..2], byte, endian);
+}
+
 pub fn readAll(allocator: std.mem.Allocator, bytes: []const u8, options: mzml.StreamReader.Options) !void {
     var input = std.Io.Reader.fixed(bytes);
     var reader = try mzml.StreamReader.init(allocator, &input, options);
     defer reader.deinit();
     _ = try reader.readHeader();
     while (try reader.nextRecord()) |_| {}
-}
-
-pub fn rewriteFixture(allocator: std.mem.Allocator, sink: *std.Io.Writer) !void {
-    var input = std.Io.Reader.fixed(DOCUMENT);
-    var reader = try mzml.StreamReader.init(allocator, &input, .{});
-    defer reader.deinit();
-    var writer = try mzml.Writer.init(allocator, sink, .{});
-    defer writer.deinit();
-    const header = try reader.readHeader();
-    try writer.writeHeader(header.*);
-    try writer.beginList(.spectrum_list, 1, "dp");
-    try writer.writeRecord((try reader.nextRecord()).?.node);
-    try writer.endList();
-    try writer.beginList(.chromatogram_list, 1, "dp");
-    try writer.writeRecord((try reader.nextRecord()).?.node);
-    try writer.endList();
-    try std.testing.expectEqual(null, try reader.nextRecord());
-    try writer.finish();
 }
 
 pub fn expectNode(expected: mzml.model.Node, actual: mzml.model.Node) !void {
@@ -106,12 +92,6 @@ pub fn expectNode(expected: mzml.model.Node, actual: mzml.model.Node) !void {
     for (expected.children, actual.children) |a, b| try expectNode(a, b);
 }
 
-pub fn rewriteAllocated(allocator: std.mem.Allocator) !void {
-    var bytes: [8192]u8 = undefined;
-    var sink = std.Io.Writer.fixed(&bytes);
-    try rewriteFixture(allocator, &sink);
-}
-
 pub fn rewriteDocument(allocator: std.mem.Allocator, source: []const u8, sink: *std.Io.Writer, indexed: bool) !void {
     var input = std.Io.Reader.fixed(source);
     var reader = try mzml.StreamReader.init(allocator, &input, .{});
@@ -122,11 +102,6 @@ pub fn rewriteDocument(allocator: std.mem.Allocator, source: []const u8, sink: *
     try writer.writeHeader(header.*);
     while (try reader.nextItem()) |item| try writer.writeItem(item);
     try writer.finish();
-}
-
-pub fn indexedRewriteAllocated(allocator: std.mem.Allocator) !void {
-    var discard: std.Io.Writer.Discarding = .init(&.{});
-    try rewriteDocument(allocator, REFERENCED_DOCUMENT, &discard.writer, true);
 }
 
 pub fn constructFixture(allocator: std.mem.Allocator, sink: *std.Io.Writer, indexed: bool, pipelines: []const mzml.arrays.Pipeline) !void {
@@ -163,7 +138,7 @@ pub fn constructFixture(allocator: std.mem.Allocator, sink: *std.Io.Writer, inde
                 else => null,
             } };
             var nodes: [2]mzml.Builder.Array = undefined;
-            var wires: [2]mzml.Writer.ArrayPayload = undefined;
+            var payloads: [2]mzml.Writer.ArrayPayload = undefined;
             inline for (0..2) |i| {
                 const array_options: mzml.Builder.ArrayOptions = .{
                     .cv_ref = "MS",
@@ -176,67 +151,20 @@ pub fn constructFixture(allocator: std.mem.Allocator, sink: *std.Io.Writer, inde
                 };
                 const built = try builder.prepareArray(f64, &.{ 1, 2, 3 }, array_options, &encoder);
                 nodes[i] = built.array;
-                wires[i] = built.payload;
+                payloads[i] = built.payload;
             }
             var id: [64]u8 = undefined;
             const record = try builder.record(if (list_kind == .spectrum_list) .spectrum else .chromatogram, try std.fmt.bufPrint(&id, "{s}={s}", .{ if (list_kind == .spectrum_list) "scan" else "chromatogram", @tagName(pipeline) }), index, 3, if (list_kind == .spectrum_list) &.{.{ .group_ref = .{ .ref = "record-type" } }} else &.{}, &.{}, &nodes);
-            try writer.writeRecordWithArrays(record.node, &wires);
+            try writer.writeRecordWithArrays(record.node, &payloads);
         }
         try writer.endList();
     }
     try writer.finish();
 }
 
-pub fn constructAllocated(allocator: std.mem.Allocator) !void {
-    var discard: std.Io.Writer.Discarding = .init(&.{});
-    try constructFixture(allocator, &discard.writer, true, std.meta.tags(mzml.arrays.Pipeline));
-}
-
-pub fn checkIndexed(allocator: std.mem.Allocator, bytes: []const u8) !void {
-    var index = try mzml.IndexedReader.build(allocator, .{ .bytes = bytes }, .{});
-    defer index.deinit();
-    try std.testing.expectEqual(@as(usize, 16), index.entries().len);
-    try std.testing.expectEqual(@as(usize, 0), index.header().spectrum_list.?.observed_count);
-    var input = std.Io.Reader.fixed(bytes);
-    var reader = try mzml.StreamReader.init(allocator, &input, .{});
-    defer reader.deinit();
-    for (index.entries()) |entry| {
-        const record = (try reader.nextRecord()).?;
-        try std.testing.expectEqualStrings(entry.id, record.id);
-        try std.testing.expectEqual(entry.kind, record.node.kind);
-        try std.testing.expectEqual(entry.start, record.node.start_offset);
-        try std.testing.expect(record.node.end_offset <= entry.end);
-    }
-    try std.testing.expectEqual(null, try reader.nextRecord());
-    for ([_]usize{ 15, 0, 7, 8, 6 }) |position| {
-        const entry = index.entries()[position];
-        var record = (try index.byId(allocator, entry.id)).?;
-        defer record.deinit();
-        try std.testing.expectEqualStrings(entry.id, record.value.id);
-        try std.testing.expectEqual(entry.start, record.value.node.start_offset);
-        try std.testing.expect(record.value.node.end_offset <= entry.end);
-        try std.testing.expectEqual(@as(usize, 2), record.value.binaryArrays().len);
-        var ordinal = (try index.at(allocator, entry.kind, entry.ordinal)).?;
-        defer ordinal.deinit();
-        try expectNode(record.value.node, ordinal.value.node);
-        for (record.value.binaryArrays()) |array| {
-            var output: [3]f64 = undefined;
-            var transport: [128]u8 = undefined;
-            var transformed: [128]u8 = undefined;
-            _ = try mzml.model.decodeArray(f64, &output, array, 3, index.header().groups, .{ .transport = &transport, .transformed = &transformed });
-            for (output, [_]f64{ 1, 2, 3 }) |value, expected| try std.testing.expectApproxEqAbs(expected, value, 0.001);
-        }
-    }
-    try std.testing.expectEqual(null, try index.byId(allocator, "missing"));
-    try std.testing.expectEqual(null, try index.at(allocator, .spectrum, 8));
-}
-
-/// Pipelines whose wire bytes are one zlib stream.
-const ZLIB_PIPELINES = [_][]const u8{ "MS:1000574", "MS:1002746", "MS:1002747", "MS:1002748" };
-
-/// Checks written mzML against a frozen fixture without depending on the zlib encoder's bytes.
-/// Both documents must match after encoderIndependent, and an indexed output must carry
-/// offsets and a checksum that are correct for its own bytes.
+// Checks written mzML against a frozen fixture without depending on the zlib encoder's bytes.
+// Both documents must match after encoderIndependent, and an indexed output must carry
+// offsets and a checksum that are correct for its own bytes.
 pub fn expectWritten(expected: []const u8, actual: []const u8) !void {
     const allocator = std.testing.allocator;
     const expected_view = try encoderIndependent(allocator, expected);
@@ -261,10 +189,6 @@ pub fn expectWritten(expected: []const u8, actual: []const u8) !void {
     }
 }
 
-/// Copies a document, replacing each zlib stream with the hex of its decoded bytes and each value
-/// that follows from compressed sizes (zlib encodedLength, index offsets, checksum) with '#'.
-/// Every stream must decode to the same bytes with zmz and with the standard library.
-/// Returns where the 40-digit checksum starts, or fails when the output lacks it.
 pub fn checksumStart(bytes: []const u8) !usize {
     const tag = "<fileChecksum>";
     const start = (std.mem.indexOf(u8, bytes, tag) orelse return error.TestUnexpectedResult) + tag.len;
@@ -273,8 +197,6 @@ pub fn checksumStart(bytes: []const u8) !usize {
     return start;
 }
 
-/// Indexed output must end with its wrapper, so a lost final flush fails here.
-/// Checks that every binaryDataArray's encodedLength equals the length of its binary text.
 pub fn expectEncodedLengths(document: []const u8) !void {
     var at: usize = 0;
     var arrays: usize = 0;
@@ -290,10 +212,27 @@ pub fn expectEncodedLengths(document: []const u8) !void {
     try std.testing.expect(arrays != 0);
 }
 
+// Indexed output must end with its wrapper, so a lost final flush fails here.
 pub fn expectCompleteIndexed(bytes: []const u8) !void {
     try std.testing.expect(std.mem.endsWith(u8, std.mem.trimEnd(u8, bytes, "\n"), "</fileChecksum></indexedmzML>"));
 }
 
+pub fn writeSingleRecord(allocator: std.mem.Allocator, sink: *std.Io.Writer, header: mzml.model.Header, record: mzml.model.Node, indexed: bool, arrays: ?[]const mzml.Writer.ArrayPayload) !void {
+    var writer = if (indexed) try mzml.Writer.initIndexed(allocator, sink, .{}, .{}) else try mzml.Writer.init(allocator, sink, .{});
+    defer writer.deinit();
+    try writer.writeHeader(header);
+    try writer.beginList(.spectrum_list, 1, "dp");
+    if (arrays) |wire| try writer.writeRecordWithArrays(record, wire) else try writer.writeRecord(record);
+    try writer.endList();
+    try writer.finish();
+}
+
+// Pipelines whose wire bytes are one zlib stream.
+const ZLIB_PIPELINES = [_][]const u8{ "MS:1000574", "MS:1002746", "MS:1002747", "MS:1002748" };
+
+// Copies a document, replacing each zlib stream with the hex of its decoded bytes and each value
+// that follows from compressed sizes (zlib encodedLength, index offsets, checksum) with '#'.
+// Every stream must decode to the same bytes with zmz and with the standard library.
 fn encoderIndependent(allocator: std.mem.Allocator, document: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -347,121 +286,4 @@ fn sizeDependentValue(tag: []const u8) !?usize {
     }
     if (std.mem.startsWith(u8, tag, "<offset ")) return (std.mem.indexOfScalar(u8, tag, '>') orelse return error.TestUnexpectedResult) + 1;
     return null;
-}
-
-pub fn checkLookupAllocator(record_allocator: std.mem.Allocator) !void {
-    var retained = blk: {
-        var index = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = @embedFile("data/writer_indexed.mzML") }, .{ .policy = .open_embedded });
-        defer index.deinit();
-        var first = (try index.at(std.testing.allocator, .spectrum, 0)).?;
-        errdefer first.deinit();
-        var warm = (try index.at(std.testing.allocator, .chromatogram, 0)).?;
-        warm.deinit();
-        var last = (index.at(record_allocator, .chromatogram, 7) catch |err| {
-            var recovered = (try index.at(std.testing.allocator, .chromatogram, 1)).?;
-            defer recovered.deinit();
-            try std.testing.expectEqualStrings("chromatogram=zlib", recovered.value.id);
-            try std.testing.expectEqualStrings("scan=none", first.value.id);
-            return err;
-        }).?;
-        defer last.deinit();
-        try std.testing.expectEqualStrings("chromatogram=slof_zlib", last.value.id);
-        try std.testing.expectEqualStrings("scan=none", first.value.id);
-        break :blk first;
-    };
-    defer retained.deinit();
-    try std.testing.expectEqualStrings("scan=none", retained.value.id);
-    var values: [3]f64 = undefined;
-    var transport: [128]u8 = undefined;
-    _ = try mzml.model.decodeArray(f64, &values, retained.value.binaryArrays()[0], 3, &.{}, .{ .transport = &transport, .transformed = &.{} });
-    try std.testing.expectEqualSlices(f64, &.{ 1, 2, 3 }, &values);
-}
-
-pub fn checkOpenEmbedded(allocator: std.mem.Allocator, bytes: []const u8) !void {
-    var index = try mzml.IndexedReader.build(allocator, .{ .bytes = bytes }, .{ .policy = .open_embedded });
-    defer index.deinit();
-    try std.testing.expectEqual(@as(usize, 16), index.entries().len);
-    try std.testing.expectEqual(@as(usize, 0), index.header().spectrum_list.?.observed_count);
-    try std.testing.expectEqual(@as(usize, 0), index.header().chromatogram_list.?.observed_count);
-    for (index.entries()) |entry| {
-        var record = (try index.at(allocator, entry.kind, entry.ordinal)).?;
-        defer record.deinit();
-        try std.testing.expectEqualStrings(entry.id, record.value.id);
-        try std.testing.expectEqual(entry.start, record.value.node.start_offset);
-        try std.testing.expect(record.value.node.end_offset <= entry.end);
-        for (record.value.binaryArrays()) |array| {
-            var values: [3]f64 = undefined;
-            var transport: [128]u8 = undefined;
-            var transformed: [128]u8 = undefined;
-            _ = try mzml.model.decodeArray(f64, &values, array, 3, index.header().groups, .{ .transport = &transport, .transformed = &transformed });
-            for (values, [_]f64{ 1, 2, 3 }) |value, expected| try std.testing.expectApproxEqAbs(expected, value, 0.001);
-        }
-    }
-}
-
-pub fn copyRetained(allocator: std.mem.Allocator) !void {
-    var input = std.Io.Reader.fixed(DOCUMENT);
-    var header: mzml.owned.Header = undefined;
-    var record: mzml.owned.Record = undefined;
-    {
-        var reader = try mzml.StreamReader.init(allocator, &input, .{});
-        defer reader.deinit();
-        const source_header = try reader.readHeader();
-        const source_record = (try reader.nextRecord()).?;
-        header = try mzml.owned.Header.init(allocator, source_header.*, .{});
-        errdefer header.deinit();
-        record = try mzml.owned.Record.init(allocator, source_record, .{});
-        errdefer record.deinit();
-        try expectNode(source_header.document, header.value.document);
-        try expectNode(source_header.run, header.value.run);
-        try std.testing.expectEqualDeep(source_header.groups, header.value.groups);
-        try std.testing.expectEqualDeep(source_header.spectrum_list, header.value.spectrum_list);
-        try expectNode(source_record.node, record.value.node);
-        try std.testing.expectEqual(source_record.node.start_offset, record.value.node.start_offset);
-        try std.testing.expectEqual(source_record.node.end_offset, record.value.node.end_offset);
-        while (try reader.nextRecord()) |_| {}
-    }
-    defer header.deinit();
-    defer record.deinit();
-    try std.testing.expectEqualStrings("native=a&b", record.value.id);
-    try std.testing.expectEqualStrings("A&B", header.value.document.child(.file_description).?.child(.file_content).?.params[0].cv.name.?);
-    var output: [1]f64 = undefined;
-    var transport: [16]u8 = undefined;
-    var transformed: [16]u8 = undefined;
-    for (record.value.binaryArrays()) |array| {
-        _ = try mzml.model.decodeArray(f64, &output, array, record.value.default_array_length, header.value.groups, .{
-            .transport = &transport,
-            .transformed = &transformed,
-        });
-        try std.testing.expectEqual(@as(f64, 1), output[0]);
-    }
-}
-
-pub fn writeSingleRecord(allocator: std.mem.Allocator, sink: *std.Io.Writer, header: mzml.model.Header, record: mzml.model.Node, indexed: bool, arrays: ?[]const mzml.Writer.ArrayPayload) !void {
-    var writer = if (indexed) try mzml.Writer.initIndexed(allocator, sink, .{}, .{}) else try mzml.Writer.init(allocator, sink, .{});
-    defer writer.deinit();
-    try writer.writeHeader(header);
-    try writer.beginList(.spectrum_list, 1, "dp");
-    if (arrays) |wire| try writer.writeRecordWithArrays(record, wire) else try writer.writeRecord(record);
-    try writer.endList();
-    try writer.finish();
-}
-
-pub fn expectFragmentedRead(bytes: []const u8, payload: mzml.StreamReader.Payload) !void {
-    var expected_input = std.Io.Reader.fixed(bytes);
-    var expected = try mzml.StreamReader.init(std.testing.allocator, &expected_input, .{ .payload = payload, .retain_index = true });
-    defer expected.deinit();
-    var buffer: [7]u8 = undefined;
-    var actual_input: std.testing.Reader = .init(&buffer, &.{.{ .buffer = bytes }});
-    actual_input.artificial_limit = .limited(buffer.len);
-    var actual = try mzml.StreamReader.init(std.testing.allocator, &actual_input.interface, .{ .payload = payload, .retain_index = true });
-    defer actual.deinit();
-    const expected_header = try expected.readHeader();
-    const actual_header = try actual.readHeader();
-    while (try expected.nextRecord()) |record| {
-        try std.testing.expectEqualDeep(record, (try actual.nextRecord()).?);
-    }
-    try std.testing.expectEqual(null, try actual.nextRecord());
-    try std.testing.expectEqualDeep(expected_header.*, actual_header.*);
-    try std.testing.expectEqualDeep(expected.indexTrailer(), actual.indexTrailer());
 }

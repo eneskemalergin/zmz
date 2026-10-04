@@ -1,34 +1,34 @@
-//! Stores decoded arrays from decoded reads (nextDecodedRecord, byIdDecoded, atDecoded)
-//! and from records whose Base64 text was retained (decodeRecord, decodeArray).
+//! Stores decoded arrays from decoded reads (`nextDecodedRecord`, `nextDecodedItem`, `byIdDecoded`,
+//! `atDecoded`), from records whose Base64 text was retained (`decodeRecord`, `decodeArray`), and
+//! from text read as events (`decodeArrayText`).
 //!
-//! Each array keeps its source primitive; Numpress output is f64 unless `numpress_precision`
-//! is `.declared`, which keeps a declared 32-bit float. Numeric
-//! buffers grow as needed and are reused between records. Every array decodes as its text
-//! arrives: Base64 goes straight into typed output, into a fixed window for Numpress, or, with
-//! zlib, through a window that the decompressor pulls from. No buffer holds a payload whole.
-//! Selected results stay in source order; source_position indexes record.binaryArrays(),
-//! and is 0 for decodeArray.
-//! Results become visible only after the complete record succeeds. Returned slices last
-//! until the next decoded read using this owner, reset, or deinit; ordinary reads do not
-//! invalidate them. No source metadata is borrowed by this owner. Do not copy an owner: a copy
+//! Each array keeps its source primitive; Numpress output is f64 unless `numpress_precision` is
+//! `.declared`, which keeps a declared 32-bit float. Numeric buffers grow as needed and are reused
+//! between records. Every array decodes as its text arrives: Base64 goes straight into typed
+//! output, into a fixed window for Numpress, or, with zlib, through a window that the decompressor
+//! pulls from. No buffer holds a payload whole. Selected results stay in source order;
+//! `source_position` indexes `record.binaryArrays()`, and is 0 for `decodeArray` and
+//! `decodeArrayText`. Results become visible only after the complete record succeeds. Returned
+//! slices last until the next decoded read using this owner, reset, or deinit; ordinary reads do
+//! not invalidate them. No source metadata is borrowed by this owner. Do not copy an owner: a copy
 //! shares its buffers, and both `deinit`s would free them.
 //!
 //! While a read decodes into this owner, as from one of its selection callbacks, the decode
 //! calls return `InvalidState` and `reset` does nothing.
 //!
-//! beginArray, decodeText, and complete are internal: the reader engine and `IndexedReader`
-//! call them while they parse a record. Callers use the reads and the decode functions
-//! (decodeArrayText for text read as events).
+//! `beginArray`, `decodeText`, and `complete` are internal: the reader engine and `IndexedReader`
+//! call them while they parse a record. Callers use the reads and the decode functions.
 
 const std = @import("std");
-const model = @import("model.zig");
+const builtin = @import("builtin");
 const cv = @import("../cv/source.zig");
 const arrays = @import("../binary/arrays.zig");
 const base64 = @import("../binary/base64.zig");
 const numpress = @import("../binary/numpress.zig");
 const zlib = @import("../binary/zlib.zig");
-const Diagnostic = @import("diagnostic.zig");
 const overlaps = @import("../binary/core.zig").overlaps;
+const model = @import("model.zig");
+const Diagnostic = @import("diagnostic.zig");
 
 const DecodedArrays = @This();
 
@@ -51,10 +51,6 @@ pub const Options = struct {
     /// to the nearest (as pyteomics and pyOpenMS do); integer declarations stay f64.
     numpress_precision: enum { decoded, declared } = .decoded,
 };
-
-// Bytes decoded per step: Numpress input from Base64, or Base64 output for the decompressor. A
-// zlib payload that fits whole (most spectra) is decoded in one call, straight into its values.
-const WINDOW = 64 * 1024;
 
 allocator: std.mem.Allocator,
 options: Options,
@@ -173,7 +169,53 @@ pub fn diagnostic(self: *const DecodedArrays) ?Diagnostic {
     return self.report;
 }
 
-// Runs before the failed call's reset clears `failure` and the array count.
+pub fn beginArray(
+    self: *DecodedArrays,
+    node: model.Node,
+    default_length: ?usize,
+    groups: []const cv.Group,
+    source_position: usize,
+) Error!void {
+    errdefer |err| if (self.failure == null) {
+        self.failure = .{ .stage = .array, .detail = switch (@as(anyerror, err)) {
+            error.MissingAttribute, error.EmptyValue, error.InvalidValue, error.Overflow => .{ .attribute = .array_length },
+            else => .none,
+        } };
+    };
+    const array = try model.BinaryArray.init(node, default_length, groups);
+    try self.beginArrayWith(array.encoding, array.length, source_position);
+    self.outputs.items[self.count - 1].role = try model.arrayRole(node, groups);
+}
+
+// source.next() returns the next logical text fragment, valid until the following call, and null
+// at the end; its errors pass through unchanged and take precedence, as do Base64 errors anywhere
+// in the text over zlib errors, and zlib errors over Numpress errors.
+pub fn decodeText(self: *DecodedArrays, source: anytype) !void {
+    if (self.count == 0) return error.InvalidState;
+    const output = &self.outputs.items[self.count - 1];
+    if (output.encoding.pipeline.hasZlib()) try self.decompressText(source) else {
+        while (try source.next()) |bytes| try self.text(bytes);
+        try self.finishArray();
+    }
+    if (self.options.numpress_precision == .declared and output.encoding.pipeline.isNumpress() and output.encoding.primitive == .float32) {
+        // Each f32 lands inside f64 values already read, so narrowing in place is safe.
+        const wide = output.values(f64);
+        const narrow = std.mem.bytesAsSlice(f32, std.mem.sliceAsBytes(output.words.items))[0..output.length];
+        for (narrow, 0..) |*value, i| value.* = @floatCast(wide[i]);
+        output.narrowed = true;
+        output.bytes = output.length * @sizeOf(f32);
+    }
+}
+
+pub fn complete(self: *DecodedArrays) void {
+    self.ready = true;
+}
+
+// Bytes decoded per step: Numpress input from Base64, or Base64 output for the decompressor. A
+// zlib payload that fits whole (most spectra) is decoded in one call, straight into its values.
+const WINDOW = 64 * 1024;
+
+// Runs before the failed call's reset clears failure and the array count.
 fn keepReport(self: *DecodedArrays, err: anyerror) void {
     const stage: Diagnostic.Stage = if (self.failure) |failure| failure.stage else .array;
     const detail: Diagnostic.Detail = if (self.failure) |failure| failure.detail else .none;
@@ -183,7 +225,13 @@ fn keepReport(self: *DecodedArrays, err: anyerror) void {
     self.report = report;
 }
 
-fn decodeRetained(self: *DecodedArrays, node: model.Node, default_length: ?usize, groups: []const cv.Group, source_position: usize) Error!void {
+fn decodeRetained(
+    self: *DecodedArrays,
+    node: model.Node,
+    default_length: ?usize,
+    groups: []const cv.Group,
+    source_position: usize,
+) Error!void {
     self.position = source_position;
     // Text kept in this owner's storage would be freed or overwritten as arrays are sized.
     if (node.child(.binary)) |binary| if (binary.text) |retained| {
@@ -206,29 +254,6 @@ const RetainedText = struct {
         return self.text;
     }
 };
-
-// --- Reader engine entry points ---
-
-/// Decodes the current array's binary text, pulled from source until its next() returns null.
-/// source.next() returns the next logical text fragment, valid until the following call; its
-/// errors pass through unchanged and take precedence, as do Base64 errors anywhere in the text
-/// over zlib errors, and zlib errors over Numpress errors.
-pub fn decodeText(self: *DecodedArrays, source: anytype) !void {
-    if (self.count == 0) return error.InvalidState;
-    const output = &self.outputs.items[self.count - 1];
-    if (output.encoding.pipeline.hasZlib()) try self.decompressText(source) else {
-        while (try source.next()) |bytes| try self.text(bytes);
-        try self.finishArray();
-    }
-    if (self.options.numpress_precision == .declared and output.encoding.pipeline.isNumpress() and output.encoding.primitive == .float32) {
-        // Each f32 lands inside f64 values already read, so narrowing in place is safe.
-        const wide = output.values(f64);
-        const narrow = std.mem.bytesAsSlice(f32, std.mem.sliceAsBytes(output.words.items))[0..output.length];
-        for (narrow, 0..) |*value, i| value.* = @floatCast(wide[i]);
-        output.narrowed = true;
-        output.bytes = output.length * @sizeOf(f32);
-    }
-}
 
 fn text(self: *DecodedArrays, bytes: []const u8) Error!void {
     errdefer if (self.failure == null) {
@@ -263,22 +288,6 @@ fn feed(self: *DecodedArrays, bytes: []const u8) void {
     };
 }
 
-pub fn complete(self: *DecodedArrays) void {
-    self.ready = true;
-}
-
-pub fn beginArray(self: *DecodedArrays, node: model.Node, default_length: ?usize, groups: []const cv.Group, source_position: usize) Error!void {
-    errdefer |err| if (self.failure == null) {
-        self.failure = .{ .stage = .array, .detail = switch (@as(anyerror, err)) {
-            error.MissingAttribute, error.EmptyValue, error.InvalidValue, error.Overflow => .{ .attribute = .array_length },
-            else => .none,
-        } };
-    };
-    const array = try model.BinaryArray.init(node, default_length, groups);
-    try self.beginArrayWith(array.encoding, array.length, source_position);
-    self.outputs.items[self.count - 1].role = try model.arrayRole(node, groups);
-}
-
 fn beginArrayWith(self: *DecodedArrays, encoding: model.Encoding, length: usize, source_position: usize) Error!void {
     errdefer if (self.failure == null) {
         self.failure = .{ .stage = .array };
@@ -295,13 +304,19 @@ fn beginArrayWith(self: *DecodedArrays, encoding: model.Encoding, length: usize,
     output.bytes = 0;
     const bytes = std.math.mul(usize, length, output.primitive().size()) catch return error.LengthOverflow;
     if (bytes > self.options.array_bytes) {
-        self.failure = .{ .stage = .array, .detail = .{ .limit = .{ .name = .array_bytes, .maximum = self.options.array_bytes, .needed = bytes } } };
+        self.failure = .{
+            .stage = .array,
+            .detail = .{ .limit = .{ .name = .array_bytes, .maximum = self.options.array_bytes, .needed = bytes } },
+        };
         return error.LimitExceeded;
     }
     var record_bytes = bytes;
     for (self.outputs.items[0 .. self.count - 1]) |previous| record_bytes +|= previous.bytes;
     if (record_bytes > self.options.record_array_bytes) {
-        self.failure = .{ .stage = .array, .detail = .{ .limit = .{ .name = .record_array_bytes, .maximum = self.options.record_array_bytes, .needed = record_bytes } } };
+        self.failure = .{
+            .stage = .array,
+            .detail = .{ .limit = .{ .name = .record_array_bytes, .maximum = self.options.record_array_bytes, .needed = record_bytes } },
+        };
         return error.LimitExceeded;
     }
     try output.words.resize(self.allocator, bytes / 8 + @intFromBool(bytes % 8 != 0));
@@ -356,7 +371,6 @@ fn decompressText(self: *DecodedArrays, source: anytype) !void {
     const inflated = self.decompressInto(decompressor, output, &short);
     if (input.failure) |err| return input.fail(self, err);
     input.drain() catch |err| return input.fail(self, err);
-    // An empty plain zlib array has no text and was decoded whole above.
     inflated catch |err| {
         self.failure = .{ .stage = .array, .detail = output.shortDetail(short) };
         return err;
@@ -503,6 +517,7 @@ fn Base64Input(comptime Source: type) type {
         }
     };
 }
+
 const Output = struct {
     words: std.ArrayList(u64) = .empty,
     source_position: usize = 0,
@@ -526,7 +541,7 @@ const Output = struct {
 
     // Values arrive as little-endian bytes; big-endian targets swap them in place.
     fn toNative(self: *const Output) void {
-        if (comptime @import("builtin").cpu.arch.endian() == .little) return;
+        if (comptime builtin.cpu.arch.endian() == .little) return;
         switch (self.primitive()) {
             inline else => |kind| {
                 const T = kind.Type();
@@ -540,3 +555,23 @@ const Output = struct {
         return std.mem.bytesAsSlice(T, std.mem.sliceAsBytes(self.words.items))[0..self.length];
     }
 };
+
+// --- Tests ---
+
+test "[failure] - [mzML decoded arrays]: refuses text before its array and leaves a limit-stopped array empty" {
+    const int32 = cv.Entry{ .cv = .{ .accession = .{ .raw = "MS:1000519" }, .name = "32-bit integer" } };
+    const plain = cv.Entry{ .cv = .{ .accession = .{ .raw = "MS:1000576" }, .name = "no compression" } };
+    const node: model.Node = .{ .kind = .binary_data_array, .params = &.{ int32, plain }, .children = &.{.{ .kind = .binary, .text = "QUFBQUFBQUE=" }} };
+    const Empty = struct {
+        fn next(_: *@This()) error{}!?[]const u8 {
+            return null;
+        }
+    };
+    var output = DecodedArrays.init(std.testing.allocator, .{ .array_bytes = 64 });
+    defer output.deinit();
+    var empty: Empty = .{};
+    try std.testing.expectError(error.InvalidState, output.decodeText(&empty));
+    try std.testing.expectError(error.LimitExceeded, output.beginArray(node, 1000, &.{}, 0));
+    output.complete();
+    try std.testing.expectEqual(@as(usize, 0), output.get(0).?.values.int32.len);
+}

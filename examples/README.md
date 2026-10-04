@@ -8,7 +8,7 @@ zig build examples -Doptimize=ReleaseFast
 
 The executables go in `zig-out/bin/`. `zig build test-examples` compiles and runs them on small fixtures; `zig build test` includes those checks. No external datasets are needed.
 
-The stream, indexed, and rewrite programs print saved `mzml.Diagnostic` reports on failure. These include the native error, operation, and available location or size details. Indexed opening uses `buildWithDiagnostic` so its report survives cleanup; lookup, forward-reader, and writer reports come from `diagnostic()`.
+The stream, select, indexed, and rewrite programs print saved `mzml.Diagnostic` reports on failure. These include the native error, operation, and available location or size details. Indexed opening uses `buildWithDiagnostic` so its report survives cleanup; lookup, forward-reader, writer, and `DecodedArrays` reports come from `diagnostic()`.
 
 ## Read, select, and retain
 
@@ -150,4 +150,4 @@ The reader handles XML 1.0 in UTF-8, UTF-16, and declared ISO-8859-1. Returned t
 
 When a singular metadata container repeats, only the first occurrence is modeled. Later occurrences remain intact in `Node.content` as XML. Scan helpers, array decoding, and group expansion do not read those fragments. Copying preserves them; `--zlib` leaves their payloads unchanged. Even `--metadata` retains their XML bytes, within the reader's retained-byte limits. Multiple binary payloads in one modeled array and unsupported run/list ordering still fail.
 
-The stream example prints the reader's first error, byte offset, and element when available, then returns the error. No example prechecks the whole file or silently skips a failed record. Whole-file gzip is not handled here.
+The stream example prints the reader's first error, its location, and the element when available, then returns the error. No example prechecks the whole file or silently skips a failed record. Whole-file gzip is not handled here.

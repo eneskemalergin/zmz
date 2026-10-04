@@ -1,4 +1,7 @@
 //! Implements forward mzML reading and the private fragment operations used by indexing.
+//!
+//! `Limits`, `Payload`, `Selection`, `ArraySelector`, and `Options` reach callers through
+//! `StreamReader`; everything else here serves the readers only.
 
 const std = @import("std");
 const cv = @import("../../cv/source.zig");
@@ -11,23 +14,6 @@ const DecodedArrays = @import("../decoded_arrays.zig");
 const Diagnostic = @import("../diagnostic.zig");
 
 const Engine = @This();
-
-const ParamAttributes = struct {
-    ref: ?[]const u8 = null,
-    cv_ref: ?[]const u8 = null,
-    accession: ?[]const u8 = null,
-    name: ?[]const u8 = null,
-    value: ?[]const u8 = null,
-    value_type: ?[]const u8 = null,
-    unit_cv_ref: ?[]const u8 = null,
-    unit_accession: ?[]const u8 = null,
-    unit_name: ?[]const u8 = null,
-};
-const PARAM_ATTRIBUTES = std.StaticStringMap(std.meta.FieldEnum(ParamAttributes)).initComptime(.{
-    .{ "ref", .ref },               .{ "cvRef", .cv_ref },                 .{ "accession", .accession },
-    .{ "name", .name },             .{ "value", .value },                  .{ "type", .value_type },
-    .{ "unitCvRef", .unit_cv_ref }, .{ "unitAccession", .unit_accession }, .{ "unitName", .unit_name },
-});
 
 /// Byte limits count stored slices, excluding allocator bookkeeping and scratch capacity.
 pub const Limits = struct {
@@ -85,6 +71,15 @@ pub const Error = xml.Error || model.MetadataError || DecodedArrays.Error || std
 };
 pub const FragmentError = Error || error{InvalidIndex};
 
+pub const Scope = struct { start: u64, end: u64, name: []const u8 };
+pub const FragmentTarget = struct { kind: model.Kind, id: []const u8 };
+
+// Parsed indexed-wrapper children. Release its arena once.
+pub const ParsedFooter = struct {
+    arena: std.heap.ArenaAllocator,
+    nodes: [2]model.Node,
+};
+
 allocator: std.mem.Allocator,
 cursor: xml.Cursor,
 options: Options,
@@ -93,7 +88,7 @@ record_store: Storage,
 header: model.Header = undefined,
 header_ready: bool = false,
 // The groups that references in records resolve against, and each unique ID's position in
-// them (`REPEATED_ID` for a repeated ID), built once per groups slice.
+// them (REPEATED_ID for a repeated ID), built once per groups slice.
 reference_groups: []const cv.Group = &.{},
 group_positions: std.StringHashMapUnmanaged(usize) = .empty,
 group_positions_of: []const cv.Group = &.{},
@@ -110,8 +105,12 @@ child_scratch: std.ArrayList(model.Node) = .empty,
 param_scratch: std.ArrayList(cv.Entry) = .empty,
 decoded_arrays: ?*DecodedArrays = null,
 // The in-scope namespace declarations built for one scope and storage (scopeDeclarations).
-scope_declarations: struct { storage: ?*const Storage = null, resets: usize = 0, scope: u64 = 0, attributes: []const model.Attribute = &.{} } = .{},
-// The decoded record's defaultArrayLength, for its arrays.
+scope_declarations: struct {
+    storage: ?*const Storage = null,
+    resets: usize = 0,
+    scope: u64 = 0,
+    attributes: []const model.Attribute = &.{},
+} = .{},
 record_default_length: ?usize = null,
 // A call is in progress. Caller code runs inside it (selection callbacks, the input reader,
 // the allocator); reentering would reset storage the parse still uses.
@@ -119,13 +118,8 @@ active: bool = false,
 decode_binary: bool = false,
 fragment_ancestors: ?xml.Ancestors = null,
 
-pub const Scope = struct { start: u64, end: u64, name: []const u8 };
-pub const FragmentTarget = struct { kind: model.Kind, id: []const u8 };
-
 pub fn init(allocator: std.mem.Allocator, input: *std.Io.Reader, options: Options) xml.InitError!Engine {
     if (options.limits.nodes == 0 or options.limits.list_entries == 0) return error.InvalidOptions;
-    if (input.buffer.len == 0 and input.vtable != std.Io.Reader.ending.vtable)
-        return error.InvalidOptions;
     return .{
         .allocator = allocator,
         .cursor = try xml.Cursor.init(allocator, input, options.limits.attributes, options.limits.attribute_bytes),
@@ -151,6 +145,40 @@ pub fn readHeader(self: *Engine) Error!*const model.Header {
     return self.ensureHeader();
 }
 
+pub fn nextRecord(self: *Engine) Error!?model.Record {
+    try self.enter();
+    defer self.active = false;
+    return self.nextRecordFor(.tree);
+}
+
+pub fn nextIndexRecord(self: *Engine) Error!?model.Record {
+    try self.enter();
+    defer self.active = false;
+    return self.nextRecordFor(.entry);
+}
+
+pub fn nextItem(self: *Engine) Error!?model.Item {
+    try self.enter();
+    defer self.active = false;
+    return self.nextItemFor(.tree, true);
+}
+
+pub fn nextDecodedItem(self: *Engine, output: *DecodedArrays) Error!?model.Item {
+    try self.enter();
+    defer self.active = false;
+    return self.nextDecoded(model.Item, nextTreeItem, output);
+}
+
+pub fn nextDecodedRecord(self: *Engine, output: *DecodedArrays) Error!?model.Record {
+    try self.enter();
+    defer self.active = false;
+    return self.nextDecoded(model.Record, nextTreeRecord, output);
+}
+
+pub fn diagnostic(self: *const Engine) ?Diagnostic {
+    return self.failure;
+}
+
 fn enter(self: *Engine) Error!void {
     if (self.active) return error.InvalidState;
     self.active = true;
@@ -165,18 +193,6 @@ fn ensureHeader(self: *Engine) Error!*const model.Header {
     return &self.header;
 }
 
-pub fn nextRecord(self: *Engine) Error!?model.Record {
-    try self.enter();
-    defer self.active = false;
-    return self.nextRecordFor(.tree);
-}
-
-pub fn nextIndexRecord(self: *Engine) Error!?model.Record {
-    try self.enter();
-    defer self.active = false;
-    return self.nextRecordFor(.entry);
-}
-
 const Retention = enum { tree, entry, none };
 
 fn nextRecordFor(self: *Engine, comptime retention: Retention) Error!?model.Record {
@@ -186,12 +202,6 @@ fn nextRecordFor(self: *Engine, comptime retention: Retention) Error!?model.Reco
     return null;
 }
 
-pub fn nextItem(self: *Engine) Error!?model.Item {
-    try self.enter();
-    defer self.active = false;
-    return self.nextItemFor(.tree, true);
-}
-
 fn nextItemFor(self: *Engine, comptime retention: Retention, comptime retain_xml: bool) Error!?model.Item {
     if (self.failure != null) return error.FailedState;
     errdefer |err| self.fail(err, if (retain_xml) .read_item else .read_record);
@@ -199,18 +209,6 @@ fn nextItemFor(self: *Engine, comptime retention: Retention, comptime retain_xml
     self.record_store.reset();
     if (self.done) return null;
     return self.nextItemInner(retention, retain_xml);
-}
-
-pub fn nextDecodedItem(self: *Engine, output: *DecodedArrays) Error!?model.Item {
-    try self.enter();
-    defer self.active = false;
-    return self.nextDecoded(model.Item, nextTreeItem, output);
-}
-
-pub fn nextDecodedRecord(self: *Engine, output: *DecodedArrays) Error!?model.Record {
-    try self.enter();
-    defer self.active = false;
-    return self.nextDecoded(model.Record, nextTreeRecord, output);
 }
 
 fn nextTreeItem(self: *Engine) Error!?model.Item {
@@ -237,170 +235,19 @@ fn nextDecoded(self: *Engine, comptime T: type, comptime next: fn (*Engine) Erro
     return value;
 }
 
-pub fn diagnostic(self: *const Engine) ?Diagnostic {
-    return self.failure;
-}
-
 // A parsed spectrum or chromatogram node, whose id the parser has checked.
 fn recordOf(self: *Engine, node: model.Node) Error!model.Record {
     return .{
         .node = node,
         .id = node.attribute("id").?,
-        .index = try self.number(node, .index),
-        .default_array_length = try self.number(node, .default_array_length),
+        .index = try self.integerAttribute(node, .index),
+        .default_array_length = try self.integerAttribute(node, .default_array_length),
     };
 }
 
 fn captureScope(self: *Engine) Error!Scope {
     const event = self.cursor.current orelse return error.UnexpectedEnd;
     return .{ .start = event.span.start, .end = event.span.end, .name = try self.header_store.copy(u8, event.data.start_element.name.raw) };
-}
-
-/// Internal reusable fragment reader. Returned records use the requested allocator;
-/// parser and list scratch remain owned by this reader. No source bytes remain borrowed.
-pub fn readFragment(self: *Engine, allocator: std.mem.Allocator, input: *std.Io.Reader, ancestors: usize, physical_start: u64, prefix_length: usize, complete: bool, reuse_ancestors: bool, expected: ?FragmentTarget) FragmentError!owned.Record {
-    try self.enter();
-    defer self.active = false;
-    self.failure = null;
-    self.current_kind = null;
-    if (self.header_ready or ancestors > 4 or physical_start < prefix_length) return error.InvalidOptions;
-    errdefer self.fragment_ancestors = null;
-    if (reuse_ancestors) {
-        self.cursor.resetToAncestors(input, self.fragment_ancestors.?, prefix_length);
-    } else {
-        self.fragment_ancestors = null;
-        self.cursor.reset(input);
-    }
-    defer self.cursor.detachFragment();
-    self.record_store.arena.deinit();
-    self.record_store = Storage.init(allocator, self.options.limits.record_bytes);
-    defer {
-        self.record_store.arena.deinit();
-        self.record_store = Storage.init(self.allocator, self.options.limits.record_bytes);
-    }
-    errdefer |err| self.fail(err, .lookup_record);
-    try self.cursor.advance(false);
-    for (0..if (reuse_ancestors) 0 else ancestors) |i| {
-        if ((self.cursor.current orelse return error.UnexpectedEnd).data != .start_element)
-            return error.InvalidStructure;
-        if (i + 1 == ancestors) self.fragment_ancestors = self.cursor.ancestors();
-        try self.cursor.advance(false);
-    }
-    const kind_value = try self.kind();
-    if (expected) |target| {
-        errdefer |err| self.capture(err, .index, .none);
-        if (kind_value != target.kind) return error.InvalidIndex;
-        const start = self.cursor.current.?.data.start_element;
-        const id = start.attributeRaw("id") orelse return try self.attributeError(error.MissingAttribute, .id);
-        if (!std.mem.eql(u8, id.value, target.id)) return error.InvalidIndex;
-    }
-    if (kind_value != .spectrum and kind_value != .chromatogram) return error.InvalidStructure;
-    var node = try self.parseNodeFor(&self.record_store, 1, complete, self.options.payload, .tree);
-    if (complete) {
-        for (0..ancestors) |_| {
-            if ((self.cursor.current orelse return error.UnexpectedEnd).data != .end_element)
-                return error.InvalidStructure;
-            try self.cursor.advance(false);
-        }
-        if (self.cursor.current != null) return error.InvalidStructure;
-    }
-    try shiftOffsets(&node, physical_start - prefix_length);
-    const record = try self.recordOf(node);
-    const arena = self.record_store.arena;
-    self.record_store.arena = .init(allocator);
-    return .{ .arena = arena, .value = record };
-}
-
-/// Internal owner for parsed indexed-wrapper children. Release its arena once.
-pub const ParsedFooter = struct {
-    arena: std.heap.ArenaAllocator,
-    nodes: [2]model.Node,
-};
-
-/// Internal footer parser. Bytes start with the original indexed-wrapper opening,
-/// followed by the index offset, checksum, wrapper closing tag, and EOF.
-pub fn parseFooter(allocator: std.mem.Allocator, bytes: []const u8, options: Options, physical_start: u64, prefix_length: usize, failure: *?Diagnostic) Error!ParsedFooter {
-    failure.* = null;
-    if (physical_start < prefix_length) return error.InvalidOptions;
-    var input = std.Io.Reader.fixed(bytes);
-    var reader = try init(allocator, &input, options);
-    defer reader.deinit();
-    errdefer |err| {
-        reader.fail(err, .open_index);
-        failure.* = reader.failure;
-        failure.*.?.translate(physical_start, bytes.len - prefix_length, prefix_length);
-    }
-    try reader.cursor.advance(false);
-    if (try reader.kind() != .indexed_mzml) return error.InvalidStructure;
-    try reader.cursor.advance(false);
-    var nodes: [2]model.Node = .{ .{ .kind = .index_list_offset }, .{ .kind = .file_checksum } };
-    for (&nodes) |*node| {
-        if (try reader.kind() != node.kind) return error.InvalidStructure;
-        node.* = try reader.parseNodeFor(&reader.header_store, 1, true, reader.options.payload, .tree);
-        try shiftOffsets(node, physical_start - prefix_length);
-    }
-    try reader.consumeEnd(.indexed_mzml, true);
-    if (reader.cursor.current != null) return error.InvalidStructure;
-    const arena = reader.header_store.arena;
-    reader.header_store.arena = .init(allocator);
-    return .{ .arena = arena, .nodes = nodes };
-}
-
-/// Internal seek operation used to locate a chromatogram-list opening after the
-/// final indexed spectrum. The caller supplies original ancestors and source bytes.
-pub fn resumeFollowingList(self: *Engine, input: *std.Io.Reader, ancestors: usize, physical_start: u64, prefix_length: usize) FragmentError!void {
-    if (self.active_list != .spectrum_list or
-        ancestors != self.scope_count + 1 or physical_start < prefix_length) return error.InvalidOptions;
-    const replacement = try xml.Cursor.init(self.allocator, input, self.options.limits.attributes, self.options.limits.attribute_bytes);
-    self.cursor.deinit();
-    self.cursor = replacement;
-    errdefer |err| self.fail(err, .open_index);
-    try self.cursor.advance(false);
-    for (0..ancestors) |_| {
-        if ((self.cursor.current orelse return error.UnexpectedEnd).data != .start_element) return error.InvalidStructure;
-        try self.cursor.advance(false);
-    }
-    // The index promised a spectrum here and a chromatogram list after the spectra.
-    if (try self.kind() != .spectrum) return error.InvalidIndex;
-    try self.cursor.skip();
-    try self.finishSpectrumList();
-    if (self.active_list != .chromatogram_list) return error.InvalidIndex;
-    const scope = &self.list_scopes[1].?;
-    scope.start = std.math.add(u64, scope.start, physical_start - prefix_length) catch return error.LimitExceeded;
-    scope.end = std.math.add(u64, scope.end, physical_start - prefix_length) catch return error.LimitExceeded;
-}
-
-/// Internal indexed-open operation for an empty spectrum list preceding chromatograms.
-pub fn finishEmptySpectrumList(self: *Engine) FragmentError!void {
-    errdefer |err| self.fail(err, .open_index);
-    if (self.active_list != .spectrum_list) return error.InvalidOptions;
-    try self.cursor.advance(false);
-    try self.finishSpectrumList();
-    if (self.active_list != .chromatogram_list) return error.InvalidIndex;
-}
-
-fn skipExtraXml(self: *Engine, parent: model.Kind) Error!void {
-    while (self.cursor.current) |event| {
-        if (event.data != .start_element or self.childKind(parent) != null) break;
-        self.record_store.reset();
-        _ = try self.readXml(&self.record_store, false);
-        try self.cursor.advance(false);
-    }
-}
-
-fn finishSpectrumList(self: *Engine) Error!void {
-    try self.skipExtraXml(.spectrum_list);
-    try self.consumeEnd(.spectrum_list, true);
-    self.active_list = null;
-    try self.skipExtraXml(.run);
-    try self.openList();
-}
-
-fn shiftOffsets(node: *model.Node, delta: u64) Error!void {
-    node.start_offset = std.math.add(u64, node.start_offset, delta) catch return error.LimitExceeded;
-    node.content_offset = std.math.add(u64, node.content_offset, delta) catch return error.LimitExceeded;
-    node.end_offset = std.math.add(u64, node.end_offset, delta) catch return error.LimitExceeded;
-    for (@constCast(node.children)) |*child| try shiftOffsets(child, delta);
 }
 
 fn fail(self: *Engine, err: FragmentError, operation: Diagnostic.Operation) void {
@@ -439,7 +286,7 @@ fn attributeError(self: *Engine, err: Error, attribute: Diagnostic.Attribute) Er
     return err;
 }
 
-fn number(self: *Engine, node: model.Node, attribute: Diagnostic.Attribute) Error!?usize {
+fn integerAttribute(self: *Engine, node: model.Node, attribute: Diagnostic.Attribute) Error!?usize {
     const value = node.attribute(attribute.xmlName()) orelse return null;
     return cv.parseInteger(usize, value) catch |err| return try self.attributeError(err, attribute);
 }
@@ -541,21 +388,16 @@ fn openList(self: *Engine) Error!void {
     const event = self.cursor.current orelse return error.UnexpectedEnd;
     if (event.data == .end_element) return;
     const kind_value = try self.kind();
-    switch (kind_value) {
-        .spectrum_list => if (self.header.spectrum_list != null or self.header.chromatogram_list != null) return error.InvalidStructure,
-        .chromatogram_list => if (self.header.chromatogram_list != null) return error.InvalidStructure,
+    const slot: *?model.RecordList = switch (kind_value) {
+        .spectrum_list => if (self.header.spectrum_list != null or self.header.chromatogram_list != null)
+            return error.InvalidStructure
+        else
+            &self.header.spectrum_list,
+        .chromatogram_list => if (self.header.chromatogram_list != null) return error.InvalidStructure else &self.header.chromatogram_list,
         else => return error.InvalidStructure,
-    }
-    const node = try self.startNodeFor(&self.header_store, kind_value, true);
-    const list: model.RecordList = .{
-        .attributes = node.attributes,
-        .declared_count = try self.number(node, .count),
     };
-    switch (kind_value) {
-        .spectrum_list => self.header.spectrum_list = list,
-        .chromatogram_list => self.header.chromatogram_list = list,
-        else => return error.InvalidStructure,
-    }
+    const node = try self.startNodeFor(&self.header_store, kind_value, true);
+    slot.* = .{ .attributes = node.attributes, .declared_count = try self.integerAttribute(node, .count) };
     self.active_list = kind_value;
     self.position = .list_start;
     self.list_scopes[if (kind_value == .spectrum_list) @as(usize, 0) else 1] = try self.captureScope();
@@ -672,6 +514,176 @@ fn firstChildKind(self: *Engine, parent: model.Kind, seen: std.EnumSet(model.Kin
     return value;
 }
 
+// --- Indexed fragments ---
+
+// Returned records use the requested allocator; parser and list scratch remain owned by this
+// reader. No source bytes remain borrowed.
+pub fn readFragment(
+    self: *Engine,
+    allocator: std.mem.Allocator,
+    input: *std.Io.Reader,
+    ancestors: usize,
+    physical_start: u64,
+    prefix_length: usize,
+    complete: bool,
+    reuse_ancestors: bool,
+    expected: FragmentTarget,
+) FragmentError!owned.Record {
+    try self.enter();
+    defer self.active = false;
+    self.failure = null;
+    self.current_kind = null;
+    if (self.header_ready or ancestors > 4 or physical_start < prefix_length) return error.InvalidOptions;
+    errdefer self.fragment_ancestors = null;
+    if (reuse_ancestors) {
+        self.cursor.resetToAncestors(input, self.fragment_ancestors.?, prefix_length);
+    } else {
+        self.fragment_ancestors = null;
+        self.cursor.reset(input);
+    }
+    defer self.cursor.detachFragment();
+    self.record_store.arena.deinit();
+    self.record_store = Storage.init(allocator, self.options.limits.record_bytes);
+    defer {
+        self.record_store.arena.deinit();
+        self.record_store = Storage.init(self.allocator, self.options.limits.record_bytes);
+    }
+    errdefer |err| self.fail(err, .lookup_record);
+    try self.cursor.advance(false);
+    for (0..if (reuse_ancestors) 0 else ancestors) |i| {
+        if ((self.cursor.current orelse return error.UnexpectedEnd).data != .start_element)
+            return error.InvalidStructure;
+        if (i + 1 == ancestors) self.fragment_ancestors = self.cursor.ancestors();
+        try self.cursor.advance(false);
+    }
+    const kind_value = try self.kind();
+    {
+        errdefer |err| self.capture(err, .index, .none);
+        if (kind_value != expected.kind) return error.InvalidIndex;
+        const start = self.cursor.current.?.data.start_element;
+        const id = start.attributeRaw("id") orelse return try self.attributeError(error.MissingAttribute, .id);
+        if (!std.mem.eql(u8, id.value, expected.id)) return error.InvalidIndex;
+    }
+    if (kind_value != .spectrum and kind_value != .chromatogram) return error.InvalidStructure;
+    var node = try self.parseNodeFor(&self.record_store, 1, complete, self.options.payload, .tree);
+    if (complete) {
+        for (0..ancestors) |_| {
+            if ((self.cursor.current orelse return error.UnexpectedEnd).data != .end_element)
+                return error.InvalidStructure;
+            try self.cursor.advance(false);
+        }
+        if (self.cursor.current != null) return error.InvalidStructure;
+    }
+    try shiftOffsets(&node, physical_start - prefix_length);
+    const record = try self.recordOf(node);
+    const arena = self.record_store.arena;
+    self.record_store.arena = .init(allocator);
+    return .{ .arena = arena, .value = record };
+}
+
+// Bytes start with the original indexed-wrapper opening, followed by the index offset, checksum,
+// wrapper closing tag, and EOF.
+pub fn parseFooter(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+    options: Options,
+    physical_start: u64,
+    prefix_length: usize,
+    failure: *?Diagnostic,
+) Error!ParsedFooter {
+    failure.* = null;
+    if (physical_start < prefix_length) return error.InvalidOptions;
+    var input = std.Io.Reader.fixed(bytes);
+    var reader = try init(allocator, &input, options);
+    defer reader.deinit();
+    errdefer |err| {
+        reader.fail(err, .open_index);
+        failure.* = reader.failure;
+        failure.*.?.translate(physical_start, bytes.len - prefix_length, prefix_length);
+    }
+    try reader.cursor.advance(false);
+    if (try reader.kind() != .indexed_mzml) return error.InvalidStructure;
+    try reader.cursor.advance(false);
+    var nodes: [2]model.Node = .{ .{ .kind = .index_list_offset }, .{ .kind = .file_checksum } };
+    for (&nodes) |*node| {
+        if (try reader.kind() != node.kind) return error.InvalidStructure;
+        node.* = try reader.parseNodeFor(&reader.header_store, 1, true, reader.options.payload, .tree);
+        try shiftOffsets(node, physical_start - prefix_length);
+    }
+    try reader.consumeEnd(.indexed_mzml, true);
+    if (reader.cursor.current != null) return error.InvalidStructure;
+    const arena = reader.header_store.arena;
+    reader.header_store.arena = .init(allocator);
+    return .{ .arena = arena, .nodes = nodes };
+}
+
+// Locates a chromatogram-list opening after the final indexed spectrum. The caller supplies
+// original ancestors and source bytes.
+pub fn resumeFollowingList(
+    self: *Engine,
+    input: *std.Io.Reader,
+    ancestors: usize,
+    physical_start: u64,
+    prefix_length: usize,
+) FragmentError!void {
+    if (self.active_list != .spectrum_list or
+        ancestors != self.scope_count + 1 or physical_start < prefix_length) return error.InvalidOptions;
+    const replacement = try xml.Cursor.init(self.allocator, input, self.options.limits.attributes, self.options.limits.attribute_bytes);
+    self.cursor.deinit();
+    self.cursor = replacement;
+    errdefer |err| self.fail(err, .open_index);
+    try self.cursor.advance(false);
+    for (0..ancestors) |_| {
+        if ((self.cursor.current orelse return error.UnexpectedEnd).data != .start_element) return error.InvalidStructure;
+        try self.cursor.advance(false);
+    }
+    // The index promised a spectrum here and a chromatogram list after the spectra.
+    if (try self.kind() != .spectrum) return error.InvalidIndex;
+    var budget: usize = std.math.maxInt(usize);
+    try self.cursor.skipElement(&budget);
+    try self.cursor.advance(false);
+    try self.finishSpectrumList();
+    if (self.active_list != .chromatogram_list) return error.InvalidIndex;
+    const scope = &self.list_scopes[1].?;
+    scope.start = std.math.add(u64, scope.start, physical_start - prefix_length) catch return error.LimitExceeded;
+    scope.end = std.math.add(u64, scope.end, physical_start - prefix_length) catch return error.LimitExceeded;
+}
+
+// For an empty spectrum list preceding chromatograms when opening an index.
+pub fn finishEmptySpectrumList(self: *Engine) FragmentError!void {
+    errdefer |err| self.fail(err, .open_index);
+    if (self.active_list != .spectrum_list) return error.InvalidOptions;
+    try self.cursor.advance(false);
+    try self.finishSpectrumList();
+    if (self.active_list != .chromatogram_list) return error.InvalidIndex;
+}
+
+fn skipExtraXml(self: *Engine, parent: model.Kind) Error!void {
+    while (self.cursor.current) |event| {
+        if (event.data != .start_element or self.childKind(parent) != null) break;
+        self.record_store.reset();
+        _ = try self.readXml(&self.record_store, false);
+        try self.cursor.advance(false);
+    }
+}
+
+fn finishSpectrumList(self: *Engine) Error!void {
+    try self.skipExtraXml(.spectrum_list);
+    try self.consumeEnd(.spectrum_list, true);
+    self.active_list = null;
+    try self.skipExtraXml(.run);
+    try self.openList();
+}
+
+fn shiftOffsets(node: *model.Node, delta: u64) Error!void {
+    node.start_offset = std.math.add(u64, node.start_offset, delta) catch return error.LimitExceeded;
+    node.content_offset = std.math.add(u64, node.content_offset, delta) catch return error.LimitExceeded;
+    node.end_offset = std.math.add(u64, node.end_offset, delta) catch return error.LimitExceeded;
+    for (@constCast(node.children)) |*child| try shiftOffsets(child, delta);
+}
+
+// --- Element parsing ---
+
 fn startNodeFor(self: *Engine, storage: *Storage, kind_value: model.Kind, comptime retain: bool) Error!model.Node {
     if (storage.nodes == self.options.limits.nodes) return try self.limitError(.metadata, .nodes, self.options.limits.nodes, null);
     storage.nodes += 1;
@@ -734,7 +746,14 @@ const TextSource = struct {
     }
 };
 
-fn parseNodeFor(self: *Engine, storage: *Storage, depth: usize, advance_after: bool, payload: Payload, comptime retention: Retention) Error!model.Node {
+fn parseNodeFor(
+    self: *Engine,
+    storage: *Storage,
+    depth: usize,
+    advance_after: bool,
+    payload: Payload,
+    comptime retention: Retention,
+) Error!model.Node {
     if (depth > schema.MAX_DEPTH) return try self.limitError(.metadata, .depth, schema.MAX_DEPTH, depth);
     const kind_value = try self.kind();
     const array_position = storage.arrays;
@@ -748,7 +767,7 @@ fn parseNodeFor(self: *Engine, storage: *Storage, depth: usize, advance_after: b
     var child_payload = payload;
     if (storage == &self.record_store and depth == 1) {
         if (self.decoded_arrays != null) {
-            self.record_default_length = try self.number(node, .default_array_length);
+            self.record_default_length = try self.integerAttribute(node, .default_array_length);
             child_payload = .retain;
         }
     }
@@ -791,7 +810,10 @@ fn parseNodeFor(self: *Engine, storage: *Storage, depth: usize, advance_after: b
             storage.arrays += 1;
             if (child_payload == .retain) {
                 if (self.options.array_selector) |selector|
-                    child_payload = try selector.select(selector.user_data, .{ .node = node, .position = position, .groups = self.header.groups });
+                    child_payload = try selector.select(
+                        selector.user_data,
+                        .{ .node = node, .position = position, .groups = self.header.groups },
+                    );
             }
             if (self.decoded_arrays) |output| {
                 decode_array = child_payload == .retain;
@@ -812,11 +834,10 @@ fn parseNodeFor(self: *Engine, storage: *Storage, depth: usize, advance_after: b
         const children_start = self.child_scratch.items.len;
         defer self.child_scratch.shrinkRetainingCapacity(children_start);
         if (retention == .tree and children.allowed.count() != 0)
-            try self.child_scratch.ensureUnusedCapacity(self.allocator, @min(
-                4,
-                self.options.limits.list_entries,
-                (storage.limit -| storage.used) / @sizeOf(model.Node),
-            ));
+            try self.child_scratch.ensureUnusedCapacity(
+                self.allocator,
+                @min(4, self.options.limits.list_entries, (storage.limit -| storage.used) / @sizeOf(model.Node)),
+            );
         var child_count: usize = 0;
         // The array's encoding terms classified so far, so each later run is classified once.
         var array_terms: ?encoding.Terms = null;
@@ -855,7 +876,8 @@ fn parseNodeFor(self: *Engine, storage: *Storage, depth: usize, advance_after: b
             };
             if (child_kind == .binary and seen.contains(.binary)) return error.InvalidStructure;
             seen.insert(child_kind);
-            if (child_count == self.options.limits.list_entries) return try self.limitError(.metadata, .list_entries, self.options.limits.list_entries, null);
+            if (child_count == self.options.limits.list_entries)
+                return try self.limitError(.metadata, .list_entries, self.options.limits.list_entries, null);
             if (child_kind == .binary_data_array_list and storage == &self.record_store and child_payload == .retain) {
                 if (self.options.array_selector) |selector| {
                     if (selector.select_record) |select| {
@@ -887,12 +909,30 @@ fn parseNodeFor(self: *Engine, storage: *Storage, depth: usize, advance_after: b
     return node;
 }
 
-fn paramKind(self: *const Engine, start: xml.StartElement) ?u2 {
+const ParamAttributes = struct {
+    ref: ?[]const u8 = null,
+    cv_ref: ?[]const u8 = null,
+    accession: ?[]const u8 = null,
+    name: ?[]const u8 = null,
+    value: ?[]const u8 = null,
+    value_type: ?[]const u8 = null,
+    unit_cv_ref: ?[]const u8 = null,
+    unit_accession: ?[]const u8 = null,
+    unit_name: ?[]const u8 = null,
+};
+const ParamKind = std.meta.Tag(cv.Entry);
+const PARAM_ATTRIBUTES = std.StaticStringMap(std.meta.FieldEnum(ParamAttributes)).initComptime(.{
+    .{ "ref", .ref },               .{ "cvRef", .cv_ref },                 .{ "accession", .accession },
+    .{ "name", .name },             .{ "value", .value },                  .{ "type", .value_type },
+    .{ "unitCvRef", .unit_cv_ref }, .{ "unitAccession", .unit_accession }, .{ "unitName", .unit_name },
+});
+
+fn paramKind(self: *const Engine, start: xml.StartElement) ?ParamKind {
     if (!std.mem.eql(u8, start.name.expanded.namespace_uri orelse "", self.cursor.mzml_namespace)) return null;
     const local = start.name.expanded.local;
-    if (std.mem.eql(u8, local, "referenceableParamGroupRef")) return 0;
-    if (std.mem.eql(u8, local, "cvParam")) return 1;
-    if (std.mem.eql(u8, local, "userParam")) return 2;
+    if (std.mem.eql(u8, local, "referenceableParamGroupRef")) return .group_ref;
+    if (std.mem.eql(u8, local, "cvParam")) return .cv;
+    if (std.mem.eql(u8, local, "userParam")) return .user;
     return null;
 }
 
@@ -915,8 +955,8 @@ fn parseParams(self: *Engine, storage: *Storage, comptime retain: bool, count: *
             .accession = if (attrs.unit_accession) |value| .{ .raw = value } else null,
         };
         const entry: cv.Entry = switch (selected) {
-            0 => .{ .group_ref = .{ .ref = attrs.ref, .xml = extra, .position = try self.groupPosition(attrs.ref) } },
-            1 => .{ .cv = .{
+            .group_ref => .{ .group_ref = .{ .ref = attrs.ref, .xml = extra, .position = try self.groupPosition(attrs.ref) } },
+            .cv => .{ .cv = .{
                 .cv_ref = attrs.cv_ref,
                 .name = attrs.name,
                 .accession = if (attrs.accession) |value| .{ .raw = value } else null,
@@ -924,14 +964,13 @@ fn parseParams(self: *Engine, storage: *Storage, comptime retain: bool, count: *
                 .unit = unit,
                 .xml = extra,
             } },
-            2 => .{ .user = .{
+            .user => .{ .user = .{
                 .name = attrs.name,
                 .value = attrs.value,
                 .value_type = attrs.value_type,
                 .unit = unit,
                 .xml = extra,
             } },
-            else => unreachable,
         };
         if (retain) try entries.append(self.allocator, entry);
         count.* += 1;
@@ -959,7 +998,8 @@ fn parseParams(self: *Engine, storage: *Storage, comptime retain: bool, count: *
                     },
                 };
                 if (retain) {
-                    if (content.items.len == self.options.limits.list_entries) return try self.limitError(.metadata, .list_entries, self.options.limits.list_entries, null);
+                    if (content.items.len == self.options.limits.list_entries)
+                        return try self.limitError(.metadata, .list_entries, self.options.limits.list_entries, null);
                     try content.append(self.allocator, part);
                 }
                 if (part != .text) try self.cursor.advance(true);
@@ -975,7 +1015,13 @@ fn parseParams(self: *Engine, storage: *Storage, comptime retain: bool, count: *
     }
 }
 
-fn copyParamAttributes(storage: *Storage, start: xml.StartElement, selected: u2, comptime retain: bool, has_extra: *bool) Error!ParamAttributes {
+fn copyParamAttributes(
+    storage: *Storage,
+    start: xml.StartElement,
+    selected: ParamKind,
+    comptime retain: bool,
+    has_extra: *bool,
+) Error!ParamAttributes {
     var result: ParamAttributes = .{};
     for (start.attributes) |attribute| {
         const name = attribute.name.expanded;
@@ -1002,6 +1048,24 @@ fn copyParamAttributes(storage: *Storage, start: xml.StartElement, selected: u2,
             position += value.len;
         }
     }
+    return result;
+}
+
+fn parameterAttribute(name: xml.ExpandedName, selected: ParamKind) ?std.meta.FieldEnum(ParamAttributes) {
+    if (name.namespace_uri != null) return null;
+    const field = PARAM_ATTRIBUTES.get(name.local) orelse return null;
+    if (selected == .group_ref) return if (field == .ref) field else null;
+    return switch (field) {
+        .ref => null,
+        .cv_ref, .accession => if (selected == .cv) field else null,
+        .value_type => if (selected == .user) field else null,
+        else => field,
+    };
+}
+
+fn copyParamExtra(self: *Engine, storage: *Storage, start: xml.StartElement, selected: ParamKind) Error!*cv.ParameterXml {
+    const result = &(try storage.alloc(cv.ParameterXml, 1))[0];
+    result.* = .{ .attributes = try self.copyForeignAttributes(storage, start, selected) };
     return result;
 }
 
@@ -1071,21 +1135,59 @@ fn copyAttributes(
     return result;
 }
 
-fn parameterAttribute(name: xml.ExpandedName, selected: u2) ?std.meta.FieldEnum(ParamAttributes) {
-    if (name.namespace_uri != null) return null;
-    const field = PARAM_ATTRIBUTES.get(name.local) orelse return null;
-    if (selected == 0) return if (field == .ref) field else null;
-    return switch (field) {
-        .ref => null,
-        .cv_ref, .accession => if (selected == 1) field else null,
-        .value_type => if (selected == 2) field else null,
-        else => field,
-    };
+// The in-scope declarations, then the element's own attributes (a parameter's fields excluded).
+// Nodes and parameters in one scope share the declarations, copied once into storage.
+fn copyForeignAttributes(self: *Engine, storage: *Storage, start: xml.StartElement, parameter: ?ParamKind) Error![]const model.Attribute {
+    const scope = try self.scopeDeclarations(storage);
+    var own: usize = 0;
+    for (start.attributes) |attribute| {
+        if (parameter) |selected| if (parameterAttribute(attribute.name.expanded, selected) != null) continue;
+        own += 1;
+    }
+    if (own == 0) return scope;
+    const result = try storage.alloc(model.Attribute, scope.len + own);
+    @memcpy(result[0..scope.len], scope);
+    var i = scope.len;
+    for (start.attributes) |attribute| {
+        if (parameter) |selected| if (parameterAttribute(attribute.name.expanded, selected) != null) continue;
+        result[i] = .{
+            .name = try storage.copy(u8, attribute.name.raw),
+            .namespace_uri = if (attribute.name.expanded.namespace_uri) |uri| try storage.copy(u8, uri) else null,
+            .value = try storage.copy(u8, attribute.value),
+        };
+        i += 1;
+    }
+    return result;
 }
 
-fn copyParamExtra(self: *Engine, storage: *Storage, start: xml.StartElement, selected: u2) Error!*cv.ParameterXml {
-    const result = &(try storage.alloc(cv.ParameterXml, 1))[0];
-    result.* = .{ .attributes = try self.copyForeignAttributes(storage, start, selected) };
+// Every in-scope binding as an xmlns attribute, with xmlns="" when no default is bound.
+fn scopeDeclarations(self: *Engine, storage: *Storage) Error![]const model.Attribute {
+    const cache = &self.scope_declarations;
+    if (cache.storage == storage and cache.resets == storage.resets and cache.scope == self.cursor.namespace_scope)
+        return cache.attributes;
+    var count: usize = 0;
+    var position: usize = 0;
+    var has_default = false;
+    while (self.cursor.namespaceAt(&position)) |binding| {
+        count += 1;
+        has_default = has_default or binding.prefix.len == 0;
+    }
+    if (!has_default) count += 1;
+    const result = try storage.alloc(model.Attribute, count);
+    position = 0;
+    var i: usize = 0;
+    while (self.cursor.namespaceAt(&position)) |binding| {
+        const name = try storage.alloc(u8, if (binding.prefix.len == 0) 5 else 6 + binding.prefix.len);
+        @memcpy(name[0..5], "xmlns");
+        if (binding.prefix.len != 0) {
+            name[5] = ':';
+            @memcpy(name[6..], binding.prefix);
+        }
+        result[i] = .{ .name = name, .namespace_uri = xml.XMLNS_NAMESPACE, .value = try storage.copy(u8, binding.uri) };
+        i += 1;
+    }
+    if (!has_default) result[i] = .{ .name = "xmlns", .namespace_uri = xml.XMLNS_NAMESPACE, .value = "" };
+    cache.* = .{ .storage = storage, .resets = storage.resets, .scope = self.cursor.namespace_scope, .attributes = result };
     return result;
 }
 
@@ -1105,7 +1207,10 @@ fn readXml(self: *Engine, storage: *Storage, comptime retain: bool) Error![]cons
     var remaining = self.options.limits.nodes - storage.nodes;
     if (!retain) {
         self.cursor.skipElement(&remaining) catch |err| return switch (err) {
-            error.LimitExceeded => if (self.cursor.limit_failure == .nodes) try self.limitError(.metadata, .nodes, self.options.limits.nodes, null) else err,
+            error.LimitExceeded => if (self.cursor.limit_failure == .nodes)
+                try self.limitError(.metadata, .nodes, self.options.limits.nodes, null)
+            else
+                err,
             else => err,
         };
         storage.nodes = self.options.limits.nodes - remaining;
@@ -1116,7 +1221,10 @@ fn readXml(self: *Engine, storage: *Storage, comptime retain: bool) Error![]cons
     var writer = xml.Writer.init(self.allocator, &output.writer, .{ .fragment = true });
     defer writer.deinit();
     self.cursor.writeElement(&writer, &remaining) catch |err| return switch (err) {
-        error.WriteFailed => if ((output.failure orelse error.InvalidXml) == error.LimitExceeded) try storage.limitError(null) else output.failure orelse error.InvalidXml,
+        error.WriteFailed => if ((output.failure orelse error.InvalidXml) == error.LimitExceeded)
+            try storage.limitError(null)
+        else
+            output.failure orelse error.InvalidXml,
         error.InvalidName, error.InvalidCharacter, error.InvalidNamespace, error.DuplicateAttribute => error.InvalidXml,
         error.LimitExceeded => if (self.cursor.limit_failure == .nodes)
             try self.limitError(.metadata, .nodes, self.options.limits.nodes, null)
@@ -1157,62 +1265,6 @@ const FragmentBuffer = struct {
         return bytes.len;
     }
 };
-
-// The in-scope declarations, then the element's own attributes (a parameter's fields excluded).
-// Nodes and parameters in one scope share the declarations, copied once into storage.
-fn copyForeignAttributes(self: *Engine, storage: *Storage, start: xml.StartElement, parameter: ?u2) Error![]const model.Attribute {
-    const scope = try self.scopeDeclarations(storage);
-    var own: usize = 0;
-    for (start.attributes) |attribute| {
-        if (parameter) |selected| if (parameterAttribute(attribute.name.expanded, selected) != null) continue;
-        own += 1;
-    }
-    if (own == 0) return scope;
-    const result = try storage.alloc(model.Attribute, scope.len + own);
-    @memcpy(result[0..scope.len], scope);
-    var i = scope.len;
-    for (start.attributes) |attribute| {
-        if (parameter) |selected| if (parameterAttribute(attribute.name.expanded, selected) != null) continue;
-        result[i] = .{
-            .name = try storage.copy(u8, attribute.name.raw),
-            .namespace_uri = if (attribute.name.expanded.namespace_uri) |uri| try storage.copy(u8, uri) else null,
-            .value = try storage.copy(u8, attribute.value),
-        };
-        i += 1;
-    }
-    return result;
-}
-
-// Every in-scope binding as an `xmlns` attribute, with `xmlns=""` when no default is bound.
-fn scopeDeclarations(self: *Engine, storage: *Storage) Error![]const model.Attribute {
-    const cache = &self.scope_declarations;
-    if (cache.storage == storage and cache.resets == storage.resets and cache.scope == self.cursor.namespace_scope)
-        return cache.attributes;
-    var count: usize = 0;
-    var position: usize = 0;
-    var has_default = false;
-    while (self.cursor.namespaceAt(&position)) |binding| {
-        count += 1;
-        has_default = has_default or binding.prefix.len == 0;
-    }
-    if (!has_default) count += 1;
-    const result = try storage.alloc(model.Attribute, count);
-    position = 0;
-    var i: usize = 0;
-    while (self.cursor.namespaceAt(&position)) |binding| {
-        const name = try storage.alloc(u8, if (binding.prefix.len == 0) 5 else 6 + binding.prefix.len);
-        @memcpy(name[0..5], "xmlns");
-        if (binding.prefix.len != 0) {
-            name[5] = ':';
-            @memcpy(name[6..], binding.prefix);
-        }
-        result[i] = .{ .name = name, .namespace_uri = xml.XMLNS_NAMESPACE, .value = try storage.copy(u8, binding.uri) };
-        i += 1;
-    }
-    if (!has_default) result[i] = .{ .name = "xmlns", .namespace_uri = xml.XMLNS_NAMESPACE, .value = "" };
-    cache.* = .{ .storage = storage, .resets = storage.resets, .scope = self.cursor.namespace_scope, .attributes = result };
-    return result;
-}
 
 const Storage = struct {
     arena: std.heap.ArenaAllocator,
@@ -1264,8 +1316,10 @@ const Storage = struct {
     }
 };
 
-/// Test helper: reads one record after a synthetic ancestor prefix, with offsets
-/// relative to physical_start in the original source.
+// --- Tests ---
+
+// Reads one record after a synthetic ancestor prefix, with offsets relative to physical_start in
+// the original source.
 fn parseFragment(
     allocator: std.mem.Allocator,
     bytes: []const u8,
@@ -1278,7 +1332,16 @@ fn parseFragment(
     var input = std.Io.Reader.fixed(bytes);
     var reader = try init(allocator, &input, options);
     defer reader.deinit();
-    return reader.readFragment(allocator, &input, ancestors, physical_start, prefix_length, true, false, null);
+    return reader.readFragment(
+        allocator,
+        &input,
+        ancestors,
+        physical_start,
+        prefix_length,
+        true,
+        false,
+        .{ .kind = .spectrum, .id = "scan=1" },
+    );
 }
 
 test "[integration] - [mzML fragment parsing]: preserves text boundaries and physical offsets" {
@@ -1295,7 +1358,11 @@ test "[integration] - [mzML fragment parsing]: preserves text boundaries and phy
     };
     inline for (wrappers) |wrapper| {
         for (cases) |case| {
-            const source = try std.fmt.allocPrint(std.testing.allocator, "{s}<spectrum id='scan=1' index='0' defaultArrayLength='0'>{s}{s}{s}</spectrum></mzML>", .{ prefix, wrapper[0], case.text, wrapper[1] });
+            const source = try std.fmt.allocPrint(
+                std.testing.allocator,
+                "{s}<spectrum id='scan=1' index='0' defaultArrayLength='0'>{s}{s}{s}</spectrum></mzML>",
+                .{ prefix, wrapper[0], case.text, wrapper[1] },
+            );
             defer std.testing.allocator.free(source);
             const result = parseFragment(std.testing.allocator, source, .{}, 1, 4096, prefix.len);
             if (case.failure) |failure| {

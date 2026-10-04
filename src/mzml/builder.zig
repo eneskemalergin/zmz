@@ -1,24 +1,26 @@
 //! Constructs owned mzML metadata and encoded arrays within a byte limit.
 //!
-//! Returned metadata is copied from its inputs and lasts until reset or deinit. Prepared wire
-//! belongs to the arrays.Encoder until its reset, or borrows little-endian primitive values.
+//! Returned metadata is copied from its inputs and lasts until reset or deinit. A prepared payload
+//! is an `arrays.Source` that borrows its values and the encoder until the record is written.
 //! Failed operations may consume arena capacity; reset releases it and invalidates earlier
-//! views. Do not copy an initialized builder.
+//! views. Do not copy an initialized builder: a copy shares its arena, and both `deinit`s would
+//! free it.
 
 const std = @import("std");
 const cv = @import("../cv/source.zig");
-const model = @import("model.zig");
-const owned = @import("owned.zig");
-const copy = @import("internal/owned_copy.zig");
 const arrays = @import("../binary/arrays.zig");
 const encoding = @import("../binary/encoding.zig");
-const schema = @import("schema.zig");
 const xml = @import("../xml/mzml_adapter.zig");
+const model = @import("model.zig");
+const owned = @import("owned.zig");
+const schema = @import("schema.zig");
 const Writer = @import("writer.zig");
+const copy = @import("internal/owned_copy.zig");
 
 const Builder = @This();
 
 pub const Error = owned.Error || schema.Error || arrays.OptionsError || model.EncodingError || error{
+    InvalidOptions,
     InvalidState,
     GroupRewriteRequired,
 };
@@ -35,7 +37,7 @@ pub const ArrayOptions = struct {
     empty_values: bool = false,
 };
 
-/// An encoded array with its known value count, used to check the enclosing record length.
+/// Array metadata with its known value count, used to check the enclosing record length.
 pub const Array = struct {
     node: model.Node,
     length: usize,
@@ -61,7 +63,15 @@ pub const Reencoding = struct {
 
     /// Like builder.prepareArrayFrom, moving references to the prepared group definitions.
     /// InvalidState once the creating builder was reset.
-    pub fn prepareArray(self: Reencoding, builder: *Builder, comptime T: type, values: []const T, source: model.Node, options: arrays.EncodeOptions, encoder: *arrays.Encoder) Error!PreparedArray {
+    pub fn prepareArray(
+        self: Reencoding,
+        builder: *Builder,
+        comptime T: type,
+        values: []const T,
+        source: model.Node,
+        options: arrays.EncodeOptions,
+        encoder: *arrays.Encoder,
+    ) Error!PreparedArray {
         if (self.owner.generation != self.generation) return error.InvalidState;
         return builder.prepareArrayFromInner(T, values, source, self.source_groups, options, encoder, self.replacements);
     }
@@ -105,7 +115,8 @@ pub fn list(self: *Builder, kind: model.Kind, children: []const model.Node) Erro
     }}, .children = children });
 }
 
-/// Constructs a `cv` declaration from explicit source identity and version fields.
+/// Constructs a `cv` declaration from explicit source identity and version fields. `id`,
+/// `full_name`, and `uri` are required (`InvalidOptions` otherwise).
 pub fn cvDeclaration(self: *Builder, declaration: cv.Declaration) Error!model.Node {
     if (declaration.id == null or declaration.full_name == null or declaration.uri == null)
         return error.InvalidOptions;
@@ -116,6 +127,66 @@ pub fn cvDeclaration(self: *Builder, declaration: cv.Declaration) Error!model.No
         .{ .name = "version", .value = declaration.version orelse "" },
     };
     return self.node(.{ .kind = .cv, .attributes = attrs[0..if (declaration.version == null) @as(usize, 3) else 4] });
+}
+
+/// Builds a spectrum or chromatogram with new id, index, and defaultArrayLength attributes, for
+/// `writeRecordWithArrays` with the arrays' payloads. Arrays from another builder, or prepared
+/// before this builder's last reset, are `InvalidState`; default arrays must match
+/// `default_length`. To keep a source record's attributes, edit a view of its node instead.
+pub fn record(
+    self: *Builder,
+    kind: model.Kind,
+    id: []const u8,
+    index: usize,
+    default_length: usize,
+    params: []const cv.Entry,
+    children: []const model.Node,
+    binary_arrays: []const Array,
+) Error!model.Record {
+    if ((kind != .spectrum and kind != .chromatogram) or id.len == 0) return error.InvalidOptions;
+    for (children) |child| if (child.kind == .binary_data_array_list) return error.InvalidOptions;
+    for (binary_arrays) |array| {
+        if (array.owner != self or array.generation != self.generation) return error.InvalidState;
+        if (array.is_default and array.length != default_length) return error.InvalidOptions;
+    }
+    const child_count = std.math.add(usize, children.len, @intFromBool(binary_arrays.len != 0)) catch return error.LimitExceeded;
+    var copier = self.makeCopier();
+    defer self.remaining = copier.remaining;
+    const record_children = try copier.alloc(model.Node, child_count);
+    for (children, record_children[0..children.len]) |child, *destination|
+        destination.* = try copier.node(child, schema.MAX_DEPTH - 1);
+    if (binary_arrays.len != 0) {
+        const array_nodes = try copier.alloc(model.Node, binary_arrays.len);
+        for (binary_arrays, array_nodes) |array, *destination| destination.* = array.node;
+        var count_text: [32]u8 = undefined;
+        var list_node = try copier.node(.{
+            .kind = .binary_data_array_list,
+            .attributes = &.{.{
+                .name = "count",
+                .value = count_text[0..std.fmt.printInt(&count_text, binary_arrays.len, 10, .lower, .{})],
+            }},
+        }, schema.MAX_DEPTH);
+        list_node.children = array_nodes;
+        record_children[children.len] = list_node;
+    }
+    var index_text: [32]u8 = undefined;
+    var length_text: [32]u8 = undefined;
+    var result = try copier.node(.{ .kind = kind, .attributes = &.{
+        .{ .name = "id", .value = id },
+        .{ .name = "index", .value = index_text[0..std.fmt.printInt(&index_text, index, 10, .lower, .{})] },
+        .{ .name = "defaultArrayLength", .value = length_text[0..std.fmt.printInt(&length_text, default_length, 10, .lower, .{})] },
+    }, .params = params }, schema.MAX_DEPTH);
+    result.children = record_children;
+    return .{ .node = result, .id = result.attribute("id").?, .index = index, .default_array_length = default_length };
+}
+
+/// Copies header metadata and derives group entries from the copied definitions.
+pub fn header(self: *Builder, source: model.Header) Error!model.Header {
+    try schema.checkHeader(source);
+    var copier = self.makeCopier();
+    defer self.remaining = copier.remaining;
+    // Only the metadata: list descriptors and the index flag are reader state.
+    return copier.header(.{ .document = source.document, .run = source.run, .namespace_uri = source.namespace_uri });
 }
 
 /// Builds a cvParam whose value is the number in XML Schema spelling, with the caller's
@@ -136,7 +207,13 @@ pub fn number(self: *Builder, parameter: cv.Param, value: f64) Error!cv.Param {
 /// checked here; Numpress value errors surface when the record is written. Default arrays
 /// (m/z, intensity, time) omit arrayLength; others carry it. The metadata has no
 /// encodedLength: the writer writes it first, from the text it writes.
-pub fn prepareArray(self: *Builder, comptime T: type, values: []const T, options: ArrayOptions, encoder: *arrays.Encoder) Error!PreparedArray {
+pub fn prepareArray(
+    self: *Builder,
+    comptime T: type,
+    values: []const T,
+    options: ArrayOptions,
+    encoder: *arrays.Encoder,
+) Error!PreparedArray {
     try checkArrayOptions(options);
     const source = arrays.Source.of(T, values, options.encoding, encoder);
     try source.check();
@@ -146,12 +223,11 @@ pub fn prepareArray(self: *Builder, comptime T: type, values: []const T, options
     };
 }
 
-/// Prepares values under a copy of the source array's metadata, like prepareArray, replacing
-/// its primitive, codec, and arrayLength and keeping other fields in order; the writer
-/// replaces encodedLength. Bare group references become local parameters; changing an
-/// annotated group's encoding needs a Reencoding header and otherwise returns
-/// GroupRewriteRequired. If a default array omits arrayLength, update
-/// the record's defaultArrayLength when the length changes.
+/// Prepares values under a copy of the source array's metadata, like prepareArray, replacing its
+/// primitive, codec, and arrayLength and keeping other fields in order; the writer replaces
+/// encodedLength. Bare group references become local parameters; changing an annotated group's
+/// encoding needs a Reencoding header and otherwise returns GroupRewriteRequired. If a default
+/// array omits arrayLength, update the record's defaultArrayLength when the length changes.
 pub fn prepareArrayFrom(
     self: *Builder,
     comptime T: type,
@@ -164,65 +240,6 @@ pub fn prepareArrayFrom(
     return self.prepareArrayFromInner(T, values, source, groups, options, encoder, null);
 }
 
-fn prepareArrayFromInner(self: *Builder, comptime T: type, values: []const T, source: model.Node, groups: []const cv.Group, options: arrays.EncodeOptions, encoder: *arrays.Encoder, replacements: ?[]const GroupReplacement) Error!PreparedArray {
-    _ = try model.arrayEncoding(source, groups);
-    if (source.children.len != 1 or source.children[0].kind != .binary) return error.InvalidStructure;
-    const target: model.Encoding = .{ .primitive = encoding.Primitive.of(T), .pipeline = options.pipeline };
-    const counted = try reencodedParams(null, source.params, groups, target, replacements, self.remaining / @sizeOf(cv.Entry));
-    const prepared = arrays.Source.of(T, values, options, encoder);
-    try prepared.check();
-    var copier = self.makeCopier();
-    defer self.remaining = copier.remaining;
-    const params = try copier.alloc(cv.Entry, counted.count);
-    _ = try reencodedParams(params, source.params, groups, target, replacements, params.len);
-    for (params) |*entry| entry.* = try copier.entry(entry.*);
-    const is_default = counted.is_default;
-    var array_length: [32]u8 = undefined;
-    const length_text = array_length[0..std.fmt.printInt(&array_length, values.len, 10, .lower, .{})];
-    const add_array_length = !is_default and source.attribute("arrayLength") == null;
-    const added: usize = @intFromBool(add_array_length);
-    const attributes = try copier.alloc(model.Attribute, std.math.add(usize, source.attributes.len, added) catch return error.LimitExceeded);
-    for (source.attributes, attributes[0..source.attributes.len]) |attribute, *destination| {
-        var changed = attribute;
-        if (attribute.namespace_uri == null and std.mem.eql(u8, attribute.name, "arrayLength")) changed.value = length_text;
-        destination.* = try copier.attribute(changed);
-    }
-    if (add_array_length) {
-        attributes[source.attributes.len] = try copier.attribute(.{ .name = "arrayLength", .value = length_text });
-    }
-    var binary = source.children[0];
-    binary.text = null;
-    const children = try copier.alloc(model.Node, 1);
-    children[0] = try copier.node(binary, schema.MAX_DEPTH - 1);
-    var result = source;
-    result.attributes = attributes;
-    result.params = params;
-    result.children = children;
-    result.text = if (source.text) |text| try copier.text(text) else null;
-    if (source.content) |content| {
-        // Parameter runs keep their place; each takes its reencoded count.
-        const items = try copier.contentItems(content.items);
-        var position: usize = 0;
-        for (items) |*item| {
-            if (item.* != .params) continue;
-            const count = item.params;
-            if (count > source.params.len - position) return error.InvalidStructure;
-            const run = try reencodedParams(null, source.params[position..][0..count], groups, target, replacements, params.len);
-            item.* = .{ .params = run.count };
-            position += count;
-        }
-        if (position != source.params.len) return error.InvalidStructure;
-        result.content = try copier.contentOf(items);
-    }
-    return .{ .array = .{
-        .node = result,
-        .length = values.len,
-        .is_default = is_default,
-        .owner = self,
-        .generation = self.generation,
-    }, .payload = .{ .source = prepared } };
-}
-
 /// Copies a header and adds a group definition for each requested output encoding, keeping
 /// the originals for unchanged arrays; equivalent replacements share one definition.
 pub fn reencoding(self: *Builder, source: model.Header, targets: []const model.Encoding) Error!Reencoding {
@@ -233,7 +250,13 @@ pub fn reencoding(self: *Builder, source: model.Header, targets: []const model.E
         if (groupReplacement(group.entries, targets, i) != null)
             count = std.math.add(usize, count, 1) catch return error.LimitExceeded;
     };
-    if (count == 0) return .{ .header = header_copy, .source_groups = source_groups, .replacements = &.{}, .owner = self, .generation = self.generation };
+    if (count == 0) return .{
+        .header = header_copy,
+        .source_groups = source_groups,
+        .replacements = &.{},
+        .owner = self,
+        .generation = self.generation,
+    };
     var copier = self.makeCopier();
     defer self.remaining = copier.remaining;
     const replacements = try copier.alloc(GroupReplacement, count);
@@ -301,21 +324,140 @@ pub fn reencoding(self: *Builder, source: model.Header, targets: []const model.E
             const items = try copier.alloc(model.Content.Item, content.items.len + 1);
             @memcpy(items[0..content.items.len], content.items);
             items[content.items.len] = .{ .children = count };
-            const copied = &(try copier.alloc(model.Content, 1))[0];
-            copied.* = .{ .items = items };
-            list_node.content = copied;
+            list_node.content = try copier.contentOf(items);
         }
         break;
     }
     header_copy.groups = groups;
-    return .{ .header = header_copy, .source_groups = source_groups, .replacements = replacements, .owner = self, .generation = self.generation };
+    return .{
+        .header = header_copy,
+        .source_groups = source_groups,
+        .replacements = replacements,
+        .owner = self,
+        .generation = self.generation,
+    };
+}
+
+fn prepareArrayFromInner(
+    self: *Builder,
+    comptime T: type,
+    values: []const T,
+    source: model.Node,
+    groups: []const cv.Group,
+    options: arrays.EncodeOptions,
+    encoder: *arrays.Encoder,
+    replacements: ?[]const GroupReplacement,
+) Error!PreparedArray {
+    _ = try model.arrayEncoding(source, groups);
+    if (source.children.len != 1 or source.children[0].kind != .binary) return error.InvalidStructure;
+    const target: model.Encoding = .{ .primitive = encoding.Primitive.of(T), .pipeline = options.pipeline };
+    const counted = try reencodedParams(null, source.params, groups, target, replacements, self.remaining / @sizeOf(cv.Entry));
+    const prepared = arrays.Source.of(T, values, options, encoder);
+    try prepared.check();
+    var copier = self.makeCopier();
+    defer self.remaining = copier.remaining;
+    const params = try copier.alloc(cv.Entry, counted.count);
+    _ = try reencodedParams(params, source.params, groups, target, replacements, params.len);
+    for (params) |*entry| entry.* = try copier.entry(entry.*);
+    const is_default = counted.is_default;
+    var array_length: [32]u8 = undefined;
+    const length_text = array_length[0..std.fmt.printInt(&array_length, values.len, 10, .lower, .{})];
+    const add_array_length = !is_default and source.attribute("arrayLength") == null;
+    const added: usize = @intFromBool(add_array_length);
+    const attributes = try copier.alloc(
+        model.Attribute,
+        std.math.add(usize, source.attributes.len, added) catch return error.LimitExceeded,
+    );
+    for (source.attributes, attributes[0..source.attributes.len]) |attribute, *destination| {
+        var changed = attribute;
+        if (attribute.namespace_uri == null and std.mem.eql(u8, attribute.name, "arrayLength")) changed.value = length_text;
+        destination.* = try copier.attribute(changed);
+    }
+    if (add_array_length) {
+        attributes[source.attributes.len] = try copier.attribute(.{ .name = "arrayLength", .value = length_text });
+    }
+    var binary = source.children[0];
+    binary.text = null;
+    const children = try copier.alloc(model.Node, 1);
+    children[0] = try copier.node(binary, schema.MAX_DEPTH - 1);
+    var result = source;
+    result.attributes = attributes;
+    result.params = params;
+    result.children = children;
+    result.text = if (source.text) |text| try copier.text(text) else null;
+    if (source.content) |content| {
+        const items = try copier.contentItems(content.items);
+        var position: usize = 0;
+        for (items) |*item| {
+            if (item.* != .params) continue;
+            const count = item.params;
+            if (count > source.params.len - position) return error.InvalidStructure;
+            const run = try reencodedParams(null, source.params[position..][0..count], groups, target, replacements, params.len);
+            item.* = .{ .params = run.count };
+            position += count;
+        }
+        if (position != source.params.len) return error.InvalidStructure;
+        result.content = try copier.contentOf(items);
+    }
+    return .{ .array = .{
+        .node = result,
+        .length = values.len,
+        .is_default = is_default,
+        .owner = self,
+        .generation = self.generation,
+    }, .payload = .{ .source = prepared } };
+}
+
+fn checkArrayOptions(options: ArrayOptions) Error!void {
+    if (options.cv_ref.len == 0 or options.role.cv_ref == null or options.role.accession == null or
+        options.role.name == null) return error.InvalidOptions;
+}
+
+fn arrayMetadata(self: *Builder, comptime T: type, value_count: usize, options: ArrayOptions) Error!Array {
+    const is_default = isDefaultRole(options.role.accession.?);
+    const primitive = encoding.primitiveTerm(encoding.Primitive.of(T));
+    const codec = encoding.codecTerm(options.encoding.pipeline);
+    var count: [32]u8 = undefined;
+    var attrs = [_]model.Attribute{
+        .{ .name = "arrayLength", .value = count[0..std.fmt.printInt(&count, value_count, 10, .lower, .{})] },
+        .{ .name = "dataProcessingRef", .value = options.data_processing_ref orelse "" },
+    };
+    var attribute_count: usize = if (is_default) 0 else 1;
+    if (options.data_processing_ref != null) {
+        attrs[attribute_count] = attrs[1];
+        attribute_count += 1;
+    }
+    const value: ?[]const u8 = if (options.empty_values) "" else null;
+    const params = [_]cv.Entry{
+        .{ .cv = options.role },
+        .{ .cv = .{ .cv_ref = options.cv_ref, .accession = .{ .raw = primitive.accession }, .name = primitive.name, .value = value } },
+        .{ .cv = .{ .cv_ref = options.cv_ref, .accession = .{ .raw = codec.accession }, .name = codec.name, .value = value } },
+    };
+    const result: model.Node = .{
+        .kind = .binary_data_array,
+        .attributes = attrs[0..attribute_count],
+        .params = &params,
+        .children = &.{.{ .kind = .binary }},
+    };
+    _ = try model.arrayEncoding(result, &.{});
+    return .{
+        .node = try self.node(result),
+        .length = value_count,
+        .is_default = is_default,
+        .owner = self,
+        .generation = self.generation,
+    };
 }
 
 const GroupEncoding = struct { primitive: ?model.Primitive = null, pipeline: ?arrays.Pipeline = null };
 const GroupReplacement = struct { source_id: []const u8, encoding: GroupEncoding, id: []const u8 };
 
 // Extra group lists are not expanded, but their IDs must not be reused.
-fn addExtraGroupIds(allocator: std.mem.Allocator, header_value: model.Header, used: *std.StringHashMapUnmanaged(void)) (xml.InitError || xml.AdvanceError)!void {
+fn addExtraGroupIds(
+    allocator: std.mem.Allocator,
+    header_value: model.Header,
+    used: *std.StringHashMapUnmanaged(void),
+) (xml.InitError || xml.AdvanceError)!void {
     const content = header_value.document.content orelse return;
     for (content.items) |item| {
         if (item != .xml) continue;
@@ -324,7 +466,8 @@ fn addExtraGroupIds(allocator: std.mem.Allocator, header_value: model.Header, us
         defer cursor.deinit();
         try cursor.advanceFragment(false);
         const root = cursor.current orelse return error.InvalidXml;
-        if (root.data != .start_element or !root.data.start_element.name.eql(header_value.namespace_uri, "referenceableParamGroupList")) continue;
+        if (root.data != .start_element or
+            !root.data.start_element.name.eql(header_value.namespace_uri, "referenceableParamGroupList")) continue;
         while (true) {
             try cursor.advanceFragment(true);
             const event = cursor.current orelse break;
@@ -391,7 +534,14 @@ fn isDefaultRole(accession: cv.Accession) bool {
 
 const ParamCount = struct { count: usize = 0, is_default: bool = false };
 
-fn reencodedParams(output: ?[]cv.Entry, params: []const cv.Entry, groups: []const cv.Group, target: model.Encoding, replacements: ?[]const GroupReplacement, limit: usize) Error!ParamCount {
+fn reencodedParams(
+    output: ?[]cv.Entry,
+    params: []const cv.Entry,
+    groups: []const cv.Group,
+    target: model.Encoding,
+    replacements: ?[]const GroupReplacement,
+    limit: usize,
+) Error!ParamCount {
     var result: ParamCount = .{};
     for (params, 0..) |entry, position| {
         if (entry == .group_ref and (entry.group_ref.xml != null or replacements != null)) {
@@ -404,7 +554,8 @@ fn reencodedParams(output: ?[]cv.Entry, params: []const cv.Entry, groups: []cons
             if (changedGroupEncoding(entries, target)) |key| {
                 retained.group_ref.ref = replacement: {
                     for (replacements orelse return error.GroupRewriteRequired) |replacement| {
-                        if (cv.sameId(id, replacement.source_id) and std.meta.eql(key, replacement.encoding)) break :replacement replacement.id;
+                        if (cv.sameId(id, replacement.source_id) and std.meta.eql(key, replacement.encoding))
+                            break :replacement replacement.id;
                     }
                     return error.GroupRewriteRequired;
                 };
@@ -424,92 +575,6 @@ fn reencodedParams(output: ?[]cv.Entry, params: []const cv.Entry, groups: []cons
         }
     }
     return result;
-}
-
-fn checkArrayOptions(options: ArrayOptions) Error!void {
-    if (options.cv_ref.len == 0 or options.role.cv_ref == null or options.role.accession == null or
-        options.role.name == null) return error.InvalidOptions;
-}
-
-fn arrayMetadata(self: *Builder, comptime T: type, value_count: usize, options: ArrayOptions) Error!Array {
-    const is_default = isDefaultRole(options.role.accession.?);
-    const primitive = encoding.primitiveTerm(encoding.Primitive.of(T));
-    const codec = encoding.codecTerm(options.encoding.pipeline);
-    var count: [32]u8 = undefined;
-    var attrs = [_]model.Attribute{
-        .{ .name = "arrayLength", .value = count[0..std.fmt.printInt(&count, value_count, 10, .lower, .{})] },
-        .{ .name = "dataProcessingRef", .value = options.data_processing_ref orelse "" },
-    };
-    var attribute_count: usize = if (is_default) 0 else 1;
-    if (options.data_processing_ref != null) {
-        attrs[attribute_count] = attrs[1];
-        attribute_count += 1;
-    }
-    const value: ?[]const u8 = if (options.empty_values) "" else null;
-    const params = [_]cv.Entry{
-        .{ .cv = options.role },
-        .{ .cv = .{ .cv_ref = options.cv_ref, .accession = .{ .raw = primitive.accession }, .name = primitive.name, .value = value } },
-        .{ .cv = .{ .cv_ref = options.cv_ref, .accession = .{ .raw = codec.accession }, .name = codec.name, .value = value } },
-    };
-    const result: model.Node = .{
-        .kind = .binary_data_array,
-        .attributes = attrs[0..attribute_count],
-        .params = &params,
-        .children = &.{.{ .kind = .binary }},
-    };
-    _ = try model.arrayEncoding(result, &.{});
-    return .{ .node = try self.node(result), .length = value_count, .is_default = is_default, .owner = self, .generation = self.generation };
-}
-
-/// Builds a spectrum or chromatogram with new id, index, and defaultArrayLength attributes,
-/// for writeRecordWithArrays with the arrays' wire. Arrays from another builder, or prepared
-/// before this builder's last reset, are InvalidState; default arrays must match
-/// default_length. To keep a source record's attributes, edit a view of its node instead.
-pub fn record(self: *Builder, kind: model.Kind, id: []const u8, index: usize, default_length: usize, params: []const cv.Entry, children: []const model.Node, binary_arrays: []const Array) Error!model.Record {
-    if ((kind != .spectrum and kind != .chromatogram) or id.len == 0) return error.InvalidOptions;
-    for (children) |child| if (child.kind == .binary_data_array_list) return error.InvalidOptions;
-    for (binary_arrays) |array| {
-        if (array.owner != self or array.generation != self.generation) return error.InvalidState;
-        if (array.is_default and array.length != default_length) return error.InvalidOptions;
-    }
-    const child_count = std.math.add(usize, children.len, @intFromBool(binary_arrays.len != 0)) catch return error.LimitExceeded;
-    var copier = self.makeCopier();
-    defer self.remaining = copier.remaining;
-    const record_children = try copier.alloc(model.Node, child_count);
-    for (children, record_children[0..children.len]) |child, *destination|
-        destination.* = try copier.node(child, schema.MAX_DEPTH - 1);
-    if (binary_arrays.len != 0) {
-        const array_nodes = try copier.alloc(model.Node, binary_arrays.len);
-        for (binary_arrays, array_nodes) |array, *destination| destination.* = array.node;
-        var count_text: [32]u8 = undefined;
-        var list_node = try copier.node(.{
-            .kind = .binary_data_array_list,
-            .attributes = &.{.{
-                .name = "count",
-                .value = count_text[0..std.fmt.printInt(&count_text, binary_arrays.len, 10, .lower, .{})],
-            }},
-        }, schema.MAX_DEPTH);
-        list_node.children = array_nodes;
-        record_children[children.len] = list_node;
-    }
-    var index_text: [32]u8 = undefined;
-    var length_text: [32]u8 = undefined;
-    var result = try copier.node(.{ .kind = kind, .attributes = &.{
-        .{ .name = "id", .value = id },
-        .{ .name = "index", .value = index_text[0..std.fmt.printInt(&index_text, index, 10, .lower, .{})] },
-        .{ .name = "defaultArrayLength", .value = length_text[0..std.fmt.printInt(&length_text, default_length, 10, .lower, .{})] },
-    }, .params = params }, schema.MAX_DEPTH);
-    result.children = record_children;
-    return .{ .node = result, .id = result.attribute("id").?, .index = index, .default_array_length = default_length };
-}
-
-/// Copies header metadata and derives group entries from the copied definitions.
-pub fn header(self: *Builder, source: model.Header) Error!model.Header {
-    try schema.checkHeader(source);
-    var copier = self.makeCopier();
-    defer self.remaining = copier.remaining;
-    // Only the metadata: list descriptors and the index flag are reader state.
-    return copier.header(.{ .document = source.document, .run = source.run, .namespace_uri = source.namespace_uri }, schema.MAX_DEPTH);
 }
 
 fn makeCopier(self: *Builder) copy.Copier {

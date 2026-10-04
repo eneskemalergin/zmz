@@ -1,14 +1,12 @@
-//! Encodes and decodes padded Base64 in caller-owned buffers without allocating. Input and
-//! output must be disjoint, and output after a failure is unspecified. On x86-64, AVX2 is used
-//! when available and touches nothing outside the given slices.
+//! Encodes and decodes padded Base64 in caller-owned buffers without allocating. Input and output
+//! must be disjoint (`OverlappingBuffers` otherwise), and output after a failure is unspecified. On
+//! x86-64, AVX2 is used when available and touches nothing outside the given slices.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const kernel = @import("kernel_options");
 const core = @import("core.zig");
 const overlaps = core.overlaps;
-// Zig's self-hosted x86 backend cannot assemble vector memory operands yet.
-const USE_AVX2 = builtin.cpu.arch == .x86_64 and kernel.dispatch and builtin.zig_backend == .stage2_llvm;
 
 pub const DecodeError = error{
     InvalidCharacter,
@@ -26,6 +24,136 @@ pub const Counts = struct {
     text_bytes: usize = 0,
     significant_bytes: usize = 0,
     decoded_bytes: usize = 0,
+};
+
+/// Decodes XML text given in fragments into a borrowed output, keeping at most one incomplete
+/// quartet between updates; fragments are borrowed only during update. Failures are sticky.
+/// counts is current after every successful update and final after finish; output holds the
+/// whole payload only after finish. A Decoder is a plain value: a copy taken before an update
+/// restores the state from before it.
+///
+/// `take` hands out the bytes decoded since the last take and reuses output from its start,
+/// so a window that holds one update's bytes replaces a buffer for the whole payload.
+pub const Decoder = struct {
+    pub const Error = DecodeError || error{ AlreadyFinished, FailedState };
+
+    output: []u8,
+    counts: Counts = .{},
+    // Decoded bytes already handed out by take; output index = decoded_bytes - taken.
+    taken: usize = 0,
+    quartet: [4]u8 = undefined,
+    quartet_len: u3 = 0,
+    padded: bool = false,
+    finished: bool = false,
+    failed: bool = false,
+
+    pub fn init(output: []u8) Decoder {
+        return .{ .output = output };
+    }
+
+    /// Consumes one text fragment. Empty fragments are valid before finish.
+    pub noinline fn update(self: *Decoder, text: []const u8) Error!void {
+        if (self.failed) return error.FailedState;
+        if (self.finished) return error.AlreadyFinished;
+        errdefer self.failed = true;
+        return self.consume(text);
+    }
+
+    /// Returns the bytes decoded since the last take; the next update writes from output's
+    /// start again. The slice is valid until the next update.
+    pub fn take(self: *Decoder) []u8 {
+        const n = self.counts.decoded_bytes - self.taken;
+        self.taken = self.counts.decoded_bytes;
+        return self.output[0..n];
+    }
+
+    /// Decodes later updates into `output`, from its start, as `take` does. Bytes not yet taken
+    /// are dropped; call `take` first.
+    pub fn retarget(self: *Decoder, output: []u8) void {
+        self.output = output;
+        self.taken = self.counts.decoded_bytes;
+    }
+
+    /// Returns the text characters per update that always fit a window of `window` bytes with
+    /// `take`: a quartet left from the previous update has at most 3 characters, so 4 per 3 bytes
+    /// fit.
+    pub fn pieceFor(window: usize) usize {
+        return window / 3 * 4;
+    }
+
+    /// Checks the final quartet and returns the counts; call it once.
+    pub fn finish(self: *Decoder) Error!Counts {
+        if (self.failed) return error.FailedState;
+        if (self.finished) return error.AlreadyFinished;
+        errdefer self.failed = true;
+        if (self.quartet_len != 0) return error.TruncatedInput;
+        self.finished = true;
+        return self.counts;
+    }
+
+    // One fragment without the sticky-state checks, which the one-shot decode does not need.
+    fn consume(self: *Decoder, text: []const u8) DecodeError!void {
+        if (overlaps(self.output, text)) return error.OverlappingBuffers;
+        if (text.len > std.math.maxInt(usize) - self.counts.text_bytes) return error.LengthOverflow;
+        return self.updateParts(text);
+    }
+
+    fn updateParts(self: *Decoder, text: []const u8) DecodeError!void {
+        var index: usize = 0;
+        while (index < text.len) {
+            const consumed = self.decodeRun(text[index..]);
+            if (consumed != 0) {
+                index += consumed;
+                continue;
+            }
+            const byte = text[index];
+            index += 1;
+            self.counts.text_bytes += 1;
+            if (isWhitespace(byte)) continue;
+            if (self.padded) return error.InvalidPadding;
+            if (byte != '=' and DECODE_TABLE[byte] == 0xff) return error.InvalidCharacter;
+            self.counts.significant_bytes += 1;
+            self.quartet[self.quartet_len] = byte;
+            self.quartet_len += 1;
+            if (self.quartet_len == 4) try self.flushQuartet();
+        }
+    }
+
+    fn decodeRun(self: *Decoder, text: []const u8) usize {
+        if (self.quartet_len != 0 or self.padded or text.len < 4) return 0;
+        const output = self.output[self.counts.decoded_bytes - self.taken ..];
+        const has_tail = text.len % 4 == 0 and text[text.len - 1] == '=';
+        const plain_length = text.len - @as(usize, if (has_tail) 4 else 0);
+        var length = decodePrefix(output, text[0..plain_length]);
+        var decoded = length / 4 * 3;
+        if (has_tail and length == plain_length) tail: {
+            const group = decodeQuartet(text[length..][0..4].*) catch break :tail;
+            if (group.len > output.len - decoded) break :tail;
+            inline for (0..3) |i| {
+                if (i < group.len) output[decoded + i] = group.bytes[i];
+            }
+            length += 4;
+            decoded += group.len;
+            self.padded = true;
+        }
+        self.counts.text_bytes += length;
+        self.counts.significant_bytes += length;
+        self.counts.decoded_bytes += decoded;
+        return length;
+    }
+
+    fn flushQuartet(self: *Decoder) DecodeError!void {
+        const group = try decodeQuartet(self.quartet);
+        const end = std.math.add(usize, self.counts.decoded_bytes, group.len) catch
+            return error.LengthOverflow;
+        if (end - self.taken > self.output.len) return error.OutputTooSmall;
+        inline for (0..3) |i| {
+            if (i < group.len) self.output[self.counts.decoded_bytes - self.taken + i] = group.bytes[i];
+        }
+        self.counts.decoded_bytes = end;
+        self.quartet_len = 0;
+        self.padded = group.len != 3;
+    }
 };
 
 /// Returns the padded encoded length with checked arithmetic.
@@ -52,137 +180,9 @@ pub fn decode(output: []u8, source: []const u8) DecodeError![]u8 {
     return output[0..decoder.counts.decoded_bytes];
 }
 
-/// Decodes XML text given in fragments into a borrowed output, keeping at most one incomplete
-/// quartet between updates; fragments are borrowed only during update. Failures are sticky.
-/// counts is current after every successful update and final after finish; output holds the
-/// whole payload only after finish. A Decoder is a plain value: a copy taken before an update
-/// restores the state from before it.
-///
-/// `take` hands out the bytes decoded since the last take and reuses output from its start,
-/// so a window that holds one update's bytes replaces a buffer for the whole payload.
-pub const Decoder = struct {
-    output: []u8,
-    counts: Counts = .{},
-    // Decoded bytes already handed out by take; output index = decoded_bytes - taken.
-    taken: usize = 0,
-    quartet: [4]u8 = undefined,
-    quartet_len: u3 = 0,
-    padded: bool = false,
-    finished: bool = false,
-    failed: bool = false,
-
-    pub const Error = DecodeError || error{ AlreadyFinished, FailedState };
-
-    pub fn init(output: []u8) Decoder {
-        return .{ .output = output };
-    }
-
-    /// Consumes one text fragment. Empty fragments are valid before finish.
-    pub noinline fn update(self: *Decoder, text: []const u8) Error!void {
-        if (self.failed) return error.FailedState;
-        if (self.finished) return error.AlreadyFinished;
-        errdefer self.failed = true;
-        return self.consume(text);
-    }
-
-    // One fragment without the sticky-state checks, which the one-shot decode does not need.
-    fn consume(self: *Decoder, text: []const u8) DecodeError!void {
-        if (overlaps(self.output, text)) return error.OverlappingBuffers;
-        if (text.len > std.math.maxInt(usize) - self.counts.text_bytes) return error.LengthOverflow;
-        return self.updateParts(text);
-    }
-
-    fn updateParts(self: *Decoder, text: []const u8) DecodeError!void {
-        var index: usize = 0;
-        while (index < text.len) {
-            const consumed = self.decodeRun(text[index..]);
-            if (consumed != 0) {
-                index += consumed;
-                continue;
-            }
-            const byte = text[index];
-            index += 1;
-            self.counts.text_bytes += 1;
-            if (isWhitespace(byte)) continue;
-            if (self.padded) return error.InvalidPadding;
-            if (byte != '=' and alphabet(byte) == null) return error.InvalidCharacter;
-            self.counts.significant_bytes += 1;
-            self.quartet[self.quartet_len] = byte;
-            self.quartet_len += 1;
-            if (self.quartet_len == 4) try self.flushQuartet();
-        }
-    }
-
-    fn decodeRun(self: *Decoder, text: []const u8) usize {
-        if (self.quartet_len != 0 or self.padded or text.len < 4) return 0;
-        const output = self.output[self.counts.decoded_bytes - self.taken ..];
-        const capacity = output.len;
-        const input = text;
-        const has_tail = input.len >= 4 and input.len % 4 == 0 and input[input.len - 1] == '=';
-        const plain_length = input.len - @as(usize, if (has_tail) 4 else 0);
-        var length = decodePrefix(output[0..capacity], input[0..plain_length]);
-        var decoded = length / 4 * 3;
-        if (has_tail and length == plain_length) tail: {
-            const group = decodeQuartet(input[length..][0..4].*) catch break :tail;
-            if (group.len > capacity - decoded) break :tail;
-            inline for (0..3) |i| {
-                if (i < group.len) output[decoded + i] = group.bytes[i];
-            }
-            length += 4;
-            decoded += group.len;
-            self.padded = true;
-        }
-        self.counts.text_bytes += length;
-        self.counts.significant_bytes += length;
-        self.counts.decoded_bytes += decoded;
-        return length;
-    }
-
-    /// Returns the bytes decoded since the last take; the next update writes from output's
-    /// start again. The slice is valid until the next update.
-    pub fn take(self: *Decoder) []u8 {
-        const n = self.counts.decoded_bytes - self.taken;
-        self.taken = self.counts.decoded_bytes;
-        return self.output[0..n];
-    }
-
-    /// Decodes later updates into output, from its start, as take does.
-    pub fn retarget(self: *Decoder, output: []u8) void {
-        self.output = output;
-        self.taken = self.counts.decoded_bytes;
-    }
-
-    /// Text characters per update that always fit a window of `window` bytes with take: a
-    /// quartet left from the previous update has at most 3 characters, so 4 per 3 bytes fit.
-    pub fn pieceFor(window: usize) usize {
-        return window / 3 * 4;
-    }
-
-    /// Checks the final quartet and returns the counts; call it once.
-    pub fn finish(self: *Decoder) Error!Counts {
-        if (self.failed) return error.FailedState;
-        if (self.finished) return error.AlreadyFinished;
-        errdefer self.failed = true;
-        if (self.quartet_len != 0) return error.TruncatedInput;
-        self.finished = true;
-        return self.counts;
-    }
-
-    fn flushQuartet(self: *Decoder) DecodeError!void {
-        const group = try decodeQuartet(self.quartet);
-        const end = std.math.add(usize, self.counts.decoded_bytes, group.len) catch
-            return error.LengthOverflow;
-        if (end - self.taken > self.output.len) return error.OutputTooSmall;
-        inline for (0..3) |i| {
-            if (i < group.len) self.output[self.counts.decoded_bytes - self.taken + i] = group.bytes[i];
-        }
-        self.counts.decoded_bytes = end;
-        self.quartet_len = 0;
-        self.padded = group.len != 3;
-    }
-};
-
-// --- Scalar groups ---
+// HACK: Zig's self-hosted x86 backend cannot assemble vector memory operands; drop the
+// stage2_llvm check when it can.
+const USE_AVX2 = builtin.cpu.arch == .x86_64 and kernel.dispatch and builtin.zig_backend == .stage2_llvm;
 
 const ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 const ENCODE_PAIRS: [4096]u16 = blk: {
@@ -311,16 +311,9 @@ inline fn decodeQuartet(q: [4]u8) DecodeError!struct { bytes: [3]u8, len: usize 
     return .{ .bytes = bytes, .len = 3 };
 }
 
-fn alphabet(byte: u8) ?u8 {
-    const value = DECODE_TABLE[byte];
-    return if (value == 0xff) null else value;
-}
-
 fn isWhitespace(byte: u8) bool {
     return byte == ' ' or byte == '\t' or byte == '\r' or byte == '\n';
 }
-
-// --- AVX2 ---
 
 const AVX2_ENCODE: [8][32]u8 align(32) = .{
     [_]u8{ 1, 0, 2, 1, 4, 3, 5, 4, 7, 6, 8, 7, 10, 9, 11, 10 } ** 2,

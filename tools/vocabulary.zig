@@ -1,11 +1,16 @@
 //! Generates pinned vocabulary tables and reviews explicit local OBO candidates offline.
+//!
+//! `inspect` checks a manifest and the digests of its two OBO files, then prints their counts and
+//! monitored terms. `review` also checks the manifest's expected counts and compares the candidates
+//! with the bundled tables, failing on changes nobody reviewed. `generate` reviews, generates the
+//! tables twice, and writes `OUTPUT.zig` atomically only when both runs match. `scan` resolves the
+//! parameters of explicit mzML files. Nothing uses the network; a failure prints its error and
+//! exits with status 1.
 
 const std = @import("std");
 const zmz = @import("zmz");
 const mzml = zmz.mzml;
 const Vocabulary = mzml.cv.Vocabulary;
-
-// --- Command dispatch ---
 
 pub fn main(init: std.process.Init) void {
     run(init) catch |err| {
@@ -155,6 +160,7 @@ fn scan(allocator: std.mem.Allocator, io: std.Io, path: []const u8, output: *std
     var input = file.reader(io, &buffer);
     var reader = try mzml.StreamReader.init(allocator, &input.interface, .{ .payload = .skip });
     defer reader.deinit();
+    errdefer if (reader.diagnostic()) |report| std.debug.print("{s}: {f}\n", .{ path, report });
     const header = try reader.readHeader();
     const declarations = try header.cvDeclarations(allocator);
     defer allocator.free(declarations);
@@ -977,7 +983,7 @@ test "[unit] - [vocabulary update]: reports each metadata change without changin
     try std.testing.expect(std.mem.indexOf(u8, report.written(), "\"kind\":\"restored\"") != null);
 }
 
-test "[failure] - [vocabulary update]: blocks removals kernel changes and new family terms" {
+test "[failure] - [vocabulary update]: blocks removals, kernel changes, and new family terms" {
     const baseline = mzml.cv.Resolver.BUNDLED;
     var next = [_]Vocabulary{ baseline[0], baseline[1] };
     const terms = try std.testing.allocator.dupe(Vocabulary.Term, baseline[0].terms);

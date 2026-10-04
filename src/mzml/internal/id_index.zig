@@ -2,7 +2,6 @@
 
 const std = @import("std");
 
-/// Types for a set of positions into a slice of Entry, looked up by Entry.id.
 pub fn IdIndex(comptime Entry: type) type {
     return struct {
         pub const Map = std.HashMapUnmanaged(usize, void, Context, std.hash_map.default_max_load_percentage);

@@ -1,4 +1,8 @@
 //! Maps established mzML encoding declarations to binary pipelines and back.
+//!
+//! `model` re-exports the caller-facing types. `classify`, `Terms`, and the accession lookups are
+//! internal: the model, the readers, and the builder classify and write array declarations with
+//! them.
 
 const std = @import("std");
 const cv = @import("../cv/source.zig");
@@ -10,7 +14,6 @@ pub const Primitive = enum {
     int32,
     int64,
 
-    /// The primitive stored as Zig type T.
     pub fn of(comptime T: type) Primitive {
         return switch (T) {
             f32 => .float32,
@@ -21,7 +24,6 @@ pub const Primitive = enum {
         };
     }
 
-    /// The Zig type of the primitive.
     pub fn Type(comptime self: Primitive) type {
         return switch (self) {
             .float32 => f32,
@@ -31,7 +33,6 @@ pub const Primitive = enum {
         };
     }
 
-    /// Bytes per value.
     pub fn size(self: Primitive) usize {
         return switch (self) {
             .float32, .int32 => 4,
@@ -75,6 +76,70 @@ pub const Pipeline = enum {
 
 pub const Term = struct { accession: []const u8, name: []const u8 };
 
+/// A recognized established encoding. Unknown metadata remains in the source node.
+pub const Descriptor = struct {
+    primitive: Primitive,
+    pipeline: Pipeline,
+
+    /// The primitive of decoded values: f64 for Numpress, the declared primitive otherwise.
+    pub fn decodedPrimitive(self: Descriptor) Primitive {
+        return if (self.pipeline.isNumpress()) .float64 else self.primitive;
+    }
+
+    /// The pipeline to decode a payload with. Some producers omit the zlib stream of an
+    /// empty array, so an empty zlib array without Base64 characters decodes uncompressed.
+    pub fn payloadPipeline(self: Descriptor, value_count: usize, empty_text: bool) Pipeline {
+        return if (value_count == 0 and self.pipeline == .zlib and empty_text) .none else self.pipeline;
+    }
+};
+
+/// Failures when selecting an encoding, distinct from malformed payload bytes.
+pub const Error = cv.ExpansionError || error{
+    MissingPrimitive,
+    MissingCompression,
+    ConflictingPrimitive,
+    ConflictingCompression,
+    UnsupportedEncoding,
+};
+
+/// What one CV accession declares about an array's encoding. An unsupported term says which
+/// declaration it is: a binary data type or a compression.
+pub const Declared = union(enum) {
+    primitive: Primitive,
+    compression: Pipeline,
+    unsupported: enum { primitive, compression },
+};
+
+// The terms classified so far, for a parameter list read in runs: add classifies one more run
+// and returns what classify returns for every run added, without revisiting the others.
+pub const Terms = struct {
+    primitive: ?Primitive = null,
+    pipeline: ?Pipeline = null,
+
+    pub fn add(self: *Terms, params: []const cv.Entry, groups: []const cv.Group) Error!Descriptor {
+        var iterator: cv.EffectiveIterator = .{ .entries = params, .groups = groups };
+        while (try iterator.next()) |entry| {
+            if (entry != .cv) continue;
+            const accession = entry.cv.accession orelse continue;
+            switch (declared(accession.raw) orelse continue) {
+                .primitive => |selected| {
+                    if (self.primitive != null and self.primitive.? != selected) return error.ConflictingPrimitive;
+                    self.primitive = selected;
+                },
+                .compression => |selected| {
+                    if (self.pipeline != null and self.pipeline.? != selected) return error.ConflictingCompression;
+                    self.pipeline = selected;
+                },
+                .unsupported => return error.UnsupportedEncoding,
+            }
+        }
+        return .{
+            .primitive = self.primitive orelse return error.MissingPrimitive,
+            .pipeline = self.pipeline orelse return error.MissingCompression,
+        };
+    }
+};
+
 pub fn primitiveTerm(primitive: Primitive) Term {
     return switch (primitive) {
         .float32 => .{ .accession = "MS:1000521", .name = "32-bit float" },
@@ -111,44 +176,9 @@ pub fn codecFromAccession(accession: []const u8) ?Pipeline {
     return null;
 }
 
-/// A recognized established encoding. Unknown metadata remains in the source node.
-pub const Descriptor = struct {
-    primitive: Primitive,
-    pipeline: Pipeline,
-
-    /// The primitive of decoded values: f64 for Numpress, the declared primitive otherwise.
-    pub fn decodedPrimitive(self: Descriptor) Primitive {
-        return if (self.pipeline.isNumpress()) .float64 else self.primitive;
-    }
-
-    /// The pipeline to decode a payload with. Some producers omit the zlib stream of an
-    /// empty array, so an empty zlib array without Base64 characters decodes uncompressed.
-    pub fn payloadPipeline(self: Descriptor, value_count: usize, empty_text: bool) Pipeline {
-        return if (value_count == 0 and self.pipeline == .zlib and empty_text) .none else self.pipeline;
-    }
-};
-
-/// Failures when selecting an encoding, distinct from malformed payload bytes.
-pub const Error = cv.ExpansionError || error{
-    MissingPrimitive,
-    MissingCompression,
-    ConflictingPrimitive,
-    ConflictingCompression,
-    UnsupportedEncoding,
-};
-
-/// What one CV accession declares about an array's encoding. An unsupported term says which
-/// declaration it is: a binary data type or a compression.
-pub const Declared = union(enum) {
-    primitive: Primitive,
-    compression: Pipeline,
-    unsupported: enum { primitive, compression },
-};
-
-/// The encoding meaning of one accession, or null when it says nothing about encoding. Recognized
-/// but unsupported encodings (16-bit floats, ASCII strings, zstd, byte shuffling, truncation,
-/// coordinate grids) are `unsupported`; tests check every current PSI-MS binary data and
-/// compression type is covered.
+/// Returns the encoding meaning of one accession, or null when it says nothing about encoding.
+/// Recognized but unsupported encodings (16-bit floats, ASCII strings, zstd, byte shuffling,
+/// truncation, coordinate grids) are `unsupported`.
 pub fn declared(accession: []const u8) ?Declared {
     if (primitiveFromAccession(accession)) |primitive| return .{ .primitive = primitive };
     if (codecFromAccession(accession)) |pipeline| return .{ .compression = pipeline };
@@ -163,39 +193,8 @@ pub fn declared(accession: []const u8) ?Declared {
     return null;
 }
 
-/// Classifies the reviewed primitive and compression terms. A missing term is an error, and
-/// repeated terms must agree.
+// A missing term is an error, and repeated terms must agree.
 pub fn classify(params: []const cv.Entry, groups: []const cv.Group) Error!Descriptor {
     var terms: Terms = .{};
     return terms.add(params, groups);
 }
-
-/// The terms classified so far, for a parameter list read in runs: `add` classifies one more
-/// run and returns what `classify` returns for every run added, without revisiting the others.
-pub const Terms = struct {
-    primitive: ?Primitive = null,
-    pipeline: ?Pipeline = null,
-
-    pub fn add(self: *Terms, params: []const cv.Entry, groups: []const cv.Group) Error!Descriptor {
-        var iterator: cv.EffectiveIterator = .{ .entries = params, .groups = groups };
-        while (try iterator.next()) |entry| {
-            if (entry != .cv) continue;
-            const accession = entry.cv.accession orelse continue;
-            switch (declared(accession.raw) orelse continue) {
-                .primitive => |selected| {
-                    if (self.primitive != null and self.primitive.? != selected) return error.ConflictingPrimitive;
-                    self.primitive = selected;
-                },
-                .compression => |selected| {
-                    if (self.pipeline != null and self.pipeline.? != selected) return error.ConflictingCompression;
-                    self.pipeline = selected;
-                },
-                .unsupported => return error.UnsupportedEncoding,
-            }
-        }
-        return .{
-            .primitive = self.primitive orelse return error.MissingPrimitive,
-            .pipeline = self.pipeline orelse return error.MissingCompression,
-        };
-    }
-};

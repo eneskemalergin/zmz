@@ -82,9 +82,46 @@ test "[integration] - [mzML 1.0 copies]: keeps header and record metadata after 
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }
 
+fn copyRetained(allocator: std.mem.Allocator) !void {
+    var input = std.Io.Reader.fixed(support.DOCUMENT);
+    var header: mzml.owned.Header = undefined;
+    var record: mzml.owned.Record = undefined;
+    {
+        var reader = try mzml.StreamReader.init(allocator, &input, .{});
+        defer reader.deinit();
+        const source_header = try reader.readHeader();
+        const source_record = (try reader.nextRecord()).?;
+        header = try mzml.owned.Header.init(allocator, source_header.*, .{});
+        errdefer header.deinit();
+        record = try mzml.owned.Record.init(allocator, source_record, .{});
+        errdefer record.deinit();
+        try support.expectNode(source_header.document, header.value.document);
+        try support.expectNode(source_header.run, header.value.run);
+        try std.testing.expectEqualDeep(source_header.groups, header.value.groups);
+        try std.testing.expectEqualDeep(source_header.spectrum_list, header.value.spectrum_list);
+        try support.expectNode(source_record.node, record.value.node);
+        try std.testing.expectEqual(source_record.node.start_offset, record.value.node.start_offset);
+        try std.testing.expectEqual(source_record.node.end_offset, record.value.node.end_offset);
+        while (try reader.nextRecord()) |_| {}
+    }
+    defer header.deinit();
+    defer record.deinit();
+    try std.testing.expectEqualStrings("native=a&b", record.value.id);
+    try std.testing.expectEqualStrings("A&B", header.value.document.child(.file_description).?.child(.file_content).?.params[0].cv.name.?);
+    var output: [1]f64 = undefined;
+    var transport: [16]u8 = undefined;
+    var transformed: [16]u8 = undefined;
+    for (record.value.binaryArrays()) |array| {
+        _ = try mzml.model.decodeArray(f64, &output, array, record.value.default_array_length, header.value.groups, .{
+            .transport = &transport,
+            .transformed = &transformed,
+        });
+        try std.testing.expectEqual(@as(f64, 1), output[0]);
+    }
+}
+
 test "[integration] - [mzML ownership]: retains grouped records after reader closure and cleans failed copies" {
-    try support.copyRetained(std.testing.allocator);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, support.copyRetained, .{});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, copyRetained, .{});
 }
 
 test "[integration] - [mzML ownership]: copies optional text and bounds storage and nesting" {

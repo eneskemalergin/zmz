@@ -8,13 +8,13 @@
 //! values match C++ ms-numpress and numpress-rs on Linux.
 //!
 //! Each direction has its own error set. In them `InvalidData` describes encoded input, and
-//! `InvalidValue` and `ValueOutOfRange` describe source numbers; `Decoder` adds `FailedState`
-//! and `AlreadyFinished` for calls after an error or after `finish`. Output contents after an
-//! error are unspecified, but writes stay within the supplied span.
+//! `InvalidValue` and `ValueOutOfRange` describe source numbers; `Decoder` adds `FailedState` and
+//! `AlreadyFinished` for calls after an error or after `finish`. Output contents after an error are
+//! unspecified, but writes stay within the supplied span. Output must not overlap the input: every
+//! entry point returns `OverlappingBuffers` before writing anything otherwise.
 
 const std = @import("std");
 const builtin = @import("builtin");
-
 const libm = @import("libm_data.zig");
 const overlaps = @import("core.zig").overlaps;
 
@@ -40,8 +40,6 @@ pub const DecodeError = error{
 /// fixed_point.
 pub const Transform = enum { linear, pic, slof };
 
-/// The encoded length bound of the transform: linearMaxEncodedLen, picMaxEncodedLen, or
-/// slofEncodedLen.
 pub fn maxEncodedLen(transform: Transform, value_count: usize) error{LengthOverflow}!usize {
     return switch (transform) {
         .linear => linearMaxEncodedLen(value_count),
@@ -50,7 +48,6 @@ pub fn maxEncodedLen(transform: Transform, value_count: usize) error{LengthOverf
     };
 }
 
-/// encodeLinear, encodePic, or encodeSlof.
 pub fn encode(transform: Transform, input: anytype, fixed_point: f64, output: []u8) EncodeError!usize {
     return switch (transform) {
         .linear => encodeLinear(input, fixed_point, output),
@@ -59,7 +56,6 @@ pub fn encode(transform: Transform, input: anytype, fixed_point: f64, output: []
     };
 }
 
-/// encodeLinearTo, encodePicTo, or encodeSlofTo.
 pub fn encodeTo(transform: Transform, input: anytype, fixed_point: f64, writer: *std.Io.Writer) WriteError!usize {
     return switch (transform) {
         .linear => encodeLinearTo(input, fixed_point, writer),
@@ -68,25 +64,11 @@ pub fn encodeTo(transform: Transform, input: anytype, fixed_point: f64, writer: 
     };
 }
 
-/// decodeLinear, decodePic, or decodeSlof.
-pub fn decode(transform: Transform, input: []const u8, output: []f64) DecodeError!usize {
-    return switch (transform) {
-        .linear => decodeLinear(input, output),
-        .pic => decodePic(input, output),
-        .slof => decodeSlof(input, output),
-    };
-}
-
-/// decodeLinearExact, decodePicExact, or decodeSlofExact.
 pub fn decodeExact(transform: Transform, input: []const u8, output: []f64) DecodeError!void {
-    return switch (transform) {
-        .linear => decodeLinearExact(input, output),
-        .pic => decodePicExact(input, output),
-        .slof => decodeSlofExact(input, output),
-    };
+    _ = try decodeWhole(transform, true, input, output);
 }
 
-/// Returns a safe upper bound for a linear encoding of `value_count` doubles.
+/// Returns a safe upper bound for a linear encoding of `value_count` values.
 pub fn linearMaxEncodedLen(value_count: usize) error{LengthOverflow}!usize {
     const initial_count: usize = @min(value_count, 2);
     const tail_count = value_count - initial_count;
@@ -134,6 +116,42 @@ pub fn optimalLinearFixedPoint(input: anytype) error{ InvalidFixedPoint, Invalid
     return fixedPointForMaximum(try linearMaximumScalar(values, index, maximum));
 }
 
+/// Selects a Linear fixed point that bounds rounding error by `max_abs_error`.
+pub fn linearFixedPointForAbsoluteError(
+    input: anytype,
+    max_abs_error: f64,
+) error{ InvalidFixedPoint, InvalidValue, ToleranceUnattainable, ValueOutOfRange }!f64 {
+    const values = slice(input);
+    if (!std.math.isFinite(max_abs_error) or max_abs_error <= 0) {
+        return error.InvalidValue;
+    }
+    if (values.len == 0) return 0;
+
+    const required = 0.5 / max_abs_error;
+    if (!std.math.isFinite(required) or required <= 0) {
+        return error.ToleranceUnattainable;
+    }
+    const maximum = try optimalLinearFixedPoint(values);
+    if (required > maximum) return error.ToleranceUnattainable;
+    return required;
+}
+
+/// Selects the reference-compatible SLOF fixed point for valid nonnegative data.
+pub fn optimalSlofFixedPoint(input: anytype) error{ InvalidFixedPoint, InvalidValue }!f64 {
+    const values = slice(input);
+    if (values.len == 0) return 0;
+
+    var maximum: f64 = 1;
+    for (0..values.len) |index| {
+        const value = valueAt(values, index);
+        try validateNonnegative(value);
+        maximum = @max(maximum, logLibm(value + 1.0));
+    }
+    const fixed_point = @floor(65_535.0 / maximum);
+    if (fixed_point < 1) return error.InvalidFixedPoint;
+    return fixed_point;
+}
+
 fn linearMaximumVector(
     values: anytype,
     start: usize,
@@ -173,42 +191,6 @@ fn linearMaximumScalar(
     return maximum;
 }
 
-/// Selects a Linear fixed point that bounds rounding error by `max_abs_error`.
-pub fn linearFixedPointForAbsoluteError(
-    input: anytype,
-    max_abs_error: f64,
-) error{ InvalidFixedPoint, InvalidValue, ToleranceUnattainable, ValueOutOfRange }!f64 {
-    const values = slice(input);
-    if (!std.math.isFinite(max_abs_error) or max_abs_error <= 0) {
-        return error.InvalidValue;
-    }
-    if (values.len == 0) return 0;
-
-    const required = 0.5 / max_abs_error;
-    if (!std.math.isFinite(required) or required <= 0) {
-        return error.ToleranceUnattainable;
-    }
-    const maximum = try optimalLinearFixedPoint(values);
-    if (required > maximum) return error.ToleranceUnattainable;
-    return required;
-}
-
-/// Selects the reference-compatible SLOF fixed point for valid nonnegative data.
-pub fn optimalSlofFixedPoint(input: anytype) error{ InvalidFixedPoint, InvalidValue }!f64 {
-    const values = slice(input);
-    if (values.len == 0) return 0;
-
-    var maximum: f64 = 1;
-    for (0..values.len) |index| {
-        const value = valueAt(values, index);
-        try validateNonnegative(value);
-        maximum = @max(maximum, logLibm(value + 1.0));
-    }
-    const fixed_point = @floor(65_535.0 / maximum);
-    if (fixed_point < 1) return error.InvalidFixedPoint;
-    return fixed_point;
-}
-
 fn fixedPointForMaximum(maximum: f64) error{ InvalidFixedPoint, InvalidValue }!f64 {
     if (!std.math.isFinite(maximum) or maximum < 0) return error.InvalidValue;
     if (maximum == 0) return @floatFromInt(std.math.maxInt(i32));
@@ -219,54 +201,7 @@ fn fixedPointForMaximum(maximum: f64) error{ InvalidFixedPoint, InvalidValue }!f
 
 // --- Encoding ---
 
-// Values per encode block; decode was flat from 64 to 1,024, and 128 keeps the stack blocks
-// under 2 KiB.
-const BLOCK = 128;
-// One block's worst case: 128 values of 9 nibbles, the 8-byte store margin, and a spare byte.
-const BLOCK_BYTES = 9 * BLOCK / 2 + 16;
-
-const LANES = std.simd.suggestVectorLength(f64) orelse 1;
-
-// Encoders and selectors take f32 or f64 values. f32 widens to f64 exactly, and every step
-// computes in f64 after widening, so f32 input encodes as its f64 copy would, without the copy.
-fn Input(comptime Values: type) type {
-    const T = std.meta.Elem(Values);
-    if (T != f64 and T != f32) @compileError("Numpress encodes f32 or f64 values, not " ++ @typeName(T));
-    return T;
-}
-
-inline fn valueAt(values: anytype, index: usize) f64 {
-    _ = Input(@TypeOf(values));
-    return values[index];
-}
-
-// The input as a slice: f32 slices and arrays stay f32; everything else (f64 slices, arrays,
-// and literals such as &.{ 1, 2 }) coerces to []const f64.
-fn Slice(comptime Values: type) type {
-    const info = @typeInfo(Values);
-    if (info == .pointer) {
-        const child = info.pointer.child;
-        if (info.pointer.size == .slice and child == f32) return []const f32;
-        if (info.pointer.size == .one and @typeInfo(child) == .array and @typeInfo(child).array.child == f32) return []const f32;
-    }
-    return []const f64;
-}
-
-inline fn slice(values: anytype) Slice(@TypeOf(values)) {
-    return values;
-}
-
-inline fn load(comptime N: usize, values: anytype, index: usize) @Vector(N, f64) {
-    const T = Input(@TypeOf(values));
-    const v: @Vector(N, T) = values[index..][0..N].*;
-    return if (T == f64) v else @floatCast(v);
-}
-const F64s = @Vector(LANES, f64);
-const I64s = @Vector(LANES, i64);
-const U32s = @Vector(LANES, u32);
-const U64s = @Vector(LANES, u64);
-
-/// Encodes finite doubles from zero through `maxInt(u32)` by rounding to the nearest integer
+/// Encodes finite values from zero through `maxInt(u32)` by rounding to the nearest integer
 /// and applying the Numpress integer code.
 pub noinline fn encodePic(input: anytype, output: []u8) EncodeError!usize {
     const values = slice(input);
@@ -280,7 +215,7 @@ pub noinline fn encodePic(input: anytype, output: []u8) EncodeError!usize {
     };
 }
 
-/// Encodes nonnegative doubles with MS-Numpress linear prediction.
+/// Encodes nonnegative values with MS-Numpress linear prediction.
 pub noinline fn encodeLinear(input: anytype, fixed_point: f64, output: []u8) EncodeError!usize {
     const values = slice(input);
     if (overlaps(output, std.mem.sliceAsBytes(values))) return error.OverlappingBuffers;
@@ -294,7 +229,7 @@ pub noinline fn encodeLinear(input: anytype, fixed_point: f64, output: []u8) Enc
     };
 }
 
-/// Encodes nonnegative doubles with the MS-Numpress short logged float transform.
+/// Encodes nonnegative values with the MS-Numpress short logged float transform.
 pub noinline fn encodeSlof(input: anytype, fixed_point: f64, output: []u8) EncodeError!usize {
     const values = slice(input);
     if (overlaps(output, std.mem.sliceAsBytes(values))) return error.OverlappingBuffers;
@@ -308,7 +243,7 @@ pub noinline fn encodeSlof(input: anytype, fixed_point: f64, output: []u8) Encod
     };
 }
 
-/// Writes the PIC encoding of `values` to `writer` and returns the bytes written. Errors match
+/// Writes the PIC encoding of `input` to `writer` and returns the bytes written. Errors match
 /// `encodePic`; after one, the writer holds an unspecified prefix.
 pub fn encodePicTo(input: anytype, writer: *std.Io.Writer) WriteError!usize {
     const values = slice(input);
@@ -336,7 +271,7 @@ pub fn encodePicTo(input: anytype, writer: *std.Io.Writer) WriteError!usize {
     return blocks.written;
 }
 
-/// Writes the Linear encoding of `values` to `writer` and returns the bytes written. Errors
+/// Writes the Linear encoding of `input` to `writer` and returns the bytes written. Errors
 /// match `encodeLinear`; after one, the writer holds an unspecified prefix.
 pub fn encodeLinearTo(input: anytype, fixed_point: f64, writer: *std.Io.Writer) WriteError!usize {
     const values = slice(input);
@@ -392,7 +327,7 @@ pub fn encodeLinearTo(input: anytype, fixed_point: f64, writer: *std.Io.Writer) 
     return blocks.written;
 }
 
-/// Writes the SLOF encoding of `values` to `writer` and returns the bytes written. Errors
+/// Writes the SLOF encoding of `input` to `writer` and returns the bytes written. Errors
 /// match `encodeSlof`; after one, the writer holds an unspecified prefix.
 pub fn encodeSlofTo(input: anytype, fixed_point: f64, writer: *std.Io.Writer) WriteError!usize {
     const values = slice(input);
@@ -427,6 +362,54 @@ pub fn encodeSlofTo(input: anytype, fixed_point: f64, writer: *std.Io.Writer) Wr
     return blocks.written;
 }
 
+// Values per encode block; decode was flat from 64 to 1,024, and 128 keeps the stack blocks
+// under 2 KiB.
+const BLOCK = 128;
+// One block's worst case: 128 values of 9 nibbles, the 8-byte store margin, and a spare byte.
+const BLOCK_BYTES = 9 * BLOCK / 2 + 16;
+
+const LANES = std.simd.suggestVectorLength(f64) orelse 1;
+
+// Encoders and selectors take f32 or f64 values. f32 widens to f64 exactly, and every step
+// computes in f64 after widening, so f32 input encodes as its f64 copy would, without the copy.
+fn Input(comptime Values: type) type {
+    const T = std.meta.Elem(Values);
+    if (T != f64 and T != f32) @compileError("Numpress encodes f32 or f64 values, not " ++ @typeName(T));
+    return T;
+}
+
+inline fn valueAt(values: anytype, index: usize) f64 {
+    _ = Input(@TypeOf(values));
+    return values[index];
+}
+
+// The input as a slice: f32 slices and arrays stay f32; everything else (f64 slices, arrays,
+// and literals such as &.{ 1, 2 }) coerces to []const f64.
+fn Slice(comptime Values: type) type {
+    const info = @typeInfo(Values);
+    if (info == .pointer) {
+        const child = info.pointer.child;
+        if (info.pointer.size == .slice and child == f32) return []const f32;
+        if (info.pointer.size == .one and @typeInfo(child) == .array and @typeInfo(child).array.child == f32) return []const f32;
+    }
+    return []const f64;
+}
+
+inline fn slice(values: anytype) Slice(@TypeOf(values)) {
+    return values;
+}
+
+inline fn load(comptime N: usize, values: anytype, index: usize) @Vector(N, f64) {
+    const T = Input(@TypeOf(values));
+    const v: @Vector(N, T) = values[index..][0..N].*;
+    return if (T == f64) v else @floatCast(v);
+}
+
+const F64s = @Vector(LANES, f64);
+const I64s = @Vector(LANES, i64);
+const U32s = @Vector(LANES, u32);
+const U64s = @Vector(LANES, u64);
+
 // Where encoded blocks go. A writer whose buffer holds a whole block gets the bytes written
 // straight into that buffer: a fixed writer over the caller's output (the slice encoders) or
 // a compressor's input buffer. Smaller buffers go through a local block. Do not copy a Blocks
@@ -436,7 +419,7 @@ const Blocks = struct {
     written: usize = 0,
     staged: [BLOCK_BYTES]u8 = undefined,
 
-    // At least `needed` bytes of room, needed <= BLOCK_BYTES.
+    // At least needed bytes of room, needed <= BLOCK_BYTES.
     inline fn room(self: *Blocks, needed: usize) std.Io.Writer.Error![]u8 {
         const writer = self.writer;
         if (writer.buffer.len - writer.end >= needed) return writer.buffer[writer.end..];
@@ -519,8 +502,8 @@ noinline fn encodeSlofChecked(values: anytype, fixed_point: f64, output: []u8) E
 // Rounds a PIC block into u32 codes and gives each code's leading zero nibbles, read from the
 // exponent of v + 0.5: for v >= 0 it lies in [0.5, 2^32), and truncating to the code keeps the
 // binary exponent E, so the code has (1054 - E) >> 2 leading zero nibbles (8 for zero, where E
-// is 1022). `.wide` means a code reaches 0xf0000000, whose leading nibbles are F, so the block
-// needs the general word builder; `.invalid` means a value needs the checked path.
+// is 1022). .wide means a code reaches 0xf0000000, whose leading nibbles are F, so the block
+// needs the general word builder; .invalid means a value needs the checked path.
 const Rounded = enum { simple, wide, invalid };
 
 fn roundPicBlock(values: anytype, codes: []u32, leading: []u32) Rounded {
@@ -631,9 +614,9 @@ const SlofF64s = @Vector(SLOF_LANES, f64);
 const SlofCodes = @Vector(SLOF_LANES, u16);
 
 // The codes of a SLOF block, or null when a value needs the checked path. Codes whose scaled
-// logarithm lies within `guard` of a rounding boundary are recomputed with the glibc-exact
+// logarithm lies within guard of a rounding boundary are recomputed with the glibc-exact
 // scalar log, so every code matches C++; the range limit is such a boundary, so a block within
-// `guard` of 65535 takes the checked path, which rejects what C++ rejects.
+// guard of 65535 takes the checked path, which rejects what C++ rejects.
 inline fn slofBlock(values: anytype, fixed_point: f64, guard: f64) ?SlofCodes {
     const v = load(SLOF_LANES, values, 0);
     const valid = (v >= @as(SlofF64s, @splat(0))) & (v <= @as(SlofF64s, @splat(std.math.floatMax(f64))));
@@ -678,18 +661,6 @@ inline fn storeCodes(bytes: *[2 * SLOF_LANES]u8, codes: SlofCodes) void {
 
 // --- Decoding ---
 
-// Bytes staged between updates: the unconsumed tail of a fragment (under one value, at most 5
-// bytes) plus the first JOIN_BYTES of the next fragment, so a value split across fragments is
-// decoded from one buffer. Everything else is decoded in place.
-const JOIN_BYTES = 16;
-const STAGE_BYTES = 32;
-// Linear runs the unchecked block kernel only while |value| and |step| stay this small, so the
-// up to 1,024 values of one kernel call cannot overflow i64: |step| < 2^40 + 1024 * 2^31 and
-// |value| < 2^60 + 1024 * 2^41 < 2^62.
-const LINEAR_FAST_VALUE: i64 = 1 << 60;
-const LINEAR_FAST_STEP: i64 = 1 << 40;
-const LINEAR_FAST_VALUES = 1024;
-
 /// Decodes one payload given in fragments: `init` or `initExact` with the output, `update`
 /// with each fragment, `finish` once. Fragments are borrowed only during `update`; at most one
 /// value's worth of bytes, or the header, is kept between updates. Errors that depend on the
@@ -697,6 +668,8 @@ const LINEAR_FAST_VALUES = 1024;
 /// split of a payload gives the same values and error. After an error every call returns
 /// `FailedState`; after `finish`, `AlreadyFinished`.
 pub const Decoder = struct {
+    pub const Error = DecodeError || error{ AlreadyFinished, FailedState };
+
     transform: Transform,
     output: []f64,
     exact: bool,
@@ -717,8 +690,6 @@ pub const Decoder = struct {
     nonfinite: bool = false,
     failed: bool = false,
     finished: bool = false,
-
-    pub const Error = DecodeError || error{ AlreadyFinished, FailedState };
 
     /// Decodes at most output.len values, like the decode functions.
     pub fn init(transform: Transform, output: []f64) Decoder {
@@ -825,7 +796,7 @@ pub const Decoder = struct {
         }
         const pos = try self.run(bytes, start);
         const first = pos >> 1;
-        // The kernel stops at most 8 bytes before the end; stage them and finish whole values
+        // The kernel stops at most 9 bytes before the end; stage them and finish whole values
         // there, each with one 8-byte window load from the zero-padded stage.
         for (bytes[first..], 0..) |b, k| self.stage[k] = b;
         const len = bytes.len - first;
@@ -836,7 +807,7 @@ pub const Decoder = struct {
         self.parity = done & 1;
     }
 
-    // Whole values in stage[0..len] from nibble `start` that begin before `limit` and cannot
+    // Whole values in stage[0..len] from nibble start that begin before limit and cannot
     // be the final padding nibble; returns the nibble position after them.
     fn stageRun(self: *Decoder, len: usize, start: usize, limit: usize) DecodeError!usize {
         @memset(self.stage[len..][0..8], 0);
@@ -868,9 +839,9 @@ pub const Decoder = struct {
         return pos;
     }
 
-    // Decodes the values of buf from nibble `start` with the block kernel, and returns the
-    // nibble position after them: within 8 bytes of the end, or further back only where the
-    // kernel cannot run, in which case the scalar loop takes the rest.
+    // Decodes the values of buf from nibble start with the block kernel, and returns the nibble
+    // position after them: within 9 bytes of the end, or further back only where the kernel cannot
+    // run, in which case the scalar loop takes the rest.
     fn run(self: *Decoder, buf: []const u8, start: usize) DecodeError!usize {
         var pos = start;
         while (self.count < self.output.len) {
@@ -922,6 +893,7 @@ pub const Decoder = struct {
                 self.previous_2 = self.previous_1;
                 self.previous_1 = next;
             },
+            // SLOF has fixed-width codes, so consume and finishInner never reach the nibble path.
             .slof => unreachable,
         }
         self.count += 1;
@@ -1044,6 +1016,18 @@ pub fn decodeSlofExact(input: []const u8, output: []f64) DecodeError!void {
     _ = try decodeWhole(.slof, true, input, output);
 }
 
+// Bytes staged between updates: the unconsumed tail of a fragment (under one value, at most 5
+// bytes) plus the first JOIN_BYTES of the next fragment, so a value split across fragments is
+// decoded from one buffer. Everything else is decoded in place.
+const JOIN_BYTES = 16;
+const STAGE_BYTES = 32;
+// Linear runs the unchecked block kernel only while |value| and |step| stay this small, so the
+// up to 1,024 values of one kernel call cannot overflow i64: |step| < 2^40 + 1024 * 2^31 and
+// |value| < 2^60 + 1024 * 2^41 < 2^62.
+const LINEAR_FAST_VALUE: i64 = 1 << 60;
+const LINEAR_FAST_STEP: i64 = 1 << 40;
+const LINEAR_FAST_VALUES = 1024;
+
 // One update and finish on a fresh decoder, without the sticky-state checks.
 inline fn decodeWhole(transform: Transform, exact: bool, input: []const u8, output: []f64) DecodeError!usize {
     if (overlaps(std.mem.sliceAsBytes(output), input)) return error.OverlappingBuffers;
@@ -1089,9 +1073,9 @@ inline fn nibbleWord(v: u32) struct { word: u64, nibbles: u64 } {
 }
 
 // Packs stream-order words with each byte's first nibble in its low half, the order the words
-// are built in, so no value pays for the swap; `swapFinished` turns finished bytes into wire
-// order a block at a time. `put` stores 8 bytes after every word and needs 8 bytes of room past
-// the current position; `fitting` counts the values that have it.
+// are built in, so no value pays for the swap; swapFinished turns finished bytes into wire
+// order a block at a time. put stores 8 bytes after every word and needs 8 bytes of room past
+// the current position; fitting counts the values that have it.
 const RawSink = struct {
     out: []u8,
     pos: usize = 0,
@@ -1120,7 +1104,7 @@ const RawSink = struct {
         self.bits &= 7;
     }
 
-    // How many of `count` more values can take `put`: the position grows by at most 4.5 bytes
+    // How many of count more values can take put: the position grows by at most 4.5 bytes
     // a value, and every store needs 8 bytes. Only the last few values of an output sized to
     // the bound fall outside.
     inline fn fitting(self: *const RawSink, count: usize) usize {
@@ -1233,7 +1217,7 @@ const LinearSink = struct {
     }
 };
 
-// Decodes complete values from nibble `start` into `sink` (at most sink.out.len), with every
+// Decodes complete values from nibble start into sink (at most sink.out.len), with every
 // load inside the input. A vector pre-pass writes each nibble's value length, as if a value
 // started there, and the stream with each byte's halves swapped. Each value's start depends on
 // the previous value's head, so the chain is kept to one byte load and one add per value,
@@ -1267,7 +1251,7 @@ noinline fn unpackChase(
         swapped[i..][0..V].* = (low << @splat(4)) | high;
         lengths[2 * i ..][0 .. 2 * V].* = std.simd.interlace(.{ lengthsOf(V, high), lengthsOf(V, low) });
     }
-    // Positions are relative to byte `first_byte`. A value may start where its 8-byte load
+    // Positions are relative to byte first_byte. A value may start where its 8-byte load
     // stays inside the covered bytes, which also keeps it inside the input; it then ends inside
     // that load (16 nibbles, at most 9 used).
     const stop = 2 * (bytes - 8) + 2;
@@ -1299,7 +1283,7 @@ inline fn chaseBits(swapped: []const u8, p: usize) u32 {
     return (@as(u32, @truncate(window >> 4)) & BODY_MASK[head]) | FILL[head];
 }
 
-// The value at nibble `pos` of a stage with at least 8 readable bytes from pos >> 1 (bytes past
+// The value at nibble pos of a stage with at least 8 readable bytes from pos >> 1 (bytes past
 // the staged ones are zero and masked off): its bits and its length in nibbles.
 inline fn stageValue(stage: *const [STAGE_BYTES]u8, pos: usize) struct { bits: u32, nibbles: usize } {
     const window = swapNibbles(std.mem.readInt(u64, stage[pos >> 1 ..][0..8], .little)) >> @intCast(4 * (pos & 1));
@@ -1314,7 +1298,7 @@ inline fn nibbleAt(buf: []const u8, pos: usize) u4 {
     return @truncate(buf[pos >> 1] >> @intCast(4 * (1 - (pos & 1))));
 }
 
-// The value bits of the complete value whose head nibble is at `pos`.
+// The value bits of the complete value whose head nibble is at pos.
 fn readBits(buf: []const u8, pos: usize, head: u4) u32 {
     var bits = FILL[head];
     for (0..BODY_NIBBLES[head]) |i| bits |= @as(u32, nibbleAt(buf, pos + 1 + i)) << @intCast(4 * i);
@@ -1372,6 +1356,12 @@ const NibbleWriter = struct {
 
 // --- Value checks ---
 
+/// Checks the Linear and SLOF rule: a finite, nonnegative fixed point, zero only with no values.
+pub fn validateFixedPoint(fixed_point: f64, allow_zero: bool) error{InvalidFixedPoint}!void {
+    if (!std.math.isFinite(fixed_point) or fixed_point < 0) return error.InvalidFixedPoint;
+    if (!allow_zero and fixed_point == 0) return error.InvalidFixedPoint;
+}
+
 // The values are read while the writer's buffer is written, and an allocating writer may
 // move it, so they must not live in it.
 fn checkDestination(values: anytype, writer: *const std.Io.Writer) error{OverlappingBuffers}!void {
@@ -1381,12 +1371,6 @@ fn checkDestination(values: anytype, writer: *const std.Io.Writer) error{Overlap
 fn validateNonnegative(value: f64) error{InvalidValue}!void {
     if (!std.math.isFinite(value)) return error.InvalidValue;
     if (value < 0) return error.InvalidValue;
-}
-
-/// The Linear and SLOF rule: a finite, nonnegative fixed point, zero only with no values.
-pub fn validateFixedPoint(fixed_point: f64, allow_zero: bool) error{InvalidFixedPoint}!void {
-    if (!std.math.isFinite(fixed_point) or fixed_point < 0) return error.InvalidFixedPoint;
-    if (!allow_zero and fixed_point == 0) return error.InvalidFixedPoint;
 }
 
 fn roundedPic(value: f64) error{ InvalidValue, ValueOutOfRange }!u32 {
@@ -1452,13 +1436,12 @@ fn readFixedPoint(input: *const [8]u8) f64 {
 }
 
 // --- SLOF math ---
-//
+
 // C++ ms-numpress and numpress-rs call the platform's exp and log; on Linux that is glibc,
 // which runs ARM optimized-routines builds of both: an FMA build on CPUs with FMA and a plain
-// build otherwise. These ports reproduce both bit for bit. `madd` is a fused multiply-add
+// build otherwise. These ports reproduce both bit for bit. madd is a fused multiply-add
 // exactly where GCC fused glibc's FMA build and a separate multiply and add otherwise; the FMA
 // form is used when the target has FMA, so each build matches glibc on the CPUs it runs on.
-
 const FUSED = switch (builtin.cpu.arch) {
     .x86_64 => std.Target.x86.featureSetHas(builtin.cpu.features, .fma),
     .aarch64 => true,
