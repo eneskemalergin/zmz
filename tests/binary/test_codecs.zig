@@ -30,9 +30,11 @@ fn expectSlofBound(expected: []const f64, actual: []const f64, fixed_point: f64)
 // --- Base64 ---
 
 /// Decodes text in one call: the reference for split updates.
-fn decodeWhole(text: []const u8) base64.Error!base64.Counts {
+fn decodeWhole(text: []const u8) base64.Decoder.Error!base64.Counts {
     var output: [1536]u8 = undefined;
-    return base64.decode(&output, text);
+    var decoder = base64.Decoder.init(&output);
+    try decoder.update(text);
+    return decoder.finish();
 }
 
 test "[property] - [base64]: encoding matches independent bytes around vector blocks" {
@@ -60,8 +62,7 @@ test "[property] - [base64]: exact unaligned slices match independent encoding a
             const expected = std.base64.standard.Encoder.encode(&reference, input);
             const text = try base64.encode(encoded[offset..][0..expected.len], input);
             try std.testing.expectEqualSlices(u8, expected, text);
-            const counts = try base64.decode(decoded[offset..][0..length], text);
-            try std.testing.expectEqual(length, counts.decoded_bytes);
+            try std.testing.expectEqual(length, (try base64.decode(decoded[offset..][0..length], text)).len);
             try std.testing.expectEqualSlices(u8, input, decoded[offset..][0..length]);
             try std.testing.expect(std.mem.allEqual(u8, encoded[0..offset], 0xa5));
             try std.testing.expect(std.mem.allEqual(u8, encoded[offset + expected.len ..], 0xa5));
@@ -192,7 +193,7 @@ test "[property] - [base64]: pieces of pieceFor characters always fit a retarget
 
 // Checks text of any length through one window: each update takes at most pieceFor(window)
 // characters, and take() hands the decoded bytes over before the next update reuses it.
-fn checkWindowed(text: []const u8, window: []u8, expected: []const u8) base64.Error!base64.Counts {
+fn checkWindowed(text: []const u8, window: []u8, expected: []const u8) base64.Decoder.Error!base64.Counts {
     var decoder = base64.Decoder.init(window);
     var compared: usize = 0;
     var rest = text;
@@ -260,12 +261,7 @@ test "[property] - [base64]: preserves all one-byte and two-byte inputs" {
         try std.testing.expectEqualSlices(u8, &input, decoded[0..counts.decoded_bytes]);
         if (number < 256) {
             const short = try base64.encode(&encoded, input[0..1]);
-            const short_counts = try base64.decode(&decoded, short);
-            try std.testing.expectEqualSlices(
-                u8,
-                input[0..1],
-                decoded[0..short_counts.decoded_bytes],
-            );
+            try std.testing.expectEqualSlices(u8, input[0..1], try base64.decode(&decoded, short));
         }
     }
 }
@@ -340,12 +336,12 @@ fn compareBase64Updates(text: []const u8, capacity: usize) !void {
     var scalar_output: [384]u8 = undefined;
     var bulk = base64.Decoder.init(bulk_output[0..capacity]);
     var scalar = base64.Decoder.init(scalar_output[0..capacity]);
-    const bulk_error: ?base64.Error = result: {
+    const bulk_error: ?base64.Decoder.Error = result: {
         bulk.update(text) catch |err| break :result err;
         _ = bulk.finish() catch |err| break :result err;
         break :result null;
     };
-    const scalar_error: ?base64.Error = result: {
+    const scalar_error: ?base64.Decoder.Error = result: {
         for (text) |byte| scalar.update(&.{byte}) catch |err| break :result err;
         _ = scalar.finish() catch |err| break :result err;
         break :result null;
@@ -613,8 +609,7 @@ test "[property] - [zlib]: streamed inflation matches whole-stream results and e
                 var total: usize = 0;
                 const actual = while (true) {
                     if (total > whole.len) break error.OutputTooSmall;
-                    const piece = decompressor.read(streamed[total..][0..@min(window, streamed.len - total)]) catch |err| break err;
-                    if (piece.len == 0) break total;
+                    const piece = (decompressor.read(streamed[total..][0..@min(window, streamed.len - total)]) catch |err| break err) orelse break total;
                     total += piece.len;
                 };
                 if (expected) |bytes| {
@@ -626,7 +621,7 @@ test "[property] - [zlib]: streamed inflation matches whole-stream results and e
     }
 }
 
-fn decompressReference(output: []u8, source: []const u8) zlib.Error![]u8 {
+fn decompressReference(output: []u8, source: []const u8) zlib.DecompressError![]u8 {
     if (source.len < 2) return error.TruncatedInput;
     const header = std.mem.readInt(u16, source[0..2], .big);
     if (source[0] & 15 != 8 or source[0] >> 4 > 7 or header % 31 != 0) return error.InvalidData;
@@ -849,8 +844,7 @@ test "[failure] - [zlib arrays]: returns DecodedSizeMismatch when a stream outgr
     try std.testing.expectEqualSlices(f64, &.{ 1, 2 }, output[0..2]);
     try std.testing.expectError(error.DecodedSizeMismatch, arrays.decode(f64, output[0..1], two, .zlib, scratch));
     try std.testing.expectError(error.DecodedSizeMismatch, arrays.decode(f64, &output, two, .zlib, scratch));
-    const counts = try base64.decode(&transport, two);
-    try std.testing.expectError(error.DecodedSizeMismatch, arrays.decodeWire(f64, output[0..1], transport[0..counts.decoded_bytes], .zlib, &.{}));
+    try std.testing.expectError(error.DecodedSizeMismatch, arrays.decodeWire(f64, output[0..1], try base64.decode(&transport, two), .zlib, &.{}));
     // Three SLOF values exceed the wire bound of one; short transformed scratch is still the caller's.
     try std.testing.expectError(error.DecodedSizeMismatch, arrays.decode(f64, output[0..1], "eJxzWO/AAAFXuSpUARP4Aqw=", .slof_zlib, scratch));
     try std.testing.expectError(error.OutputTooSmall, arrays.decode(f64, &output, "eJxzWO/AAAFXuSpUARP4Aqw=", .slof_zlib, .{

@@ -7,7 +7,22 @@ pub fn IdIndex(comptime Entry: type) type {
     return struct {
         pub const Map = std.HashMapUnmanaged(usize, void, Context, std.hash_map.default_max_load_percentage);
 
-        pub const Context = struct {
+        // Capacity comes first, so a failure leaves no position without its entry.
+        pub fn insert(
+            map: *Map,
+            allocator: std.mem.Allocator,
+            entries: *std.ArrayList(Entry),
+            entry: Entry,
+        ) error{ OutOfMemory, DuplicateId }!void {
+            try entries.ensureUnusedCapacity(allocator, 1);
+            const query: Query = .{ .entries = entries.items };
+            const found = try map.getOrPutContextAdapted(allocator, entry.id, query, .{ .entries = entries.items });
+            if (found.found_existing) return error.DuplicateId;
+            found.key_ptr.* = entries.items.len;
+            entries.appendAssumeCapacity(entry);
+        }
+
+        const Context = struct {
             entries: []const Entry,
 
             pub fn hash(self: Context, position: usize) u64 {

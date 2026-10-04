@@ -44,7 +44,7 @@ pub fn main(init: std.process.Init) !void {
     });
     defer reader.deinit();
     const header = try reader.readHeader();
-    var decoded = mzml.StreamReader.DecodedArrays.init(init.gpa, .{});
+    var decoded = mzml.DecodedArrays.init(init.gpa, .{});
     defer decoded.deinit();
     var output_buffer: [4096]u8 = undefined;
     var output = std.Io.File.stdout().writer(init.io, &output_buffer);

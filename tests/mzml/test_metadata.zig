@@ -127,6 +127,7 @@ test "[property] - [mzML scientific metadata]: distinguishes absent repeated and
     try std.testing.expectEqual(model.Polarity.negative, (try record.polarity(&.{})).?);
     record.node.kind = .scan;
     try std.testing.expectError(error.UnexpectedElement, record.polarity(&.{}));
+    try std.testing.expectError(error.UnexpectedElement, model.arrayEncoding(record.node, &.{}));
 }
 
 test "[property] - [mzML scientific metadata]: preserves independent fields and propagates scalar errors" {

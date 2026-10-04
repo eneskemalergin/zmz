@@ -234,6 +234,17 @@ test "[failure] - [numpress encoders]: reject invalid values, scales, and capaci
     try std.testing.expectError(error.OutputTooSmall, numpress.encodeLinear(&.{}, 0, output[0..7]));
     try std.testing.expectError(error.OutputTooSmall, numpress.encodePic(&.{0}, output[0..0]));
     try std.testing.expectError(error.OutputTooSmall, numpress.encodeSlof(&.{0}, 1, output[0..9]));
+
+    // An output over the values is refused before any byte is written: below the bound the
+    // encoders take the value-by-value path, at it the block path.
+    var shared: [4]f64 = .{ 1, 2, 3, 4 };
+    const shared_bytes = std.mem.sliceAsBytes(&shared);
+    for ([_]usize{ 4, shared_bytes.len }) |len| {
+        try std.testing.expectError(error.OverlappingBuffers, numpress.encodePic(&shared, shared_bytes[0..len]));
+        try std.testing.expectError(error.OverlappingBuffers, numpress.encodeLinear(&shared, 1, shared_bytes[0..len]));
+        try std.testing.expectError(error.OverlappingBuffers, numpress.encodeSlof(&shared, 1, shared_bytes[0..len]));
+        try std.testing.expectEqualSlices(f64, &.{ 1, 2, 3, 4 }, &shared);
+    }
 }
 
 test "[failure] - [numpress decoders]: reject malformed bytes and short destinations" {
@@ -263,6 +274,17 @@ test "[failure] - [numpress decoders]: reject malformed bytes and short destinat
         error.OutputTooSmall,
         numpress.decodeLinear(linear_encoded[0..linear_len], &short_output),
     );
+
+    // Payload bytes inside the output are refused, whole or in fragments.
+    var decoded: [4]f64 = undefined;
+    const payload = std.mem.sliceAsBytes(&decoded)[0..16];
+    for ([_]numpress.Transform{ .linear, .pic, .slof }) |transform| {
+        try std.testing.expectError(error.OverlappingBuffers, numpress.decode(transform, payload, &decoded));
+        try std.testing.expectError(error.OverlappingBuffers, numpress.decodeExact(transform, payload, &decoded));
+        var decoder = numpress.Decoder.init(transform, &decoded);
+        try std.testing.expectError(error.OverlappingBuffers, decoder.update(payload[0..3]));
+        try std.testing.expectError(error.FailedState, decoder.finish());
+    }
 }
 
 test "[property] - [numpress decoders]: bounded arbitrary bytes stay within output spans" {
@@ -445,7 +467,7 @@ test "[property] - [numpress encoders]: f32 input encodes as its f64 copy" {
     try std.testing.expectError(error.InvalidValue, numpress.encodeLinear(&invalid, 1, &from_narrow));
 }
 
-fn expectSameBytes(narrow: numpress.Error!usize, wide: numpress.Error!usize, narrow_bytes: []const u8, wide_bytes: []const u8) !void {
+fn expectSameBytes(narrow: numpress.EncodeError!usize, wide: numpress.EncodeError!usize, narrow_bytes: []const u8, wide_bytes: []const u8) !void {
     const length = try wide;
     try std.testing.expectEqual(length, try narrow);
     try std.testing.expectEqualSlices(u8, wide_bytes[0..length], narrow_bytes[0..length]);
@@ -651,7 +673,7 @@ fn fillAscending(values: []f64, source: std.Random) void {
     }
 }
 
-fn decodeWhole(transform: numpress.Transform, exact: bool, input: []const u8, output: []f64) numpress.Error!usize {
+fn decodeWhole(transform: numpress.Transform, exact: bool, input: []const u8, output: []f64) numpress.DecodeError!usize {
     if (!exact) return numpress.decode(transform, input, output);
     try numpress.decodeExact(transform, input, output);
     return output.len;
@@ -664,7 +686,7 @@ fn decodeFed(
     output: []f64,
     max_piece: usize,
     source: std.Random,
-) numpress.Error!usize {
+) numpress.Decoder.Error!usize {
     var decoder = if (exact) numpress.Decoder.initExact(transform, output) else numpress.Decoder.init(transform, output);
     var at: usize = 0;
     while (at < input.len) {
@@ -677,9 +699,9 @@ fn decodeFed(
 }
 
 fn expectSameDecode(
-    expected: numpress.Error!usize,
+    expected: numpress.Decoder.Error!usize,
     expected_values: []const f64,
-    actual: numpress.Error!usize,
+    actual: numpress.Decoder.Error!usize,
     actual_values: []const f64,
 ) !void {
     const count = expected catch |err| return std.testing.expectError(err, actual);

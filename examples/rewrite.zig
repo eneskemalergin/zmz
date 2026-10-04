@@ -49,7 +49,7 @@ pub fn main(init: std.process.Init) !void {
     else
         null;
     defer if (editor) |*value| value.deinit(init.gpa);
-    var decoded = mzml.StreamReader.DecodedArrays.init(init.gpa, .{});
+    var decoded = mzml.DecodedArrays.init(init.gpa, .{});
     defer decoded.deinit();
     var header_builder = mzml.Builder.init(init.gpa, .{});
     defer header_builder.deinit();
@@ -171,7 +171,7 @@ const Reencoder = struct {
         self.builder.deinit();
     }
 
-    fn write(self: *Reencoder, writer: *mzml.Writer, source: mzml.model.Node, decoded: *const mzml.StreamReader.DecodedArrays) !void {
+    fn write(self: *Reencoder, writer: *mzml.Writer, source: mzml.model.Node, decoded: *const mzml.DecodedArrays) !void {
         self.builder.reset();
         self.encoder.reset();
         const source_arrays = if (source.child(.binary_data_array_list)) |list| list.children else &.{};

@@ -10,7 +10,7 @@ const cv = @import("../cv/source.zig");
 const owned = @import("owned.zig");
 const schema = @import("schema.zig");
 const StreamReader = @import("stream_reader.zig").StreamReader;
-const DecodedArrays = StreamReader.DecodedArrays;
+const DecodedArrays = @import("decoded_arrays.zig");
 const Engine = @import("internal/reader_engine.zig");
 const xml = @import("../xml/mzml_adapter.zig");
 const Diagnostic = @import("diagnostic.zig");
@@ -18,7 +18,7 @@ const Ids = @import("internal/id_index.zig").IdIndex(Entry);
 
 const IndexedReader = @This();
 
-/// Borrowed immutable bytes or a regular-file handle kept open by the caller.
+/// Immutable bytes or a regular-file handle, borrowed until `deinit`.
 pub const Source = union(enum) {
     bytes: []const u8,
     file: struct { handle: std.Io.File, io: std.Io },
@@ -29,7 +29,7 @@ pub const Policy = enum { rebuild, open_embedded };
 /// Bounds index storage and trailer parsing separately from header and record storage.
 pub const Options = struct {
     policy: Policy = .open_embedded,
-    max_records: usize = 1_000_000,
+    records: usize = 1_000_000,
     index_bytes: usize = 256 * 1024 * 1024,
     /// Largest raw XML record span a lookup reads.
     record_span_bytes: usize = 256 * 1024 * 1024,
@@ -39,10 +39,10 @@ pub const Options = struct {
     reader: StreamReader.Options = .{},
 };
 
-/// Physical span and ID, borrowed from this index. Index is the zero-based lookup
-/// ordinal within the record kind, not the source record's index. With open_embedded,
+/// Physical span and ID, borrowed from this index. `ordinal` is the zero-based lookup position
+/// within the record kind (as `at` takes it), not the source record's index. With open_embedded,
 /// start may precede XML whitespace and end bounds the span at the next target or trailer.
-pub const Entry = struct { kind: model.Kind, id: []const u8, index: usize, start: u64, end: u64 };
+pub const Entry = struct { kind: model.Kind, id: []const u8, ordinal: usize, start: u64, end: u64 };
 
 pub const Error = StreamReader.Error || owned.Error || std.Io.File.StatError || std.Io.File.ReadPositionalError || error{
     MissingIndex,
@@ -61,7 +61,7 @@ options: Options,
 size: u64,
 stamp: ?std.Io.File.Stat = null,
 remaining: usize,
-entries: std.ArrayList(Entry) = .empty,
+entry_list: std.ArrayList(Entry) = .empty,
 ids: [2]Ids.Map = .{ .empty, .empty },
 metadata: ?owned.Header = null,
 contexts: [2]?FragmentAncestors = .{ null, null },
@@ -153,22 +153,18 @@ fn buildInner(allocator: std.mem.Allocator, source: Source, options: Options, fa
     return self;
 }
 
-// Copies the next entry's ID, within max_records and the index bytes.
+// Copies the next entry's ID, within records and the index bytes.
 fn entryId(self: *IndexedReader, id: []const u8) Error![]const u8 {
-    if (self.entries.items.len == self.options.max_records) return try self.limitError(.records, self.options.max_records, null);
+    if (self.entry_list.items.len == self.options.records) return try self.limitError(.records, self.options.records, null);
     try self.charge(@sizeOf(Entry) + @sizeOf(usize) * 4);
     return self.copy(id);
 }
 
-// Adds an entry whose ID entryId copied, unique within its kind. Capacity comes first, so a
-// failure leaves no ID without its entry.
+// Adds an entry whose ID entryId copied, unique within its kind.
 fn addEntry(self: *IndexedReader, kind: model.Kind, copied: []const u8, start: u64, end: u64) Error!void {
-    try self.entries.ensureUnusedCapacity(self.allocator, 1);
     const k = kindIndex(kind);
-    const entry = try self.ids[k].getOrPutContextAdapted(self.allocator, copied, Ids.Query{ .entries = self.entries.items }, .{ .entries = self.entries.items });
-    if (entry.found_existing) return error.DuplicateId;
-    entry.key_ptr.* = self.entries.items.len;
-    self.entries.appendAssumeCapacity(.{ .kind = kind, .id = copied, .index = self.counts[k], .start = start, .end = end });
+    const entry: Entry = .{ .kind = kind, .id = copied, .ordinal = self.counts[k], .start = start, .end = end };
+    try Ids.insert(&self.ids[k], self.allocator, &self.entry_list, entry);
     self.counts[k] += 1;
 }
 
@@ -176,10 +172,15 @@ fn addEntry(self: *IndexedReader, kind: model.Kind, copied: []const u8, start: u
 pub fn deinit(self: *IndexedReader) void {
     if (self.lookup_reader) |*reader| reader.deinit();
     if (self.metadata) |*metadata| metadata.deinit();
-    self.entries.deinit(self.allocator);
+    self.entry_list.deinit(self.allocator);
     for (&self.ids) |*ids| ids.deinit(self.allocator);
     self.arena.deinit();
     self.* = undefined;
+}
+
+/// Returns every entry, spectra first, valid until deinit.
+pub fn entries(self: *const IndexedReader) []const Entry {
+    return self.entry_list.items;
 }
 
 /// Valid until deinit. With open_embedded, list observed counts stay zero; the index gives the
@@ -240,13 +241,13 @@ fn lookup(self: *IndexedReader, allocator: std.mem.Allocator, target: Target, ou
         .id => |id| self.idPosition(id),
         .ordinal => |ordinal| self.ordinalPosition(ordinal.kind, ordinal.ordinal),
     } orelse return null;
-    const entry = self.entries.items[position];
+    const entry = self.entry_list.items[position];
     return try if (output) |decoded| self.readDecodedEntry(allocator, entry, decoded) else self.readEntry(allocator, entry, null);
 }
 
 fn idPosition(self: *IndexedReader, id: []const u8) Error!?usize {
     try self.checkSource();
-    const query: Ids.Query = .{ .entries = self.entries.items };
+    const query: Ids.Query = .{ .entries = self.entry_list.items };
     const spectrum = self.ids[0].getKeyAdapted(id, query);
     const chromatogram = self.ids[1].getKeyAdapted(id, query);
     if (spectrum != null and chromatogram != null) return error.AmbiguousId;
@@ -269,7 +270,7 @@ fn readDecodedEntry(self: *IndexedReader, allocator: std.mem.Allocator, entry: E
 fn readEntry(self: *IndexedReader, allocator: std.mem.Allocator, entry: Entry, output: ?*DecodedArrays) Error!owned.Record {
     errdefer |err| {
         self.capture(err, .index, .none);
-        self.failure.?.record = Diagnostic.RecordPosition.of(entry.kind, entry.index);
+        self.failure.?.record = Diagnostic.RecordPosition.of(entry.kind, entry.ordinal);
     }
     const context = self.contexts[kindIndex(entry.kind)].?;
     const length = std.math.cast(usize, entry.end - entry.start) orelse return error.LimitExceeded;
@@ -417,8 +418,8 @@ const FragmentInput = struct {
 fn trailerLimits(self: *const IndexedReader) StreamReader.Limits {
     var limits = self.options.reader.limits;
     limits.header_bytes = self.options.index_bytes;
-    limits.list_entries = @max(2, self.options.max_records);
-    limits.nodes = self.options.max_records +| 5;
+    limits.list_entries = @max(2, self.options.records);
+    limits.nodes = self.options.records +| 5;
     return limits;
 }
 
@@ -474,8 +475,8 @@ fn openEmbedded(self: *IndexedReader, reader: *Engine) Error!void {
     var buffer: [64 * 1024]u8 = undefined;
     var input = FragmentInput.init(self, prefix, start, trailer_len, &.{}, buffer[0..@max(4, @min(buffer.len, bytes_len))]);
     self.readEmbeddedEntries(&input.interface, start, prefix_len, final_scope.end, endian) catch |err| return try self.inputError(&input, err);
-    for (self.entries.items, 0..) |*entry, i| {
-        if (i + 1 < self.entries.items.len) entry.end = self.entries.items[i + 1].start;
+    for (self.entry_list.items, 0..) |*entry, i| {
+        if (i + 1 < self.entry_list.items.len) entry.end = self.entry_list.items[i + 1].start;
         if (entry.start >= entry.end) return error.InvalidIndex;
     }
     if (reader.list_scopes[0] != null) self.contexts[0] = try self.captureAncestors(reader, 0);
@@ -486,7 +487,7 @@ fn openEmbedded(self: *IndexedReader, reader: *Engine) Error!void {
         if (self.counts[0] == 0) {
             try reader.finishEmptySpectrumList();
         } else {
-            const last = self.entries.items[self.counts[0] - 1];
+            const last = self.entry_list.items[self.counts[0] - 1];
             const context = self.contexts[0] orelse return error.InvalidIndex;
             const span = std.math.cast(usize, last.end - last.start) orelse return error.LimitExceeded;
             if (span > self.options.record_span_bytes) return try self.limitError(.record_span_bytes, self.options.record_span_bytes, span);
@@ -504,7 +505,7 @@ fn openEmbedded(self: *IndexedReader, reader: *Engine) Error!void {
     for ([_]?model.RecordList{ source_header.spectrum_list, source_header.chromatogram_list }, 0..) |list, k| {
         if (list != null) {
             if (self.counts[k] != 0) {
-                const first = self.entries.items[if (k == 0) 0 else self.counts[0]];
+                const first = self.entry_list.items[if (k == 0) 0 else self.counts[0]];
                 if (first.start < reader.list_scopes[k].?.end) return error.InvalidIndex;
             }
         } else if (self.counts[k] != 0) return error.InvalidIndex;
@@ -562,8 +563,8 @@ fn readEmbeddedEntries(self: *IndexedReader, input: *std.Io.Reader, index_start:
     try indexEnd(&cursor, .indexed_mzml);
     if (cursor.current != null) return error.InvalidStructure;
     // Each kind is already ordered. Rotate only when the two index elements are reversed.
-    if (self.counts[0] != 0 and self.counts[1] != 0 and self.entries.items[0].kind == .chromatogram) {
-        std.mem.rotate(Entry, self.entries.items, self.counts[1]);
+    if (self.counts[0] != 0 and self.counts[1] != 0 and self.entry_list.items[0].kind == .chromatogram) {
+        std.mem.rotate(Entry, self.entry_list.items, self.counts[1]);
         // Move positions with their entries so each stored hash still names the same ID.
         var spectra = self.ids[0].keyIterator();
         while (spectra.next()) |position| position.* -= self.counts[1];

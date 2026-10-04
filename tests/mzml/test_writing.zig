@@ -21,11 +21,12 @@ test "[failure] - [mzML diagnostics]: reports writer counts indexes and allocati
                 try writer.writeRecord(node);
                 try std.testing.expectError(error.CountMismatch, writer.writeItem(.{ .record = .{ .node = node, .id = "", .index = null, .default_array_length = null } }));
             },
-            3 => try std.testing.expectError(error.MissingValue, writer.writeRecord(node)),
+            3 => try std.testing.expectError(error.MissingAttribute, writer.writeRecord(node)),
             else => unreachable,
         }
         const report = writer.diagnostic().?;
         if (case == 3) {
+            try std.testing.expectEqual(.missing_attribute, report.id);
             try std.testing.expectEqual(.index, report.detail.attribute);
         } else {
             try std.testing.expectEqual(@as(u64, if (case == 0) 0 else 1), report.detail.size.expected);
@@ -223,12 +224,12 @@ test "[integration] - [mzML children]: copies retained XML without indexing nest
             defer index.deinit();
             try std.testing.expectEqualDeep([_]usize{ 1, 1 }, index.counts);
             try std.testing.expectEqual(null, try index.byId(allocator, "not-a-record"));
-            var decoded = mzml.StreamReader.DecodedArrays.init(allocator, .{});
+            var decoded = mzml.DecodedArrays.init(allocator, .{});
             defer decoded.deinit();
-            for (index.entries.items) |entry| {
+            for (index.entries()) |entry| {
                 var retained = (try index.byId(allocator, entry.id)).?;
                 defer retained.deinit();
-                var numeric = (try index.atDecoded(allocator, entry.kind, entry.index, &decoded)).?;
+                var numeric = (try index.atDecoded(allocator, entry.kind, entry.ordinal, &decoded)).?;
                 defer numeric.deinit();
                 try std.testing.expectEqualDeep(retained.value.node.content, numeric.value.node.content);
                 try std.testing.expectEqual(if (entry.kind == .spectrum) @as(usize, 2) else 0, decoded.len());
@@ -777,7 +778,7 @@ test "[integration] - [mzML prepared writing]: preserves primitive bytes across 
                     var source = std.Io.Reader.fixed(expected.buffered());
                     var decoded_reader = try mzml.StreamReader.init(std.testing.allocator, &source, .{});
                     defer decoded_reader.deinit();
-                    var decoded_arrays = mzml.StreamReader.DecodedArrays.init(std.testing.allocator, .{});
+                    var decoded_arrays = mzml.DecodedArrays.init(std.testing.allocator, .{});
                     defer decoded_arrays.deinit();
                     const decoded_record = (try decoded_reader.nextDecodedRecord(&decoded_arrays)).?;
                     try std.testing.expectEqual(@as(usize, 2), decoded_arrays.len());
@@ -796,7 +797,7 @@ test "[integration] - [mzML prepared writing]: preserves primitive bytes across 
                     if (indexed) {
                         var index = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = rewritten.buffered() }, .{});
                         defer index.deinit();
-                        try std.testing.expectEqual(@as(usize, 1), index.entries.items.len);
+                        try std.testing.expectEqual(@as(usize, 1), index.entries().len);
                         var fetched = (try index.atDecoded(std.testing.allocator, .spectrum, 0, &decoded_arrays)).?;
                         defer fetched.deinit();
                         try std.testing.expectEqual(@as(usize, 2), decoded_arrays.len());
@@ -901,7 +902,7 @@ test "[failure] - [mzML mixed writing]: checks supplied bytes and keeps failures
             defer writer.deinit();
             try writer.writeHeader(header.*);
             try writer.beginList(.spectrum_list, 1, "dp");
-            const before = writer.engine.byteOffset();
+            const before = writer.outputPosition();
             var choices = [_]?mzml.Writer.ArrayPayload{ null, .{ .wire = &wire } };
             var supplied: []const ?mzml.Writer.ArrayPayload = &choices;
             var arrays = [_]mzml.model.Node{ record.binaryArrays()[0], record.binaryArrays()[1] };
@@ -931,11 +932,13 @@ test "[failure] - [mzML mixed writing]: checks supplied bytes and keeps failures
                 else => unreachable,
             }
             try std.testing.expectError(expected_error, writer.writeRecordWithSelectedArrays(node, supplied));
-            if (case != 4 and case != 7) try std.testing.expectEqual(before, writer.engine.byteOffset());
+            if (case != 4 and case != 7) try std.testing.expectEqual(before, writer.outputPosition());
             const report = writer.diagnostic().?;
             try std.testing.expectEqual(.write_record, report.operation);
             if (case >= 1 and case <= 5)
                 try std.testing.expectEqual(@as(usize, if (case == 4) 0 else 1), report.array_position.?);
+            // Array text over the limit is the array's, kept or supplied.
+            if (case == 1 or case == 3) try std.testing.expectEqual(.array, report.stage);
             try std.testing.expectError(error.FailedState, writer.writeRecordWithSelectedArrays(node, &choices));
             try std.testing.expectError(error.FailedState, writer.finish());
             try std.testing.expectEqualDeep(report, writer.diagnostic().?);
@@ -958,7 +961,7 @@ test "[integration] - [mzML prepared writing]: rejects mismatches and keeps sink
             defer writer.deinit();
             try writer.writeHeader(header.*);
             try writer.beginList(.spectrum_list, 1, "dp");
-            const before = writer.engine.byteOffset().?;
+            const before = writer.outputPosition().?;
             switch (failure) {
                 0 => try std.testing.expectError(error.CountMismatch, writer.writeRecordWithArrays(record.node, &.{})),
                 1 => {
@@ -992,11 +995,11 @@ test "[integration] - [mzML prepared writing]: rejects mismatches and keeps sink
                     const list = changed.child(.binary_data_array_list).?;
                     changed.children = &.{ list, list };
                     try std.testing.expectError(error.InvalidStructure, writer.writeRecordWithArrays(changed, &.{ .{ .wire = &bytes }, .{ .wire = &bytes } }));
-                    try std.testing.expect(writer.engine.byteOffset().? > before);
+                    try std.testing.expect(writer.outputPosition().? > before);
                 },
                 else => unreachable,
             }
-            if (failure != 4 and failure != 8) try std.testing.expectEqual(before, writer.engine.byteOffset().?);
+            if (failure != 4 and failure != 8) try std.testing.expectEqual(before, writer.outputPosition().?);
             const report = writer.diagnostic().?;
             try std.testing.expectEqual(.write_record, report.operation);
             try std.testing.expectEqual(@as(usize, 0), report.record.?.ordinal);
@@ -1010,6 +1013,7 @@ test "[integration] - [mzML prepared writing]: rejects mismatches and keeps sink
                 1 => {
                     try std.testing.expectEqual(@as(usize, 0), report.array_position.?);
                     try std.testing.expectEqual(.text_bytes, report.detail.limit.name);
+                    try std.testing.expectEqual(.array, report.stage);
                     try std.testing.expectEqual(@as(u64, 3), report.detail.limit.maximum);
                 },
                 3 => {
@@ -1107,6 +1111,8 @@ test "[failure] - [mzML writer]: checks node bounds and missing payloads during 
         try writer.beginList(.spectrum_list, 1, "dp");
         if (case[1]) |failure| {
             try std.testing.expectError(failure, writer.writeRecord(node));
+            // The retained Base64 text is the array's, as it is when arrays are replaced.
+            if (case[0].text_bytes == 3) try std.testing.expectEqual(.array, writer.diagnostic().?.stage);
             try std.testing.expectError(error.FailedState, writer.finish());
         } else {
             try writer.writeRecord(node);
@@ -1207,7 +1213,7 @@ test "[integration] - [mzML file writer]: patches counts without changing record
                 }
                 try known.endList();
                 try writer.endList();
-                try std.testing.expectEqual(sink.logicalPos(), writer.engine.byteOffset().?);
+                try std.testing.expectEqual(sink.logicalPos(), writer.outputPosition().?);
             }
             try known.finish();
             try writer.finish();
@@ -1241,7 +1247,7 @@ test "[integration] - [mzML file writer]: patches counts without changing record
                 var index = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = bytes }, .{ .policy = .open_embedded });
                 defer index.deinit();
                 try std.testing.expectEqualDeep(case.counts, index.counts);
-                for (index.entries.items) |entry| {
+                for (index.entries()) |entry| {
                     var found = (try index.byId(std.testing.allocator, entry.id)).?;
                     defer found.deinit();
                     try std.testing.expectEqual(entry.start, found.value.node.start_offset);
@@ -1307,7 +1313,7 @@ test "[integration] - [mzML writer]: separates absent source numbers from output
         try required.beginListWithAttributes(.spectrum_list, 1, opening.list_start.list.attributes);
         var missing = record.node;
         missing.attributes = &.{.{ .name = "id", .value = "x" }};
-        try std.testing.expectError(error.MissingValue, required.writeRecord(missing));
+        try std.testing.expectError(error.MissingAttribute, required.writeRecord(missing));
         try std.testing.expectError(error.FailedState, required.finish());
     }
 }
@@ -1317,17 +1323,18 @@ test "[failure] - [mzML file writer]: unknown counts need a file and do not bypa
     var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
     defer reader.deinit();
     const header = try reader.readHeader();
-    for ([_]bool{ false, true }) |indexed| {
+    // A kind that is not a list is a wrong argument, like an unknown count without a file.
+    for ([_]bool{ false, true }) |indexed| for ([_]struct { kind: mzml.model.Kind, count: ?usize }{ .{ .kind = .spectrum_list, .count = null }, .{ .kind = .run, .count = 0 } }) |case| {
         var buffer: [4096]u8 = undefined;
         var sink = std.Io.Writer.fixed(&buffer);
         var writer = if (indexed) try mzml.Writer.initIndexed(std.testing.allocator, &sink, .{}, .{}) else try mzml.Writer.init(std.testing.allocator, &sink, .{});
         defer writer.deinit();
         try writer.writeHeader(header.*);
         const before = sink.buffered().len;
-        try std.testing.expectError(error.InvalidOptions, writer.beginList(.spectrum_list, null, "dp"));
+        try std.testing.expectError(error.InvalidOptions, writer.beginList(case.kind, case.count, "dp"));
         try std.testing.expectEqual(before, sink.buffered().len);
         try std.testing.expectError(error.FailedState, writer.finish());
-    }
+    };
     var dir = std.testing.tmpDir(.{});
     defer dir.cleanup();
     const file = try dir.dir.createFile(std.testing.io, "out.mzML", .{});
@@ -1408,7 +1415,7 @@ test "[failure] - [mzML file writer]: flush, count patch, and checksum read fail
             .unseekable => try std.testing.expectError(error.Unseekable, writer.endList()),
             .read, .eof => {
                 try writer.endList();
-                try std.testing.expectError(if (failure == .read) error.InputOutput else error.UnexpectedEndOfFile, writer.finish());
+                try std.testing.expectError(if (failure == .read) error.InputOutput else error.TruncatedSource, writer.finish());
             },
         }
         const report = writer.diagnostic().?;
@@ -1417,7 +1424,7 @@ test "[failure] - [mzML file writer]: flush, count patch, and checksum read fail
             .patch => error.NoSpaceLeft,
             .unseekable => error.Unseekable,
             .read => error.InputOutput,
-            .eof => error.UnexpectedEndOfFile,
+            .eof => error.TruncatedSource,
         }, report.code);
         try std.testing.expectEqual(.output, report.stage);
         try std.testing.expectEqual(null, report.location);
@@ -1479,7 +1486,7 @@ test "[integration] - [mzML declarations]: preserves version metadata across rea
             defer index.deinit();
             try std.testing.expectEqualDeep(version, index.header().document.attribute("version"));
             try std.testing.expectEqualDeep([2]usize{ 1, 1 }, index.counts);
-            var decoded = mzml.StreamReader.DecodedArrays.init(std.testing.allocator, .{});
+            var decoded = mzml.DecodedArrays.init(std.testing.allocator, .{});
             defer decoded.deinit();
             var record = (try index.byIdDecoded(std.testing.allocator, "native=a&b", &decoded)).?;
             defer record.deinit();
@@ -1513,7 +1520,7 @@ test "[property] - [mzML streamed writing]: every pipeline round trips through s
     defer reference_encoder.deinit();
     var builder = mzml.Builder.init(allocator, .{});
     defer builder.deinit();
-    var decoded = mzml.StreamReader.DecodedArrays.init(allocator, .{});
+    var decoded = mzml.DecodedArrays.init(allocator, .{});
     defer decoded.deinit();
     for ([_]usize{ 0, 1, 3, 700, 20_000 }) |count| {
         for (std.meta.tags(mzml.arrays.Pipeline)) |pipeline| {
@@ -1576,7 +1583,7 @@ test "[property] - [mzML streamed writing]: every pipeline round trips through s
                     try std.testing.expectEqualStrings(&std.fmt.bytesToHex(digest, .lower), bytes[end..][0..40]);
                     var index = try mzml.IndexedReader.build(allocator, .{ .bytes = bytes }, .{});
                     defer index.deinit();
-                    try std.testing.expectEqual(@as(usize, 1), index.entries.items.len);
+                    try std.testing.expectEqual(@as(usize, 1), index.entries().len);
                 }
                 var read_input = std.Io.Reader.fixed(bytes);
                 var reader = try mzml.StreamReader.init(allocator, &read_input, .{});
@@ -1600,7 +1607,7 @@ fn writeStreamedRecord(writer: *mzml.Writer, header: mzml.model.Header, record: 
 }
 
 // Lossless pipelines give the values back; Numpress gives what decoding its encoding gives.
-fn expectArray(comptime T: type, actual: mzml.StreamReader.DecodedArrays.Values, values: []const T, options: mzml.arrays.EncodeOptions, encoder: *mzml.arrays.Encoder) !void {
+fn expectArray(comptime T: type, actual: mzml.DecodedArrays.Values, values: []const T, options: mzml.arrays.EncodeOptions, encoder: *mzml.arrays.Encoder) !void {
     if (!options.pipeline.isNumpress()) {
         const typed = @field(actual, @tagName(mzml.model.Primitive.of(T)));
         return std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(values), std.mem.sliceAsBytes(typed));
@@ -1637,9 +1644,9 @@ test "[failure] - [mzML streamed writing]: Numpress value errors write nothing t
         defer writer.deinit();
         try writer.writeHeader(header.*);
         try writer.beginList(.spectrum_list, 1, "dp");
-        const before = writer.engine.byteOffset();
+        const before = writer.outputPosition();
         try std.testing.expectError(error.InvalidValue, writer.writeRecordWithArrays(record.node, &.{prepared.payload}));
-        try std.testing.expectEqual(before, writer.engine.byteOffset());
+        try std.testing.expectEqual(before, writer.outputPosition());
         const stream_report = writer.diagnostic().?;
         try std.testing.expectEqual(.array, stream_report.stage);
         try std.testing.expectEqual(.binary_data_array, stream_report.element.?);
@@ -1693,10 +1700,11 @@ test "[failure] - [mzML streamed writing]: the text limit stops streams first an
     defer writer.deinit();
     try writer.writeHeader(header.*);
     try writer.beginList(.spectrum_list, 1, "dp");
-    const before = writer.engine.byteOffset();
+    const before = writer.outputPosition();
     try std.testing.expectError(error.LimitExceeded, writer.writeRecordWithArrays(record.node, &.{prepared.payload}));
-    try std.testing.expectEqual(before, writer.engine.byteOffset());
+    try std.testing.expectEqual(before, writer.outputPosition());
     try std.testing.expectEqual(.text_bytes, writer.diagnostic().?.detail.limit.name);
+    try std.testing.expectEqual(.array, writer.diagnostic().?.stage);
 
     var dir = std.testing.tmpDir(.{});
     defer dir.cleanup();
@@ -1708,9 +1716,9 @@ test "[failure] - [mzML streamed writing]: the text limit stops streams first an
     defer file_writer.deinit();
     try file_writer.writeHeader(header.*);
     try file_writer.beginList(.spectrum_list, 1, "dp");
-    const file_before = file_writer.engine.byteOffset().?;
+    const file_before = file_writer.outputPosition().?;
     try std.testing.expectError(error.LimitExceeded, file_writer.writeRecordWithArrays(record.node, &.{prepared.payload}));
-    try std.testing.expect(file_writer.engine.byteOffset().? > file_before);
+    try std.testing.expect(file_writer.outputPosition().? > file_before);
     try std.testing.expectEqual(.text_bytes, file_writer.diagnostic().?.detail.limit.name);
     try std.testing.expectError(error.FailedState, file_writer.finish());
 }
@@ -1759,7 +1767,7 @@ test "[failure] - [mzML writer]: rejects metadata that shares memory with its ou
         attributes[record.node.attributes.len] = .{ .name = "note", .value = aliased };
         var node = record.node;
         node.attributes = attributes[0 .. record.node.attributes.len + 1];
-        try std.testing.expectError(error.InvalidState, writer.writeRecord(node));
+        try std.testing.expectError(error.OverlappingBuffers, writer.writeRecord(node));
         try std.testing.expectError(error.FailedState, writer.finish());
     }
     // A growing caller sink behind the indexed writer's hashing writer is checked as it is now.
@@ -1777,7 +1785,7 @@ test "[failure] - [mzML writer]: rejects metadata that shares memory with its ou
     attributes[record.node.attributes.len] = .{ .name = "note", .value = aliased };
     var node = record.node;
     node.attributes = attributes[0 .. record.node.attributes.len + 1];
-    try std.testing.expectError(error.InvalidState, writer.writeRecord(node));
+    try std.testing.expectError(error.OverlappingBuffers, writer.writeRecord(node));
 }
 
 test "[failure] - [mzML writer]: a sink cannot reenter the writer that drains into it" {
@@ -1845,12 +1853,12 @@ test "[failure] - [mzML writer]: refuses a wire that a source in the same record
     defer writer.deinit();
     try writer.writeHeader(header.*);
     try writer.beginList(.spectrum_list, 1, "dp");
-    const before = writer.engine.byteOffset();
+    const before = writer.outputPosition();
     try std.testing.expectError(error.InvalidState, writer.writeRecordWithArrays(record.node, &.{
         .{ .wire = wire },
         .{ .source = mzml.arrays.Source.of(f64, &values, options, &encoder) },
     }));
-    try std.testing.expectEqual(before, writer.engine.byteOffset());
+    try std.testing.expectEqual(before, writer.outputPosition());
 }
 
 test "[failure] - [mzML writer]: rejects node arrays that live in its output buffer" {
@@ -1870,9 +1878,9 @@ test "[failure] - [mzML writer]: rejects node arrays that live in its output buf
     @memcpy(aliased, record.node.attributes);
     var node = record.node;
     node.attributes = aliased;
-    const before = writer.engine.byteOffset();
-    try std.testing.expectError(error.InvalidState, writer.writeRecord(node));
-    try std.testing.expectEqual(before, writer.engine.byteOffset());
+    const before = writer.outputPosition();
+    try std.testing.expectError(error.OverlappingBuffers, writer.writeRecord(node));
+    try std.testing.expectEqual(before, writer.outputPosition());
 }
 
 test "[integration] - [writer conventions]: writes empty generated values and indexedmzML attributes on request" {
@@ -1917,7 +1925,7 @@ test "[integration] - [writer conventions]: writes empty generated values and in
         // The checksum and offsets cover the wrapper; values read back unchanged.
         var index = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = written }, .{ .policy = .open_embedded });
         defer index.deinit();
-        var decoded = mzml.StreamReader.DecodedArrays.init(std.testing.allocator, .{});
+        var decoded = mzml.DecodedArrays.init(std.testing.allocator, .{});
         defer decoded.deinit();
         var found = (try index.byIdDecoded(std.testing.allocator, "scan=1", &decoded)).?;
         defer found.deinit();

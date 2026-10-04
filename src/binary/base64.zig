@@ -10,7 +10,7 @@ const overlaps = core.overlaps;
 // Zig's self-hosted x86 backend cannot assemble vector memory operands yet.
 const USE_AVX2 = builtin.cpu.arch == .x86_64 and kernel.dispatch and builtin.zig_backend == .stage2_llvm;
 
-pub const Error = error{
+pub const DecodeError = error{
     InvalidCharacter,
     InvalidPadding,
     NonCanonicalTail,
@@ -18,9 +18,8 @@ pub const Error = error{
     OutputTooSmall,
     LengthOverflow,
     OverlappingBuffers,
-    AlreadyFinished,
-    FailedState,
 };
+pub const EncodeError = error{ OutputTooSmall, LengthOverflow, OverlappingBuffers };
 
 /// Successful input and output counts; significant bytes include padding.
 pub const Counts = struct {
@@ -30,13 +29,13 @@ pub const Counts = struct {
 };
 
 /// Returns the padded encoded length with checked arithmetic.
-pub fn encodedSize(source_len: usize) Error!usize {
+pub fn encodedSize(source_len: usize) error{LengthOverflow}!usize {
     const groups = source_len / 3 + @intFromBool(source_len % 3 != 0);
     return std.math.mul(usize, groups, 4) catch error.LengthOverflow;
 }
 
 /// Writes canonical padded Base64.
-pub fn encode(output: []u8, source: []const u8) Error![]u8 {
+pub fn encode(output: []u8, source: []const u8) EncodeError![]u8 {
     if (overlaps(output, source)) return error.OverlappingBuffers;
     const required = try encodedSize(source.len);
     if (output.len < required) return error.OutputTooSmall;
@@ -44,17 +43,20 @@ pub fn encode(output: []u8, source: []const u8) Error![]u8 {
     return output[0..required];
 }
 
-/// Decodes XML text, allowing XML whitespace between Base64 characters. Decoding past output's
-/// capacity fails with OutputTooSmall.
-pub fn decode(output: []u8, source: []const u8) Error!Counts {
+/// Decodes XML text, allowing XML whitespace between Base64 characters, and returns the
+/// written prefix of output. Decoding past output's capacity fails with OutputTooSmall.
+pub fn decode(output: []u8, source: []const u8) DecodeError![]u8 {
     var decoder = Decoder.init(output);
-    try decoder.update(source);
-    return decoder.finish();
+    try decoder.consume(source);
+    if (decoder.quartet_len != 0) return error.TruncatedInput;
+    return output[0..decoder.counts.decoded_bytes];
 }
 
 /// Decodes XML text given in fragments into a borrowed output, keeping at most one incomplete
-/// quartet between updates; fragments are borrowed only during update. Failures are sticky,
-/// and counts and output are valid only after finish succeeds.
+/// quartet between updates; fragments are borrowed only during update. Failures are sticky.
+/// counts is current after every successful update and final after finish; output holds the
+/// whole payload only after finish. A Decoder is a plain value: a copy taken before an update
+/// restores the state from before it.
 ///
 /// `take` hands out the bytes decoded since the last take and reuses output from its start,
 /// so a window that holds one update's bytes replaces a buffer for the whole payload.
@@ -69,6 +71,8 @@ pub const Decoder = struct {
     finished: bool = false,
     failed: bool = false,
 
+    pub const Error = DecodeError || error{ AlreadyFinished, FailedState };
+
     pub fn init(output: []u8) Decoder {
         return .{ .output = output };
     }
@@ -78,12 +82,17 @@ pub const Decoder = struct {
         if (self.failed) return error.FailedState;
         if (self.finished) return error.AlreadyFinished;
         errdefer self.failed = true;
+        return self.consume(text);
+    }
+
+    // One fragment without the sticky-state checks, which the one-shot decode does not need.
+    fn consume(self: *Decoder, text: []const u8) DecodeError!void {
         if (overlaps(self.output, text)) return error.OverlappingBuffers;
         if (text.len > std.math.maxInt(usize) - self.counts.text_bytes) return error.LengthOverflow;
         return self.updateParts(text);
     }
 
-    fn updateParts(self: *Decoder, text: []const u8) Error!void {
+    fn updateParts(self: *Decoder, text: []const u8) DecodeError!void {
         var index: usize = 0;
         while (index < text.len) {
             const consumed = self.decodeRun(text[index..]);
@@ -159,7 +168,7 @@ pub const Decoder = struct {
         return self.counts;
     }
 
-    fn flushQuartet(self: *Decoder) Error!void {
+    fn flushQuartet(self: *Decoder) DecodeError!void {
         const group = try decodeQuartet(self.quartet);
         const end = std.math.add(usize, self.counts.decoded_bytes, group.len) catch
             return error.LengthOverflow;
@@ -277,7 +286,7 @@ fn decodePrefix(output: []u8, source: []const u8) usize {
     return position;
 }
 
-inline fn decodeQuartet(q: [4]u8) Error!struct { bytes: [3]u8, len: usize } {
+inline fn decodeQuartet(q: [4]u8) DecodeError!struct { bytes: [3]u8, len: usize } {
     const a = DECODE_TABLE[q[0]];
     if (a == 0xff) return error.InvalidPadding;
     const b = DECODE_TABLE[q[1]];

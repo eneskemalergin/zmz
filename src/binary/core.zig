@@ -142,8 +142,7 @@ test "[property] - [base64 dispatch]: cached scalar fallback preserves both dire
     var decoded: [257]u8 = undefined;
     const text = try base64.encode(&encoded, &source);
     try std.testing.expectEqualSlices(u8, std.base64.standard.Encoder.encode(&expected, &source), text);
-    const counts = try base64.decode(&decoded, text);
-    try std.testing.expectEqualSlices(u8, &source, decoded[0..counts.decoded_bytes]);
+    try std.testing.expectEqualSlices(u8, &source, try base64.decode(&decoded, text));
 }
 
 test "[property] - [x86-64-v3 detection]: requires every feature and OS vector state" {

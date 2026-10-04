@@ -18,10 +18,8 @@ const Writer = @import("writer.zig");
 
 const Builder = @This();
 
-pub const Error = owned.Error || schema.Error || arrays.Error || model.EncodingError || model.LookupError || error{
-    InvalidDeclaration,
-    InvalidRecord,
-    InvalidArrayLength,
+pub const Error = owned.Error || schema.Error || arrays.OptionsError || model.EncodingError || error{
+    InvalidState,
     GroupRewriteRequired,
 };
 
@@ -107,10 +105,10 @@ pub fn list(self: *Builder, kind: model.Kind, children: []const model.Node) Erro
     }}, .children = children });
 }
 
-/// Constructs a vocabulary declaration from explicit source identity and version fields.
-pub fn vocabulary(self: *Builder, declaration: cv.Declaration) Error!model.Node {
+/// Constructs a `cv` declaration from explicit source identity and version fields.
+pub fn cvDeclaration(self: *Builder, declaration: cv.Declaration) Error!model.Node {
     if (declaration.id == null or declaration.full_name == null or declaration.uri == null)
-        return error.InvalidDeclaration;
+        return error.InvalidOptions;
     const attrs = [_]model.Attribute{
         .{ .name = "id", .value = declaration.id.? },
         .{ .name = "fullName", .value = declaration.full_name.? },
@@ -317,7 +315,7 @@ const GroupEncoding = struct { primitive: ?model.Primitive = null, pipeline: ?ar
 const GroupReplacement = struct { source_id: []const u8, encoding: GroupEncoding, id: []const u8 };
 
 // Extra group lists are not expanded, but their IDs must not be reused.
-fn addExtraGroupIds(allocator: std.mem.Allocator, header_value: model.Header, used: *std.StringHashMapUnmanaged(void)) xml.Error!void {
+fn addExtraGroupIds(allocator: std.mem.Allocator, header_value: model.Header, used: *std.StringHashMapUnmanaged(void)) (xml.InitError || xml.AdvanceError)!void {
     const content = header_value.document.content orelse return;
     for (content.items) |item| {
         if (item != .xml) continue;
@@ -430,7 +428,7 @@ fn reencodedParams(output: ?[]cv.Entry, params: []const cv.Entry, groups: []cons
 
 fn checkArrayOptions(options: ArrayOptions) Error!void {
     if (options.cv_ref.len == 0 or options.role.cv_ref == null or options.role.accession == null or
-        options.role.name == null) return error.InvalidDeclaration;
+        options.role.name == null) return error.InvalidOptions;
 }
 
 fn arrayMetadata(self: *Builder, comptime T: type, value_count: usize, options: ArrayOptions) Error!Array {
@@ -464,16 +462,15 @@ fn arrayMetadata(self: *Builder, comptime T: type, value_count: usize, options: 
 }
 
 /// Builds a spectrum or chromatogram with new id, index, and defaultArrayLength attributes,
-/// for writeRecordWithArrays with the arrays' wire. Arrays must come from this builder since
-/// its last reset, and
-/// default arrays must match default_length. To keep a source record's attributes, edit a
-/// view of its node instead.
+/// for writeRecordWithArrays with the arrays' wire. Arrays from another builder, or prepared
+/// before this builder's last reset, are InvalidState; default arrays must match
+/// default_length. To keep a source record's attributes, edit a view of its node instead.
 pub fn record(self: *Builder, kind: model.Kind, id: []const u8, index: usize, default_length: usize, params: []const cv.Entry, children: []const model.Node, binary_arrays: []const Array) Error!model.Record {
-    if ((kind != .spectrum and kind != .chromatogram) or id.len == 0) return error.InvalidRecord;
-    for (children) |child| if (child.kind == .binary_data_array_list) return error.InvalidRecord;
+    if ((kind != .spectrum and kind != .chromatogram) or id.len == 0) return error.InvalidOptions;
+    for (children) |child| if (child.kind == .binary_data_array_list) return error.InvalidOptions;
     for (binary_arrays) |array| {
-        if (array.owner != self or array.generation != self.generation) return error.InvalidRecord;
-        if (array.is_default and array.length != default_length) return error.InvalidArrayLength;
+        if (array.owner != self or array.generation != self.generation) return error.InvalidState;
+        if (array.is_default and array.length != default_length) return error.InvalidOptions;
     }
     const child_count = std.math.add(usize, children.len, @intFromBool(binary_arrays.len != 0)) catch return error.LimitExceeded;
     var copier = self.makeCopier();

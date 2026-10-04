@@ -135,12 +135,12 @@ fn search(comptime T: type, items: []const T, id: []const u8) ?usize {
 }
 
 /// Graph failures are distinct from a completed negative ancestry query.
-pub const GraphError = error{ UnknownTerm, Cycle, TraversalLimit, DestinationTooSmall };
+pub const GraphError = error{ UnknownTerm, Cycle, TraversalLimit, OutputTooSmall };
 
 /// Tests reflexive ancestry within this resource, including alternate IDs.
 /// Limits edge and node visits; nesting is additionally capped at 64 terms.
 /// Missing nodes and cycles encountered before a match return explicit errors.
-pub fn isA(self: Vocabulary, child: []const u8, parent: []const u8, max_work: usize) GraphError!bool {
+pub fn isA(self: Vocabulary, child: []const u8, parent: []const u8, max_work: usize) error{ UnknownTerm, Cycle, TraversalLimit }!bool {
     const target = self.lookup(parent) orelse return error.UnknownTerm;
     var walk: Walk = .{ .resource = self, .remaining = max_work };
     return walk.ancestor(child, target.term.id, 0);
@@ -152,14 +152,14 @@ pub fn isA(self: Vocabulary, child: []const u8, parent: []const u8, max_work: us
 pub fn valueTypes(
     self: Vocabulary,
     accession: []const u8,
-    destination: [][]const u8,
+    output: [][]const u8,
     max_work: usize,
 ) GraphError![][]const u8 {
     const term = self.lookup(accession) orelse return error.UnknownTerm;
     var walk: Walk = .{ .resource = self, .remaining = max_work };
     var count: usize = 0;
-    try walk.types(term.term.id, destination, &count, 0, true);
-    return destination[0..count];
+    try walk.types(term.term.id, output, &count, 0, true);
+    return output[0..count];
 }
 
 const Walk = struct {
@@ -167,7 +167,7 @@ const Walk = struct {
     remaining: usize,
     path: [64][]const u8 = undefined,
 
-    fn enter(self: *Walk, id: []const u8, depth: usize) GraphError!void {
+    fn enter(self: *Walk, id: []const u8, depth: usize) error{ Cycle, TraversalLimit }!void {
         if (depth == self.path.len or self.remaining == 0) return error.TraversalLimit;
         self.remaining -= 1;
         for (self.path[0..depth]) |seen|
@@ -175,7 +175,7 @@ const Walk = struct {
         self.path[depth] = id;
     }
 
-    fn ancestor(self: *Walk, id: []const u8, target: []const u8, depth: usize) GraphError!bool {
+    fn ancestor(self: *Walk, id: []const u8, target: []const u8, depth: usize) error{ UnknownTerm, Cycle, TraversalLimit }!bool {
         const match = self.resource.lookup(id) orelse return error.UnknownTerm;
         try self.enter(match.term.id, depth);
         if (std.mem.eql(u8, match.term.id, target)) return true;
@@ -187,7 +187,7 @@ const Walk = struct {
     fn types(
         self: *Walk,
         id: []const u8,
-        destination: [][]const u8,
+        output: [][]const u8,
         count: *usize,
         depth: usize,
         root: bool,
@@ -200,14 +200,14 @@ const Walk = struct {
             var has_targets = false;
             while (targets.next()) |target| {
                 has_targets = true;
-                try self.types(target, destination, count, depth + 1, false);
+                try self.types(target, output, count, depth + 1, false);
             }
             if (has_targets or root) return;
         } else if (!std.mem.startsWith(u8, id, "xsd:") or id.len == 4) {
             return error.UnknownTerm;
         }
-        if (count.* == destination.len) return error.DestinationTooSmall;
-        destination[count.*] = canonical;
+        if (count.* == output.len) return error.OutputTooSmall;
+        output[count.*] = canonical;
         count.* += 1;
     }
 };

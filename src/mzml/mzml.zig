@@ -12,6 +12,7 @@ pub const owned = @import("owned.zig");
 pub const Builder = @import("builder.zig");
 pub const IndexedReader = @import("indexed_reader.zig");
 pub const StreamReader = @import("stream_reader.zig").StreamReader;
+pub const DecodedArrays = @import("decoded_arrays.zig");
 pub const Events = @import("events.zig");
 pub const Writer = @import("writer.zig");
 pub const Diagnostic = @import("diagnostic.zig");

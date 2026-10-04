@@ -26,8 +26,6 @@ pub const ReadError = error{
     ReadFailed,
     LimitExceeded,
     InvalidState,
-    EndOfStream,
-    NoText,
 };
 
 /// Which XML rule malformed input broke, kept with `InvalidXml` (`Cursor.xml_rule`).
@@ -63,11 +61,14 @@ pub const Rule = enum {
 /// Cursor construction failures caused by invalid limits or input setup.
 pub const InitError = error{InvalidOptions};
 /// Errors returned by the mzML XML cursor.
-pub const Error = ReadError || InitError || std.mem.Allocator.Error || error{
+pub const Error = ReadError || std.mem.Allocator.Error || error{
     WrongNamespace,
     UnexpectedEnd,
 };
-const ParserError = Error;
+/// What a fragment advance can return: it never checks the root's namespace, and after the
+/// document ends it leaves `current` null again instead of failing.
+pub const AdvanceError = ReadError || std.mem.Allocator.Error;
+const ParserError = AdvanceError || error{EndOfStream};
 
 const Encoding = enum {
     utf8,
@@ -117,7 +118,7 @@ pub const Attribute = struct {
     name: Name,
     value: []const u8,
     /// Source offset of the attribute's name.
-    offset: u64 = 0,
+    offset: u64,
 };
 
 /// A parsed start element and its borrowed non-namespace attributes.
@@ -151,13 +152,10 @@ pub const Text = struct {
     bytes: []const u8,
 };
 
-/// Events exposed to the mzML reader and indexed-reader bridge.
 pub const EventData = union(enum) {
-    document_start,
     start_element: StartElement,
     end_element: EndElement,
     text: Text,
-    document_end: void,
 };
 
 /// An event with physical source-byte offsets.
@@ -229,7 +227,7 @@ fn ordinaryRun(comptime max_width: usize, bytes: []const u8, stops: [3]u8) usize
 const Source = struct {
     reader: ?*std.Io.Reader,
     detected: bool = false,
-    detection_failure: ?Error = null,
+    detection_failure: ?AdvanceError = null,
     probe: [4]u8 = undefined,
     probe_len: usize = 0,
     probe_pos: usize = 0,
@@ -294,7 +292,7 @@ const Source = struct {
         self.detected = true;
     }
 
-    fn addPosition(self: *Source, amount: usize) ParserError!void {
+    fn addPosition(self: *Source, amount: usize) AdvanceError!void {
         self.position = std.math.add(u64, self.position, @intCast(amount)) catch return error.LimitExceeded;
     }
 
@@ -319,7 +317,7 @@ const Source = struct {
         const first = try self.readByte();
         const second = self.readByte() catch |err| return switch (err) {
             error.EndOfStream => error.InvalidEncoding,
-            else => err,
+            else => |other| other,
         };
         return if (self.encoding == .utf16_le)
             @as(u16, first) | (@as(u16, second) << 8)
@@ -387,7 +385,7 @@ const Source = struct {
         return error.InvalidEncoding;
     }
 
-    fn unread(self: *Source, value: Codepoint) Error!void {
+    fn unread(self: *Source, value: Codepoint) AdvanceError!void {
         if (self.pending_len == self.pending.len) return error.InvalidState;
         var index = self.pending_len;
         while (index != 0) : (index -= 1) self.pending[index] = self.pending[index - 1];
@@ -411,7 +409,7 @@ const Source = struct {
         return if (self.encoding == .utf16_le or self.encoding == .utf16_be) 2 else 1;
     }
 
-    fn commitBorrowed(self: *Source) ParserError!void {
+    fn commitBorrowed(self: *Source) AdvanceError!void {
         if (self.borrowed_len == 0) return;
         const reader = self.reader orelse return error.InvalidState;
         reader.toss(self.borrowed_len);
@@ -524,7 +522,7 @@ pub const Cursor = struct {
         input: *std.Io.Reader,
         max_attributes: usize,
         max_attribute_bytes: usize,
-    ) Error!Cursor {
+    ) InitError!Cursor {
         if (max_attributes == 0 or max_attribute_bytes == 0) {
             return error.InvalidOptions;
         }
@@ -581,7 +579,7 @@ pub const Cursor = struct {
 
     /// Restores ancestor storage left intact by a successful fragment read.
     /// A failed read or a different prefix requires parsing those ancestors again.
-    pub fn resetToAncestors(self: *Cursor, input: *std.Io.Reader, saved: Ancestors, prefix_length: usize) Error!void {
+    pub fn resetToAncestors(self: *Cursor, input: *std.Io.Reader, saved: Ancestors, prefix_length: usize) void {
         self.source.reset(input);
         self.resetState(true);
         self.source.detected = true;
@@ -636,30 +634,36 @@ pub const Cursor = struct {
         return self.advanceInner(text, true);
     }
 
-    pub fn advanceFragment(self: *Cursor, text: bool) Error!void {
+    pub fn advanceFragment(self: *Cursor, text: bool) AdvanceError!void {
         return self.advanceInner(text, false);
     }
 
-    fn advanceInner(self: *Cursor, text: bool, comptime mzml_root: bool) Error!void {
+    fn advanceInner(
+        self: *Cursor,
+        text: bool,
+        comptime mzml_root: bool,
+    ) (if (mzml_root) Error else AdvanceError)!void {
         errdefer |err| self.failure = err;
         self.current = null;
+        const ended_before = self.document_ended;
         while (true) {
             const maybe_event = self.nextEvent(!text) catch |err| {
                 self.offset = self.failedAt(err);
-                if (err == error.EndOfStream or err == error.NoText)
-                    self.xml_rule = if (err == error.EndOfStream) .unexpected_end else .malformed_markup;
+                if (err == error.EndOfStream) self.xml_rule = .unexpected_end;
                 return switch (err) {
-                    error.EndOfStream, error.NoText => error.InvalidXml,
-                    else => err,
+                    error.EndOfStream => error.InvalidXml,
+                    else => |other| other,
                 };
             };
+            // The document's end leaves no event; advancing again past it is an error only for
+            // the mzML root walk.
             const event = maybe_event orelse {
                 self.offset = self.source.currentOffset();
-                return error.UnexpectedEnd;
+                if (mzml_root and ended_before) return error.UnexpectedEnd;
+                return;
             };
             self.offset = event.span.start;
             switch (event.data) {
-                .document_start => {},
                 .start_element => |start| {
                     if (self.depth == 1 and optionalSliceEql(start.name.expanded.namespace_uri, NAMESPACE_1_0))
                         self.mzml_namespace = NAMESPACE_1_0;
@@ -681,10 +685,6 @@ pub const Cursor = struct {
                         self.xml_rule = .unexpected_text;
                         return error.InvalidXml;
                     };
-                },
-                .document_end => {
-                    self.current = null;
-                    return;
                 },
             }
         }
@@ -723,7 +723,12 @@ pub const Cursor = struct {
 
     /// Copies the current subtree without interpreting its contents, leaving its end event.
     /// Namespace bindings make the emitted fragment independent of its former ancestors.
-    pub fn writeElement(self: *Cursor, output: *Writer, remaining_nodes: *usize) (Error || WriterError)!void {
+    pub fn writeElement(
+        self: *Cursor,
+        output: *Writer,
+        remaining_nodes: *usize,
+    ) (AdvanceError || WriterError || error{UnexpectedEnd})!void {
+        if ((self.current orelse return error.InvalidState).data != .start_element) return error.InvalidState;
         var nesting: usize = 0;
         while (self.current) |event| {
             switch (event.data) {
@@ -745,13 +750,11 @@ pub const Cursor = struct {
                     for (start.attributes) |attribute| try output.attribute(attribute.name.raw, attribute.value);
                 },
                 .end_element => {
-                    if (nesting == 0) return self.malformedAt(.mismatched_end_tag, event.span.start);
                     try output.endElement();
                     nesting -= 1;
                     if (nesting == 0) return;
                 },
                 .text => |value| try output.text(value.bytes),
-                else => return self.malformedAt(.malformed_markup, event.span.start),
             }
             try self.advanceFragment(true);
         }
@@ -759,7 +762,8 @@ pub const Cursor = struct {
     }
 
     /// Discards the current subtree within the node budget, leaving its end event.
-    pub fn skipElement(self: *Cursor, remaining_nodes: *usize) Error!void {
+    pub fn skipElement(self: *Cursor, remaining_nodes: *usize) (AdvanceError || error{UnexpectedEnd})!void {
+        if ((self.current orelse return error.InvalidState).data != .start_element) return error.InvalidState;
         var nesting: usize = 0;
         while (self.current) |event| {
             switch (event.data) {
@@ -769,12 +773,10 @@ pub const Cursor = struct {
                     nesting += 1;
                 },
                 .end_element => {
-                    if (nesting == 0) return self.malformedAt(.mismatched_end_tag, event.span.start);
                     nesting -= 1;
                     if (nesting == 0) return;
                 },
                 .text => {},
-                else => return self.malformedAt(.malformed_markup, event.span.start),
             }
             try self.advanceFragment(true);
         }
@@ -794,8 +796,8 @@ pub const Cursor = struct {
             const event = (self.nextEvent(false) catch |err| {
                 self.offset = self.failedAt(err);
                 return switch (err) {
-                    error.EndOfStream, error.NoText => error.UnexpectedEnd,
-                    else => err,
+                    error.EndOfStream => error.UnexpectedEnd,
+                    else => |other| other,
                 };
             }) orelse return error.UnexpectedEnd;
             switch (event.data) {
@@ -807,7 +809,7 @@ pub const Cursor = struct {
         try self.advance(false);
     }
 
-    fn beginEvent(self: *Cursor) ParserError!void {
+    fn beginEvent(self: *Cursor) AdvanceError!void {
         try self.source.commitBorrowed();
         self.event_bytes.clearRetainingCapacity();
         self.text_bytes.clearRetainingCapacity();
@@ -838,40 +840,29 @@ pub const Cursor = struct {
         if (!self.document_started) {
             try self.prepareDocument();
             self.document_started = true;
-            return .{
-                .span = .{ .start = 0, .end = self.source.currentOffset() },
-                .data = .document_start,
-            };
         }
 
         if (self.pending_empty) return try self.syntheticEnd();
 
         while (true) {
             if (self.in_cdata) {
-                return self.readTextEvent() catch |err| switch (err) {
-                    error.NoText => continue,
-                    else => err,
-                };
+                if (try self.readTextEvent()) |event| return event;
+                continue;
             }
             if (ignore_whitespace) self.skipBufferedWhitespace();
             const first = self.source.peekCodepoint() catch |err| switch (err) {
                 error.EndOfStream => {
                     if (self.root_seen and self.root_closed and self.depth == 0) {
                         self.document_ended = true;
-                        return .{
-                            .span = .{ .start = self.source.position, .end = self.source.position },
-                            .data = .document_end,
-                        };
+                        return null;
                     }
                     return self.malformed(.unexpected_end);
                 },
-                else => return err,
+                else => |other| return other,
             };
             if (first.value != '<') {
-                return self.readTextEvent() catch |err| switch (err) {
-                    error.NoText => continue,
-                    else => err,
-                };
+                if (try self.readTextEvent()) |event| return event;
+                continue;
             }
             self.normal_text_brackets = 0;
 
@@ -909,7 +900,7 @@ pub const Cursor = struct {
     fn prepareDocument(self: *Cursor) ParserError!void {
         const first = self.source.peekCodepoint() catch |err| switch (err) {
             error.EndOfStream => return,
-            else => return err,
+            else => |other| return other,
         };
         if (first.value != '<') return;
 
@@ -919,7 +910,7 @@ pub const Cursor = struct {
                 try self.source.unread(opening);
                 return;
             },
-            else => return err,
+            else => |other| return other,
         };
         if (marker.value != '?') {
             try self.source.unread(opening);
@@ -929,25 +920,18 @@ pub const Cursor = struct {
         try self.readProcessingInstruction(true);
     }
 
-    fn requiredCodepoint(self: *Cursor) Error!Codepoint {
+    fn requiredCodepoint(self: *Cursor) AdvanceError!Codepoint {
         return self.source.readCodepoint() catch |err| switch (err) {
-            error.EndOfStream, error.NoText => self.malformed(.unexpected_end),
-            else => err,
+            error.EndOfStream => self.malformed(.unexpected_end),
+            else => |other| other,
         };
     }
 
-    fn peekRequired(self: *Cursor) Error!Codepoint {
-        return self.source.peekCodepoint() catch |err| switch (err) {
-            error.EndOfStream, error.NoText => self.malformed(.unexpected_end),
-            else => err,
-        };
-    }
-
-    fn appendEventByte(self: *Cursor, value: u8) Error!void {
+    fn appendEventByte(self: *Cursor, value: u8) AdvanceError!void {
         return self.appendEventSlice(&.{value});
     }
 
-    fn appendEventSlice(self: *Cursor, value: []const u8) Error!void {
+    fn appendEventSlice(self: *Cursor, value: []const u8) AdvanceError!void {
         const next_length = std.math.add(usize, self.event_bytes.items.len, value.len) catch return error.LimitExceeded;
         if (next_length > self.max_attribute_bytes) {
             self.limit_needed = next_length;
@@ -956,20 +940,20 @@ pub const Cursor = struct {
         try self.event_bytes.appendSlice(self.allocator, value);
     }
 
-    fn appendCodepoint(self: *Cursor, value: u21) Error!void {
+    fn appendCodepoint(self: *Cursor, value: u21) AdvanceError!void {
         var encoded: [4]u8 = undefined;
         try self.appendEventSlice(encodeChar(value, &encoded) orelse return self.malformed(.invalid_character));
     }
 
     // Callers check the chunk has room first, so text ends a chunk instead of failing.
-    fn appendTextCodepoint(self: *Cursor, value: u21) Error!void {
+    fn appendTextCodepoint(self: *Cursor, value: u21) AdvanceError!void {
         var encoded: [4]u8 = undefined;
         const bytes = encodeChar(value, &encoded) orelse return self.malformed(.invalid_character);
         std.debug.assert(bytes.len <= TEXT_CHUNK_BYTES - self.text_bytes.items.len);
         try self.text_bytes.appendSlice(self.allocator, bytes);
     }
 
-    fn skipWhitespace(self: *Cursor) Error!void {
+    fn skipWhitespace(self: *Cursor) ParserError!void {
         while (true) {
             if (try self.source.peekSingleByte()) |bytes| {
                 var length: usize = 0;
@@ -982,15 +966,15 @@ pub const Cursor = struct {
                 continue;
             }
             const value = self.source.peekCodepoint() catch |err| return switch (err) {
-                error.EndOfStream, error.NoText => {},
-                else => err,
+                error.EndOfStream => {},
+                else => |other| other,
             };
             if (!isXmlWhitespace(value.value)) return;
             _ = try self.requiredCodepoint();
         }
     }
 
-    fn parseQName(self: *Cursor) Error!NameRange {
+    fn parseQName(self: *Cursor) ParserError!NameRange {
         const start = self.event_bytes.items.len;
         var have_character = false;
         var prefix_len: usize = 0;
@@ -1047,7 +1031,7 @@ pub const Cursor = struct {
         return .{ .start = start, .len = self.event_bytes.items.len - start, .prefix_len = prefix_len };
     }
 
-    fn parseAttributeValue(self: *Cursor, quote: u21) Error!Range {
+    fn parseAttributeValue(self: *Cursor, quote: u21) ParserError!Range {
         const start = self.event_bytes.items.len;
         while (true) {
             if (try self.source.peekSingleByte()) |bytes| {
@@ -1071,7 +1055,7 @@ pub const Cursor = struct {
                 if (value.value == '\r') {
                     const next = self.source.peekCodepoint() catch |err| switch (err) {
                         error.EndOfStream => null,
-                        else => return err,
+                        else => |other| return other,
                     };
                     if (next) |following| {
                         if (following.value == '\n') _ = try self.requiredCodepoint();
@@ -1087,7 +1071,7 @@ pub const Cursor = struct {
 
     /// Reads an entity or character reference after '&' through its ';'.
     /// Digits stream, so any number of leading zeros is accepted.
-    fn readEntity(self: *Cursor) Error!u21 {
+    fn readEntity(self: *Cursor) AdvanceError!u21 {
         const start = self.source.last_start;
         const first = (try self.requiredCodepoint()).value;
         if (first != '#') {
@@ -1150,7 +1134,7 @@ pub const Cursor = struct {
         return false;
     }
 
-    fn readBufferedStartElement(self: *Cursor, start_offset: u64) Error!?Event {
+    fn readBufferedStartElement(self: *Cursor, start_offset: u64) AdvanceError!?Event {
         if (!self.source.bytesAreCharacters()) return null;
         const reader = self.source.reader orelse return null;
         const bytes = reader.buffered();
@@ -1215,7 +1199,7 @@ pub const Cursor = struct {
         return try self.finishStartElement(bytes, start_offset, name_offset, name_range, empty);
     }
 
-    fn readStartElement(self: *Cursor, start_offset: u64) Error!Event {
+    fn readStartElement(self: *Cursor, start_offset: u64) ParserError!Event {
         self.event_bytes.clearRetainingCapacity();
         self.attribute_ranges.clearRetainingCapacity();
         self.namespace_declarations.clearRetainingCapacity();
@@ -1279,7 +1263,7 @@ pub const Cursor = struct {
         return self.finishStartElement(self.event_bytes.items, start_offset, name_offset, name_range, empty);
     }
 
-    fn finishStartElement(self: *Cursor, bytes: []const u8, start_offset: u64, name_offset: u64, name_range: NameRange, empty: bool) Error!Event {
+    fn finishStartElement(self: *Cursor, bytes: []const u8, start_offset: u64, name_offset: u64, name_range: NameRange, empty: bool) AdvanceError!Event {
         if (self.depth == 0) {
             if (self.root_closed) return self.malformedAt(.content_after_root, start_offset);
             self.root_seen = true;
@@ -1329,7 +1313,7 @@ pub const Cursor = struct {
     }
 
     // Raw attribute names are unique, so each prefix is declared once per element.
-    fn installNamespaces(self: *Cursor) Error!void {
+    fn installNamespaces(self: *Cursor) AdvanceError!void {
         if (self.namespace_declarations.items.len != 0) self.scopeChanged();
         for (self.namespace_declarations.items) |declaration| {
             const prefix = self.event_bytes.items[declaration.prefix.start..][0..declaration.prefix.len];
@@ -1377,7 +1361,7 @@ pub const Cursor = struct {
     }
 
     // An unprefixed attribute has no namespace; an unprefixed element has the default one.
-    fn makeName(self: *Cursor, bytes: []const u8, range: NameRange, comptime attribute: bool, offset: u64) Error!Name {
+    fn makeName(self: *Cursor, bytes: []const u8, range: NameRange, comptime attribute: bool, offset: u64) AdvanceError!Name {
         const raw = bytes[range.start..][0..range.len];
         const prefix = if (range.prefix_len == 0) null else raw[0..range.prefix_len];
         const local = if (range.prefix_len == 0) raw else raw[range.prefix_len + 1 ..];
@@ -1405,7 +1389,7 @@ pub const Cursor = struct {
         if (self.depth == 0) self.root_closed = true;
     }
 
-    fn readEndElement(self: *Cursor, start_offset: u64) Error!Event {
+    fn readEndElement(self: *Cursor, start_offset: u64) ParserError!Event {
         if (self.depth == 0) return self.malformedAt(.mismatched_end_tag, start_offset);
         const name_offset = self.source.currentOffset();
         const name_range = try self.parseQName();
@@ -1424,7 +1408,7 @@ pub const Cursor = struct {
         };
     }
 
-    fn syntheticEnd(self: *Cursor) Error!Event {
+    fn syntheticEnd(self: *Cursor) AdvanceError!Event {
         if (!self.pending_empty or self.depth == 0) return error.InvalidState;
         const frame = self.frames[self.depth - 1];
         self.event_bytes.clearRetainingCapacity();
@@ -1438,12 +1422,13 @@ pub const Cursor = struct {
         };
     }
 
-    fn readTextEvent(self: *Cursor) ParserError!Event {
+    // Null when the run held no text: ignored whitespace, or markup that produced none.
+    fn readTextEvent(self: *Cursor) ParserError!?Event {
         if (self.in_cdata) return self.readCdataText();
         return self.readScalarText();
     }
 
-    fn readScalarText(self: *Cursor) ParserError!Event {
+    fn readScalarText(self: *Cursor) ParserError!?Event {
         const start = self.source.currentOffset();
         while (self.text_bytes.items.len < TEXT_CHUNK_BYTES) {
             if (self.normal_text_brackets == 0) {
@@ -1460,7 +1445,7 @@ pub const Cursor = struct {
             }
             const value = self.source.peekCodepoint() catch |err| switch (err) {
                 error.EndOfStream => break,
-                else => return err,
+                else => |other| return other,
             };
             if (value.value == '<') break;
             if (value.value == '&') {
@@ -1482,7 +1467,7 @@ pub const Cursor = struct {
                 self.normal_text_brackets = 0;
                 const next = self.source.peekCodepoint() catch |err| switch (err) {
                     error.EndOfStream => null,
-                    else => return err,
+                    else => |other| return other,
                 };
                 if (next) |following| {
                     if (following.value == '\n') _ = try self.requiredCodepoint();
@@ -1493,14 +1478,14 @@ pub const Cursor = struct {
                 try self.appendTextCodepoint(value.value);
             }
         }
-        if (self.text_bytes.items.len == 0) return error.NoText;
+        if (self.text_bytes.items.len == 0) return null;
         return .{
             .span = .{ .start = start, .end = self.source.currentOffset() },
             .data = .{ .text = .{ .bytes = self.text_bytes.items } },
         };
     }
 
-    fn readCdataStart(self: *Cursor, start_offset: u64) Error!void {
+    fn readCdataStart(self: *Cursor, start_offset: u64) AdvanceError!void {
         if (self.depth == 0) return self.malformedAt(.malformed_markup, start_offset);
         for ("CDATA[") |expected| {
             const value = try self.requiredCodepoint();
@@ -1510,12 +1495,12 @@ pub const Cursor = struct {
         self.cdata_brackets = 0;
     }
 
-    fn readCdataText(self: *Cursor) ParserError!Event {
+    fn readCdataText(self: *Cursor) ParserError!?Event {
         const start = self.source.currentOffset();
         while (self.text_bytes.items.len < TEXT_CHUNK_BYTES) {
             const value = self.source.peekCodepoint() catch |err| switch (err) {
                 error.EndOfStream => return self.malformed(.unexpected_end),
-                else => return err,
+                else => |other| return other,
             };
             const output_length = if (value.value == ']')
                 if (self.cdata_brackets == 2) @as(usize, 1) else 0
@@ -1545,7 +1530,7 @@ pub const Cursor = struct {
             if (value.value == '\r') {
                 const next = self.source.peekCodepoint() catch |err| switch (err) {
                     error.EndOfStream => null,
-                    else => return err,
+                    else => |other| return other,
                 };
                 if (next) |following| {
                     if (following.value == '\n') _ = try self.requiredCodepoint();
@@ -1555,14 +1540,14 @@ pub const Cursor = struct {
                 try self.appendTextCodepoint(value.value);
             }
         }
-        if (self.text_bytes.items.len == 0) return error.NoText;
+        if (self.text_bytes.items.len == 0) return null;
         return .{
             .span = .{ .start = start, .end = self.source.currentOffset() },
             .data = .{ .text = .{ .bytes = self.text_bytes.items } },
         };
     }
 
-    fn readComment(self: *Cursor) Error!void {
+    fn readComment(self: *Cursor) AdvanceError!void {
         var dashes: u2 = 0;
         while (true) {
             const value = try self.requiredCodepoint();
@@ -1580,7 +1565,7 @@ pub const Cursor = struct {
         }
     }
 
-    fn readProcessingInstruction(self: *Cursor, initial: bool) Error!void {
+    fn readProcessingInstruction(self: *Cursor, initial: bool) ParserError!void {
         self.event_bytes.clearRetainingCapacity();
         const target_offset = self.source.currentOffset();
         const target = try self.parseQName();
@@ -1614,17 +1599,17 @@ pub const Cursor = struct {
         if (declaration) try self.parseXmlDeclaration();
     }
 
-    fn appendDeclarationByte(self: *Cursor, value: u8) Error!void {
+    fn appendDeclarationByte(self: *Cursor, value: u8) AdvanceError!void {
         if (self.declaration_bytes.items.len == MAX_DECLARATION_BYTES) return self.limitError(.declaration_bytes);
         try self.declaration_bytes.append(self.allocator, value);
     }
 
     // The rule's offending character is the last one read, except at the end of input.
-    fn malformed(self: *Cursor, rule: Rule) Error {
+    fn malformed(self: *Cursor, rule: Rule) AdvanceError {
         return self.malformedAt(rule, if (rule == .unexpected_end) self.source.currentOffset() else self.source.last_start);
     }
 
-    fn malformedAt(self: *Cursor, rule: Rule, offset: u64) Error {
+    fn malformedAt(self: *Cursor, rule: Rule, offset: u64) AdvanceError {
         self.xml_rule = rule;
         self.failure_offset = offset;
         self.offset = offset;
@@ -1632,7 +1617,7 @@ pub const Cursor = struct {
     }
 
     // Declaration bytes are ASCII, one character each.
-    fn declarationError(self: *Cursor, position: usize, err: Error) Error {
+    fn declarationError(self: *Cursor, position: usize, err: AdvanceError) AdvanceError {
         const offset = self.declaration_start + position * self.source.unitWidth();
         if (err == error.InvalidXml) return self.malformedAt(.malformed_declaration, offset);
         self.failure_offset = offset;
@@ -1642,18 +1627,18 @@ pub const Cursor = struct {
 
     // A failure's offset: the offending character for broken rules and encodings, otherwise
     // the next unread byte.
-    fn failedAt(self: *const Cursor, err: Error) u64 {
+    fn failedAt(self: *const Cursor, err: ParserError) u64 {
         if (self.failure_offset) |offset| return offset;
         if (err == error.InvalidEncoding) return self.source.last_start;
         return self.source.currentOffset();
     }
 
-    fn limitError(self: *Cursor, limit: @TypeOf(self.limit_failure.?)) Error {
+    fn limitError(self: *Cursor, limit: @TypeOf(self.limit_failure.?)) AdvanceError {
         self.limit_failure = limit;
         return error.LimitExceeded;
     }
 
-    fn parseXmlDeclaration(self: *Cursor) Error!void {
+    fn parseXmlDeclaration(self: *Cursor) AdvanceError!void {
         const bytes = self.declaration_bytes.items;
         var position: usize = 0;
         var version: ?[]const u8 = null;
@@ -1732,11 +1717,10 @@ fn digitValue(value: u8, base: u32) ?u32 {
     return digit;
 }
 
-/// Writer construction failures caused by invalid options.
-pub const WriterInitError = error{InvalidOptions};
 /// Writer state, namespace, character, sink, and bound failures.
 pub const WriterError = error{
     InvalidState,
+    OverlappingBuffers,
     InvalidName,
     InvalidCharacter,
     InvalidNamespace,
@@ -1788,7 +1772,7 @@ pub const Writer = struct {
     binary_carry_len: usize = 0,
 
     /// Initializes a writer over a caller-owned sink.
-    pub fn init(allocator: std.mem.Allocator, sink: *std.Io.Writer, options: struct { fragment: bool = false }) WriterInitError!Writer {
+    pub fn init(allocator: std.mem.Allocator, sink: *std.Io.Writer, options: struct { fragment: bool = false }) Writer {
         return .{ .allocator = allocator, .sink = sink, .state = if (options.fragment) .epilog else .initial };
     }
 
@@ -1810,7 +1794,7 @@ pub const Writer = struct {
     fn checkInput(self: *Writer, bytes: []const u8) WriterError!void {
         if (self.overlapsOutput(bytes)) {
             @branchHint(.cold);
-            return self.fail(error.InvalidState);
+            return self.fail(error.OverlappingBuffers);
         }
     }
 
@@ -2260,7 +2244,7 @@ test "[property] - [mzML XML writer]: generated Base64 preserves text state, off
                 var failures: [2]?WriterError = .{ null, null };
                 for (0..2) |i| {
                     var sink = std.Io.Writer.fixed(output[i][0..capacity]);
-                    var writer = try Writer.init(std.testing.allocator, &sink, .{});
+                    var writer = Writer.init(std.testing.allocator, &sink, .{});
                     defer writer.deinit();
                     writeBinaryCase(&writer, wire[0..length], i == 1, prefix) catch |err| {
                         failures[i] = err;
@@ -2303,6 +2287,8 @@ test "[unit] - [mzML XML cursor]: skips declarations, comments, processing instr
     try std.testing.expectEqualStrings("p:mzML", cursor.current.?.data.end_element.name.raw);
     try cursor.advance(false);
     try std.testing.expectEqual(@as(?Event, null), cursor.current);
+    // The end of the document is reported once; reading past it is an error.
+    try std.testing.expectError(error.UnexpectedEnd, cursor.advance(false));
 }
 
 test "[unit] - [mzML XML cursor]: a written fragment declares its scope once and nested elements their own" {
@@ -2315,13 +2301,16 @@ test "[unit] - [mzML XML cursor]: a written fragment declares its scope once and
     try cursor.advanceFragment(false);
     var buffer: [512]u8 = undefined;
     var sink = std.Io.Writer.fixed(&buffer);
-    var output = try Writer.init(std.testing.allocator, &sink, .{ .fragment = true });
+    var output = Writer.init(std.testing.allocator, &sink, .{ .fragment = true });
     defer output.deinit();
     var remaining: usize = 100;
     try cursor.writeElement(&output, &remaining);
     // Redundant and inherited bindings are not repeated; shadowing and undeclaring are kept.
     try std.testing.expectEqualStrings("<f xmlns=\"urn:d\" xmlns:a=\"urn:a\" xmlns:b=\"urn:b\"><a:x b:y=\"1\" a:y=\"2\">" ++
         "<c xmlns=\"\" xmlns:a=\"urn:a2\"><a:z/></c><d/></a:x></f>", sink.buffered());
+    // On the end event the walkers have no subtree; that is the call's fault, not the input's.
+    try std.testing.expectError(error.InvalidState, cursor.skipElement(&remaining));
+    try std.testing.expectError(error.InvalidState, cursor.writeElement(&output, &remaining));
 }
 
 test "[property] - [mzML XML cursor]: decodes Latin-1 attributes text and CDATA across refills" {
@@ -2488,6 +2477,9 @@ test "[unit] - [mzML XML cursor]: decodes UTF-8 at the bounds of every well-form
         try cursor.advanceFragment(true);
         try cursor.advanceFragment(true);
         try std.testing.expectEqualStrings(text, cursor.current.?.data.text.bytes);
+        // After the document ends, a fragment advance leaves no event again instead of failing.
+        for (0..3) |_| try cursor.advanceFragment(true);
+        try std.testing.expectEqual(null, cursor.current);
     }
 }
 
@@ -2926,7 +2918,7 @@ test "[property] - [mzML XML writer]: preserves text runs, split brackets, and l
         const expected = try std.fmt.bufPrint(&expected_buffer, opening ++ ">]]{s}]]&gt;&lt;&amp;&#xD;\xc2\xb5]]&gt;</binary>", .{ordinary[0..length]});
         for ([_]usize{ 0, length / 2, length, length + 1, length + 2, length + 3, value.len }) |split| {
             var sink = std.Io.Writer.fixed(&output);
-            var writer = try Writer.init(std.testing.allocator, &sink, .{});
+            var writer = Writer.init(std.testing.allocator, &sink, .{});
             defer writer.deinit();
             try writer.startDocument();
             try writer.startElement("binary");
@@ -2943,7 +2935,7 @@ test "[property] - [mzML XML writer]: preserves text runs, split brackets, and l
             const bad = try std.fmt.bufPrint(&value_buffer, "{s}&{s}", .{ ordinary[0..length], invalid });
             for ([_]bool{ false, true }) |attribute| {
                 var sink = std.Io.Writer.fixed(&output);
-                var writer = try Writer.init(std.testing.allocator, &sink, .{});
+                var writer = Writer.init(std.testing.allocator, &sink, .{});
                 defer writer.deinit();
                 try writer.startDocument();
                 try writer.startElement("binary");
@@ -2961,7 +2953,7 @@ test "[property] - [mzML XML writer]: preserves text runs, split brackets, and l
 test "[unit] - [mzML XML writer]: emits escaped values and flushes empty text" {
     var output: [1024]u8 = undefined;
     var sink = std.Io.Writer.fixed(&output);
-    var writer = try Writer.init(std.testing.allocator, &sink, .{});
+    var writer = Writer.init(std.testing.allocator, &sink, .{});
     defer writer.deinit();
 
     try writer.startDocument();
@@ -2981,7 +2973,7 @@ test "[unit] - [mzML XML writer]: emits escaped values and flushes empty text" {
 test "[unit] - [mzML XML writer]: keeps duplicate-attribute failures sticky" {
     var output: [128]u8 = undefined;
     var sink = std.Io.Writer.fixed(&output);
-    var writer = try Writer.init(std.testing.allocator, &sink, .{});
+    var writer = Writer.init(std.testing.allocator, &sink, .{});
     defer writer.deinit();
 
     try writer.startDocument();
@@ -2999,7 +2991,7 @@ test "[property] - [mzML XML writer]: copies attribute names and permits reuse o
     var expected_buffer: [32768]u8 = undefined;
     for ([_]usize{ 1, 7, 8, 9, 15, 16, 17, 255, 256, 257, 4096 }) |length| {
         var sink = std.Io.Writer.fixed(&output);
-        var writer = try Writer.init(std.testing.allocator, &sink, .{});
+        var writer = Writer.init(std.testing.allocator, &sink, .{});
         defer writer.deinit();
         try writer.startDocument();
         try writer.startElement("mzML");
@@ -3028,7 +3020,7 @@ test "[unit] - [mzML XML writer]: rejects undeclared namespace names" {
     {
         var output: [256]u8 = undefined;
         var sink = std.Io.Writer.fixed(&output);
-        var writer = try Writer.init(std.testing.allocator, &sink, .{});
+        var writer = Writer.init(std.testing.allocator, &sink, .{});
         defer writer.deinit();
 
         try writer.startDocument();
@@ -3039,7 +3031,7 @@ test "[unit] - [mzML XML writer]: rejects undeclared namespace names" {
     {
         var output: [256]u8 = undefined;
         var sink = std.Io.Writer.fixed(&output);
-        var writer = try Writer.init(std.testing.allocator, &sink, .{});
+        var writer = Writer.init(std.testing.allocator, &sink, .{});
         defer writer.deinit();
 
         try writer.startDocument();
@@ -3101,7 +3093,7 @@ test "[property] - [mzML XML writer]: Base64 in pieces equals Base64 of the whol
     for (&wire, 0..) |*byte, i| byte.* = @truncate(i * 37 + 11);
     var whole_bytes: [256]u8 = undefined;
     var whole_sink = std.Io.Writer.fixed(&whole_bytes);
-    var whole = try Writer.init(std.testing.allocator, &whole_sink, .{ .fragment = true });
+    var whole = Writer.init(std.testing.allocator, &whole_sink, .{ .fragment = true });
     defer whole.deinit();
     try whole.startElement("binary");
     try whole.binary(&wire);
@@ -3109,7 +3101,7 @@ test "[property] - [mzML XML writer]: Base64 in pieces equals Base64 of the whol
     for (1..8) |piece| {
         var bytes: [256]u8 = undefined;
         var sink = std.Io.Writer.fixed(&bytes);
-        var writer = try Writer.init(std.testing.allocator, &sink, .{ .fragment = true });
+        var writer = Writer.init(std.testing.allocator, &sink, .{ .fragment = true });
         defer writer.deinit();
         try writer.startElement("binary");
         var at: usize = 0;
@@ -3120,7 +3112,7 @@ test "[property] - [mzML XML writer]: Base64 in pieces equals Base64 of the whol
     }
     var bytes: [256]u8 = undefined;
     var sink = std.Io.Writer.fixed(&bytes);
-    var writer = try Writer.init(std.testing.allocator, &sink, .{ .fragment = true });
+    var writer = Writer.init(std.testing.allocator, &sink, .{ .fragment = true });
     defer writer.deinit();
     try writer.startElement("binary");
     try writer.binaryPart(wire[0..4]);

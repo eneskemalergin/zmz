@@ -23,8 +23,9 @@ test "[failure] - [mzML diagnostics]: keeps failed index builds after cleanup an
     for ([_]mzml.IndexedReader.Policy{ .rebuild, .open_embedded }) |policy| {
         try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.build, .{policy});
         var report: ?mzml.Diagnostic = null;
-        try std.testing.expectError(error.LimitExceeded, mzml.IndexedReader.buildWithDiagnostic(std.testing.allocator, .{ .bytes = @embedFile("data/writer_indexed.mzML") }, .{ .policy = policy, .max_records = 0 }, &report));
+        try std.testing.expectError(error.LimitExceeded, mzml.IndexedReader.buildWithDiagnostic(std.testing.allocator, .{ .bytes = @embedFile("data/writer_indexed.mzML") }, .{ .policy = policy, .records = 0 }, &report));
         try std.testing.expectEqual(.records, report.?.detail.limit.name);
+        try std.testing.expectEqual(.index, report.?.stage);
         try std.testing.expectEqual(@as(u64, 0), report.?.detail.limit.maximum);
         try std.testing.expectEqual(if (policy == .rebuild) mzml.Diagnostic.Operation.rebuild_index else .open_index, report.?.operation);
         var index = try mzml.IndexedReader.buildWithDiagnostic(std.testing.allocator, .{ .bytes = @embedFile("data/writer_indexed.mzML") }, .{ .policy = policy }, &report);
@@ -58,7 +59,7 @@ test "[failure] - [mzML diagnostics]: translates fresh and reused UTF-16 lookup 
         for (support.DOCUMENT, 0..) |byte, i| std.mem.writeInt(u16, source[2 + i * 2 ..][0..2], byte, endian);
         var index = try mzml.IndexedReader.build(allocator, .{ .bytes = source }, .{ .policy = .rebuild });
         defer index.deinit();
-        var output = mzml.StreamReader.DecodedArrays.init(allocator, .{});
+        var output = mzml.DecodedArrays.init(allocator, .{});
         defer output.deinit();
         for ([_]bool{ false, true }) |reuse| {
             if (reuse) {
@@ -107,21 +108,21 @@ test "[integration] - [mzML 1.0 indexes]: retains IDs offsets and selected value
             var input = std.Io.Reader.fixed(bytes);
             var reader = try mzml.StreamReader.init(allocator, &input, .{ .array_selector = if (selected) .{ .select = select } else null });
             defer reader.deinit();
-            var decoded = mzml.StreamReader.DecodedArrays.init(allocator, .{});
+            var decoded = mzml.DecodedArrays.init(allocator, .{});
             defer decoded.deinit();
-            for (index.entries.items) |entry| {
+            for (index.entries()) |entry| {
                 const expected = (try reader.nextRecord()).?;
                 try std.testing.expectEqualStrings(entry.id, expected.id);
                 var by_id = (try index.byId(allocator, entry.id)).?;
                 defer by_id.deinit();
-                var ordinal = (try index.at(allocator, entry.kind, entry.index)).?;
+                var ordinal = (try index.at(allocator, entry.kind, entry.ordinal)).?;
                 defer ordinal.deinit();
                 try support.expectNode(expected.node, by_id.value.node);
                 try support.expectNode(expected.node, ordinal.value.node);
                 try std.testing.expectEqual(expected.node.start_offset, by_id.value.node.start_offset);
                 try std.testing.expectEqual(expected.node.end_offset, by_id.value.node.end_offset);
                 for ([_]bool{ false, true }) |by_name| {
-                    var numeric = (if (by_name) try index.byIdDecoded(allocator, entry.id, &decoded) else try index.atDecoded(allocator, entry.kind, entry.index, &decoded)).?;
+                    var numeric = (if (by_name) try index.byIdDecoded(allocator, entry.id, &decoded) else try index.atDecoded(allocator, entry.kind, entry.ordinal, &decoded)).?;
                     defer numeric.deinit();
                     try std.testing.expectEqualStrings(expected.id, numeric.value.id);
                     try std.testing.expectEqual(expected.node.start_offset, numeric.value.node.start_offset);
@@ -198,7 +199,7 @@ fn expectDecodedNode(expected: mzml.model.Node, actual: mzml.model.Node) !void {
     for (expected.children, actual.children) |left, right| try expectDecodedNode(left, right);
 }
 
-fn expectDecodedRecord(record: mzml.model.Record, groups: []const mzml.cv.Group, actual: mzml.model.Record, output: *const mzml.StreamReader.DecodedArrays) !void {
+fn expectDecodedRecord(record: mzml.model.Record, groups: []const mzml.cv.Group, actual: mzml.model.Record, output: *const mzml.DecodedArrays) !void {
     try expectDecodedNode(record.node, actual.node);
     try std.testing.expectEqualStrings(record.id, actual.id);
     try std.testing.expectEqual(record.index, actual.index);
@@ -237,11 +238,11 @@ fn checkDecodedLookupAllocations(allocator: std.mem.Allocator, selected: bool) !
         .reader = .{ .array_selector = if (selected) .{ .select = Selection.select } else null },
     });
     defer index.deinit();
-    var output = mzml.StreamReader.DecodedArrays.init(allocator, .{});
+    var output = mzml.DecodedArrays.init(allocator, .{});
     defer output.deinit();
     var record = (index.byIdDecoded(allocator, "scan=slof_zlib", &output) catch |err| {
         try std.testing.expectEqual(@as(usize, 0), output.len());
-        var recovered_output = mzml.StreamReader.DecodedArrays.init(std.testing.allocator, .{});
+        var recovered_output = mzml.DecodedArrays.init(std.testing.allocator, .{});
         defer recovered_output.deinit();
         var recovered = (try index.atDecoded(std.testing.allocator, .spectrum, 0, &recovered_output)).?;
         defer recovered.deinit();
@@ -257,17 +258,17 @@ test "[integration] - [mzML indexed decoding]: preserves codecs, groups, metadat
     const allocator = std.testing.allocator;
     const source = @embedFile("data/writer_indexed.mzML");
     for (std.enums.values(mzml.IndexedReader.Policy)) |policy| {
-        var output = mzml.StreamReader.DecodedArrays.init(allocator, .{});
+        var output = mzml.DecodedArrays.init(allocator, .{});
         defer output.deinit();
         var retained = blk: {
             var index = try mzml.IndexedReader.build(allocator, .{ .bytes = source }, .{ .policy = policy });
             defer index.deinit();
             var first = (try index.byIdDecoded(allocator, "scan=none", &output)).?;
             errdefer first.deinit();
-            for (index.entries.items) |entry| {
-                var decoded = (try index.atDecoded(allocator, entry.kind, entry.index, &output)).?;
+            for (index.entries()) |entry| {
+                var decoded = (try index.atDecoded(allocator, entry.kind, entry.ordinal, &output)).?;
                 defer decoded.deinit();
-                var ordinary = (try index.at(allocator, entry.kind, entry.index)).?;
+                var ordinary = (try index.at(allocator, entry.kind, entry.ordinal)).?;
                 defer ordinary.deinit();
                 try expectDecodedRecord(ordinary.value, index.header().groups, decoded.value, &output);
                 try std.testing.expectEqualStrings("scan=none", first.value.id);
@@ -327,7 +328,7 @@ test "[integration] - [mzML indexed decoding]: selects arrays and records withou
             var input = std.Io.Reader.fixed(bytes);
             var reader = try mzml.StreamReader.init(allocator, &input, .{});
             defer reader.deinit();
-            var output = mzml.StreamReader.DecodedArrays.init(allocator, .{});
+            var output = mzml.DecodedArrays.init(allocator, .{});
             defer output.deinit();
             while (try reader.nextRecord()) |expected| {
                 for ([_]bool{ false, true }) |by_id| {
@@ -386,14 +387,14 @@ test "[integration] - [mzML index]: keeps lookup ordinals separate from source i
                 var reader = try mzml.StreamReader.init(allocator, &input, .{});
                 defer reader.deinit();
                 const header = try reader.readHeader();
-                var output = mzml.StreamReader.DecodedArrays.init(allocator, .{});
+                var output = mzml.DecodedArrays.init(allocator, .{});
                 defer output.deinit();
                 var counts = [_]usize{ 0, 0 };
                 while (try reader.nextRecord()) |record| {
                     const k: usize = if (record.node.kind == .spectrum) 0 else 1;
                     const ordinal = counts[k];
-                    const entry = index.entries.items[counts[0] + counts[1]];
-                    try std.testing.expectEqual(ordinal, entry.index);
+                    const entry = index.entries()[counts[0] + counts[1]];
+                    try std.testing.expectEqual(ordinal, entry.ordinal);
                     try std.testing.expectEqualStrings(record.id, entry.id);
                     counts[k] += 1;
                     try std.testing.expectEqual(if (missing) @as(?usize, null) else 9, record.index);
@@ -450,7 +451,7 @@ test "[integration] - [mzML index]: traverses entries without trusting declared 
                     var input = std.Io.Reader.fixed(bytes);
                     var reader = try mzml.StreamReader.init(allocator, &input, .{ .retain_index = true });
                     defer reader.deinit();
-                    var output = mzml.StreamReader.DecodedArrays.init(allocator, .{});
+                    var output = mzml.DecodedArrays.init(allocator, .{});
                     defer output.deinit();
                     var records: usize = 0;
                     while (try reader.nextRecord()) |record| {
@@ -492,11 +493,11 @@ test "[integration] - [mzML index]: decodes explicit array lengths without a rec
                     .reader = .{ .array_selector = if (selected) .{ .select = Selection.select } else null },
                 });
                 defer index.deinit();
-                var output = mzml.StreamReader.DecodedArrays.init(allocator, .{});
+                var output = mzml.DecodedArrays.init(allocator, .{});
                 defer output.deinit();
-                for (index.entries.items) |entry| {
+                for (index.entries()) |entry| {
                     for ([_]bool{ false, true }) |by_id| {
-                        const result = if (by_id) index.byIdDecoded(allocator, entry.id, &output) else index.atDecoded(allocator, entry.kind, entry.index, &output);
+                        const result = if (by_id) index.byIdDecoded(allocator, entry.id, &output) else index.atDecoded(allocator, entry.kind, entry.ordinal, &output);
                         if (selected) {
                             var record = (try result).?;
                             defer record.deinit();
@@ -505,11 +506,11 @@ test "[integration] - [mzML index]: decodes explicit array lengths without a rec
                             try std.testing.expectEqual(@as(usize, 1), output.get(0).?.source_position);
                             try std.testing.expectEqualSlices(f64, &.{1}, output.get(0).?.values.float64);
                         } else {
-                            try std.testing.expectError(error.MissingValue, result);
+                            try std.testing.expectError(error.MissingAttribute, result);
                             try std.testing.expectEqual(@as(usize, 0), output.len());
                         }
                     }
-                    var record = (try index.at(allocator, entry.kind, entry.index)).?;
+                    var record = (try index.at(allocator, entry.kind, entry.ordinal)).?;
                     defer record.deinit();
                     try std.testing.expectEqual(null, record.value.default_array_length);
                     try std.testing.expectEqual(null, record.value.node.attribute("defaultArrayLength"));
@@ -528,7 +529,7 @@ test "[integration] - [mzML index]: reads trailer fields used for lookup" {
     {
         var index = try mzml.IndexedReader.build(allocator, .{ .bytes = bytes }, .{});
         defer index.deinit();
-        try std.testing.expectEqual(@as(usize, 16), index.entries.items.len);
+        try std.testing.expectEqual(@as(usize, 16), index.entries().len);
         var record = (try index.at(allocator, .spectrum, 0)).?;
         defer record.deinit();
         try std.testing.expectEqualStrings("scan=none", record.value.id);
@@ -553,7 +554,7 @@ test "[failure] - [mzML indexed decoding]: clears results and recovers after dec
     defer allocator.free(source);
     var index = try mzml.IndexedReader.build(allocator, .{ .bytes = source }, .{ .policy = .open_embedded });
     defer index.deinit();
-    var output = mzml.StreamReader.DecodedArrays.init(allocator, .{});
+    var output = mzml.DecodedArrays.init(allocator, .{});
     defer output.deinit();
     const payload = std.mem.indexOf(u8, source, "<binary>").? + "<binary>".len;
     const end = std.mem.indexOf(u8, source, "</spectrum>").? + "</spectrum".len - 1;
@@ -600,7 +601,7 @@ test "[failure] - [mzML indexed decoding]: clears results and recovers after dec
     try std.testing.expectError(error.InvalidOptions, index.atDecoded(allocator, .run, 0, &output));
     try std.testing.expectEqual(error.InvalidOptions, index.diagnostic().?.code);
     try std.testing.expectEqual(mzml.Diagnostic.Id.invalid_options, index.diagnostic().?.id);
-    var limited = mzml.StreamReader.DecodedArrays.init(allocator, .{ .array_bytes = 1 });
+    var limited = mzml.DecodedArrays.init(allocator, .{ .array_bytes = 1 });
     defer limited.deinit();
     try std.testing.expectError(error.LimitExceeded, index.atDecoded(allocator, .spectrum, 0, &limited));
     try std.testing.expectEqual(@as(usize, 0), limited.len());
@@ -645,7 +646,7 @@ test "[failure] - [mzML indexed lookup]: checks the source once before reading a
     const io: std.Io = .{ .userdata = &source, .vtable = &vtable };
     var index = try mzml.IndexedReader.build(allocator, .{ .file = .{ .handle = file, .io = io } }, .{ .policy = .open_embedded });
     defer index.deinit();
-    var output = mzml.StreamReader.DecodedArrays.init(allocator, .{});
+    var output = mzml.DecodedArrays.init(allocator, .{});
     defer output.deinit();
     for ([_]bool{ false, true }) |by_id| {
         source = .{};
@@ -708,7 +709,7 @@ test "[integration] - [mzML indexed decoding]: preserves every primitive's bits 
     try source.writer.writeAll("<binaryDataArray encodedLength='0'><cvParam cvRef='MS' accession='MS:1000523' name='64-bit float'/><cvParam cvRef='MS' accession='MS:1000574' name='zlib compression'/><binary/></binaryDataArray></binaryDataArrayList></spectrum></spectrumList></run></mzML>");
     var index = try mzml.IndexedReader.build(allocator, .{ .bytes = source.written() }, .{ .policy = .rebuild });
     defer index.deinit();
-    var output = mzml.StreamReader.DecodedArrays.init(allocator, .{});
+    var output = mzml.DecodedArrays.init(allocator, .{});
     defer output.deinit();
     var decoded = (try index.atDecoded(allocator, .spectrum, 0, &output)).?;
     defer decoded.deinit();
@@ -774,7 +775,7 @@ test "[integration] - [mzML indexed selection]: selects only fetched arrays and 
             .reader = .{ .array_selector = .{ .user_data = &selection, .select = Selection.select } },
         });
         defer index.deinit();
-        var output = mzml.StreamReader.DecodedArrays.init(allocator, .{});
+        var output = mzml.DecodedArrays.init(allocator, .{});
         defer output.deinit();
         try std.testing.expectError(error.InvalidXml, if (numeric) index.atDecoded(allocator, .spectrum, 0, &output) else index.at(allocator, .spectrum, 0));
         try std.testing.expectEqual(@as(usize, 0), output.len());
@@ -849,7 +850,7 @@ test "[integration] - [mzML index]: reads Latin-1 offsets and rewrites metadata 
         for (std.enums.values(mzml.IndexedReader.Policy)) |policy| {
             var index = try mzml.IndexedReader.build(allocator, input, .{ .policy = policy });
             defer index.deinit();
-            var output = mzml.StreamReader.DecodedArrays.init(allocator, .{});
+            var output = mzml.DecodedArrays.init(allocator, .{});
             defer output.deinit();
             for ([_]usize{ 0, 1, 0, 1 }) |position| {
                 const id = ([_][]const u8{ "scan=\xc3\xa9", "scan=\xc3\xbf" })[position];
@@ -918,14 +919,14 @@ test "[integration] - [mzML indexed lookup]: crosses file refills with UTF-16 an
                 for ([_]mzml.IndexedReader.Source{ .{ .bytes = encoded }, .{ .file = .{ .handle = file, .io = std.testing.io } } }) |indexed_source| {
                     var index = try mzml.IndexedReader.build(allocator, indexed_source, .{ .policy = .rebuild, .reader = .{ .payload = payload } });
                     defer index.deinit();
-                    const span: usize = @intCast(index.entries.items[0].end - index.entries.items[0].start);
+                    const span: usize = @intCast(index.entries()[0].end - index.entries()[0].start);
                     index.options.record_span_bytes = span - 1;
                     try std.testing.expectError(error.LimitExceeded, index.at(allocator, .spectrum, 0));
                     index.options.record_span_bytes = span;
                     var record = (try index.byId(allocator, expected.id)).?;
                     defer record.deinit();
                     try std.testing.expectEqualDeep(expected, record.value);
-                    var output = mzml.StreamReader.DecodedArrays.init(allocator, .{});
+                    var output = mzml.DecodedArrays.init(allocator, .{});
                     defer output.deinit();
                     var decoded = (try index.atDecoded(allocator, .spectrum, 0, &output)).?;
                     defer decoded.deinit();
@@ -969,7 +970,7 @@ test "[property] - [mzML index]: preserves ID lookups across growth and reversed
         fn check(allocator: std.mem.Allocator, bytes: []const u8, policy: mzml.IndexedReader.Policy) !void {
             var index = try mzml.IndexedReader.build(allocator, .{ .bytes = bytes }, .{ .policy = policy });
             defer index.deinit();
-            try std.testing.expectEqual(@as(usize, 59), index.entries.items.len);
+            try std.testing.expectEqual(@as(usize, 59), index.entries().len);
         }
     };
     const allocator = std.testing.allocator;
@@ -1049,7 +1050,7 @@ test "[integration] - [mzML index]: opens embedded targets without checking unre
     try support.checkOpenEmbedded(std.testing.allocator, sink.buffered());
     try std.testing.checkAllAllocationFailures(std.testing.allocator, support.checkOpenEmbedded, .{sink.buffered()});
     try std.testing.expectError(error.InvalidOptions, mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = sink.buffered() }, .{ .policy = .open_embedded, .tail_bytes = 0 }));
-    try std.testing.expectError(error.LimitExceeded, mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = sink.buffered() }, .{ .policy = .open_embedded, .max_records = 1 }));
+    try std.testing.expectError(error.LimitExceeded, mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = sink.buffered() }, .{ .policy = .open_embedded, .records = 1 }));
     try std.testing.expectError(error.MissingIndex, mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = support.DOCUMENT }, .{ .policy = .open_embedded }));
     const checksum_start = try support.checksumStart(sink.buffered());
     const saved = buffer[checksum_start];
@@ -1148,8 +1149,8 @@ test "[integration] - [mzML index]: opens indented encoded targets and restores 
                     defer opened.deinit();
                     var rebuilt = try mzml.IndexedReader.build(allocator, .{ .bytes = bytes }, .{ .policy = .rebuild });
                     defer rebuilt.deinit();
-                    try std.testing.expectEqual(spectra + 1, opened.entries.items.len);
-                    for (opened.entries.items) |entry| {
+                    try std.testing.expectEqual(spectra + 1, opened.entries().len);
+                    for (opened.entries()) |entry| {
                         var actual = (try opened.at(allocator, entry.kind, 0)).?;
                         defer actual.deinit();
                         var expected = (try rebuilt.at(allocator, entry.kind, 0)).?;
@@ -1157,7 +1158,7 @@ test "[integration] - [mzML index]: opens indented encoded targets and restores 
                         try support.expectNode(expected.value.node, actual.value.node);
                         try std.testing.expectEqual(expected.value.node.start_offset, actual.value.node.start_offset);
                         try std.testing.expectEqual(expected.value.node.end_offset, actual.value.node.end_offset);
-                        var output = mzml.StreamReader.DecodedArrays.init(allocator, .{});
+                        var output = mzml.DecodedArrays.init(allocator, .{});
                         defer output.deinit();
                         var decoded = (try opened.byIdDecoded(allocator, entry.id, &output)).?;
                         defer decoded.deinit();
@@ -1272,7 +1273,7 @@ test "[integration] - [mzML index]: verifies emitted targets checksum and indepe
     try std.testing.expectError(error.InvalidXml, mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = sink.buffered() }, .{}));
     var rebuilt = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = sink.buffered() }, .{ .policy = .rebuild });
     defer rebuilt.deinit();
-    try std.testing.expectEqual(@as(usize, 16), rebuilt.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 16), rebuilt.entries().len);
 }
 
 test "[integration] - [mzML index]: discarded metadata does not consume retained record bytes" {
@@ -1294,9 +1295,9 @@ test "[integration] - [mzML index]: discarded metadata does not consume retained
             .reader = .{ .limits = .{ .record_bytes = 384 } },
         });
         defer index.deinit();
-        try std.testing.expectEqual(@as(usize, 2), index.entries.items.len);
-        try std.testing.expectEqualStrings("large", index.entries.items[0].id);
-        try std.testing.expectEqualStrings("small", index.entries.items[1].id);
+        try std.testing.expectEqual(@as(usize, 2), index.entries().len);
+        try std.testing.expectEqualStrings("large", index.entries()[0].id);
+        try std.testing.expectEqualStrings("small", index.entries()[1].id);
         try std.testing.expectError(error.LimitExceeded, index.at(allocator, .spectrum, 0));
         var small = (try index.at(allocator, .spectrum, 1)).?;
         defer small.deinit();
@@ -1310,7 +1311,7 @@ test "[integration] - [mzML index]: discarded metadata does not consume retained
         }));
         try std.testing.expectError(error.LimitExceeded, mzml.IndexedReader.build(allocator, .{ .bytes = bytes }, .{
             .policy = .rebuild,
-            .max_records = 1,
+            .records = 1,
         }));
         if (case != 2) try std.testing.expectError(error.LimitExceeded, mzml.IndexedReader.build(allocator, .{ .bytes = bytes }, .{
             .policy = .rebuild,
@@ -1339,7 +1340,7 @@ test "[integration] - [mzML index]: skips extra XML while preserving record span
         while (try reader.nextItem()) |item| {
             if (item != .record) continue;
             const record = item.record;
-            const entry = index.entries.items[count];
+            const entry = index.entries()[count];
             count += 1;
             try std.testing.expectEqual(record.node.start_offset, entry.start);
             try std.testing.expectEqual(record.node.end_offset, entry.end);
@@ -1347,7 +1348,7 @@ test "[integration] - [mzML index]: skips extra XML while preserving record span
             defer found.deinit();
             try std.testing.expectEqualDeep(record, found.value);
         }
-        try std.testing.expectEqual(index.entries.items.len, count);
+        try std.testing.expectEqual(index.entries().len, count);
         try std.testing.expectEqualDeep((try reader.readHeader()).*, index.header().*);
     }
 }
@@ -1367,7 +1368,7 @@ test "[property] - [mzML index]: preserves parser checks and limits during rebui
             };
             defer index.deinit();
             try std.testing.expectEqual(null, expected);
-            try std.testing.expectEqual(@as(usize, 2), index.entries.items.len);
+            try std.testing.expectEqual(@as(usize, 2), index.entries().len);
         }
     };
     for ([_]usize{ 0, 1, 2, 3, 4, 8, 16, 32, 64, 256, 1024, 4096, 8192 }) |limit| {
@@ -1428,12 +1429,12 @@ test "[integration] - [mzML index]: rebuilds from records without reading the un
         var actual = try mzml.IndexedReader.build(allocator, .{ .bytes = bytes }, .{ .policy = .rebuild });
         defer actual.deinit();
         try std.testing.expectEqualDeep(expected.header().*, actual.header().*);
-        try std.testing.expectEqualDeep(expected.entries.items, actual.entries.items);
+        try std.testing.expectEqualDeep(expected.entries(), actual.entries());
         for ([_]usize{ 0, 7, 8, 15 }) |position| {
-            const entry = actual.entries.items[position];
+            const entry = actual.entries()[position];
             var left = (try expected.byId(allocator, entry.id)).?;
             defer left.deinit();
-            var right = (try actual.at(allocator, entry.kind, entry.index)).?;
+            var right = (try actual.at(allocator, entry.kind, entry.ordinal)).?;
             defer right.deinit();
             try std.testing.expectEqualDeep(left.value, right.value);
         }
@@ -1449,18 +1450,18 @@ test "[integration] - [mzML index]: separates trailer budgets from header and re
     }) |limits| {
         try std.testing.expectError(error.LimitExceeded, support.readAll(allocator, source, .{ .retain_index = true, .limits = limits }));
         var index = try mzml.IndexedReader.build(allocator, .{ .bytes = source }, .{
-            .max_records = 16,
+            .records = 16,
             .reader = .{ .limits = limits },
         });
         defer index.deinit();
-        try std.testing.expectEqual(@as(usize, 16), index.entries.items.len);
+        try std.testing.expectEqual(@as(usize, 16), index.entries().len);
         var record = (try index.byId(allocator, "chromatogram=slof_zlib")).?;
         defer record.deinit();
         try std.testing.expectEqualStrings("chromatogram=slof_zlib", record.value.id);
         try std.testing.expectEqual(@as(usize, 7), record.value.index);
     }
     for ([_]mzml.IndexedReader.Options{
-        .{ .max_records = 15 },                               .{ .index_bytes = 1024 },
+        .{ .records = 15 },                                   .{ .index_bytes = 1024 },
         .{ .reader = .{ .limits = .{ .header_bytes = 1 } } }, .{ .reader = .{ .limits = .{ .nodes = 1 } } },
         .{ .reader = .{ .limits = .{ .list_entries = 1 } } },
     }) |options| {
@@ -1514,13 +1515,13 @@ test "[integration] - [mzML index]: builds plain files explicitly and rejects ch
     try std.testing.expectError(error.StaleSource, index.byId(std.testing.allocator, "absent"));
     try std.testing.expectError(error.StaleSource, index.at(std.testing.allocator, .spectrum, 0));
     try std.testing.expectError(error.StaleSource, index.at(std.testing.allocator, .spectrum, 100));
-    var decoded = mzml.StreamReader.DecodedArrays.init(std.testing.allocator, .{});
+    var decoded = mzml.DecodedArrays.init(std.testing.allocator, .{});
     defer decoded.deinit();
     try std.testing.expectError(error.StaleSource, index.byIdDecoded(std.testing.allocator, "absent", &decoded));
     try std.testing.expectError(error.StaleSource, index.atDecoded(std.testing.allocator, .spectrum, 100, &decoded));
     try std.testing.expectEqual(@as(usize, 0), decoded.len());
     try std.testing.expectError(error.InvalidOptions, index.at(std.testing.allocator, .run, 0));
-    try std.testing.expectError(error.LimitExceeded, mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = support.DOCUMENT }, .{ .policy = .rebuild, .max_records = 1 }));
+    try std.testing.expectError(error.LimitExceeded, mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = support.DOCUMENT }, .{ .policy = .rebuild, .records = 1 }));
     try std.testing.expectError(error.LimitExceeded, mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = support.DOCUMENT }, .{ .policy = .rebuild, .index_bytes = 1 }));
     const duplicate = support.HEADER ++ "<spectrumList count='2' defaultDataProcessingRef='dp'>" ++
         "<spectrum id='scan=1' index='0' defaultArrayLength='0'/>" ++
@@ -1567,7 +1568,7 @@ test "[integration] - [mzML record IDs]: keeps spectrum and chromatogram keys se
     var index = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = source }, .{ .policy = .rebuild });
     defer index.deinit();
     try std.testing.expectError(error.AmbiguousId, index.byId(std.testing.allocator, "native=a&b"));
-    var decoded = mzml.StreamReader.DecodedArrays.init(std.testing.allocator, .{});
+    var decoded = mzml.DecodedArrays.init(std.testing.allocator, .{});
     defer decoded.deinit();
     var decoded_record = (try index.atDecoded(std.testing.allocator, .chromatogram, 0, &decoded)).?;
     defer decoded_record.deinit();
@@ -1645,6 +1646,7 @@ test "[failure] - [mzML indexed writer]: keeps record-limit and sink failures st
     try writer.beginList(.spectrum_list, 1, "dp");
     try std.testing.expectError(error.LimitExceeded, writer.writeRecord(record.node));
     try std.testing.expectEqual(.records, writer.diagnostic().?.detail.limit.name);
+    try std.testing.expectEqual(.index, writer.diagnostic().?.stage);
     const report = writer.diagnostic().?;
     try std.testing.expectError(error.FailedState, writer.finish());
     try std.testing.expectEqualDeep(report, writer.diagnostic().?);
@@ -1678,12 +1680,12 @@ test "[integration] - [mzML indexed writer]: opens empty indexes and escaped IDs
             try writer.endList();
         }
         try writer.finish();
-        var index = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = sink.buffered() }, .{ .max_records = count });
+        var index = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = sink.buffered() }, .{ .records = count });
         defer index.deinit();
-        try std.testing.expectEqual(count, index.entries.items.len);
-        var rebuilt = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = sink.buffered() }, .{ .policy = .rebuild, .max_records = count });
+        try std.testing.expectEqual(count, index.entries().len);
+        var rebuilt = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = sink.buffered() }, .{ .policy = .rebuild, .records = count });
         defer rebuilt.deinit();
-        try std.testing.expectEqual(count, rebuilt.entries.items.len);
+        try std.testing.expectEqual(count, rebuilt.entries().len);
         if (try index.byId(std.testing.allocator, "native=a&b")) |copied| {
             var owner = copied;
             defer owner.deinit();
@@ -1745,7 +1747,7 @@ test "[property] - [mzML indexed writer]: preserves IDs and offsets across index
                 try std.testing.expectEqualStrings(expected, found.value.id);
                 try std.testing.expectEqual(kind, found.value.node.kind);
                 try std.testing.expectEqual(position, found.value.index);
-                const entry = index.entries.items[position + if (kind == .spectrum) @as(usize, 0) else counts[0]];
+                const entry = index.entries()[position + if (kind == .spectrum) @as(usize, 0) else counts[0]];
                 try std.testing.expectEqual(entry.start, found.value.node.start_offset);
             }
         }
@@ -1811,8 +1813,8 @@ fn checkLargeIndexed(bytes: []const u8) !void {
     try std.testing.expectEqualStrings(&std.fmt.bytesToHex(digest, .lower), bytes[end..][0..40]);
     var index = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = bytes }, .{});
     defer index.deinit();
-    try std.testing.expectEqual(@as(usize, LARGE_RECORDS), index.entries.items.len);
-    var decoded = mzml.StreamReader.DecodedArrays.init(std.testing.allocator, .{});
+    try std.testing.expectEqual(@as(usize, LARGE_RECORDS), index.entries().len);
+    var decoded = mzml.DecodedArrays.init(std.testing.allocator, .{});
     defer decoded.deinit();
     for (0..LARGE_RECORDS) |position| {
         var record = (try index.at(std.testing.allocator, .spectrum, position)).?;

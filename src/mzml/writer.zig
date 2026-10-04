@@ -64,7 +64,7 @@ pub const Error = xml.WriterError || xml.Error || cv.ValueError || arrays.Encode
     FailedState,
     DuplicateId,
     InvalidOptions,
-    UnexpectedEndOfFile,
+    TruncatedSource,
 };
 
 engine: xml.Writer,
@@ -96,13 +96,18 @@ pub const IndexOptions = struct {
 };
 
 /// Call deinit even after a failure; do not copy the writer.
-pub fn init(allocator: std.mem.Allocator, sink: *std.Io.Writer, limits: Limits) Error!Writer {
+pub fn init(allocator: std.mem.Allocator, sink: *std.Io.Writer, limits: Limits) error{InvalidOptions}!Writer {
     try schema.checkLimits(limits);
-    return .{ .engine = try xml.Writer.init(allocator, sink, .{}), .allocator = allocator, .limits = limits };
+    return .{ .engine = xml.Writer.init(allocator, sink, .{}), .allocator = allocator, .limits = limits };
 }
 
 /// Writes indexedmzML, keeping each record's ID and offset (within index_options) until deinit.
-pub fn initIndexed(allocator: std.mem.Allocator, sink: *std.Io.Writer, limits: Limits, index_options: IndexOptions) Error!Writer {
+pub fn initIndexed(
+    allocator: std.mem.Allocator,
+    sink: *std.Io.Writer,
+    limits: Limits,
+    index_options: IndexOptions,
+) (std.mem.Allocator.Error || error{InvalidOptions})!Writer {
     try schema.checkLimits(limits);
     for (index_options.wrapper_attributes) |attr| if (attr.namespace_uri == null) return error.InvalidOptions;
     const state = try allocator.create(IndexState);
@@ -110,7 +115,7 @@ pub fn initIndexed(allocator: std.mem.Allocator, sink: *std.Io.Writer, limits: L
     const chunk = try allocator.alloc(u8, CHUNK_BYTES);
     errdefer allocator.free(chunk);
     state.* = .{ .allocator = allocator, .hashed = .init(sink, chunk), .arena = .init(allocator), .options = index_options };
-    var engine = try xml.Writer.init(allocator, &state.hashed.writer, .{});
+    var engine = xml.Writer.init(allocator, &state.hashed.writer, .{});
     engine.guard = sink;
     return .{ .engine = engine, .allocator = allocator, .limits = limits, .index_state = state };
 }
@@ -118,7 +123,12 @@ pub fn initIndexed(allocator: std.mem.Allocator, sink: *std.Io.Writer, limits: L
 /// Writes to a positional file writer at offset zero on an empty file; nothing else may write
 /// through it until finish. List counts may be null. Null index_options selects plain mzML;
 /// indexed output needs a readable file, whose prefix finish rereads for the checksum.
-pub fn initFile(allocator: std.mem.Allocator, sink: *std.Io.File.Writer, limits: Limits, index_options: ?IndexOptions) Error!Writer {
+pub fn initFile(
+    allocator: std.mem.Allocator,
+    sink: *std.Io.File.Writer,
+    limits: Limits,
+    index_options: ?IndexOptions,
+) (std.mem.Allocator.Error || error{InvalidOptions})!Writer {
     if (sink.logicalPos() != 0 or (sink.mode != .positional and sink.mode != .positional_simple))
         return error.InvalidOptions;
     var writer = if (index_options) |index|
@@ -149,6 +159,13 @@ pub fn diagnostic(self: *const Writer) ?Diagnostic {
     return self.failure;
 }
 
+/// The output position: bytes written from the document start, including indexed output still
+/// in the hashing buffer, so callers can keep their own record offsets. Null after an output
+/// failure.
+pub fn outputPosition(self: *const Writer) ?u64 {
+    return self.engine.byteOffset();
+}
+
 fn capture(self: *Writer, err: Error, stage: Diagnostic.Stage, detail: Diagnostic.Detail) void {
     if (self.failure != null) return;
     var report = Diagnostic.init(err, .write_record, stage, detail);
@@ -166,8 +183,8 @@ fn fail(self: *Writer, err: Error, operation: Diagnostic.Operation) void {
     self.failure.?.operation = operation;
 }
 
-fn limitError(self: *Writer, name: Diagnostic.Limit, maximum: usize, needed: ?usize) Error!noreturn {
-    self.capture(error.LimitExceeded, .metadata, .{ .limit = .{ .name = name, .maximum = maximum, .needed = needed } });
+fn limitError(self: *Writer, stage: Diagnostic.Stage, name: Diagnostic.Limit, maximum: usize, needed: ?usize) Error!noreturn {
+    self.capture(error.LimitExceeded, stage, .{ .limit = .{ .name = name, .maximum = maximum, .needed = needed } });
     return error.LimitExceeded;
 }
 
@@ -177,7 +194,11 @@ fn sizeError(self: *Writer, err: Error, expected: usize, actual: usize, unit: Di
 }
 
 fn number(self: *Writer, node: model.Node, attribute: Diagnostic.Attribute) Error!usize {
-    return cv.parseInteger(usize, node.attribute(attribute.xmlName())) catch |err| {
+    const value = node.attribute(attribute.xmlName()) orelse {
+        self.capture(error.MissingAttribute, .metadata, .{ .attribute = attribute });
+        return error.MissingAttribute;
+    };
+    return cv.parseInteger(usize, value) catch |err| {
         self.capture(err, .metadata, .{ .attribute = attribute });
         return @as(Error!usize, err);
     };
@@ -252,7 +273,7 @@ fn openList(self: *Writer, kind: model.Kind, count: ?usize, attributes: []const 
     }
     try self.checkParts(.{attributes});
     if (self.phase != .run) return error.InvalidState;
-    if (kind != .spectrum_list and kind != .chromatogram_list) return error.InvalidStructure;
+    if (kind != .spectrum_list and kind != .chromatogram_list) return error.InvalidOptions;
     if (self.list_kind == kind or self.list_kind == .chromatogram_list) return error.InvalidStructure;
     if (count == null and self.file_sink == null) return error.InvalidOptions;
     var buffer: [32]u8 = undefined;
@@ -379,23 +400,19 @@ fn writeRecordInner(self: *Writer, node: model.Node, comptime replace_arrays: bo
             self.capture(error.MissingAttribute, .index, .{ .attribute = .id });
             return error.MissingAttribute;
         };
-        if (state.entries.items.len == state.options.records) return try self.limitError(.records, state.options.records, null);
+        if (state.entries.items.len == state.options.records) return try self.limitError(.index, .records, state.options.records, null);
         const copied = try self.copyId(state, id);
-        const found = try state.ids[if (node.kind == .spectrum) @as(usize, 0) else 1].getOrPutContextAdapted(
-            state.allocator,
-            copied,
-            Ids.Query{ .entries = state.entries.items },
-            .{ .entries = state.entries.items },
-        );
-        if (found.found_existing) return error.DuplicateId;
-        found.key_ptr.* = state.entries.items.len;
+        // Historical IDs are copied and reserved first, so they stay parallel to the entries.
+        var native_id: ?[]const u8 = null;
+        var spot_id: ?[]const u8 = null;
         if (state.historical) {
-            const native_id = if (node.attribute("nativeID")) |value| try self.copyId(state, value) else null;
-            const spot_id = if (node.attribute("spotID")) |value| try self.copyId(state, value) else null;
-            try state.historical_ids.append(state.allocator, .{ .native_id = native_id, .spot_id = spot_id });
+            if (node.attribute("nativeID")) |value| native_id = try self.copyId(state, value);
+            if (node.attribute("spotID")) |value| spot_id = try self.copyId(state, value);
+            try state.historical_ids.ensureUnusedCapacity(state.allocator, 1);
         }
-        try state.entries.ensureUnusedCapacity(state.allocator, 1);
-        state.entries.appendAssumeCapacity(.{ .id = copied, .offset = offset });
+        const ids = &state.ids[if (node.kind == .spectrum) @as(usize, 0) else 1];
+        try Ids.insert(ids, state.allocator, &state.entries, .{ .id = copied, .offset = offset });
+        if (state.historical) state.historical_ids.appendAssumeCapacity(.{ .native_id = native_id, .spot_id = spot_id });
         if (node.kind == .spectrum) state.spectra += 1;
     }
     var remaining: []const Plan = self.plans.items;
@@ -407,7 +424,7 @@ fn writeRecordInner(self: *Writer, node: model.Node, comptime replace_arrays: bo
 
 fn textLength(self: *Writer, wire_length: usize) Error!usize {
     const length = try base64.encodedSize(wire_length);
-    if (length > self.limits.text_bytes) return try self.limitError(.text_bytes, self.limits.text_bytes, length);
+    if (length > self.limits.text_bytes) return try self.limitError(.array, .text_bytes, self.limits.text_bytes, length);
     return length;
 }
 
@@ -418,7 +435,7 @@ fn planSource(self: *Writer, source: arrays.Source, payloads: anytype) Error!Pla
     switch (source.values) {
         inline else => |values| if (self.engine.overlapsOutput(std.mem.sliceAsBytes(values))) return error.OverlappingBuffers,
     }
-    if (source.wireLength()) |length| return .{ .source = .{ .payload = source, .text_length = try self.textLength(length) } };
+    if (source.wireSize()) |length| return .{ .source = .{ .payload = source, .text_length = try self.textLength(length) } };
     if (self.file_sink != null) {
         // The placeholder is as wide as the longest text the source could produce.
         var longest = switch (source.values) {
@@ -469,7 +486,7 @@ fn writeSource(self: *Writer, source: arrays.Source) Error!void {
     const end = self.engine.byteOffset() orelse return error.LimitExceeded;
     self.source_text_length = std.math.cast(usize, end - start) orelse return error.LimitExceeded;
     if (self.source_text_length > self.limits.text_bytes)
-        return try self.limitError(.text_bytes, self.limits.text_bytes, self.source_text_length);
+        return try self.limitError(.array, .text_bytes, self.limits.text_bytes, self.source_text_length);
 }
 
 // A writer that Base64-encodes everything written to it into the engine's open binary text.
@@ -645,7 +662,7 @@ fn writeIndex(self: *Writer, state: *IndexState) Error!void {
         while (position < end) {
             const capacity: usize = @intCast(@min(buffer.len, end - position));
             const length = sink.file.readPositional(sink.io, &.{buffer[0..capacity]}, position) catch |err| return try self.ioFailure(err);
-            if (length == 0) return try self.ioFailure(error.UnexpectedEndOfFile);
+            if (length == 0) return try self.ioFailure(error.TruncatedSource);
             hasher.update(buffer[0..length]);
             position += length;
         }
@@ -665,7 +682,7 @@ fn writeNode(self: *Writer, node: model.Node, comptime replace_arrays: bool, rem
         self.capture(err, .metadata, .none);
         if (self.failure.?.element == null) self.failure.?.element = node.kind;
     }
-    if (budget.* == 0) return try self.limitError(.nodes, self.limits.nodes, null);
+    if (budget.* == 0) return try self.limitError(.metadata, .nodes, self.limits.nodes, null);
     budget.* -= 1;
     try self.checkNode(node);
     const plan: Plan = if (replace_arrays and (node.kind == .binary or node.kind == .binary_data_array)) blk: {
@@ -696,7 +713,7 @@ fn writeNode(self: *Writer, node: model.Node, comptime replace_arrays: bool, rem
         },
         .keep => {
             const text = node.text.?;
-            if (text.len > self.limits.text_bytes) return try self.limitError(.text_bytes, self.limits.text_bytes, text.len);
+            if (text.len > self.limits.text_bytes) return try self.limitError(.array, .text_bytes, self.limits.text_bytes, text.len);
             try self.engine.text(text);
         },
     };
@@ -757,7 +774,7 @@ fn writeChild(self: *Writer, parent: model.Node, child: model.Node, position: us
 
 // Keep fragment parser storage off ordinary recursive write frames.
 noinline fn writeXml(self: *Writer, bytes: []const u8, budget: *usize) Error!void {
-    if (bytes.len > self.limits.text_bytes) return try self.limitError(.text_bytes, self.limits.text_bytes, bytes.len);
+    if (bytes.len > self.limits.text_bytes) return try self.limitError(.metadata, .text_bytes, self.limits.text_bytes, bytes.len);
     var input = std.Io.Reader.fixed(bytes);
     var cursor = try xml.Cursor.init(self.allocator, &input, @max(1, bytes.len / 4), self.limits.text_bytes);
     defer cursor.deinit();
@@ -844,7 +861,7 @@ fn checkNode(self: *Writer, node: model.Node) Error!void {
 
 fn checkParts(self: *Writer, parts: anytype) Error!void {
     inline for (parts) |part| {
-        if (self.engine.overlapsOutput(std.mem.sliceAsBytes(part))) return error.InvalidState;
+        if (self.engine.overlapsOutput(std.mem.sliceAsBytes(part))) return error.OverlappingBuffers;
     }
 }
 
@@ -882,7 +899,8 @@ fn writeParams(self: *Writer, params: []const cv.Entry, budget: *usize) Error!vo
         if (extra) |value| for (value.content) |part| switch (part) {
             .xml => |bytes| try self.writeXml(bytes, budget),
             .text => |bytes| {
-                if (bytes.len > self.limits.text_bytes) return try self.limitError(.text_bytes, self.limits.text_bytes, bytes.len);
+                if (bytes.len > self.limits.text_bytes)
+                    return try self.limitError(.metadata, .text_bytes, self.limits.text_bytes, bytes.len);
                 try self.engine.text(bytes);
             },
         };

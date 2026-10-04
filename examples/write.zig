@@ -61,7 +61,7 @@ fn makeHeader(builder: *mzml.Builder) !mzml.model.Header {
             .kind = .mzml,
             .attributes = &.{.{ .name = "version", .value = "1.1.0" }},
             .children = &.{
-                try builder.list(.cv_list, &.{try builder.vocabulary(.{
+                try builder.list(.cv_list, &.{try builder.cvDeclaration(.{
                     .id = "MS",
                     .full_name = "PSI-MS",
                     .uri = "http://purl.obolibrary.org/obo/ms/psi-ms.obo",

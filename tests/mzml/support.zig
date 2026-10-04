@@ -195,12 +195,12 @@ pub fn constructAllocated(allocator: std.mem.Allocator) !void {
 pub fn checkIndexed(allocator: std.mem.Allocator, bytes: []const u8) !void {
     var index = try mzml.IndexedReader.build(allocator, .{ .bytes = bytes }, .{});
     defer index.deinit();
-    try std.testing.expectEqual(@as(usize, 16), index.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 16), index.entries().len);
     try std.testing.expectEqual(@as(usize, 0), index.header().spectrum_list.?.observed_count);
     var input = std.Io.Reader.fixed(bytes);
     var reader = try mzml.StreamReader.init(allocator, &input, .{});
     defer reader.deinit();
-    for (index.entries.items) |entry| {
+    for (index.entries()) |entry| {
         const record = (try reader.nextRecord()).?;
         try std.testing.expectEqualStrings(entry.id, record.id);
         try std.testing.expectEqual(entry.kind, record.node.kind);
@@ -209,14 +209,14 @@ pub fn checkIndexed(allocator: std.mem.Allocator, bytes: []const u8) !void {
     }
     try std.testing.expectEqual(null, try reader.nextRecord());
     for ([_]usize{ 15, 0, 7, 8, 6 }) |position| {
-        const entry = index.entries.items[position];
+        const entry = index.entries()[position];
         var record = (try index.byId(allocator, entry.id)).?;
         defer record.deinit();
         try std.testing.expectEqualStrings(entry.id, record.value.id);
         try std.testing.expectEqual(entry.start, record.value.node.start_offset);
         try std.testing.expect(record.value.node.end_offset <= entry.end);
         try std.testing.expectEqual(@as(usize, 2), record.value.binaryArrays().len);
-        var ordinal = (try index.at(allocator, entry.kind, entry.index)).?;
+        var ordinal = (try index.at(allocator, entry.kind, entry.ordinal)).?;
         defer ordinal.deinit();
         try expectNode(record.value.node, ordinal.value.node);
         for (record.value.binaryArrays()) |array| {
@@ -254,8 +254,8 @@ pub fn expectWritten(expected: []const u8, actual: []const u8) !void {
     defer embedded.deinit();
     var rebuilt = try mzml.IndexedReader.build(allocator, .{ .bytes = actual }, .{ .policy = .rebuild });
     defer rebuilt.deinit();
-    try std.testing.expectEqual(rebuilt.entries.items.len, embedded.entries.items.len);
-    for (rebuilt.entries.items, embedded.entries.items) |found, listed| {
+    try std.testing.expectEqual(rebuilt.entries().len, embedded.entries().len);
+    for (rebuilt.entries(), embedded.entries()) |found, listed| {
         try std.testing.expectEqualStrings(found.id, listed.id);
         try std.testing.expectEqual(found.start, listed.start);
     }
@@ -318,14 +318,14 @@ fn encoderIndependent(allocator: std.mem.Allocator, document: []const u8) ![]u8 
             try out.append(allocator, '#');
             try out.appendSlice(allocator, document[tag + length_end .. text]);
             var wire: [512]u8 = undefined;
-            const counts = try mzml.base64.decode(&wire, document[text..text_end]);
+            const compressed = try mzml.base64.decode(&wire, document[text..text_end]);
             var reference: [512]u8 = undefined;
-            var input = std.Io.Reader.fixed(wire[0..counts.decoded_bytes]);
+            var input = std.Io.Reader.fixed(compressed);
             var plain = std.Io.Writer.fixed(&reference);
             var inflater: std.compress.flate.Decompress = .init(&input, .zlib, &.{});
             _ = try inflater.reader.streamRemaining(&plain);
             var decoded: [512]u8 = undefined;
-            try std.testing.expectEqualSlices(u8, plain.buffered(), try mzml.zlib.decompress(&decoded, wire[0..counts.decoded_bytes]));
+            try std.testing.expectEqualSlices(u8, plain.buffered(), try mzml.zlib.decompress(&decoded, compressed));
             for (plain.buffered()) |byte| try out.print(allocator, "{x:0>2}", .{byte});
             at = text_end;
         } else if (try sizeDependentValue(rest)) |prefix| {
@@ -380,11 +380,11 @@ pub fn checkLookupAllocator(record_allocator: std.mem.Allocator) !void {
 pub fn checkOpenEmbedded(allocator: std.mem.Allocator, bytes: []const u8) !void {
     var index = try mzml.IndexedReader.build(allocator, .{ .bytes = bytes }, .{ .policy = .open_embedded });
     defer index.deinit();
-    try std.testing.expectEqual(@as(usize, 16), index.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 16), index.entries().len);
     try std.testing.expectEqual(@as(usize, 0), index.header().spectrum_list.?.observed_count);
     try std.testing.expectEqual(@as(usize, 0), index.header().chromatogram_list.?.observed_count);
-    for (index.entries.items) |entry| {
-        var record = (try index.at(allocator, entry.kind, entry.index)).?;
+    for (index.entries()) |entry| {
+        var record = (try index.at(allocator, entry.kind, entry.ordinal)).?;
         defer record.deinit();
         try std.testing.expectEqualStrings(entry.id, record.value.id);
         try std.testing.expectEqual(entry.start, record.value.node.start_offset);

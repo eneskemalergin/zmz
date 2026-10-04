@@ -31,7 +31,7 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print("{s}: {f}\n", .{ args[1], diagnostic });
         };
         const header = try reader.readHeader();
-        var decoded = mzml.StreamReader.DecodedArrays.init(init.gpa, .{});
+        var decoded = mzml.DecodedArrays.init(init.gpa, .{});
         defer decoded.deinit();
         while (if (metadata_only) try reader.nextRecord() else try reader.nextDecodedRecord(&decoded)) |record| {
             records += 1;

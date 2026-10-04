@@ -115,13 +115,13 @@ pub const Error = error{
     InvalidOptions,
 };
 
-pub fn checkHeader(header: model.Header) Error!void {
+pub fn checkHeader(header: model.Header) error{InvalidStructure}!void {
     if (header.document.kind != .mzml or header.run.kind != .run)
         return error.InvalidStructure;
     for (header.run.children) |child| if (child.kind != .source_file_ref_list) return error.InvalidStructure;
     if (header.document.text != null or header.run.text != null) return error.InvalidStructure;
 }
 
-pub fn checkLimits(limits: Limits) Error!void {
+pub fn checkLimits(limits: Limits) error{InvalidOptions}!void {
     if (limits.nodes == 0) return error.InvalidOptions;
 }

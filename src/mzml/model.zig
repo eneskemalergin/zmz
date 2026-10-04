@@ -157,7 +157,7 @@ pub const Node = struct {
 
     /// Returns the one parameter with this accession, looking through group references: null
     /// when absent, RepeatedParameter when there are several. Text borrows from node and groups.
-    pub fn parameter(self: Node, groups: []const cv.Group, accession: cv.Accession) LookupError!?cv.Param {
+    pub fn parameter(self: Node, groups: []const cv.Group, accession: cv.Accession) ParameterError!?cv.Param {
         return switch (try cv.findOne(self.params, groups, accession)) {
             .missing => null,
             .one => |param| param,
@@ -167,20 +167,20 @@ pub const Node = struct {
 
     /// Parses the unique parameter's value as a decimal integer. Null means the parameter is
     /// absent; a missing or malformed value is an error.
-    pub fn integer(self: Node, comptime T: type, groups: []const cv.Group, accession: cv.Accession) (LookupError || cv.ValueError)!?T {
+    pub fn integer(self: Node, comptime T: type, groups: []const cv.Group, accession: cv.Accession) (ParameterError || cv.ValueError)!?T {
         const param = try self.parameter(groups, accession) orelse return null;
         return try cv.parseInteger(T, param.value);
     }
 
     /// Parses the unique parameter's value as a float, returned with its source parameter.
     /// Units are not converted.
-    pub fn number(self: Node, groups: []const cv.Group, accession: cv.Accession) (LookupError || cv.ValueError)!?Number {
+    pub fn number(self: Node, groups: []const cv.Group, accession: cv.Accession) (ParameterError || cv.ValueError)!?Number {
         const param = try self.parameter(groups, accession) orelse return null;
         return .{ .value = try cv.parseFloat(f64, param.value), .parameter = param };
     }
 
     /// Reads this scan's start time in its source units; null when absent.
-    pub fn scanStartTime(self: Node, groups: []const cv.Group) MetadataError!?Number {
+    pub fn scanStartTime(self: Node, groups: []const cv.Group) FieldError!?Number {
         if (self.kind != .scan) return error.UnexpectedElement;
         return self.number(groups, Terms.SCAN_START_TIME);
     }
@@ -193,7 +193,7 @@ pub const Node = struct {
 
     /// Parses this selected ion's fields; each absent one stays null. m/z falls back to the
     /// historical term; charge is a signed xs:int.
-    pub fn selectedIonValues(self: Node, groups: []const cv.Group) MetadataError!SelectedIon {
+    pub fn selectedIonValues(self: Node, groups: []const cv.Group) FieldError!SelectedIon {
         if (self.kind != .selected_ion) return error.UnexpectedElement;
         return .{
             .mz = try self.number(groups, Terms.SELECTED_ION_MZ) orelse try self.number(groups, Terms.HISTORICAL_SELECTED_ION_MZ),
@@ -203,7 +203,7 @@ pub const Node = struct {
     }
 
     /// Parses this isolation window's target and offsets as written; each absent one stays null.
-    pub fn isolationWindowValues(self: Node, groups: []const cv.Group) MetadataError!IsolationWindow {
+    pub fn isolationWindowValues(self: Node, groups: []const cv.Group) FieldError!IsolationWindow {
         if (self.kind != .isolation_window) return error.UnexpectedElement;
         return .{
             .target = try self.number(groups, Terms.ISOLATION_TARGET_MZ),
@@ -214,13 +214,16 @@ pub const Node = struct {
 };
 
 /// A repeated parameter or array is an error, never resolved to one of its copies.
-pub const LookupError = cv.ExpansionError || error{ RepeatedParameter, RepeatedArray };
+pub const ParameterError = cv.ExpansionError || error{RepeatedParameter};
+pub const LookupError = ParameterError || error{RepeatedArray};
 
 /// A parsed number with its source spelling and optional unit fields.
 pub const Number = struct { value: f64, parameter: cv.Param };
 
-/// Scientific access failures, including wrong node kinds and contradictory flags.
-pub const MetadataError = LookupError || cv.ValueError || error{ UnexpectedElement, ConflictingParameter };
+pub const FieldError = ParameterError || cv.ValueError || error{UnexpectedElement};
+/// Scientific access failures, including contradictory flags; also the reader selection
+/// callbacks' set, since a callback may look up arrays.
+pub const MetadataError = FieldError || error{ ConflictingParameter, RepeatedArray };
 
 /// Polarity as declared by the source.
 pub const Polarity = enum { positive, negative };
@@ -302,14 +305,14 @@ pub const Record = struct {
 
     /// Parses the spectrum's MS level (xs:int range); null when absent. Chromatograms return
     /// UnexpectedElement.
-    pub fn msLevel(self: Record, groups: []const cv.Group) MetadataError!?i32 {
+    pub fn msLevel(self: Record, groups: []const cv.Group) FieldError!?i32 {
         if (self.node.kind != .spectrum) return error.UnexpectedElement;
         return self.node.integer(i32, groups, Terms.MS_LEVEL);
     }
 
     /// Reads record polarity, or the single scan's polarity in an mzML 1.0 description.
     /// Absence of both flags returns null; repeats and opposing flags return distinct errors.
-    pub fn polarity(self: Record, groups: []const cv.Group) MetadataError!?Polarity {
+    pub fn polarity(self: Record, groups: []const cv.Group) (FieldError || error{ConflictingParameter})!?Polarity {
         if (self.node.kind != .spectrum and self.node.kind != .chromatogram)
             return error.UnexpectedElement;
         const node = if (self.node.child(.spectrum_description)) |description| description.child(.scan) orelse return null else self.node;
@@ -318,7 +321,7 @@ pub const Record = struct {
     }
 
     /// Reads centroid/profile flags from the record or its mzML 1.0 description.
-    pub fn representation(self: Record, groups: []const cv.Group) MetadataError!?Representation {
+    pub fn representation(self: Record, groups: []const cv.Group) (FieldError || error{ConflictingParameter})!?Representation {
         if (self.node.kind != .spectrum) return error.UnexpectedElement;
         const node = self.node.child(.spectrum_description) orelse self.node;
         const centroid = try exclusiveFlags(node, groups, Terms.CENTROID_SPECTRUM, Terms.PROFILE_SPECTRUM) orelse return null;
@@ -383,14 +386,14 @@ pub const ArrayRole = enum { mz, intensity, time, other };
 
 /// The role of a binary array node: m/z, intensity, or time by their terms (also through groups,
 /// checked in that order, a repeated term counting once), otherwise other.
-pub fn arrayRole(node: Node, groups: []const cv.Group) !ArrayRole {
+pub fn arrayRole(node: Node, groups: []const cv.Group) cv.ExpansionError!ArrayRole {
     const roles = .{ .{ Terms.MZ_ARRAY, ArrayRole.mz }, .{ Terms.INTENSITY_ARRAY, ArrayRole.intensity }, .{ Terms.TIME_ARRAY, ArrayRole.time } };
     inline for (roles) |role| if (try cv.findOne(node.params, groups, role[0]) != .missing) return role[1];
     return .other;
 }
 
 /// encoding.Error, and the failures of reading a modeled array node.
-pub const EncodingError = encoding.Error || error{ NotBinaryArray, PayloadNotRetained, TypeMismatch };
+pub const EncodingError = encoding.Error || error{UnexpectedElement};
 
 /// A binary array node with its classified encoding and value count.
 pub const BinaryArray = struct {
@@ -399,13 +402,18 @@ pub const BinaryArray = struct {
     length: usize,
 
     /// Classifies one binary array and reads its explicit or record-default value count.
-    /// MissingValue means neither arrayLength nor a default length was supplied.
+    /// MissingAttribute means neither arrayLength nor a default length was supplied.
     pub fn init(
         node: Node,
         default_length: ?usize,
         groups: []const cv.Group,
-    ) (EncodingError || cv.ValueError)!BinaryArray {
-        return initWithEncoding(node, default_length, try arrayEncoding(node, groups));
+    ) (EncodingError || cv.ValueError || error{MissingAttribute})!BinaryArray {
+        const descriptor = try arrayEncoding(node, groups);
+        const length = if (node.attribute("arrayLength")) |value|
+            try cv.parseInteger(usize, value)
+        else
+            default_length orelse return error.MissingAttribute;
+        return .{ .node = node, .encoding = descriptor, .length = length };
     }
 
     /// Decodes the declared values into the start of a caller-owned typed buffer and returns
@@ -417,7 +425,7 @@ pub const BinaryArray = struct {
         comptime T: type,
         output: []T,
         scratch: arrays.Scratch,
-    ) (EncodingError || arrays.Error)![]T {
+    ) (arrays.DecodeError || error{PayloadNotRetained})![]T {
         if (self.encoding.decodedPrimitive() != Primitive.of(T)) return error.TypeMismatch;
         if (output.len < self.length) return error.OutputTooSmall;
         const values = output[0..self.length];
@@ -435,10 +443,10 @@ pub const BinaryArrayIterator = struct {
     groups: []const cv.Group,
     default_length: ?usize,
     position: usize = 0,
-    failed: ?BinaryArrayError = null,
+    failed: ?(EncodingError || cv.ValueError || error{MissingAttribute}) = null,
 
     /// Returns the next descriptor or null at the end. The first classification failure is sticky.
-    pub fn next(self: *BinaryArrayIterator) BinaryArrayError!?BinaryArray {
+    pub fn next(self: *BinaryArrayIterator) (EncodingError || cv.ValueError || error{MissingAttribute})!?BinaryArray {
         if (self.failed) |failure| return failure;
         if (self.position == self.nodes.len) return null;
         const node = self.nodes[self.position];
@@ -450,11 +458,9 @@ pub const BinaryArrayIterator = struct {
     }
 };
 
-const BinaryArrayError = EncodingError || cv.ValueError;
-
 /// Classifies a binary array's primitive and compression terms; a missing term is an error.
 pub fn arrayEncoding(node: Node, groups: []const cv.Group) EncodingError!Encoding {
-    if (node.kind != .binary_data_array) return error.NotBinaryArray;
+    if (node.kind != .binary_data_array) return error.UnexpectedElement;
     return encoding.classify(node.params, groups);
 }
 
@@ -468,19 +474,8 @@ pub fn decodeArray(
     default_length: ?usize,
     groups: []const cv.Group,
     scratch: arrays.Scratch,
-) (EncodingError || cv.ValueError || arrays.Error)![]T {
-    const declared_encoding = try arrayEncoding(node, groups);
-    if (declared_encoding.decodedPrimitive() != Primitive.of(T)) return error.TypeMismatch;
-    const array = try initWithEncoding(node, default_length, declared_encoding);
-    return array.decode(T, output, scratch);
-}
-
-fn initWithEncoding(node: Node, default_length: ?usize, descriptor: Encoding) cv.ValueError!BinaryArray {
-    const length = if (node.attribute("arrayLength")) |value|
-        try cv.parseInteger(usize, value)
-    else
-        default_length orelse return error.MissingValue;
-    return .{ .node = node, .encoding = descriptor, .length = length };
+) (EncodingError || cv.ValueError || arrays.DecodeError || error{ MissingAttribute, PayloadNotRetained })![]T {
+    return (try BinaryArray.init(node, default_length, groups)).decode(T, output, scratch);
 }
 
 fn camelCase(comptime snake: []const u8) []const u8 {
@@ -515,7 +510,12 @@ fn firstChild(node: Node, kind: Kind) []const Node {
     return &.{};
 }
 
-fn exclusiveFlags(node: Node, groups: []const cv.Group, first: cv.Accession, second: cv.Accession) MetadataError!?bool {
+fn exclusiveFlags(
+    node: Node,
+    groups: []const cv.Group,
+    first: cv.Accession,
+    second: cv.Accession,
+) (FieldError || error{ConflictingParameter})!?bool {
     const a = try node.parameter(groups, first);
     const b = try node.parameter(groups, second);
     if (a != null and b != null) return error.ConflictingParameter;

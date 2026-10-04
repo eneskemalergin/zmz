@@ -2,7 +2,9 @@
 
 const std = @import("std");
 const model = @import("model.zig");
-const impl = @import("internal/reader_engine.zig");
+const Engine = @import("internal/reader_engine.zig");
+const DecodedArrays = @import("decoded_arrays.zig");
+const Diagnostic = @import("diagnostic.zig");
 
 /// Reads header metadata, then records or items, from a forward byte stream it borrows until
 /// deinit; copy neither the input nor the reader. Header metadata lasts until deinit, and each
@@ -12,21 +14,20 @@ const impl = @import("internal/reader_engine.zig");
 pub const StreamReader = struct {
     const Reader = @This();
 
-    pub const Limits = impl.Limits;
-    pub const Payload = impl.Payload;
-    pub const ArraySelector = impl.ArraySelector;
-    pub const Selection = impl.Selection;
-    pub const Options = impl.Options;
-    pub const Error = impl.Error;
-    pub const Diagnostic = impl.Diagnostic;
-    pub const DecodedArrays = @import("decoded_arrays.zig");
+    pub const Limits = Engine.Limits;
+    pub const Payload = Engine.Payload;
+    pub const ArraySelector = Engine.ArraySelector;
+    pub const Selection = Engine.Selection;
+    pub const Options = Engine.Options;
+    pub const Error = Engine.Error;
 
-    inner: impl,
+    inner: Engine,
 
-    /// Allocates parser state without consuming input. Streaming input needs buffer capacity
-    /// for peekGreedy(1), otherwise InvalidOptions; an empty fixed reader reads as malformed XML.
-    pub fn init(allocator: std.mem.Allocator, input: *std.Io.Reader, options: Options) Error!Reader {
-        return .{ .inner = try impl.init(allocator, input, options) };
+    /// Checks the options without consuming input; nothing is allocated until the first read.
+    /// Streaming input needs buffer capacity for peekGreedy(1), otherwise InvalidOptions; an
+    /// empty fixed reader reads as malformed XML.
+    pub fn init(allocator: std.mem.Allocator, input: *std.Io.Reader, options: Options) error{InvalidOptions}!Reader {
+        return .{ .inner = try Engine.init(allocator, input, options) };
     }
 
     /// Leaves the input open.

@@ -45,7 +45,7 @@ test "[unit] - [vocabulary]: resolves exact identities and bounded graph queries
     try std.testing.expectEqual(@as(usize, 1), resolved.len);
     try std.testing.expectEqualStrings("xsd:integer", resolved[0]);
     try std.testing.expectError(error.TraversalLimit, GRAPH.valueTypes("X:5", &types, 2));
-    try std.testing.expectError(error.DestinationTooSmall, GRAPH.valueTypes("X:5", &.{}, 3));
+    try std.testing.expectError(error.OutputTooSmall, GRAPH.valueTypes("X:5", &.{}, 3));
     try std.testing.expectError(error.Cycle, GRAPH.valueTypes("X:7", &types, 10));
     try std.testing.expectEqual(@as(usize, 0), (try GRAPH.valueTypes("X:1", &types, 1)).len);
     var units = GRAPH.lookup("X:5").?.term.targets("has_units");

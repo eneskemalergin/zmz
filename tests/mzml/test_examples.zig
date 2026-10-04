@@ -15,7 +15,7 @@ test "[cli] - [mzML reencoding]: preserves XML on array group references" {
     defer file.close(std.testing.io);
     var index = try mzml.IndexedReader.build(std.testing.allocator, .{ .file = .{ .handle = file, .io = std.testing.io } }, .{});
     defer index.deinit();
-    var decoded = mzml.StreamReader.DecodedArrays.init(std.testing.allocator, .{});
+    var decoded = mzml.DecodedArrays.init(std.testing.allocator, .{});
     defer decoded.deinit();
     var record = (try index.byIdDecoded(std.testing.allocator, "scan=1", &decoded)).?;
     defer record.deinit();
@@ -54,7 +54,7 @@ test "[integration] - [mzML 1.0 examples]: selects and reencodes through the ord
     var index = try mzml.IndexedReader.build(std.testing.allocator, .{ .file = .{ .handle = file, .io = std.testing.io } }, .{});
     defer index.deinit();
     try std.testing.expectEqualStrings("http://psi.hupo.org/schema_revision/mzML_1.0.0", index.header().namespace_uri);
-    var decoded = mzml.StreamReader.DecodedArrays.init(std.testing.allocator, .{});
+    var decoded = mzml.DecodedArrays.init(std.testing.allocator, .{});
     defer decoded.deinit();
     var first = (try index.byIdDecoded(std.testing.allocator, "S19", &decoded)).?;
     defer first.deinit();
@@ -190,7 +190,7 @@ test "[integration] - [mzML examples]: writes mixed primitive arrays and retriev
         defer file.close(std.testing.io);
         var index = try mzml.IndexedReader.build(std.testing.allocator, .{ .file = .{ .handle = file, .io = std.testing.io } }, .{ .policy = if (indexed) .open_embedded else .rebuild });
         defer index.deinit();
-        var decoded = mzml.StreamReader.DecodedArrays.init(std.testing.allocator, .{});
+        var decoded = mzml.DecodedArrays.init(std.testing.allocator, .{});
         defer decoded.deinit();
         var record = (try index.byIdDecoded(std.testing.allocator, "scan=1", &decoded)).?;
         defer record.deinit();
@@ -350,7 +350,7 @@ test "[cli] - [mzML metadata editing]: replaces and removes ordered record param
         try std.testing.expectEqual(null, try b.nextItem());
         var index = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = bytes }, .{});
         defer index.deinit();
-        var decoded = mzml.StreamReader.DecodedArrays.init(std.testing.allocator, .{});
+        var decoded = mzml.DecodedArrays.init(std.testing.allocator, .{});
         defer decoded.deinit();
         var record = (try index.byIdDecoded(std.testing.allocator, "s0", &decoded)).?;
         defer record.deinit();
@@ -454,9 +454,9 @@ test "[cli] - [mzML examples]: reencodes all codecs without changing values or r
             }
         }
         try support.expectNode(header.run, index.header().run);
-        var before = mzml.StreamReader.DecodedArrays.init(std.testing.allocator, .{});
+        var before = mzml.DecodedArrays.init(std.testing.allocator, .{});
         defer before.deinit();
-        var after = mzml.StreamReader.DecodedArrays.init(std.testing.allocator, .{});
+        var after = mzml.DecodedArrays.init(std.testing.allocator, .{});
         defer after.deinit();
         var ordinals = [_]usize{ 0, 0 };
         while (try reader.nextDecodedRecord(&before)) |record| {

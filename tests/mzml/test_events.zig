@@ -114,14 +114,14 @@ test "[unit] - [mzML events]: stream long text in bounded runs" {
 
 test "[failure] - [mzML events]: name the broken rule, keep the first failure, and refuse reuse" {
     const cases = .{
-        .{ "<root><a></b></root>", mzml.Events.Rule.mismatched_end_tag },
-        .{ "<root>&bogus;</root>", mzml.Events.Rule.unknown_entity },
-        .{ "<root a='1' a='2'/>", mzml.Events.Rule.duplicate_attribute },
-        .{ "<root><a>", mzml.Events.Rule.unexpected_end },
-        .{ "text<root/>", mzml.Events.Rule.unexpected_text },
-        .{ "<root/>text", mzml.Events.Rule.unexpected_text },
-        .{ "<root/> <!-- c --> <?pi?> &amp;", mzml.Events.Rule.unexpected_text },
-        .{ "<root/><root/>", mzml.Events.Rule.content_after_root },
+        .{ "<root><a></b></root>", mzml.Diagnostic.XmlRule.mismatched_end_tag },
+        .{ "<root>&bogus;</root>", mzml.Diagnostic.XmlRule.unknown_entity },
+        .{ "<root a='1' a='2'/>", mzml.Diagnostic.XmlRule.duplicate_attribute },
+        .{ "<root><a>", mzml.Diagnostic.XmlRule.unexpected_end },
+        .{ "text<root/>", mzml.Diagnostic.XmlRule.unexpected_text },
+        .{ "<root/>text", mzml.Diagnostic.XmlRule.unexpected_text },
+        .{ "<root/> <!-- c --> <?pi?> &amp;", mzml.Diagnostic.XmlRule.unexpected_text },
+        .{ "<root/><root/>", mzml.Diagnostic.XmlRule.content_after_root },
     };
     inline for (cases) |case| {
         var input = std.Io.Reader.fixed(case[0]);
@@ -254,7 +254,7 @@ test "[integration] - [mzML events]: decode arrays from text runs as the readers
         var input = std.Io.Reader.fixed(bytes);
         var reader = try mzml.StreamReader.init(allocator, &input, .{});
         defer reader.deinit();
-        var decoded = mzml.StreamReader.DecodedArrays.init(allocator, .{});
+        var decoded = mzml.DecodedArrays.init(allocator, .{});
         defer decoded.deinit();
         while (try reader.nextDecodedRecord(&decoded)) |_| for (0..decoded.len()) |i| switch (decoded.get(i).?.values) {
             inline else => |values| for (values) |value| try expected.append(allocator, wide(value)),
@@ -267,7 +267,7 @@ test "[integration] - [mzML events]: decode arrays from text runs as the readers
         input.artificial_limit = .limited(size);
         var events = try mzml.Events.init(allocator, &input.interface, .{});
         defer events.deinit();
-        var decoded = mzml.StreamReader.DecodedArrays.init(allocator, .{});
+        var decoded = mzml.DecodedArrays.init(allocator, .{});
         defer decoded.deinit();
         var record_length: usize = 0;
         var primitive: ?mzml.model.Primitive = null;

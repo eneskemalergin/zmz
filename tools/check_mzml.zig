@@ -7,7 +7,7 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     if (args.len < 2) {
         try std.Io.File.stderr().writeStreamingAll(init.io, "usage: zig build check-mzml -- FILE.mzML [FILE.mzML ...]\n");
-        return error.MissingInput;
+        return error.InvalidArguments;
     }
     var buffer: [4096]u8 = undefined;
     var output = std.Io.File.stdout().writer(init.io, &buffer);
@@ -65,9 +65,9 @@ fn checkFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Totals
     const declarations = try header.cvDeclarations(allocator);
     defer allocator.free(declarations);
     const resolver = mzml.cv.Resolver.init(declarations);
-    const count = index.entries.items.len;
+    const count = index.entries().len;
     var totals: Totals = .{};
-    var decoded = mzml.StreamReader.DecodedArrays.init(allocator, .{});
+    var decoded = mzml.DecodedArrays.init(allocator, .{});
     defer decoded.deinit();
     var ordinals = [_]usize{ 0, 0 };
     while (true) {

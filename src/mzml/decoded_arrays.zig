@@ -1,7 +1,8 @@
 //! Stores decoded arrays from decoded reads (nextDecodedRecord, byIdDecoded, atDecoded)
 //! and from records whose Base64 text was retained (decodeRecord, decodeArray).
 //!
-//! Each array keeps its source primitive, except Numpress output is always f64. Numeric
+//! Each array keeps its source primitive; Numpress output is f64 unless `numpress_precision`
+//! is `.declared`, which keeps a declared 32-bit float. Numeric
 //! buffers grow as needed and are reused between records. Every array decodes as its text
 //! arrives: Base64 goes straight into typed output, into a fixed window for Numpress, or, with
 //! zlib, through a window that the decompressor pulls from. No buffer holds a payload whole.
@@ -9,11 +10,15 @@
 //! and is 0 for decodeArray.
 //! Results become visible only after the complete record succeeds. Returned slices last
 //! until the next decoded read using this owner, reset, or deinit; ordinary reads do not
-//! invalidate them. No source metadata is borrowed by this owner.
+//! invalidate them. No source metadata is borrowed by this owner. Do not copy an owner: a copy
+//! shares its buffers, and both `deinit`s would free them.
 //!
-//! beginArray, decodeText, and complete are internal: the reader engine calls them while it
-//! parses a record. Callers use the reads and the decode functions (decodeArrayText for text
-//! read as events).
+//! While a read decodes into this owner, as from one of its selection callbacks, the decode
+//! calls return `InvalidState` and `reset` does nothing.
+//!
+//! beginArray, decodeText, and complete are internal: the reader engine and `IndexedReader`
+//! call them while they parse a record. Callers use the reads and the decode functions
+//! (decodeArrayText for text read as events).
 
 const std = @import("std");
 const model = @import("model.zig");
@@ -27,7 +32,9 @@ const overlaps = @import("../binary/core.zig").overlaps;
 
 const DecodedArrays = @This();
 
-pub const Error = model.EncodingError || cv.ValueError || arrays.Error || std.mem.Allocator.Error || error{ LimitExceeded, InvalidState };
+pub const Error = model.EncodingError || cv.ValueError || arrays.DecodeError || std.mem.Allocator.Error ||
+    base64.Decoder.Error || numpress.Decoder.Error || zlib.Decompressor.Error ||
+    error{ LimitExceeded, InvalidState, MissingAttribute, PayloadNotRetained };
 pub const Values = arrays.Values;
 /// One decoded array: its position among the record's arrays, its declared encoding, its role
 /// (null when decoded from text without its node), and its values.
@@ -60,7 +67,7 @@ decoder: base64.Decoder = undefined,
 values: numpress.Decoder = undefined,
 // The first Numpress error of the current array. It is reported only after the Base64 and
 // zlib layers finish, so their errors come first, as when each layer decodes the whole payload.
-deferred: ?numpress.Error = null,
+deferred: ?numpress.Decoder.Error = null,
 failure: ?struct { stage: Diagnostic.Stage, detail: Diagnostic.Detail = .none } = null,
 // The failure of the last decodeRecord, decodeArray, or decodeArrayText; reset keeps it.
 report: ?Diagnostic = null,
@@ -139,9 +146,11 @@ pub fn decodeArray(self: *DecodedArrays, node: model.Node, default_length: ?usiz
 
 /// Decodes one array whose Base64 text arrives in pieces from source, given its encoding and
 /// value count, for callers that read the document as events: classify the array's terms with
-/// `model.encodingTerm` and pass a source whose `next()` returns the array's text runs (for
-/// example `Events` text events) and then null. Same decoding, error order, and limits as the
-/// readers; replaces earlier results, and after a failure none are visible.
+/// `model.encodingTerm` and pass a pointer to a source whose `next()` returns the array's text
+/// runs (for example `Events` text events) and then null. Same decoding, error order, and
+/// limits as the readers; replaces earlier results, and after a failure none are visible.
+/// Returns `Error` plus the source's own errors. After a failure the source may stop before
+/// its null; read on to the element's end event.
 pub fn decodeArrayText(self: *DecodedArrays, encoding: model.Encoding, length: usize, source: anytype) !Values {
     if (self.busy) return error.InvalidState;
     self.report = null;
@@ -261,7 +270,7 @@ pub fn complete(self: *DecodedArrays) void {
 pub fn beginArray(self: *DecodedArrays, node: model.Node, default_length: ?usize, groups: []const cv.Group, source_position: usize) Error!void {
     errdefer |err| if (self.failure == null) {
         self.failure = .{ .stage = .array, .detail = switch (@as(anyerror, err)) {
-            error.MissingValue, error.EmptyValue, error.InvalidValue, error.Overflow => .{ .attribute = .array_length },
+            error.MissingAttribute, error.EmptyValue, error.InvalidValue, error.Overflow => .{ .attribute = .array_length },
             else => .none,
         } };
     };
@@ -391,13 +400,13 @@ fn decompressInto(self: *DecodedArrays, decompressor: *zlib.Decompressor, output
         }
     }
     const bytes = std.mem.sliceAsBytes(output.words.items)[0..output.bytes];
-    const length = (try decompressor.read(bytes)).len;
+    const length = if (try decompressor.read(bytes)) |piece| piece.len else 0;
     if (length != bytes.len) {
         short.* = length;
         return error.DecodedSizeMismatch;
     }
     var extra: [1]u8 = undefined;
-    if ((try decompressor.read(&extra)).len != 0) return error.DecodedSizeMismatch;
+    if (try decompressor.read(&extra) != null) return error.DecodedSizeMismatch;
     output.toNative();
 }
 
@@ -407,7 +416,7 @@ fn Base64Input(comptime Source: type) type {
     const SourceError = @typeInfo(@typeInfo(@TypeOf(std.meta.Child(Source).next)).@"fn".return_type.?).error_union.error_set;
     return struct {
         const Self = @This();
-        const Failure = SourceError || base64.Error;
+        const Failure = SourceError || base64.Decoder.Error;
 
         reader: std.Io.Reader,
         source: Source,

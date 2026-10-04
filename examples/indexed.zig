@@ -23,7 +23,7 @@ pub fn main(init: std.process.Init) !void {
     };
     defer index.deinit();
     errdefer if (index.diagnostic()) |report| std.debug.print("{s}: {f}\n", .{ args[1], report });
-    var decoded = mzml.StreamReader.DecodedArrays.init(init.gpa, .{});
+    var decoded = mzml.DecodedArrays.init(init.gpa, .{});
     defer decoded.deinit();
     var output_buffer: [4096]u8 = undefined;
     var output = std.Io.File.stdout().writer(init.io, &output_buffer);

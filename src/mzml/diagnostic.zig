@@ -4,6 +4,9 @@
 //! Locations are optional physical byte offsets. Input events do not identify an
 //! exact bad decoded character; output offsets do not imply a successful flush.
 //! Formatting writes to the caller's sink without allocating or changing the report.
+//!
+//! `init`, `initAny`, `xmlDetail`, `translate`, and `RecordPosition.of` are internal: the
+//! readers, writer, and `DecodedArrays` build reports with them.
 
 const std = @import("std");
 const model = @import("model.zig");
@@ -159,18 +162,20 @@ pub fn init(code: Errors, operation: Operation, stage: Stage, detail: Detail) Di
         error.LimitExceeded => if (detail == .limit) .limit_exceeded else .size_overflow,
         error.UnsupportedEncoding => if (stage == .xml) .xml_encoding_unavailable else .array_encoding_unavailable,
         error.MissingAttribute => .missing_attribute,
-        error.MissingValue => if (detail == .attribute) .missing_attribute else .invalid_value,
+        error.MissingValue => .invalid_value,
         error.InvalidCharacter => if (stage == .base64) .invalid_base64 else .invalid_xml,
         error.InvalidPadding, error.NonCanonicalTail => .invalid_base64,
         error.TruncatedInput => if (stage == .base64) .invalid_base64 else .array_decode_failed,
         error.DecodedSizeMismatch => .decoded_size_mismatch,
         error.InvalidIndex => .invalid_index,
         error.WriteFailed => .write_failed,
-        error.InvalidData, error.ChecksumMismatch, error.TrailingInput, error.UnsupportedDictionary, error.ToleranceUnattainable, error.ValueOutOfRange => .array_decode_failed,
-        // A fixed point is the caller's option when writing and a payload header when reading.
+        error.InvalidData, error.ChecksumMismatch, error.TrailingInput, error.UnsupportedDictionary, error.ValueOutOfRange => .array_decode_failed,
+        // A fixed point or an unsupported type is the caller's option when writing and a
+        // payload header or declaration when reading.
         error.InvalidFixedPoint => if (writing(operation)) .invalid_options else .array_decode_failed,
+        error.TypeMismatch => if (writing(operation)) .invalid_options else .array_declaration_error,
         error.MissingFixedPoint, error.UnexpectedFixedPoint, error.MissingCompressor => .invalid_options,
-        error.InvalidXml, error.InvalidEncoding, error.UnsupportedVersion, error.DtdForbidden, error.WrongNamespace, error.UnexpectedEnd, error.EndOfStream, error.NoText, error.InvalidName, error.InvalidNamespace, error.DuplicateAttribute => .invalid_xml,
+        error.InvalidXml, error.InvalidEncoding, error.UnsupportedVersion, error.DtdForbidden, error.WrongNamespace, error.UnexpectedEnd, error.InvalidName, error.InvalidNamespace, error.DuplicateAttribute => .invalid_xml,
         error.InvalidStructure, error.UnknownAttribute, error.UnexpectedElement => .invalid_structure,
         error.EmptyValue, error.InvalidValue, error.Overflow, error.RepeatedParameter, error.RepeatedArray, error.ConflictingParameter => .invalid_value,
         error.InvalidState, error.FailedState, error.AlreadyFinished => .invalid_state,
@@ -180,13 +185,13 @@ pub fn init(code: Errors, operation: Operation, stage: Stage, detail: Detail) Di
         error.PayloadNotRetained => .missing_payload,
         error.MissingGroup, error.DuplicateGroup, error.NestedGroup => .group_error,
         error.ExpansionLimit => return .{ .id = .limit_exceeded, .code = code, .operation = operation, .stage = stage, .detail = .{ .limit = .{ .name = .expansion_work, .maximum = cv.EXPANSION_WORK } } },
-        error.MissingPrimitive, error.MissingCompression, error.ConflictingPrimitive, error.ConflictingCompression, error.NotBinaryArray, error.TypeMismatch => .array_declaration_error,
+        error.MissingPrimitive, error.MissingCompression, error.ConflictingPrimitive, error.ConflictingCompression => .array_declaration_error,
         error.MissingIndex => .missing_index,
         error.DuplicateId => .duplicate_id,
         error.AmbiguousId => .ambiguous_id,
         error.StaleSource => .source_changed,
         error.UnsupportedSource => .unsupported_source,
-        error.TruncatedSource, error.UnexpectedEndOfFile => .truncated_source,
+        error.TruncatedSource => .truncated_source,
         error.ReadFailed, error.AccessDenied, error.PermissionDenied, error.InputOutput, error.IsDir, error.LockViolation, error.NotOpenForReading, error.Streaming, error.SystemResources, error.Unexpected, error.Unseekable, error.WouldBlock, error.BrokenPipe, error.DeviceBusy, error.DiskQuota, error.FileBusy, error.FileTooBig, error.NoDevice, error.NoSpaceLeft, error.NotOpenForWriting => .io_failed,
         error.Canceled => .canceled,
         error.CountMismatch => .count_mismatch,

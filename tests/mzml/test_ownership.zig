@@ -37,7 +37,7 @@ test "[integration] - [mzML extensions]: owns XML after reader closure and clean
             try writer.finish();
             var index = try mzml.IndexedReader.build(allocator, .{ .bytes = sink.buffered() }, .{});
             defer index.deinit();
-            var output = mzml.StreamReader.DecodedArrays.init(allocator, .{});
+            var output = mzml.DecodedArrays.init(allocator, .{});
             defer output.deinit();
             var found = (try index.byIdDecoded(allocator, "scan=1", &output)).?;
             defer found.deinit();

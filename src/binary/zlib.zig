@@ -11,7 +11,7 @@ const core = @import("core.zig");
 const kernel = @import("kernel_options");
 const overlaps = core.overlaps;
 
-/// A fast call's outcome; errors map one to one onto `Error`.
+/// A fast call's outcome; errors map one to one onto `DecompressError`.
 const FastResult = enum(u8) { ok, end, invalid_data, truncated_input, checksum_mismatch, trailing_input, unsupported_dictionary, output_too_small };
 /// Fills `buffer[0..capacity]` from the caller's input: `end` when exhausted, `invalid_data` on
 /// a failed read (its owner keeps the cause).
@@ -140,7 +140,14 @@ fn useFast() bool {
     return fast_linked and core.hasX86_64V3();
 }
 
-fn fastResult(code: FastResult) Error!void {
+fn fastResult(code: FastResult) error{
+    InvalidData,
+    TruncatedInput,
+    ChecksumMismatch,
+    TrailingInput,
+    UnsupportedDictionary,
+    OutputTooSmall,
+}!void {
     return switch (code) {
         .ok, .end => {},
         .invalid_data => error.InvalidData,
@@ -160,7 +167,7 @@ fn readCallback(context: *anyopaque, buffer: [*]u8, capacity: usize, filled: *us
 }
 
 /// Output after a failure is unspecified but stays within its buffer.
-pub const Error = error{
+pub const DecompressError = error{
     InvalidData,
     TruncatedInput,
     ChecksumMismatch,
@@ -168,9 +175,8 @@ pub const Error = error{
     UnsupportedDictionary,
     OutputTooSmall,
     OverlappingBuffers,
-    /// A streaming call came before its stream was started or after it was finished.
-    InvalidState,
 };
+pub const CompressError = error{ OutputTooSmall, OverlappingBuffers };
 
 /// zipir's compression presets, from fastest to smallest output. Compressed bytes may change
 /// between zipir versions; they always decode to the same values.
@@ -178,11 +184,11 @@ pub const Preset = enum { fast, even, dense };
 
 /// Decodes exactly one zlib stream into output, checking its Adler-32. Trailing bytes, such as
 /// a second stream, are an error, and expanding past output's capacity is OutputTooSmall.
-pub fn decompress(output: []u8, source: []const u8) Error![]u8 {
+pub fn decompress(output: []u8, source: []const u8) DecompressError![]u8 {
     return decompressWith(useFast(), output, source);
 }
 
-fn decompressWith(use_fast: bool, output: []u8, source: []const u8) Error![]u8 {
+fn decompressWith(use_fast: bool, output: []u8, source: []const u8) DecompressError![]u8 {
     if (overlaps(output, source)) return error.OverlappingBuffers;
     // zipir asserts distinct addresses even for empty slices, which are disjoint here.
     if (source.len == 0) return error.TruncatedInput;
@@ -198,7 +204,7 @@ fn decompressWith(use_fast: bool, output: []u8, source: []const u8) Error![]u8 {
     return output[0..length];
 }
 
-fn mapped(err: zipir.zlib.DecompressError) Error {
+fn mapped(err: zipir.zlib.DecompressError) DecompressError {
     return switch (err) {
         error.Truncated => error.TruncatedInput,
         error.BadAdler => error.ChecksumMismatch,
@@ -230,6 +236,9 @@ pub const Decompressor = struct {
     state: union(enum) { portable: *zipir.zlib.Decompressor, fast: []align(FAST_STATE_ALIGN) u8 },
     input: std.Io.Reader = undefined,
     source: enum { none, empty, stream } = .none,
+
+    /// `InvalidState` is a streaming call before `start` or `startReader`.
+    pub const Error = DecompressError || error{InvalidState};
 
     /// Allocates one zipir decompressor, the x86-64-v3 one when it runs here.
     pub fn init(allocator: std.mem.Allocator) std.mem.Allocator.Error!Decompressor {
@@ -298,20 +307,21 @@ pub const Decompressor = struct {
         return available[0..length];
     }
 
-    /// Fills window with the next decoded bytes and returns them, short only at the end; an
-    /// empty result means the stream ended and its checksum and trailing bytes were checked.
-    pub fn read(self: *Decompressor, window: []u8) Error![]u8 {
+    /// Fills window with the next decoded bytes and returns them, short only at the end; null
+    /// once the stream has ended and its checksum and trailing bytes were checked. An empty
+    /// window returns an empty slice.
+    pub fn read(self: *Decompressor, window: []u8) Error!?[]u8 {
         try self.check();
         switch (self.state) {
             .portable => |state| {
                 const length = state.reader.readSliceShort(window) catch
                     return mapped(state.err orelse error.ReadFailed);
-                return window[0..length];
+                return if (length == 0 and window.len != 0) null else window[0..length];
             },
             .fast => |state| if (!fast_linked) unreachable else {
                 var length: usize = 0;
                 try fastResult(fast.read(state.ptr, window.ptr, window.len, &length));
-                return window[0..length];
+                return if (length == 0 and window.len != 0) null else window[0..length];
             },
         }
     }
@@ -342,6 +352,9 @@ pub const Compressor = struct {
     // Which start began the open stream; finish needs start's output.
     open: enum { none, output, writer } = .none,
 
+    /// `InvalidState` is a `finish` without its `start`.
+    pub const Error = CompressError || error{InvalidState};
+
     /// Allocates one zipir compressor.
     pub fn init(allocator: std.mem.Allocator, preset: Preset) std.mem.Allocator.Error!Compressor {
         return .{ .allocator = allocator, .state = try allocator.create(zipir.zlib.Compressor), .preset = preset };
@@ -353,20 +366,20 @@ pub const Compressor = struct {
     }
 
     /// Writes one zlib stream without allocating.
-    pub fn compress(self: *Compressor, output: []u8, source: []const u8) Error![]u8 {
+    pub fn compress(self: *Compressor, output: []u8, source: []const u8) CompressError![]u8 {
         if (overlaps(output, source)) return error.OverlappingBuffers;
         const writer = try self.start(output);
         writer.writeAll(source) catch {
             self.cancel();
             return error.OutputTooSmall;
         };
-        return self.finish();
+        return self.finishOutput();
     }
 
     /// Starts one zlib stream into output and returns the writer for its source; finish
     /// ends it. A write error on the writer means output is full. output stays borrowed
     /// until finish.
-    pub fn start(self: *Compressor, output: []u8) Error!*std.Io.Writer {
+    pub fn start(self: *Compressor, output: []u8) CompressError!*std.Io.Writer {
         self.destination = std.Io.Writer.fixed(output);
         // zipir's only compression error is a full output writer.
         const writer = self.startWriter(&self.destination) catch return error.OutputTooSmall;
@@ -377,9 +390,14 @@ pub const Compressor = struct {
     /// Ends the stream begun by start and returns the written prefix of its output.
     pub fn finish(self: *Compressor) Error![]u8 {
         if (self.open != .output) return error.InvalidState;
-        self.finishWriter() catch |err| return switch (err) {
-            error.WriteFailed => error.OutputTooSmall,
-            error.InvalidState => error.InvalidState,
+        return self.finishOutput();
+    }
+
+    // Ends the open stream begun by start.
+    fn finishOutput(self: *Compressor) CompressError![]u8 {
+        self.open = .none;
+        _ = self.state.finish() catch |err| switch (err) {
+            error.WriteFailed => return error.OutputTooSmall,
         };
         return self.destination.buffered();
     }
@@ -432,15 +450,15 @@ test "[property] - [zlib dispatch]: both decoders give the same bytes and errors
         // Runs of repeats and noise, so both literal and match paths decode.
         for (plain[0..length], 0..) |*byte, i| byte.* = if (i % 97 < 40) @truncate(i / 97) else random.int(u8);
         const compressed = try compressor.compress(stream, plain[0..length]);
-        const damaged = [_][]const u8{ compressed, compressed[0 .. compressed.len / 2], compressed[0 .. compressed.len -| 1] };
+        const damaged = [_][]const u8{ compressed, compressed[0 .. compressed.len / 2], compressed[0..compressed.len -| 1] };
         for (damaged ++ [_][]const u8{stream[0 .. compressed.len + 1]}, 0..) |source, case| {
             if (case == 3) stream[compressed.len] = 0;
-            var results: [2]Error![]u8 = undefined;
+            var results: [2]Decompressor.Error![]u8 = undefined;
             for (&results, outputs, [_]bool{ false, true }) |*result, output, use_fast| result.* = decompressWith(use_fast, output, source);
             try expectSame(results);
             // Streaming from a slice, from 1- and 7-byte reads, by next and by read.
             for ([_]usize{ 0, 1, 7 }) |chunk| {
-                var streamed: [2]Error!usize = undefined;
+                var streamed: [2]Decompressor.Error!usize = undefined;
                 for (&decoders, &streamed, outputs) |*decoder, *result, output| {
                     var input: std.testing.Reader = .init(output[plain.len..][0..16], &.{.{ .buffer = source }});
                     if (chunk == 0) decoder.start(source) else {
@@ -459,18 +477,18 @@ test "[property] - [zlib dispatch]: both decoders give the same bytes and errors
         const position = 2 + random.uintLessThan(usize, compressed.len - 6);
         const flip = @as(u8, 1) << random.int(u3);
         compressed[position] ^= flip;
-        var results: [2]Error![]u8 = undefined;
+        var results: [2]Decompressor.Error![]u8 = undefined;
         for (&results, outputs, [_]bool{ false, true }) |*result, output, use_fast| result.* = decompressWith(use_fast, output, compressed);
         try expectSame(results);
         compressed[position] ^= flip;
     }
 }
 
-fn drain(decoder: *Decompressor, output: []u8, by_read: bool) Error!usize {
+fn drain(decoder: *Decompressor, output: []u8, by_read: bool) Decompressor.Error!usize {
     var length: usize = 0;
     while (true) {
         if (by_read) {
-            const piece = try decoder.read(output[length..@min(output.len, length + 4096)]);
+            const piece = try decoder.read(output[length..@min(output.len, length + 4096)]) orelse return length;
             if (piece.len == 0) return length;
             length += piece.len;
         } else {
@@ -481,7 +499,7 @@ fn drain(decoder: *Decompressor, output: []u8, by_read: bool) Error!usize {
     }
 }
 
-fn expectSame(results: [2]Error![]u8) !void {
+fn expectSame(results: [2]Decompressor.Error![]u8) !void {
     const portable = results[0] catch |err| return std.testing.expectError(err, results[1]);
     try std.testing.expectEqualSlices(u8, portable, try results[1]);
 }
