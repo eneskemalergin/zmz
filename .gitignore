@@ -15,13 +15,6 @@ __pycache__/
 *.pyc
 *.pyo
 
-# Locally built peer tools
-/tools/bin/
-/tools/src/
-/tools/build/
-/tools/venv/
-/tools/wrappers/target/
-
 # Ignored folders (dev only)
 tmp/
 plan/

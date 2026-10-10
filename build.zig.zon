@@ -15,8 +15,12 @@
         "src",
         "tests",
         "examples",
-        "tools",
+        "tools/check_mzml.zig",
+        "tools/vocabulary.zig",
+        "tools/libm_data.py",
         "vocabularies",
         "README.md",
+        "LICENSE",
+        "NOTICE",
     },
 }

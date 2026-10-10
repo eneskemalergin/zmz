@@ -10,7 +10,7 @@
   <a href="#what-zmz-is"><img src="https://img.shields.io/badge/first%20format-mzML-0066CC?style=flat-square" alt="First format: mzML"></a>
   <a href="https://ziglang.org/download/"><img src="https://img.shields.io/badge/Zig-0.16.0-F7A41D?style=flat-square&amp;logo=zig&amp;logoColor=white" alt="Zig 0.16.0"></a>
   <a href="#direction"><img src="https://img.shields.io/badge/status-early%20development-C17D10?style=flat-square" alt="Status: early development"></a>
-  <a href="#license"><img src="https://img.shields.io/badge/license-not%20selected-94a3b8?style=flat-square" alt="License: not selected"></a>
+  <a href="#license"><img src="https://img.shields.io/badge/license-Apache%202.0-0066CC?style=flat-square" alt="License: Apache 2.0"></a>
 </p>
 
 <!-- markdownlint-enable MD041 -->
@@ -62,13 +62,9 @@ The public entry point is [`src/root.zig`](src/root.zig). Vocabulary resources a
 
 [Complete, compiled examples](examples/README.md) show streamed reading, selected decoding, indexed access, array construction, and payload rewriting, with cleanup and buffer lifetimes. Build them with `zig build examples -Doptimize=ReleaseFast`. Their checks also run under `zig build test`.
 
-## Peer readers and benchmarks
-
-The local mzML reader inventory, reproducible installer, C++ and Rust MS-Numpress peers, comparison commands, and benchmark commands are in [`tools/README.md`](tools/README.md). Install them with `tools/install.sh`; generated checkouts, virtual environments, caches, binaries, and benchmark output remain local and ignored.
-
 ## License
 
-The project license has not been selected yet. The bundled vocabulary resources retain their source terms and attribution requirements; see [`vocabularies/README.md`](vocabularies/README.md). zlib support uses zipir under the [MIT license](https://github.com/eneskemalergin/zipir/blob/main/LICENSE), and SLOF's `exp` and `log` tables (`src/binary/libm_data.zig`) come from Arm's optimized-routines under the MIT license, with its notice in that file; include both notices with binary distributions.
+zmz is licensed under the [Apache License, Version 2.0](LICENSE). The third-party notices are in [`NOTICE`](NOTICE): zlib support uses zipir under the MIT license, and SLOF's `exp` and `log` tables (`src/binary/libm_data.zig`) come from Arm's optimized-routines under the MIT license. Include `LICENSE` and `NOTICE` with source and binary distributions. The bundled vocabulary resources keep their own source terms and attribution requirements; see [`vocabularies/README.md`](vocabularies/README.md).
 
 ---
 
