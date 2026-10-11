@@ -89,6 +89,16 @@ pub fn build(b: *std.Build) void {
     const check_step = b.step("check-mzml", "Read, decode, and compare indexed lookups in explicit external files");
     check_step.dependOn(&check_file.step);
     check_step.dependOn(&b.addInstallArtifact(file_check, .{}).step);
+    const check_test_options = b.addOptions();
+    check_test_options.addOptionPath("executable", file_check.getEmittedBin());
+    const check_cli_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("tests/cli/test_check_mzml.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = strip,
+        .imports = &.{.{ .name = "check_test_options", .module = check_test_options.createModule() }},
+    }) });
+    test_step.dependOn(&b.addRunArtifact(check_cli_tests).step);
 
     const vocabulary_module = b.createModule(.{
         .root_source_file = b.path("tools/vocabulary.zig"),

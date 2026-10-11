@@ -184,8 +184,8 @@ pub fn expectWritten(expected: []const u8, actual: []const u8) !void {
     defer rebuilt.deinit();
     try std.testing.expectEqual(rebuilt.entryCount(), embedded.entryCount());
     for (0..rebuilt.entryCount()) |position| {
-        const found = rebuilt.entryAt(position);
-        const listed = embedded.entryAt(position);
+        const found = rebuilt.entryAt(position).?;
+        const listed = embedded.entryAt(position).?;
         try std.testing.expectEqualStrings(found.id, listed.id);
         try std.testing.expectEqual(found.start, listed.start);
     }

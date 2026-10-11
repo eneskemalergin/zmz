@@ -561,7 +561,11 @@ const Output = struct {
 test "[failure] - [mzML decoded arrays]: refuses text before its array and leaves a limit-stopped array empty" {
     const int32 = cv.Entry{ .cv = .{ .accession = .{ .raw = "MS:1000519" }, .name = "32-bit integer" } };
     const plain = cv.Entry{ .cv = .{ .accession = .{ .raw = "MS:1000576" }, .name = "no compression" } };
-    const node: model.Node = .{ .kind = .binary_data_array, .params = &.{ int32, plain }, .children = &.{.{ .kind = .binary, .text = "QUFBQUFBQUE=" }} };
+    const node: model.Node = .{
+        .kind = .binary_data_array,
+        .params = &.{ int32, plain },
+        .children = &.{.{ .kind = .binary, .text = "QUFBQUFBQUE=" }},
+    };
     const Empty = struct {
         fn next(_: *@This()) error{}!?[]const u8 {
             return null;

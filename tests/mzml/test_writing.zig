@@ -227,7 +227,7 @@ test "[integration] - [mzML children]: copies retained XML without indexing nest
             var decoded = mzml.DecodedArrays.init(allocator, .{});
             defer decoded.deinit();
             for (0..index.entryCount()) |entry_position| {
-                const entry = index.entryAt(entry_position);
+                const entry = index.entryAt(entry_position).?;
                 var retained = (try index.byId(allocator, entry.id)).?;
                 defer retained.deinit();
                 var numeric = (try index.atDecoded(allocator, entry.kind, entry.ordinal, &decoded)).?;
@@ -1230,7 +1230,7 @@ test "[integration] - [mzML file writer]: patches counts without changing record
                 defer index.deinit();
                 try std.testing.expectEqualDeep(case.counts, index.counts);
                 for (0..index.entryCount()) |position| {
-                    const entry = index.entryAt(position);
+                    const entry = index.entryAt(position).?;
                     var found = (try index.byId(std.testing.allocator, entry.id)).?;
                     defer found.deinit();
                     try std.testing.expectEqual(entry.start, found.value.node.start_offset);

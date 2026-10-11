@@ -2,7 +2,10 @@
 //!
 //! For each file it rebuilds the index (policy `rebuild`), streams every record, resolving its
 //! metadata and decoding its arrays, compares the first, middle, and last record with their indexed
-//! lookups, and prints the totals. It stops at the first failing file and reports its error.
+//! lookups, and prints the totals. Selected-ion and isolation-window fields are read one at a
+//! time, so a malformed field is counted in `invalid_fields` and the rest of the file is still
+//! checked. Any other failure stops at that file, prints the file and its error, and exits with
+//! status 1.
 
 const std = @import("std");
 const mzml = @import("zmz").mzml;
@@ -11,7 +14,7 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     if (args.len < 2) {
         try std.Io.File.stderr().writeStreamingAll(init.io, "usage: zig build check-mzml -- FILE.mzML [FILE.mzML ...]\n");
-        return error.InvalidArguments;
+        std.process.exit(1);
     }
     var buffer: [4096]u8 = undefined;
     var output = std.Io.File.stdout().writer(init.io, &buffer);
@@ -21,15 +24,19 @@ pub fn main(init: std.process.Init) !void {
             var diagnostic = std.Io.File.stderr().writer(init.io, &error_buffer);
             try diagnostic.interface.print("{s}: {s}\n", .{ path, @errorName(err) });
             try diagnostic.interface.flush();
-            return err;
+            std.process.exit(1);
         };
         try output.interface.print("{s}: records={d} arrays={d} values={d} lookups={d}\n", .{
             path, totals.records, totals.arrays, totals.values, totals.lookups,
         });
-        try output.interface.print("metadata: scans={d} precursors={d} selected_ions={d} products={d} quantities={d} unresolved_units={d} disallowed_units={d}\n", .{
-            totals.scans,      totals.precursors,       totals.selected_ions,    totals.products,
-            totals.quantities, totals.unresolved_units, totals.disallowed_units,
-        });
+        try output.interface.print(
+            "metadata: scans={d} precursors={d} selected_ions={d} products={d} quantities={d} unresolved_units={d}" ++
+                " disallowed_units={d} invalid_fields={d}\n",
+            .{
+                totals.scans,      totals.precursors,       totals.selected_ions,    totals.products,
+                totals.quantities, totals.unresolved_units, totals.disallowed_units, totals.invalid_fields,
+            },
+        );
         try output.interface.flush();
     }
 }
@@ -46,6 +53,7 @@ const Totals = struct {
     quantities: usize = 0,
     unresolved_units: usize = 0,
     disallowed_units: usize = 0,
+    invalid_fields: usize = 0,
 };
 
 fn checkFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Totals {
@@ -129,9 +137,10 @@ fn checkMetadata(record: mzml.model.Record, groups: []const mzml.cv.Group, resol
         totals.precursors += 1;
         for (try precursor.selectedIons()) |node| {
             totals.selected_ions += 1;
-            const ion = try node.selectedIonValues(groups);
-            try checkQuantity(ion.mz, resolver, totals);
-            try checkQuantity(ion.intensity, resolver, totals);
+            const ion = try node.selectedIonFields(groups);
+            try checkField(ion.mz, resolver, totals);
+            if (ion.charge) |_| {} else |_| totals.invalid_fields += 1;
+            try checkField(ion.intensity, resolver, totals);
         }
         try checkWindow(precursor.child(.isolation_window), groups, resolver, totals);
     }
@@ -142,10 +151,18 @@ fn checkMetadata(record: mzml.model.Record, groups: []const mzml.cv.Group, resol
 }
 
 fn checkWindow(node: ?mzml.model.Node, groups: []const mzml.cv.Group, resolver: mzml.cv.Resolver, totals: *Totals) !void {
-    const window = try (node orelse return).isolationWindowValues(groups);
-    try checkQuantity(window.target, resolver, totals);
-    try checkQuantity(window.lower_offset, resolver, totals);
-    try checkQuantity(window.upper_offset, resolver, totals);
+    const window = try (node orelse return).isolationWindowFields(groups);
+    try checkField(window.target, resolver, totals);
+    try checkField(window.lower_offset, resolver, totals);
+    try checkField(window.upper_offset, resolver, totals);
+}
+
+fn checkField(field: mzml.model.FieldError!?mzml.model.Number, resolver: mzml.cv.Resolver, totals: *Totals) !void {
+    const number = field catch {
+        totals.invalid_fields += 1;
+        return;
+    };
+    try checkQuantity(number, resolver, totals);
 }
 
 fn checkQuantity(number: ?mzml.model.Number, resolver: mzml.cv.Resolver, totals: *Totals) !void {

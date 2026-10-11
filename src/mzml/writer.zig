@@ -460,7 +460,13 @@ fn writeRecordInner(self: *Writer, node: model.Node, comptime replace_arrays: bo
             try state.historical_ids.ensureUnusedCapacity(state.allocator, 1);
         }
         const ids = &state.ids[if (node.kind == .spectrum) @as(usize, 0) else 1];
-        try Ids.insert(ids, state.allocator, &state.entries, state.id_list.items, .{ .id_start = id_start, .id_len = @intCast(id.len), .offset = offset });
+        try Ids.insert(
+            ids,
+            state.allocator,
+            &state.entries,
+            state.id_list.items,
+            .{ .id_start = id_start, .id_len = @intCast(id.len), .offset = offset },
+        );
         if (state.historical) state.historical_ids.appendAssumeCapacity(.{ .native_id = native_id, .spot_id = spot_id });
         if (node.kind == .spectrum) state.spectra += 1;
     }

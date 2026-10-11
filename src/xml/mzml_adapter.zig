@@ -1108,7 +1108,12 @@ pub const Cursor = struct {
                 reader.toss(expected.len + 1);
                 try self.source.addPosition(expected.len + 1);
                 // As for a synthetic end, the open name's bytes outlive this event.
-                const name = try self.makeName(self.open_names.items, .{ .start = frame.name_start, .len = frame.name_len, .prefix_len = frame.prefix_len }, false, name_offset);
+                const name = try self.makeName(
+                    self.open_names.items,
+                    .{ .start = frame.name_start, .len = frame.name_len, .prefix_len = frame.prefix_len },
+                    false,
+                    name_offset,
+                );
                 self.popFrame(frame);
                 return .{
                     .span = .{ .start = start_offset, .end = self.source.position },
@@ -1229,8 +1234,8 @@ pub const Cursor = struct {
             else if (value.value == '>' and self.cdata_brackets == 2)
                 0
             else
-                (if (value.value == '\r') 1 else std.unicode.utf8CodepointSequenceLength(value.value) catch return self.malformed(.invalid_character)) +
-                    @as(usize, self.cdata_brackets);
+                (if (value.value == '\r') 1 else std.unicode.utf8CodepointSequenceLength(value.value) catch
+                    return self.malformed(.invalid_character)) + @as(usize, self.cdata_brackets);
             if (output_length > TEXT_CHUNK_BYTES - self.text_bytes.items.len) break;
             _ = try self.source.readCodepoint();
             if (value.value == ']') {
@@ -2997,7 +3002,8 @@ test "[unit] - [mzML XML writer]: emits escaped values and flushes empty text" {
     try writer.endElement();
     try writer.endDocument();
     try std.testing.expectEqualStrings(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><mzML xmlns=\"" ++ NAMESPACE ++ "\" id=\"a&amp;&quot;b&#x9;&#xA;&#xD;\xc2\xb5\xe2\x82\xac\xf0\x9f\x98\x80\">]]&gt; &amp;&lt;&#xD;</mzML>",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><mzML xmlns=\"" ++ NAMESPACE ++
+            "\" id=\"a&amp;&quot;b&#x9;&#xA;&#xD;\xc2\xb5\xe2\x82\xac\xf0\x9f\x98\x80\">]]&gt; &amp;&lt;&#xD;</mzML>",
         sink.buffered(),
     );
     try std.testing.expectEqual(@as(?u64, sink.buffered().len), writer.byteOffset());

@@ -170,8 +170,10 @@ pub fn entryCount(self: *const IndexedReader) usize {
     return self.entry_list.items.len;
 }
 
-/// Returns the entry at a position below `entryCount`; its ID is valid until deinit.
-pub fn entryAt(self: *const IndexedReader, position: usize) Entry {
+/// Returns the entry at a zero-based position, spectra first, or null at or past `entryCount`.
+/// Its ID is valid until deinit.
+pub fn entryAt(self: *const IndexedReader, position: usize) ?Entry {
+    if (position >= self.entry_list.items.len) return null;
     const stored = self.entry_list.items[position];
     const chromatogram = position >= self.counts[0];
     return .{
@@ -671,7 +673,7 @@ fn lookup(self: *IndexedReader, allocator: std.mem.Allocator, target: Target, ou
         .id => |id| self.idPosition(id),
         .ordinal => |ordinal| self.ordinalPosition(ordinal.kind, ordinal.ordinal),
     } orelse return null;
-    const entry = self.entryAt(position);
+    const entry = self.entryAt(position).?;
     return try if (output) |decoded| self.readDecodedEntry(allocator, entry, decoded) else self.readEntry(allocator, entry, null);
 }
 
