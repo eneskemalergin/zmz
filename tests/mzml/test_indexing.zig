@@ -233,11 +233,11 @@ fn expectDecodedRecord(record: mzml.model.Record, groups: []const mzml.cv.Group,
                 const T = @typeInfo(@TypeOf(values)).pointer.child;
                 const expected = try std.testing.allocator.alloc(T, array.length);
                 defer std.testing.allocator.free(expected);
-                const transport = try std.testing.allocator.alloc(u8, array.node.child(.binary).?.text.?.len);
-                defer std.testing.allocator.free(transport);
+                const wire_buffer = try std.testing.allocator.alloc(u8, array.node.child(.binary).?.text.?.len);
+                defer std.testing.allocator.free(wire_buffer);
                 const transformed = try std.testing.allocator.alloc(u8, try mzml.arrays.wireBound(T, array.length, array.encoding.pipeline));
                 defer std.testing.allocator.free(transformed);
-                _ = try array.decode(T, expected, .{ .transport = transport, .transformed = transformed });
+                _ = try array.decode(T, expected, .{ .wire = wire_buffer, .transformed = transformed });
                 try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(expected), std.mem.sliceAsBytes(values));
             },
         }
@@ -360,9 +360,9 @@ test "[integration] - [mzML indexed decoding]: selects arrays and records withou
                     try std.testing.expectEqual(@as(usize, 1), decoded.source_position);
                     const array = try mzml.model.BinaryArray.init(expected.binaryArrays()[decoded.source_position], expected.default_array_length, index.header().groups);
                     var values: [3]f64 = undefined;
-                    var transport: [128]u8 = undefined;
+                    var wire_buffer: [128]u8 = undefined;
                     var transformed: [128]u8 = undefined;
-                    _ = try array.decode(f64, &values, .{ .transport = &transport, .transformed = &transformed });
+                    _ = try array.decode(f64, &values, .{ .wire = &wire_buffer, .transformed = &transformed });
                     try std.testing.expectEqualDeep(array.encoding, decoded.encoding);
                     try std.testing.expectEqualSlices(f64, &values, decoded.values.float64);
                 }
@@ -930,9 +930,9 @@ fn checkIndexed(allocator: std.mem.Allocator, bytes: []const u8) !void {
         try support.expectNode(record.value.node, ordinal.value.node);
         for (record.value.binaryArrays()) |array| {
             var output: [3]f64 = undefined;
-            var transport: [128]u8 = undefined;
+            var wire_buffer: [128]u8 = undefined;
             var transformed: [128]u8 = undefined;
-            _ = try mzml.model.decodeArray(f64, &output, array, 3, index.header().groups, .{ .transport = &transport, .transformed = &transformed });
+            _ = try mzml.model.decodeArray(f64, &output, array, 3, index.header().groups, .{ .wire = &wire_buffer, .transformed = &transformed });
             for (output, [_]f64{ 1, 2, 3 }) |value, expected| try std.testing.expectApproxEqAbs(expected, value, 0.001);
         }
     }
@@ -963,8 +963,8 @@ fn checkLookupAllocator(record_allocator: std.mem.Allocator) !void {
     defer retained.deinit();
     try std.testing.expectEqualStrings("scan=none", retained.value.id);
     var values: [3]f64 = undefined;
-    var transport: [128]u8 = undefined;
-    _ = try mzml.model.decodeArray(f64, &values, retained.value.binaryArrays()[0], 3, &.{}, .{ .transport = &transport, .transformed = &.{} });
+    var wire_buffer: [128]u8 = undefined;
+    _ = try mzml.model.decodeArray(f64, &values, retained.value.binaryArrays()[0], 3, &.{}, .{ .wire = &wire_buffer, .transformed = &.{} });
     try std.testing.expectEqualSlices(f64, &.{ 1, 2, 3 }, &values);
 }
 
@@ -983,9 +983,9 @@ fn checkOpenEmbedded(allocator: std.mem.Allocator, bytes: []const u8) !void {
         try std.testing.expect(record.value.node.end_offset <= entry.end);
         for (record.value.binaryArrays()) |array| {
             var values: [3]f64 = undefined;
-            var transport: [128]u8 = undefined;
+            var wire_buffer: [128]u8 = undefined;
             var transformed: [128]u8 = undefined;
-            _ = try mzml.model.decodeArray(f64, &values, array, 3, index.header().groups, .{ .transport = &transport, .transformed = &transformed });
+            _ = try mzml.model.decodeArray(f64, &values, array, 3, index.header().groups, .{ .wire = &wire_buffer, .transformed = &transformed });
             for (values, [_]f64{ 1, 2, 3 }) |value, expected| try std.testing.expectApproxEqAbs(expected, value, 0.001);
         }
     }
@@ -1042,7 +1042,7 @@ test "[integration] - [mzML indexed lookup]: crosses file refills with UTF-16 an
                         try expectDecodedRecord(record.value, index.header().groups, decoded.value, &output);
                         var arrays = record.value.arrays(index.header().groups);
                         var value: [1]f64 = undefined;
-                        _ = try (try arrays.next()).?.decode(f64, &value, .{ .transport = &.{}, .transformed = &.{} });
+                        _ = try (try arrays.next()).?.decode(f64, &value, .{ .wire = &.{}, .transformed = &.{} });
                         try std.testing.expectEqual(@as(f64, 1), value[0]);
                     }
                 }

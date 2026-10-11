@@ -114,29 +114,13 @@ pub fn get(self: *const DecodedArrays, position: usize) ?Array {
 /// from nextRecord or an IndexedReader lookup), replacing earlier results. Order, types,
 /// and limits follow nextDecodedRecord; after a failure no results are visible.
 pub fn decodeRecord(self: *DecodedArrays, record: model.Record, groups: []const cv.Group) Error!void {
-    if (self.busy) return error.InvalidState;
-    self.report = null;
-    self.reset();
-    errdefer self.reset();
-    self.busy = true;
-    defer self.busy = false;
-    errdefer |err| self.keepReport(err);
-    for (record.binaryArrays(), 0..) |node, position| try self.decodeRetained(node, record.default_array_length, groups, position);
-    self.complete();
+    return self.decodeNodes(record.binaryArrays(), record.default_array_length, groups);
 }
 
 /// Decodes one binary array node with retained text, replacing earlier results, and returns
 /// its values; get(0) returns the same array. default_length is the record's defaultArrayLength.
 pub fn decodeArray(self: *DecodedArrays, node: model.Node, default_length: ?usize, groups: []const cv.Group) Error!Values {
-    if (self.busy) return error.InvalidState;
-    self.report = null;
-    self.reset();
-    errdefer self.reset();
-    self.busy = true;
-    defer self.busy = false;
-    errdefer |err| self.keepReport(err);
-    try self.decodeRetained(node, default_length, groups, 0);
-    self.complete();
+    try self.decodeNodes(&.{node}, default_length, groups);
     return self.get(0).?.values;
 }
 
@@ -215,6 +199,18 @@ pub fn complete(self: *DecodedArrays) void {
 // zlib payload that fits whole (most spectra) is decoded in one call, straight into its values.
 const WINDOW = 64 * 1024;
 
+fn decodeNodes(self: *DecodedArrays, nodes: []const model.Node, default_length: ?usize, groups: []const cv.Group) Error!void {
+    if (self.busy) return error.InvalidState;
+    self.report = null;
+    self.reset();
+    errdefer self.reset();
+    self.busy = true;
+    defer self.busy = false;
+    errdefer |err| self.keepReport(err);
+    for (nodes, 0..) |node, position| try self.decodeRetained(node, default_length, groups, position);
+    self.complete();
+}
+
 // Runs before the failed call's reset clears failure and the array count.
 fn keepReport(self: *DecodedArrays, err: anyerror) void {
     const stage: Diagnostic.Stage = if (self.failure) |failure| failure.stage else .array;
@@ -233,16 +229,16 @@ fn decodeRetained(
     source_position: usize,
 ) Error!void {
     self.position = source_position;
+    const retained = if (node.child(.binary)) |binary| binary.text else null;
     // Text kept in this owner's storage would be freed or overwritten as arrays are sized.
-    if (node.child(.binary)) |binary| if (binary.text) |retained| {
-        if (overlaps(self.window.allocatedSlice(), retained)) return error.OverlappingBuffers;
+    if (retained) |bytes| {
+        if (overlaps(self.window.allocatedSlice(), bytes)) return error.OverlappingBuffers;
         for (self.outputs.items) |output| {
-            if (overlaps(std.mem.sliceAsBytes(output.words.allocatedSlice()), retained)) return error.OverlappingBuffers;
+            if (overlaps(std.mem.sliceAsBytes(output.words.allocatedSlice()), bytes)) return error.OverlappingBuffers;
         }
-    };
+    }
     try self.beginArray(node, default_length, groups, source_position);
-    const binary = node.child(.binary) orelse return error.PayloadNotRetained;
-    var source = RetainedText{ .text = binary.text orelse return error.PayloadNotRetained };
+    var source = RetainedText{ .text = retained orelse return error.PayloadNotRetained };
     try self.decodeText(&source);
 }
 

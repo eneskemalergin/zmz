@@ -14,13 +14,13 @@ const overlaps = @import("core.zig").overlaps;
 pub const Pipeline = encoding.Pipeline;
 
 /// Caller-owned scratch, disjoint from each other and from input and output.
-/// Decoding: transport holds the Base64-decoded bytes of any pipeline except none, and
+/// Decoding: wire holds the Base64-decoded bytes of any pipeline except none, and
 /// transformed holds zlib output for Numpress with zlib; primitive zlib expands straight
 /// into the typed output. Encoding: transformed holds Numpress or big-endian primitive bytes
-/// without zlib; with zlib they stream into the compressor and transport holds its output.
+/// without zlib; with zlib they stream into the compressor and wire holds its output.
 /// Little-endian primitives without zlib borrow the values' bytes.
 pub const Scratch = struct {
-    transport: []u8,
+    wire: []u8,
     transformed: []u8,
 };
 
@@ -142,13 +142,13 @@ pub const Encoder = struct {
         const transformed = options.pipeline.isNumpress() or
             builtin.cpu.arch.endian() == .big;
         if (!options.pipeline.hasZlib()) {
-            if (!transformed) return encodeWire(T, values, options, .{ .transport = &.{}, .transformed = &.{} }, null);
+            if (!transformed) return encodeWire(T, values, options, .{ .wire = &.{}, .transformed = &.{} }, null);
             const output = try self.nextOutput(bound);
-            return encodeWire(T, values, options, .{ .transport = &.{}, .transformed = output }, null);
+            return encodeWire(T, values, options, .{ .wire = &.{}, .transformed = output }, null);
         }
         const state = try self.compressor();
         const output = try self.nextOutput(zlib.compressBound(bound));
-        return encodeWire(T, values, options, .{ .transport = output, .transformed = &.{} }, state);
+        return encodeWire(T, values, options, .{ .wire = output, .transformed = &.{} }, state);
     }
 
     pub fn encodeSource(self: *Encoder, source: Source) (EncodeError || std.mem.Allocator.Error)![]const u8 {
@@ -191,13 +191,13 @@ pub fn decode(
     _ = encoding.Primitive.of(T);
     try checkBuffers(std.mem.sliceAsBytes(output), source, scratch);
     if (pipeline.isNumpress() and T != f64) return error.TypeMismatch;
-    const destination = if (pipeline == .none) std.mem.sliceAsBytes(output) else scratch.transport;
+    const destination = if (pipeline == .none) std.mem.sliceAsBytes(output) else scratch.wire;
     const wire = base64.decode(destination, source) catch |err| {
         if (err != error.OutputTooSmall) return err;
         // Filling output, or Numpress scratch as large as its bound, means the text holds more
         // than the declared values; shorter scratch is the caller's buffer.
         if (pipeline == .none) return error.DecodedSizeMismatch;
-        if (pipeline.isNumpress() and !pipeline.hasZlib() and scratch.transport.len >= try wireBound(T, output.len, pipeline))
+        if (pipeline.isNumpress() and !pipeline.hasZlib() and scratch.wire.len >= try wireBound(T, output.len, pipeline))
             return error.DecodedSizeMismatch;
         return err;
     };
@@ -216,8 +216,8 @@ pub fn decodeWire(
     _ = encoding.Primitive.of(T);
     const bytes = std.mem.sliceAsBytes(output);
     const in_place = pipeline == .none and bytes.ptr == source.ptr;
-    try checkBuffers(bytes, if (in_place) &.{} else source, .{ .transport = &.{}, .transformed = transformed });
-    if (in_place) try checkBuffers(transformed, source, .{ .transport = &.{}, .transformed = &.{} });
+    try checkBuffers(bytes, if (in_place) &.{} else source, .{ .wire = &.{}, .transformed = transformed });
+    if (in_place) try checkBuffers(transformed, source, .{ .wire = &.{}, .transformed = &.{} });
     if (pipeline.isNumpress() and T != f64) return error.TypeMismatch;
     try decodeWireInner(T, output, source, pipeline, transformed);
 }
@@ -249,7 +249,7 @@ pub fn encodeWire(
     try checkBuffers(&.{}, std.mem.sliceAsBytes(values), scratch);
     try checkOptions(T, values.len, options, compressor != null);
     if (options.pipeline.hasZlib()) {
-        const writer = try compressor.?.start(scratch.transport);
+        const writer = try compressor.?.start(scratch.wire);
         errdefer compressor.?.cancel();
         writeWire(T, values, options, writer) catch |err| switch (err) {
             error.WriteFailed => return error.OutputTooSmall,
@@ -338,7 +338,7 @@ fn checkOptions(comptime T: type, count: usize, options: EncodeOptions, has_comp
 }
 
 fn checkBuffers(output: []u8, source: []const u8, scratch: Scratch) error{OverlappingBuffers}!void {
-    const buffers = [_][]const u8{ output, source, scratch.transport, scratch.transformed };
+    const buffers = [_][]const u8{ output, source, scratch.wire, scratch.transformed };
     for (buffers, 0..) |a, i| {
         for (buffers[i + 1 ..]) |b| {
             if (overlaps(a, b)) return error.OverlappingBuffers;

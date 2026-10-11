@@ -109,11 +109,11 @@ fn copyRetained(allocator: std.mem.Allocator) !void {
     try std.testing.expectEqualStrings("native=a&b", record.value.id);
     try std.testing.expectEqualStrings("A&B", header.value.document.child(.file_description).?.child(.file_content).?.params[0].cv.name.?);
     var output: [1]f64 = undefined;
-    var transport: [16]u8 = undefined;
+    var wire_buffer: [16]u8 = undefined;
     var transformed: [16]u8 = undefined;
     for (record.value.binaryArrays()) |array| {
         _ = try mzml.model.decodeArray(f64, &output, array, record.value.default_array_length, header.value.groups, .{
-            .transport = &transport,
+            .wire = &wire_buffer,
             .transformed = &transformed,
         });
         try std.testing.expectEqual(@as(f64, 1), output[0]);

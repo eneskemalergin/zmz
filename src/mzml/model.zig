@@ -404,9 +404,9 @@ pub const Record = struct {
 };
 
 pub const Primitive = encoding.Primitive;
-pub const Encoding = encoding.Descriptor;
-pub const EncodingTerm = encoding.Declared;
-pub const encodingTerm = encoding.declared;
+pub const Encoding = encoding.Encoding;
+pub const EncodingTerm = encoding.EncodingTerm;
+pub const encodingTerm = encoding.encodingTerm;
 /// What an array holds, from its array-type term.
 pub const ArrayRole = enum { mz, intensity, time, other };
 

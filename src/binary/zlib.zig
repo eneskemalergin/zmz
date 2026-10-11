@@ -377,14 +377,7 @@ fn useFast() bool {
     return FAST_LINKED and core.hasX86_64V3();
 }
 
-fn fastResult(code: FastResult) error{
-    InvalidData,
-    TruncatedInput,
-    ChecksumMismatch,
-    TrailingInput,
-    UnsupportedDictionary,
-    OutputTooSmall,
-}!void {
+fn fastResult(code: FastResult) DecompressError!void {
     return switch (code) {
         .ok, .end => {},
         .invalid_data => error.InvalidData,

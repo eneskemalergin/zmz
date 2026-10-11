@@ -1051,17 +1051,8 @@ pub const Cursor = struct {
 
     fn resolveNamespace(self: *const Cursor, prefix: ?[]const u8) ?[]const u8 {
         if (prefix) |value| if (std.mem.eql(u8, value, "xml")) return XML_NAMESPACE;
-        const wanted = prefix orelse "";
-        var index = self.namespace_bindings.items.len;
-        while (index != 0) {
-            index -= 1;
-            const binding = self.namespace_bindings.items[index];
-            const bound_prefix = self.namespace_bytes.items[binding.prefix_start..][0..binding.prefix_len];
-            if (std.mem.eql(u8, bound_prefix, wanted)) {
-                return self.namespace_bytes.items[binding.uri_start..][0..binding.uri_len];
-            }
-        }
-        return null;
+        const binding = self.namespace_bindings.items[self.bindingIndex(prefix orelse "") orelse return null];
+        return self.namespace_bytes.items[binding.uri_start..][0..binding.uri_len];
     }
 
     // An unprefixed attribute has no namespace; an unprefixed element has the default one.
@@ -1962,12 +1953,7 @@ pub const Writer = struct {
     pub fn text(self: *Writer, value: []const u8) WriterError!void {
         try self.checkContent();
         try self.checkInput(value);
-        if (self.state != .start_tag and self.state != .content) return self.fail(error.InvalidState);
-        if (self.state == .start_tag) {
-            try self.checkOpeningName();
-            try self.writeByte('>');
-            self.state = .content;
-        }
+        try self.enterContent();
         try self.writeEscapedText(value);
     }
 
@@ -1982,12 +1968,7 @@ pub const Writer = struct {
     pub fn binaryPart(self: *Writer, wire: []const u8) WriterError!void {
         try self.checkAny();
         try self.checkInput(wire);
-        if (self.state != .start_tag and self.state != .content) return self.fail(error.InvalidState);
-        if (self.state == .start_tag) {
-            try self.checkOpeningName();
-            try self.writeByte('>');
-            self.state = .content;
-        }
+        try self.enterContent();
         var rest = wire;
         if (self.binary_carry_len != 0) {
             const take = @min(3 - self.binary_carry_len, rest.len);
@@ -2100,6 +2081,14 @@ pub const Writer = struct {
     fn checkContent(self: *Writer) WriterError!void {
         try self.checkAny();
         if (self.binary_carry_len != 0) return self.fail(error.InvalidState);
+    }
+
+    fn enterContent(self: *Writer) WriterError!void {
+        if (self.state != .start_tag and self.state != .content) return self.fail(error.InvalidState);
+        if (self.state != .start_tag) return;
+        try self.checkOpeningName();
+        try self.writeByte('>');
+        self.state = .content;
     }
 
     fn checkOpeningName(self: *Writer) WriterError!void {

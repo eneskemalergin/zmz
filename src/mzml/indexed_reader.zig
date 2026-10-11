@@ -673,8 +673,9 @@ fn lookup(self: *IndexedReader, allocator: std.mem.Allocator, target: Target, ou
         .id => |id| self.idPosition(id),
         .ordinal => |ordinal| self.ordinalPosition(ordinal.kind, ordinal.ordinal),
     } orelse return null;
-    const entry = self.entryAt(position).?;
-    return try if (output) |decoded| self.readDecodedEntry(allocator, entry, decoded) else self.readEntry(allocator, entry, null);
+    const record = try self.readEntry(allocator, self.entryAt(position).?, output);
+    if (output) |decoded| decoded.complete();
+    return record;
 }
 
 fn idPosition(self: *IndexedReader, id: []const u8) Error!?usize {
@@ -692,12 +693,6 @@ fn ordinalPosition(self: *IndexedReader, kind: model.Kind, ordinal: usize) Error
     try self.checkSource();
     if (ordinal >= self.counts[kindIndex(kind)]) return null;
     return ordinal + if (kind == .spectrum) @as(usize, 0) else self.counts[0];
-}
-
-fn readDecodedEntry(self: *IndexedReader, allocator: std.mem.Allocator, entry: Entry, output: *DecodedArrays) Error!owned.Record {
-    const record = try self.readEntry(allocator, entry, output);
-    output.complete();
-    return record;
 }
 
 fn readEntry(self: *IndexedReader, allocator: std.mem.Allocator, entry: Entry, output: ?*DecodedArrays) Error!owned.Record {

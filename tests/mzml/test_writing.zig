@@ -718,7 +718,7 @@ test "[integration] - [mzML references]: preserves unresolved and external links
                 try support.expectNode(record.node, found.value.node);
                 for (next.binaryArrays()) |array| {
                     var values: [1]f64 = undefined;
-                    _ = try mzml.model.decodeArray(f64, &values, array, next.default_array_length, rewritten_header.groups, .{ .transport = &.{}, .transformed = &.{} });
+                    _ = try mzml.model.decodeArray(f64, &values, array, next.default_array_length, rewritten_header.groups, .{ .wire = &.{}, .transformed = &.{} });
                     try std.testing.expectEqual(@as(f64, 1), values[0]);
                 }
                 count += 1;
@@ -749,9 +749,9 @@ test "[integration] - [mzML prepared writing]: preserves primitive bytes across 
             for ([_]mzml.arrays.Pipeline{ .none, .zlib }) |pipeline| {
                 builder.reset();
                 var text: [16384]u8 = undefined;
-                var transport: [16384]u8 = undefined;
+                var wire_buffer: [16384]u8 = undefined;
                 var transformed: [8192]u8 = undefined;
-                const scratch: mzml.arrays.Scratch = .{ .transport = &transport, .transformed = &transformed };
+                const scratch: mzml.arrays.Scratch = .{ .wire = &wire_buffer, .transformed = &transformed };
                 encoder.reset();
                 var arrays: [2]mzml.Builder.Array = undefined;
                 for (&arrays, 0..) |*array, i| array.* = (try builder.prepareArray(T, values[0..count], .{

@@ -570,12 +570,12 @@ test "[integration] - [mzML construction]: writes and decodes every declared pip
             const encoding = array.encoding;
             try std.testing.expectEqual(@as(mzml.arrays.Pipeline, @enumFromInt(count % 8)), encoding.pipeline);
             var output: [3]f64 = undefined;
-            var transport: [512]u8 = undefined;
+            var wire_buffer: [512]u8 = undefined;
             var transformed: [512]u8 = undefined;
-            _ = try array.decode(f64, &output, .{ .transport = &transport, .transformed = &transformed });
+            _ = try array.decode(f64, &output, .{ .wire = &wire_buffer, .transformed = &transformed });
             for (output, [_]f64{ 1, 2, 3 }) |value, expected| try std.testing.expectApproxEqAbs(expected, value, 0.001);
             if (encoding.pipeline == .pic or encoding.pipeline == .pic_zlib) {
-                const decoded = try mzml.base64.decode(&transport, array.node.child(.binary).?.text.?);
+                const decoded = try mzml.base64.decode(&wire_buffer, array.node.child(.binary).?.text.?);
                 const wire = if (encoding.pipeline == .pic_zlib) try mzml.zlib.decompress(&transformed, decoded) else decoded;
                 // Each PIC integer has seven leading zero nibbles, followed by 1, 2, or 3.
                 try std.testing.expectEqualSlices(u8, &.{ 0x71, 0x72, 0x73 }, wire);

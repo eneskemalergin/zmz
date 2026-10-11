@@ -954,11 +954,11 @@ fn compareDecodedWithSelection(source: []const u8, chunk: usize, selected: bool)
                     try std.testing.expectEqual(array.length, values.len);
                     const expected = try std.testing.allocator.alloc(T, values.len);
                     defer std.testing.allocator.free(expected);
-                    const transport = try std.testing.allocator.alloc(u8, array.node.child(.binary).?.text.?.len);
-                    defer std.testing.allocator.free(transport);
+                    const wire_buffer = try std.testing.allocator.alloc(u8, array.node.child(.binary).?.text.?.len);
+                    defer std.testing.allocator.free(wire_buffer);
                     const transformed = try std.testing.allocator.alloc(u8, try mzml.arrays.wireBound(T, values.len, array.encoding.pipeline));
                     defer std.testing.allocator.free(transformed);
-                    _ = try array.decode(T, expected, .{ .transport = transport, .transformed = transformed });
+                    _ = try array.decode(T, expected, .{ .wire = wire_buffer, .transformed = transformed });
                     try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(expected), std.mem.sliceAsBytes(values));
                 },
             }
@@ -1083,7 +1083,7 @@ test "[integration] - [mzML parameters]: retains late array declarations without
     try std.testing.expectEqualStrings("late", (try array.parameter((try reader.readHeader()).groups, .{ .raw = "X:role" })).?.value.?);
     var values: [1]f64 = undefined;
     var scratch: [8]u8 = undefined;
-    _ = try mzml.model.decodeArray(f64, &values, array, 1, (try reader.readHeader()).groups, .{ .transport = &scratch, .transformed = &.{} });
+    _ = try mzml.model.decodeArray(f64, &values, array, 1, (try reader.readHeader()).groups, .{ .wire = &scratch, .transformed = &.{} });
     try std.testing.expectEqual(@as(f64, 1), values[0]);
     try compareDecoded(source, 1);
     var index = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = source }, .{ .policy = .rebuild });
@@ -1166,7 +1166,7 @@ test "[integration] - [mzML arrays]: retains repeated encoding terms across nume
         while (try reader.nextRecord()) |record| {
             for (record.binaryArrays()) |array| {
                 var value: [1]f64 = undefined;
-                _ = try mzml.model.decodeArray(f64, &value, array, 1, header.groups, .{ .transport = &.{}, .transformed = &.{} });
+                _ = try mzml.model.decodeArray(f64, &value, array, 1, header.groups, .{ .wire = &.{}, .transformed = &.{} });
                 try std.testing.expectEqualSlices(f64, &.{1}, &value);
             }
             var fetched = (try index.byIdDecoded(std.testing.allocator, record.id, &decoded)).?;
@@ -1485,10 +1485,10 @@ test "[integration] - [mzML decoded reading]: decodes zlib text across fragments
     random.random().bytes(std.mem.sliceAsBytes(&values));
     var compressor = try mzml.zlib.Compressor.init(std.testing.allocator, .fast);
     defer compressor.deinit();
-    var transport: [4096]u8 = undefined;
+    var wire_buffer: [4096]u8 = undefined;
     var transformed: [2048]u8 = undefined;
     const wire = try mzml.arrays.encodeWire(f64, &values, .{ .pipeline = .zlib }, .{
-        .transport = &transport,
+        .wire = &wire_buffer,
         .transformed = &transformed,
     }, &compressor);
     var text_buffer: [8192]u8 = undefined;
@@ -1618,14 +1618,14 @@ test "[regression] - [mzML arrays]: reads empty producer arrays with zlib declar
     const record = (try reader.nextRecord()).?;
     var scratch: [32]u8 = undefined;
     const node = record.binaryArrays()[0];
-    _ = try mzml.model.decodeArray(f64, &.{}, node, 5, &.{}, .{ .transport = &scratch, .transformed = &.{} });
+    _ = try mzml.model.decodeArray(f64, &.{}, node, 5, &.{}, .{ .wire = &scratch, .transformed = &.{} });
     var typed_arrays = record.arrays(&.{});
     const typed_array = (try typed_arrays.next()).?;
-    _ = try typed_array.decode(f64, &.{}, .{ .transport = &scratch, .transformed = &.{} });
+    _ = try typed_array.decode(f64, &.{}, .{ .wire = &scratch, .transformed = &.{} });
     var one: [1]f64 = undefined;
     var nonempty = node;
     nonempty.attributes = &.{.{ .name = "encodedLength", .value = "0" }};
-    try std.testing.expectError(error.TruncatedInput, mzml.model.decodeArray(f64, &one, nonempty, 1, &.{}, .{ .transport = &scratch, .transformed = &.{} }));
+    try std.testing.expectError(error.TruncatedInput, mzml.model.decodeArray(f64, &one, nonempty, 1, &.{}, .{ .wire = &scratch, .transformed = &.{} }));
     try std.testing.expectEqual(null, try reader.nextRecord());
 }
 
@@ -1713,7 +1713,7 @@ test "[integration] - [mzML reader]: reuses storage across growing and shrinking
     var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
     defer reader.deinit();
     const header = try reader.readHeader();
-    var transport: [4096]u8 = undefined;
+    var wire_buffer: [4096]u8 = undefined;
     var output: [512]f64 = undefined;
     for (lengths, 0..) |length, index| {
         const record = (try reader.nextRecord()).?;
@@ -1723,7 +1723,7 @@ test "[integration] - [mzML reader]: reuses storage across growing and shrinking
         for (record.binaryArrays()) |array| {
             const text = try mzml.base64.encode(&encoded, zeros[0 .. length * 8]);
             try std.testing.expectEqualStrings(text, array.child(.binary).?.text.?);
-            _ = try mzml.model.decodeArray(f64, output[0..length], array, length, header.groups, .{ .transport = &transport, .transformed = &.{} });
+            _ = try mzml.model.decodeArray(f64, output[0..length], array, length, header.groups, .{ .wire = &wire_buffer, .transformed = &.{} });
             try std.testing.expectEqualSlices(u8, zeros[0 .. length * 8], std.mem.sliceAsBytes(output[0..length]));
         }
     }
@@ -1795,8 +1795,8 @@ test "[integration] - [mzML children]: distinguishes missing payloads from repea
         const record = (try reader.nextRecord()).?;
         try std.testing.expectEqual(@as(usize, 1), record.binaryArrays().len);
         var values: [1]f64 = undefined;
-        var transport: [8]u8 = undefined;
-        const result = mzml.model.decodeArray(f64, &values, record.binaryArrays()[0], 1, (try reader.readHeader()).groups, .{ .transport = &transport, .transformed = &.{} });
+        var wire_buffer: [8]u8 = undefined;
+        const result = mzml.model.decodeArray(f64, &values, record.binaryArrays()[0], 1, (try reader.readHeader()).groups, .{ .wire = &wire_buffer, .transformed = &.{} });
         if (binary.len == 0) {
             try std.testing.expectError(error.PayloadNotRetained, result);
             try std.testing.expectError(error.PayloadNotRetained, readDecoded(std.testing.allocator, source, .{}));
@@ -2016,10 +2016,10 @@ test "[integration] - [mzML numeric attributes]: requires a length only for requ
         try std.testing.expectError(error.MissingAttribute, descriptors.next());
         var value: [1]f64 = undefined;
         const nodes = record.binaryArrays();
-        try std.testing.expectError(error.MissingAttribute, mzml.model.decodeArray(f64, &value, nodes[0], record.default_array_length, header.groups, .{ .transport = &.{}, .transformed = &.{} }));
+        try std.testing.expectError(error.MissingAttribute, mzml.model.decodeArray(f64, &value, nodes[0], record.default_array_length, header.groups, .{ .wire = &.{}, .transformed = &.{} }));
         // The absent length comes before the wrong output type.
-        try std.testing.expectError(error.MissingAttribute, mzml.model.decodeArray(f32, &.{}, nodes[0], record.default_array_length, header.groups, .{ .transport = &.{}, .transformed = &.{} }));
-        _ = try mzml.model.decodeArray(f64, &value, nodes[1], record.default_array_length, header.groups, .{ .transport = &.{}, .transformed = &.{} });
+        try std.testing.expectError(error.MissingAttribute, mzml.model.decodeArray(f32, &.{}, nodes[0], record.default_array_length, header.groups, .{ .wire = &.{}, .transformed = &.{} }));
+        _ = try mzml.model.decodeArray(f64, &value, nodes[1], record.default_array_length, header.groups, .{ .wire = &.{}, .transformed = &.{} });
         try std.testing.expectEqualSlices(f64, &.{1}, &value);
     }
     // The absent length is reported as the attribute it is, whichever read finds it.
@@ -2263,15 +2263,15 @@ test "[integration] - [mzML reader]: retains hierarchy parameters and decodes gr
     try std.testing.expectEqualStrings("", precursor.child(.selected_ion_list).?.children[0].params[0].user.value.?);
     try std.testing.expect(spectrum.node.child(.product_list).?.children[0].child(.isolation_window) != null);
     var values: [1]f64 = undefined;
-    var transport: [32]u8 = undefined;
+    var wire_buffer: [32]u8 = undefined;
     var transformed: [32]u8 = undefined;
     _ = try mzml.model.decodeArray(f64, &values, spectrum.binaryArrays()[0], 1, header.groups, .{
-        .transport = &transport,
+        .wire = &wire_buffer,
         .transformed = &transformed,
     });
     try std.testing.expectEqual(@as(f64, 1), values[0]);
     _ = try mzml.model.decodeArray(f64, &values, spectrum.binaryArrays()[1], 2, header.groups, .{
-        .transport = &transport,
+        .wire = &wire_buffer,
         .transformed = &transformed,
     });
     try std.testing.expectEqual(@as(f64, 1), values[0]);
@@ -2282,21 +2282,21 @@ test "[integration] - [mzML reader]: retains hierarchy parameters and decodes gr
         spectrum.binaryArrays()[0],
         2,
         header.groups,
-        .{ .transport = &transport, .transformed = &transformed },
+        .{ .wire = &wire_buffer, .transformed = &transformed },
     ));
     var longer: [3]f64 = undefined;
-    try std.testing.expectEqualSlices(f64, &.{1}, try mzml.model.decodeArray(f64, &longer, spectrum.binaryArrays()[0], 1, header.groups, .{ .transport = &transport, .transformed = &transformed }));
+    try std.testing.expectEqualSlices(f64, &.{1}, try mzml.model.decodeArray(f64, &longer, spectrum.binaryArrays()[0], 1, header.groups, .{ .wire = &wire_buffer, .transformed = &transformed }));
     var typed_arrays = spectrum.arrays(header.groups);
     const typed_array = (try typed_arrays.next()).?;
     try std.testing.expectEqual(spectrum.binaryArrays()[0], typed_array.node);
     try std.testing.expectEqual(mzml.model.Primitive.float64, typed_array.encoding.primitive);
     try std.testing.expectEqual(mzml.arrays.Pipeline.none, typed_array.encoding.pipeline);
     try std.testing.expectEqual(@as(usize, 1), typed_array.length);
-    _ = try typed_array.decode(f64, &values, .{ .transport = &transport, .transformed = &transformed });
+    _ = try typed_array.decode(f64, &values, .{ .wire = &wire_buffer, .transformed = &transformed });
     try std.testing.expectEqual(@as(f64, 1), values[0]);
     var wrong_type: [1]i32 = undefined;
     try std.testing.expectError(error.TypeMismatch, typed_array.decode(i32, &wrong_type, .{
-        .transport = &transport,
+        .wire = &wire_buffer,
         .transformed = &transformed,
     }));
     const second_typed_array = (try typed_arrays.next()).?;
@@ -2380,8 +2380,8 @@ test "[integration] - [mzML reader]: rejects unreadable metadata without decodin
     defer invalid.deinit();
     const record = (try invalid.nextRecord()).?;
     var values: [1]f64 = undefined;
-    var transport: [32]u8 = undefined;
-    try std.testing.expectError(error.InvalidCharacter, mzml.model.decodeArray(f64, &values, record.binaryArrays()[0], record.default_array_length, (try invalid.readHeader()).groups, .{ .transport = &transport, .transformed = &.{} }));
+    var wire_buffer: [32]u8 = undefined;
+    try std.testing.expectError(error.InvalidCharacter, mzml.model.decodeArray(f64, &values, record.binaryArrays()[0], record.default_array_length, (try invalid.readHeader()).groups, .{ .wire = &wire_buffer, .transformed = &.{} }));
 }
 
 test "[failure] - [mzML reader]: rejects unsafe XML, wrong namespaces, and malformed structure" {
@@ -2466,9 +2466,9 @@ test "[integration] - [mzML array selection]: preserves metadata and selected va
                             continue;
                         }
                         var values: [1]f64 = undefined;
-                        var transport: [8]u8 = undefined;
+                        var wire_buffer: [8]u8 = undefined;
                         const descriptor = try mzml.model.BinaryArray.init(array, record.default_array_length, header.groups);
-                        const decoded = descriptor.decode(f64, &values, .{ .transport = &transport, .transformed = &.{} });
+                        const decoded = descriptor.decode(f64, &values, .{ .wire = &wire_buffer, .transformed = &.{} });
                         if (keep) {
                             try std.testing.expectEqualSlices(f64, &.{1}, try decoded);
                         } else try std.testing.expectError(error.PayloadNotRetained, decoded);
@@ -2573,7 +2573,7 @@ test "[edge] - [mzML array selection]: excludes skipped text from record storage
     try std.testing.expectEqual(null, arrays[0].child(.binary).?.text);
     try std.testing.expectEqualStrings("", arrays[1].child(.binary).?.text.?);
     try std.testing.expectEqual(null, arrays[2].child(.binary).?.text);
-    _ = try mzml.model.decodeArray(f64, &.{}, arrays[1], 0, header.groups, .{ .transport = &.{}, .transformed = &.{} });
+    _ = try mzml.model.decodeArray(f64, &.{}, arrays[1], 0, header.groups, .{ .wire = &.{}, .transformed = &.{} });
     try std.testing.expectEqual(null, try reader.nextRecord());
 }
 
@@ -2841,13 +2841,13 @@ test "[integration] - [mzML arrays]: classifies explicit encodings without guess
             &[_]mzml.cv.Entry{ .{ .group_ref = .{ .ref = "codec" } }, primitive, compression },
         }) |entries| {
             var output: [0]f64 = .{};
-            var transport: [1]u8 = undefined;
+            var wire_buffer: [1]u8 = undefined;
             var transformed: [1]u8 = undefined;
             try std.testing.expectError(error.UnsupportedEncoding, mzml.model.decodeArray(f64, &output, .{
                 .kind = .binary_data_array,
                 .params = entries,
                 .children = &.{.{ .kind = .binary, .text = "" }},
-            }, 0, &groups, .{ .transport = &transport, .transformed = &transformed }));
+            }, 0, &groups, .{ .wire = &wire_buffer, .transformed = &transformed }));
         }
     }
 }
@@ -2944,11 +2944,11 @@ fn expectStreamedMatchesWhole(
     const array = try mzml.model.BinaryArray.init(node, length, &.{});
     const expected_values = try allocator.alloc(T, length);
     defer allocator.free(expected_values);
-    const transport = try allocator.alloc(u8, text.len / 4 * 3 + 3);
-    defer allocator.free(transport);
+    const wire_buffer = try allocator.alloc(u8, text.len / 4 * 3 + 3);
+    defer allocator.free(wire_buffer);
     const transformed = try allocator.alloc(u8, try mzml.arrays.wireBound(T, length, array.encoding.pipeline));
     defer allocator.free(transformed);
-    const expected = array.decode(T, expected_values, .{ .transport = transport, .transformed = transformed });
+    const expected = array.decode(T, expected_values, .{ .wire = wire_buffer, .transformed = transformed });
 
     var fragments: Fragments = .{ .rest = text, .source = source };
     const actual = decoded.decodeArrayText(array.encoding, length, &fragments);
