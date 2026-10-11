@@ -186,8 +186,6 @@ fn buildKernels(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.b
         const v3_target = b.resolveTargetQuery(query);
         // zlib.zig again, built for x86-64-v3, exporting its fast decoder (see zlib.zig).
         const object_options = b.addOptions();
-        object_options.addOption(bool, "dispatch", true);
-        object_options.addOption(FastZlib, "zlib_fast", .absent);
         object_options.addOption(bool, "as_object", true);
         const module = b.createModule(.{
             .root_source_file = b.path("src/binary/zlib.zig"),

@@ -49,7 +49,6 @@ pub fn main(init: std.process.Init) !void {
     } }}, &.{}, &.{ mz.array, intensity.array });
     try writer.beginList(.spectrum_list, 1, "example-processing");
     try writer.writeRecordWithArrays(record.node, &.{ mz.payload, intensity.payload });
-    builder.reset();
     try writer.endList();
     try writer.finish();
     try output.interface.flush();

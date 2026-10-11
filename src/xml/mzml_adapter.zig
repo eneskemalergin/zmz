@@ -307,14 +307,14 @@ pub const Cursor = struct {
         return null;
     }
 
-    // Leaves the subtree's end event current. Namespace bindings make the emitted fragment
-    // independent of its former ancestors.
+    // Starts at a current start element and leaves the subtree's end event current. Namespace
+    // bindings make the emitted fragment independent of its former ancestors.
     pub fn writeElement(
         self: *Cursor,
         output: *Writer,
         remaining_nodes: *usize,
     ) (AdvanceError || WriterError || error{UnexpectedEnd})!void {
-        if ((self.current orelse return error.InvalidState).data != .start_element) return error.InvalidState;
+        std.debug.assert(self.current.?.data == .start_element);
         var nesting: usize = 0;
         while (self.current) |event| {
             switch (event.data) {
@@ -347,9 +347,9 @@ pub const Cursor = struct {
         return error.UnexpectedEnd;
     }
 
-    // Leaves the subtree's end event current.
+    // Starts at a current start element and leaves the subtree's end event current.
     pub fn skipElement(self: *Cursor, remaining_nodes: *usize) (AdvanceError || error{UnexpectedEnd})!void {
-        if ((self.current orelse return error.InvalidState).data != .start_element) return error.InvalidState;
+        std.debug.assert(self.current.?.data == .start_element);
         var nesting: usize = 0;
         while (self.current) |event| {
             switch (event.data) {
@@ -493,7 +493,7 @@ pub const Cursor = struct {
 
         while (true) {
             if (self.in_cdata) {
-                if (try self.readTextEvent()) |event| return event;
+                if (try self.readCdataText()) |event| return event;
                 continue;
             }
             if (ignore_whitespace) self.skipBufferedWhitespace();
@@ -528,7 +528,7 @@ pub const Cursor = struct {
                 else => |other| return other,
             };
             if (first.value != '<') {
-                if (try self.readTextEvent()) |event| return event;
+                if (try self.readScalarText()) |event| return event;
                 continue;
             }
             self.normal_text_brackets = 0;
@@ -1137,7 +1137,7 @@ pub const Cursor = struct {
     }
 
     fn syntheticEnd(self: *Cursor) AdvanceError!Event {
-        if (!self.pending_empty or self.depth == 0) return error.InvalidState;
+        std.debug.assert(self.pending_empty and self.depth != 0);
         const frame = self.frames[self.depth - 1];
         // The open name's bytes stay in place after the pop until the next start tag, which is
         // after this event's lifetime.
@@ -1155,12 +1155,7 @@ pub const Cursor = struct {
         };
     }
 
-    // Null when the run held no text: ignored whitespace, or markup that produced none.
-    fn readTextEvent(self: *Cursor) ParserError!?Event {
-        if (self.in_cdata) return self.readCdataText();
-        return self.readScalarText();
-    }
-
+    // Null when markup or the end of input comes before any text.
     fn readScalarText(self: *Cursor) ParserError!?Event {
         const start = self.source.currentOffset();
         while (self.text_bytes.items.len < TEXT_CHUNK_BYTES) {
@@ -1222,6 +1217,7 @@ pub const Cursor = struct {
         self.cdata_brackets = 0;
     }
 
+    // Null when the section closes with no text left in it.
     fn readCdataText(self: *Cursor) ParserError!?Event {
         const start = self.source.currentOffset();
         while (self.text_bytes.items.len < TEXT_CHUNK_BYTES) {
@@ -1458,7 +1454,6 @@ const NameRange = struct {
 const Codepoint = struct {
     value: u21,
     start: u64,
-    end: u64,
 };
 
 fn optionalSliceEql(left: ?[]const u8, right: ?[]const u8) bool {
@@ -1648,14 +1643,14 @@ const Source = struct {
                 const value: u21 = 0x10000 +
                     (@as(u21, unit - 0xD800) << 10) +
                     @as(u21, next - 0xDC00);
-                return .{ .value = value, .start = start, .end = self.position };
+                return .{ .value = value, .start = start };
             }
             if (unit >= 0xDC00 and unit <= 0xDFFF) return error.InvalidEncoding;
-            return .{ .value = unit, .start = start, .end = self.position };
+            return .{ .value = unit, .start = start };
         }
 
         const first = try self.readByte();
-        if (first < 0x80 or self.encoding == .latin1) return .{ .value = first, .start = start, .end = self.position };
+        if (first < 0x80 or self.encoding == .latin1) return .{ .value = first, .start = start };
         if (self.encoding == .ascii) return self.brokenAt(start, error.InvalidEncoding);
         // Unicode's well-formed sequences: the first byte sets the length and the second byte's
         // range, so a failure is reported at the first byte that cannot continue the sequence.
@@ -1677,7 +1672,7 @@ const Source = struct {
                 return self.brokenAt(byte_start, error.InvalidEncoding);
             value = (value << 6) | (byte & 0x3F);
         }
-        return .{ .value = value, .start = start, .end = self.position };
+        return .{ .value = value, .start = start };
     }
 
     // A sequence broken at offset, or cut off there by the end of input.
@@ -1713,7 +1708,8 @@ const Source = struct {
 
     fn commitBorrowed(self: *Source) AdvanceError!void {
         if (self.borrowed_len == 0) return;
-        const reader = self.reader orelse return error.InvalidState;
+        // Borrowed bytes come from the reader's buffer, so a reader is present.
+        const reader = self.reader.?;
         reader.toss(self.borrowed_len);
         try self.addPosition(self.borrowed_len);
         self.borrowed_len = 0;
@@ -2018,7 +2014,8 @@ pub const Writer = struct {
     pub fn endElement(self: *Writer) WriterError!void {
         try self.checkContent();
         if (self.state != .start_tag and self.state != .content) return self.fail(error.InvalidState);
-        if (self.frame_count == 0) return self.fail(error.InvalidState);
+        // Both states exist only while an element is open.
+        std.debug.assert(self.frame_count != 0);
         const frame = self.frames[self.frame_count - 1];
         const name = self.open_names.items[frame.name_start..][0..frame.name_len];
         if (self.state == .start_tag) {
@@ -2369,9 +2366,6 @@ test "[unit] - [mzML XML cursor]: a written fragment declares its scope once and
     // Redundant and inherited bindings are not repeated; shadowing and undeclaring are kept.
     try std.testing.expectEqualStrings("<f xmlns=\"urn:d\" xmlns:a=\"urn:a\" xmlns:b=\"urn:b\"><a:x b:y=\"1\" a:y=\"2\">" ++
         "<c xmlns=\"\" xmlns:a=\"urn:a2\"><a:z/></c><d/></a:x></f>", sink.buffered());
-    // On the end event the walkers have no subtree; that is the call's fault, not the input's.
-    try std.testing.expectError(error.InvalidState, cursor.skipElement(&remaining));
-    try std.testing.expectError(error.InvalidState, cursor.writeElement(&output, &remaining));
 }
 
 test "[property] - [mzML XML cursor]: decodes Latin-1 attributes, text, and CDATA across refills" {
@@ -2758,7 +2752,6 @@ test "[property] - [mzML XML cursor]: leaves QName delimiters unread at exact to
                     const next = try cursor.requiredCodepoint();
                     try std.testing.expectEqual(@as(u21, delimiter), next.value);
                     try std.testing.expectEqual(@as(u64, name.len), next.start);
-                    try std.testing.expectEqual(@as(u64, name.len + 1), next.end);
                 }
             }
         }

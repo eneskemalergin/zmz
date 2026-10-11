@@ -221,7 +221,6 @@ const Parsed = struct {
 };
 
 fn parse(allocator: std.mem.Allocator, bytes: []const u8, identity: Vocabulary.Identity) !Parsed {
-    if (bytes.len > MAX_SOURCE_BYTES) return error.SourceTooLarge;
     if (!std.unicode.utf8ValidateSlice(bytes) or std.mem.indexOfScalar(u8, bytes, 0) != null)
         return error.InvalidObo;
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -444,7 +443,6 @@ fn finishStanza(
     ids: *std.StringHashMapUnmanaged(void),
 ) !void {
     const id = try decode(allocator, (try targetToken(try required(fields, "id"))).value);
-    if (id.len == 0) return error.InvalidObo;
     if ((try ids.getOrPut(allocator, id)).found_existing) return error.DuplicateId;
     if (!std.mem.eql(u8, kind, "Term")) return;
     var term: Vocabulary.Term = .{
@@ -485,7 +483,6 @@ fn finishStanza(
         } else if (std.mem.eql(u8, tag, "relationship")) {
             const relation = token(raw);
             const target = try targetToken(relation.suffix);
-            if (target.value.len == 0) return error.InvalidObo;
             try relationships.append(allocator, .{
                 .kind = try decode(allocator, relation.value),
                 .target = try decode(allocator, target.value),
@@ -497,7 +494,6 @@ fn finishStanza(
         } else {
             const list = if (std.mem.eql(u8, tag, "is_a")) &parents else if (std.mem.eql(u8, tag, "alt_id")) &aliases else if (std.mem.eql(u8, tag, "replaced_by")) &replacements else if (std.mem.eql(u8, tag, "consider")) &considerations else continue;
             const target = try targetToken(raw);
-            if (target.value.len == 0) return error.InvalidObo;
             try list.append(allocator, try decode(allocator, target.value));
         }
     }
@@ -702,7 +698,7 @@ fn sameBinaryXrefs(a: Vocabulary.Term, b: Vocabulary.Term) bool {
     return true;
 }
 
-const Operation = enum { supported, preserved_only, blocked, excluded, not_applicable };
+const Operation = enum { supported, preserved_only, blocked };
 const Disposition = struct {
     family: u3,
     terms: []const []const u8,

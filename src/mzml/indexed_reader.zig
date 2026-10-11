@@ -683,6 +683,7 @@ fn idPosition(self: *IndexedReader, id: []const u8) Error!?usize {
     const spectrum = self.ids[0].getKeyAdapted(id, query);
     const chromatogram = self.ids[1].getKeyAdapted(id, query);
     if (spectrum != null and chromatogram != null) return error.AmbiguousId;
+    // The maps store u32 positions; the final orelse widens them to ?usize.
     return spectrum orelse chromatogram orelse null;
 }
 

@@ -60,7 +60,7 @@ zig-out/bin/mzml-indexed example-indexed.mzML 'scan=1'
 
 `Builder.prepareArray` creates metadata and a payload that borrows the values; nothing is encoded until `writeRecordWithArrays` writes the record. The writer encodes each array while writing it, with the `arrays.Encoder`'s compressor, and sets `encodedLength` from the text it writes. Keep the values and the encoder alive until the record is written.
 
-Builder reset releases its metadata. The example resets only after the header or record has been written. `Writer.finish` closes the document and emits the optional index; the caller must then flush the sink. `deinit` does neither. Output creation refuses an existing path, and a failed write removes its newly created partial output.
+Builder reset releases its metadata. The example resets once the header is written, before it builds the record; a reset is safe only after what it built has been written. `Writer.finish` closes the document and emits the optional index; the caller must then flush the sink. `deinit` does neither. Output creation refuses an existing path, and a failed write removes its newly created partial output.
 
 ## Copy, filter, or reencode
 

@@ -529,11 +529,14 @@ pub fn readFragment(
     reuse_ancestors: bool,
     expected: FragmentTarget,
 ) FragmentError!owned.Record {
+    // IndexedReader keeps a lookup reader that never reads a header, captures at most four
+    // ancestors, and looks up only spectra and chromatograms placed after their prefix.
+    std.debug.assert(!self.header_ready and ancestors <= 4 and physical_start >= prefix_length);
+    std.debug.assert(expected.kind == .spectrum or expected.kind == .chromatogram);
     try self.enter();
     defer self.active = false;
     self.failure = null;
     self.current_kind = null;
-    if (self.header_ready or ancestors > 4 or physical_start < prefix_length) return error.InvalidOptions;
     errdefer self.fragment_ancestors = null;
     if (reuse_ancestors) {
         self.cursor.resetToAncestors(input, self.fragment_ancestors.?, prefix_length);
@@ -564,7 +567,6 @@ pub fn readFragment(
         const id = start.attributeRaw("id") orelse return try self.attributeError(error.MissingAttribute, .id);
         if (!std.mem.eql(u8, id.value, expected.id)) return error.InvalidIndex;
     }
-    if (kind_value != .spectrum and kind_value != .chromatogram) return error.InvalidStructure;
     var node = try self.parseNodeFor(&self.record_store, 1, complete, self.options.payload, .tree);
     if (complete) {
         for (0..ancestors) |_| {
@@ -591,8 +593,8 @@ pub fn parseFooter(
     prefix_length: usize,
     failure: *?Diagnostic,
 ) Error!ParsedFooter {
+    std.debug.assert(physical_start >= prefix_length);
     failure.* = null;
-    if (physical_start < prefix_length) return error.InvalidOptions;
     var input = std.Io.Reader.fixed(bytes);
     var reader = try init(allocator, &input, options);
     defer reader.deinit();
@@ -626,8 +628,9 @@ pub fn resumeFollowingList(
     physical_start: u64,
     prefix_length: usize,
 ) FragmentError!void {
-    if (self.active_list != .spectrum_list or
-        ancestors != self.scope_count + 1 or physical_start < prefix_length) return error.InvalidOptions;
+    // openEmbedded calls this on its own reader, with the spectrum list open and its context.
+    std.debug.assert(self.active_list == .spectrum_list and ancestors == self.scope_count + 1);
+    std.debug.assert(physical_start >= prefix_length);
     const replacement = try xml.Cursor.init(self.allocator, input, self.options.limits.attributes, self.options.limits.attribute_bytes);
     self.cursor.deinit();
     self.cursor = replacement;
@@ -651,8 +654,8 @@ pub fn resumeFollowingList(
 
 // For an empty spectrum list preceding chromatograms when opening an index.
 pub fn finishEmptySpectrumList(self: *Engine) FragmentError!void {
+    std.debug.assert(self.active_list == .spectrum_list);
     errdefer |err| self.fail(err, .open_index);
-    if (self.active_list != .spectrum_list) return error.InvalidOptions;
     try self.cursor.advance(false);
     try self.finishSpectrumList();
     if (self.active_list != .chromatogram_list) return error.InvalidIndex;
