@@ -380,20 +380,46 @@ test "[cli] - [mzml-rewrite]: replaces and removes ordered record parameters wit
     }
 }
 
+test "[cli] - [mzml-rewrite]: a wrong source count is replaced by the count written" {
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    // The source declares two spectra and holds one (MS1_30minLC_scan2s declares 1 for 2,029).
+    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "input.mzML", .data = support.HEADER ++
+        "<spectrumList count='2' defaultDataProcessingRef='dp'><spectrum index='0' id='scan=1' defaultArrayLength='0'>" ++
+        "<binaryDataArrayList count='0'/></spectrum></spectrumList></run></mzML>" });
+    for ([_][]const []const u8{
+        &.{ "input.mzML", "copy.mzML" },
+        &.{ "input.mzML", "edited.mzML", "--replace-user-param", "note", "value" },
+    }) |args| {
+        const result = try runProcess(dir.dir, options.rewrite, args);
+        defer std.testing.allocator.free(result.stdout);
+        defer std.testing.allocator.free(result.stderr);
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+        try std.testing.expectEqualStrings("note: a source list count is wrong; writing the counts of the records actually written\n", result.stderr);
+        var file = try dir.dir.openFile(std.testing.io, args[1], .{});
+        defer file.close(std.testing.io);
+        var buffer: [4096]u8 = undefined;
+        var input = file.reader(std.testing.io, &buffer);
+        var reader = try mzml.StreamReader.init(std.testing.allocator, &input.interface, .{});
+        defer reader.deinit();
+        _ = try reader.readHeader();
+        var records: usize = 0;
+        var declared: ?usize = null;
+        while (try reader.nextItem()) |item| switch (item) {
+            .list_start => |start| declared = start.list.declared_count,
+            .record => records += 1,
+            else => {},
+        };
+        try std.testing.expectEqual(@as(usize, 1), records);
+        try std.testing.expectEqual(@as(?usize, 1), declared);
+    }
+}
+
 test "[cli] - [mzml-rewrite]: failed rewrites remove partial output and never overwrite input" {
     var dir = std.testing.tmpDir(.{});
     defer dir.cleanup();
     const source = support.HEADER ++ "<spectrumList count='1' defaultDataProcessingRef='dp'/></run></mzML>";
     try dir.dir.writeFile(std.testing.io, .{ .sub_path = "input.mzML", .data = source });
-    // The source declares one spectrum and holds none, so every valid rewrite fails at the list end.
-    for ([_][]const []const u8{
-        &.{ "input.mzML", "failed.mzML" },
-        &.{ "input.mzML", "failed.mzML", "--replace-user-param", "note", "value" },
-        &.{ "input.mzML", "failed.mzML", "--remove-user-param", "note" },
-    }) |args| {
-        try runFailing(dir.dir, options.rewrite, args, error.CountMismatch, "failed.mzML");
-        try std.testing.expectError(error.FileNotFound, dir.dir.openFile(std.testing.io, "failed.mzML", .{}));
-    }
     for ([_][]const []const u8{
         &.{ "input.mzML", "failed.mzML", "--replace-user-param", "note" },
         &.{ "input.mzML", "failed.mzML", "--remove-user-param" },

@@ -2218,6 +2218,30 @@ test "[integration] - [mzML reader]: decodes Latin-1 metadata without changing p
     }
 }
 
+test "[integration] - [mzML reader]: reads a US-ASCII declaration as seven-bit text" {
+    inline for (.{ "us-ascii", "US-ASCII", "ascii" }) |name| {
+        var input = std.Io.Reader.fixed("<?xml version='1.0' encoding='" ++ name ++ "'?>" ++ support.DOCUMENT);
+        var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+        defer reader.deinit();
+        try std.testing.expectEqualStrings("native=a&b", (try reader.nextRecord()).?.id);
+        while (try reader.nextRecord()) |_| {}
+    }
+}
+
+test "[failure] - [mzML reader]: rejects a byte above seven bits or a UTF-8 mark under a US-ASCII declaration" {
+    const declaration = "<?xml version='1.0' encoding='us-ascii'?>";
+    const cases = .{
+        .{ declaration ++ support.DOCUMENT, "value=''", "value='\xe9'" },
+        .{ declaration ++ support.DOCUMENT, "value=''", "value='caf\xc3\xa9'" },
+        .{ "\xef\xbb\xbf" ++ declaration ++ support.DOCUMENT, "value=''", "value=''" },
+    };
+    inline for (cases) |case| {
+        const source = try std.mem.replaceOwned(u8, std.testing.allocator, case[0], case[1], case[2]);
+        defer std.testing.allocator.free(source);
+        try std.testing.expectError(error.InvalidEncoding, support.readAll(std.testing.allocator, source, .{}));
+    }
+}
+
 test "[integration] - [mzML reader]: retains hierarchy parameters and decodes grouped arrays" {
     var input = std.Io.Reader.fixed(support.DOCUMENT);
     var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});

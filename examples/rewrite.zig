@@ -8,6 +8,8 @@
 //! direct user parameters on spectra and chromatograms, without expanding groups.
 //! Parameter replacement keeps units, type, and extra XML; removal deletes the whole
 //! parameter. Other parameters, children, and surrounding XML keep their order.
+//! List counts are copied from the source. When a source count is wrong, the copy is redone
+//! with each count taken from the records actually written, and a note says so.
 
 const std = @import("std");
 const mzml = @import("zmz").mzml;
@@ -19,9 +21,29 @@ pub fn main(init: std.process.Init) !void {
     const replace_param = args.len == 6 and std.mem.eql(u8, args[3], "--replace-user-param");
     const remove_param = args.len == 5 and std.mem.eql(u8, args[3], "--remove-user-param");
     if (args.len != 3 and !ms1 and !reencode and !replace_param and !remove_param) {
-        try std.Io.File.stderr().writeStreamingAll(init.io, "usage: mzml-rewrite INPUT.mzML OUTPUT.mzML [--ms1|--zlib|--replace-user-param NAME VALUE|--remove-user-param NAME]\n");
+        try std.Io.File.stderr().writeStreamingAll(
+            init.io,
+            "usage: mzml-rewrite INPUT.mzML OUTPUT.mzML [--ms1|--zlib|--replace-user-param NAME VALUE|--remove-user-param NAME]\n",
+        );
         return error.InvalidArguments;
     }
+    var options: Options = .{ .ms1 = ms1, .reencode = reencode, .replace_param = replace_param, .remove_param = remove_param };
+    copy(init, args, options) catch |err| {
+        if (err != error.CountMismatch) return err;
+        try std.Io.File.stderr().writeStreamingAll(
+            init.io,
+            "note: a source list count is wrong; writing the counts of the records actually written\n",
+        );
+        options.trust_counts = false;
+        try copy(init, args, options);
+    };
+}
+
+// With trust_counts, list counts come from the source and a wrong one fails with CountMismatch,
+// leaving no output file; without it, the writer counts the records it writes.
+const Options = struct { ms1: bool, reencode: bool, replace_param: bool, remove_param: bool, trust_counts: bool = true };
+
+fn copy(init: std.process.Init, args: []const [:0]const u8, options: Options) !void {
     const dir = std.Io.Dir.cwd();
     const source = try dir.openFile(init.io, args[1], .{});
     defer source.close(init.io);
@@ -39,11 +61,13 @@ pub fn main(init: std.process.Init) !void {
     var output = destination.writer(init.io, &output_buffer);
     var writer = try mzml.Writer.initFile(init.gpa, &output, .{}, .{});
     defer writer.deinit();
-    errdefer if (writer.diagnostic()) |report| std.debug.print("{s}: {f}\n", .{ args[2], report });
+    // A wrong source count is retried, not reported.
+    errdefer |err| if (err != error.CountMismatch or !options.trust_counts) if (writer.diagnostic()) |report|
+        std.debug.print("{s}: {f}\n", .{ args[2], report });
     var attributes: std.ArrayList(mzml.model.Attribute) = .empty;
     defer attributes.deinit(init.gpa);
-    var editor: ?ParameterEditor = if (replace_param or remove_param)
-        .{ .name = args[4], .replacement = if (replace_param) args[5] else null }
+    var editor: ?ParameterEditor = if (options.replace_param or options.remove_param)
+        .{ .name = args[4], .replacement = if (options.replace_param) args[5] else null }
     else
         null;
     defer if (editor) |*value| value.deinit(init.gpa);
@@ -51,7 +75,7 @@ pub fn main(init: std.process.Init) !void {
     defer decoded.deinit();
     var header_builder = mzml.Builder.init(init.gpa, .{});
     defer header_builder.deinit();
-    const prepared_header = if (reencode) try header_builder.reencoding(header.*, &.{
+    const prepared_header = if (options.reencode) try header_builder.reencoding(header.*, &.{
         .{ .primitive = .float32, .pipeline = .zlib },
         .{ .primitive = .float64, .pipeline = .zlib },
         .{ .primitive = .int32, .pipeline = .zlib },
@@ -61,15 +85,16 @@ pub fn main(init: std.process.Init) !void {
     defer if (encoder) |*value| value.deinit();
     try writer.writeHeader(if (prepared_header) |prepared| prepared.header else header.*);
     var written: usize = 0;
-    while (if (reencode) try reader.nextDecodedItem(&decoded) else try reader.nextItem()) |item| {
+    while (if (options.reencode) try reader.nextDecodedItem(&decoded) else try reader.nextItem()) |item| {
         switch (item) {
             .list_start => |start| {
-                const filter = ms1 and start.kind == .spectrum_list;
-                try writer.beginListWithAttributes(start.kind, if (filter) null else start.list.declared_count, start.list.attributes);
+                const filter = options.ms1 and start.kind == .spectrum_list;
+                const count = if (filter or !options.trust_counts) null else start.list.declared_count;
+                try writer.beginListWithAttributes(start.kind, count, start.list.attributes);
                 written = 0;
             },
             .record => |record| {
-                const filter = ms1 and record.node.kind == .spectrum;
+                const filter = options.ms1 and record.node.kind == .spectrum;
                 if (!filter or try record.msLevel(header.groups) == 1) {
                     var emitted = record.node;
                     var index_text: [32]u8 = undefined;
@@ -179,7 +204,14 @@ const Reencoder = struct {
         try self.payloads.resize(self.allocator, source_arrays.len);
         for (source_arrays, self.arrays.items, self.payloads.items, 0..) |array, *node, *payload, i| {
             const prepared = switch (decoded.get(i).?.values) {
-                inline else => |values| try self.reencoding.prepareArray(&self.builder, @typeInfo(@TypeOf(values)).pointer.child, values, array, .{ .pipeline = .zlib }, &self.encoder),
+                inline else => |values| try self.reencoding.prepareArray(
+                    &self.builder,
+                    @typeInfo(@TypeOf(values)).pointer.child,
+                    values,
+                    array,
+                    .{ .pipeline = .zlib },
+                    &self.encoder,
+                ),
             };
             node.* = prepared.array.node;
             payload.* = prepared.payload;

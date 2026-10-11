@@ -166,6 +166,59 @@ test "[property] - [mzML scientific metadata]: preserves independent fields and 
     try std.testing.expectError(error.MissingGroup, scan.scanStartTime(&.{}));
 }
 
+test "[failure] - [mzML scientific metadata]: reports each selected-ion and window field on its own" {
+    const model = mzml.model;
+    var ion: model.Node = .{ .kind = .selected_ion };
+    // F114727's shape: a malformed peak intensity beside a valid m/z and charge.
+    ion.params = &.{
+        .{ .cv = .{ .accession = model.Terms.CHARGE_STATE, .value = "1" } },
+        .{ .cv = .{ .accession = model.Terms.SELECTED_ION_MZ, .value = "977.4697" } },
+        .{ .cv = .{ .accession = model.Terms.PEAK_INTENSITY, .value = "0 1+" } },
+    };
+    try std.testing.expectError(error.InvalidValue, ion.selectedIonValues(&.{}));
+    const fields = try ion.selectedIonFields(&.{});
+    try std.testing.expectEqual(@as(f64, 977.4697), (try fields.mz).?.value);
+    try std.testing.expectEqual(@as(?i32, 1), try fields.charge);
+    try std.testing.expectError(error.InvalidValue, fields.intensity);
+
+    // Absent fields stay absent; the historical m/z term fills in only when the current one is absent.
+    ion.params = &.{.{ .cv = .{ .accession = model.Terms.HISTORICAL_SELECTED_ION_MZ, .value = "445.3" } }};
+    const historical = try ion.selectedIonFields(&.{});
+    try std.testing.expectEqual(@as(f64, 445.3), (try historical.mz).?.value);
+    try std.testing.expectEqual(null, try historical.charge);
+    try std.testing.expectEqual(null, try historical.intensity);
+    ion.params = &.{
+        .{ .cv = .{ .accession = model.Terms.SELECTED_ION_MZ, .value = "bad" } },
+        .{ .cv = .{ .accession = model.Terms.HISTORICAL_SELECTED_ION_MZ, .value = "445.3" } },
+    };
+    try std.testing.expectError(error.InvalidValue, (try ion.selectedIonFields(&.{})).mz);
+    try std.testing.expectError(error.InvalidValue, ion.selectedIonValues(&.{}));
+
+    // A repeated parameter fails its own field only.
+    ion.params = &.{
+        .{ .cv = .{ .accession = model.Terms.CHARGE_STATE, .value = "2" } },
+        .{ .cv = .{ .accession = model.Terms.CHARGE_STATE, .value = "3" } },
+        .{ .cv = .{ .accession = model.Terms.SELECTED_ION_MZ, .value = "500" } },
+    };
+    const repeated = try ion.selectedIonFields(&.{});
+    try std.testing.expectError(error.RepeatedParameter, repeated.charge);
+    try std.testing.expectEqual(@as(f64, 500), (try repeated.mz).?.value);
+
+    var window: model.Node = .{ .kind = .isolation_window };
+    window.params = &.{
+        .{ .cv = .{ .accession = model.Terms.ISOLATION_TARGET_MZ, .value = "810.79" } },
+        .{ .cv = .{ .accession = model.Terms.ISOLATION_LOWER_OFFSET, .value = "" } },
+    };
+    try std.testing.expectError(error.EmptyValue, window.isolationWindowValues(&.{}));
+    const window_fields = try window.isolationWindowFields(&.{});
+    try std.testing.expectEqual(@as(f64, 810.79), (try window_fields.target).?.value);
+    try std.testing.expectError(error.EmptyValue, window_fields.lower_offset);
+    try std.testing.expectEqual(null, try window_fields.upper_offset);
+
+    try std.testing.expectError(error.UnexpectedElement, window.selectedIonFields(&.{}));
+    try std.testing.expectError(error.UnexpectedElement, ion.isolationWindowFields(&.{}));
+}
+
 test "[integration] - [mzML field access]: preserves source units and rejects ambiguous lookups" {
     const model = mzml.model;
     const entries = [_]mzml.cv.Entry{

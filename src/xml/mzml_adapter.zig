@@ -1412,10 +1412,13 @@ pub const Cursor = struct {
             } else if (std.ascii.eqlIgnoreCase(value, "UTF-16")) {
                 if (self.source.encoding != .utf16_le and self.source.encoding != .utf16_be)
                     return self.declarationError(encoding_at, error.InvalidEncoding);
-            } else if (std.ascii.eqlIgnoreCase(value, "ISO-8859-1")) {
-                if (self.source.encoding != .utf8 or
-                    std.mem.startsWith(u8, self.source.probe[0..self.source.probe_len], "\xef\xbb\xbf")) return self.declarationError(encoding_at, error.InvalidEncoding);
-                self.source.encoding = .latin1;
+            } else if (std.ascii.eqlIgnoreCase(value, "ISO-8859-1") or
+                std.ascii.eqlIgnoreCase(value, "US-ASCII") or std.ascii.eqlIgnoreCase(value, "ASCII"))
+            {
+                const bom = std.mem.startsWith(u8, self.source.probe[0..self.source.probe_len], "\xef\xbb\xbf");
+                if (self.source.encoding != .utf8 or bom) return self.declarationError(encoding_at, error.InvalidEncoding);
+                // Seven-bit text is read as is; a byte at or above 0x80 is an encoding error.
+                self.source.encoding = if (std.ascii.eqlIgnoreCase(value, "ISO-8859-1")) .latin1 else .ascii;
             } else {
                 return self.declarationError(encoding_at, error.UnsupportedEncoding);
             }
@@ -1431,6 +1434,7 @@ const ParserError = AdvanceError || error{EndOfStream};
 const Encoding = enum {
     utf8,
     latin1,
+    ascii,
     utf16_le,
     utf16_be,
 };
@@ -1647,6 +1651,7 @@ const Source = struct {
 
         const first = try self.readByte();
         if (first < 0x80 or self.encoding == .latin1) return .{ .value = first, .start = start, .end = self.position };
+        if (self.encoding == .ascii) return self.brokenAt(start, error.InvalidEncoding);
         // Unicode's well-formed sequences: the first byte sets the length and the second byte's
         // range, so a failure is reported at the first byte that cannot continue the sequence.
         const length: u3, const low: u8, const high: u8 = switch (first) {
@@ -1712,7 +1717,7 @@ const Source = struct {
     // Whether the reader's buffered bytes are the next characters, one byte each, so they
     // can be scanned directly.
     fn bytesAreCharacters(self: *const Source) bool {
-        return (self.encoding == .utf8 or self.encoding == .latin1) and
+        return (self.encoding == .utf8 or self.encoding == .latin1 or self.encoding == .ascii) and
             self.probe_pos == self.probe_len and self.pending_len == 0;
     }
 

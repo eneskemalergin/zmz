@@ -191,24 +191,40 @@ pub const Node = struct {
         return listItems(self, .selected_ion_list);
     }
 
-    /// Parses this selected ion's fields; each absent one stays null. m/z falls back to the
-    /// historical term; charge is a signed xs:int.
+    /// Parses this selected ion's fields; each absent one stays null. The first field error
+    /// fails the whole ion; `selectedIonFields` reads past it.
     pub fn selectedIonValues(self: Node, groups: []const cv.Group) FieldError!SelectedIon {
+        const fields = try self.selectedIonFields(groups);
+        return .{ .mz = try fields.mz, .charge = try fields.charge, .intensity = try fields.intensity };
+    }
+
+    /// Parses each selected-ion field on its own, so one malformed field (a peak intensity of
+    /// `0 1+`, say) leaves the others readable. m/z falls back to the historical term; charge
+    /// is a signed xs:int.
+    pub fn selectedIonFields(self: Node, groups: []const cv.Group) error{UnexpectedElement}!SelectedIonFields {
         if (self.kind != .selected_ion) return error.UnexpectedElement;
+        const mz = self.number(groups, Terms.SELECTED_ION_MZ);
         return .{
-            .mz = try self.number(groups, Terms.SELECTED_ION_MZ) orelse try self.number(groups, Terms.HISTORICAL_SELECTED_ION_MZ),
-            .charge = try self.integer(i32, groups, Terms.CHARGE_STATE),
-            .intensity = try self.number(groups, Terms.PEAK_INTENSITY),
+            .mz = if (mz) |found| found orelse self.number(groups, Terms.HISTORICAL_SELECTED_ION_MZ) else |err| err,
+            .charge = self.integer(i32, groups, Terms.CHARGE_STATE),
+            .intensity = self.number(groups, Terms.PEAK_INTENSITY),
         };
     }
 
     /// Parses this isolation window's target and offsets as written; each absent one stays null.
+    /// The first field error fails the whole window; `isolationWindowFields` reads past it.
     pub fn isolationWindowValues(self: Node, groups: []const cv.Group) FieldError!IsolationWindow {
+        const fields = try self.isolationWindowFields(groups);
+        return .{ .target = try fields.target, .lower_offset = try fields.lower_offset, .upper_offset = try fields.upper_offset };
+    }
+
+    /// Parses each isolation-window field on its own.
+    pub fn isolationWindowFields(self: Node, groups: []const cv.Group) error{UnexpectedElement}!IsolationWindowFields {
         if (self.kind != .isolation_window) return error.UnexpectedElement;
         return .{
-            .target = try self.number(groups, Terms.ISOLATION_TARGET_MZ),
-            .lower_offset = try self.number(groups, Terms.ISOLATION_LOWER_OFFSET),
-            .upper_offset = try self.number(groups, Terms.ISOLATION_UPPER_OFFSET),
+            .target = self.number(groups, Terms.ISOLATION_TARGET_MZ),
+            .lower_offset = self.number(groups, Terms.ISOLATION_LOWER_OFFSET),
+            .upper_offset = self.number(groups, Terms.ISOLATION_UPPER_OFFSET),
         };
     }
 };
@@ -234,9 +250,19 @@ pub const Representation = enum { centroid, profile };
 /// Selected-ion values as declared; each keeps its source parameter, and absent ones are null.
 pub const SelectedIon = struct { mz: ?Number, charge: ?i32, intensity: ?Number };
 
+/// The fields of `SelectedIon`, each holding its value or the error that field alone raised.
+pub const SelectedIonFields = struct { mz: FieldError!?Number, charge: FieldError!?i32, intensity: FieldError!?Number };
+
 /// Isolation target and offsets as declared, each optional, in source units. Offsets are
 /// distances below and above the target, not absolute bounds.
 pub const IsolationWindow = struct { target: ?Number, lower_offset: ?Number, upper_offset: ?Number };
+
+/// The fields of `IsolationWindow`, each holding its value or the error that field alone raised.
+pub const IsolationWindowFields = struct {
+    target: FieldError!?Number,
+    lower_offset: FieldError!?Number,
+    upper_offset: FieldError!?Number,
+};
 
 /// Common PSI-MS accessions used by the helpers; other terms are equally valid.
 pub const Terms = struct {
