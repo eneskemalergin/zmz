@@ -151,6 +151,10 @@ fn readSelectedDecoded(allocator: std.mem.Allocator, source: []const u8) !void {
 }
 
 // Payload, encodedLength, defaultArrayLength, compression term, and the expected error.
+// A PIC zlib stream of one value, then valid Base64 past the first decoded window, then an invalid
+// character: the zlib stream ends first, and the rest of the text is still checked.
+const LATE_INVALID = "eJwrBAAAcgBy" ++ "AAAA" ** 25_000 ++ "!AAA";
+
 const DECODING_FAILURES = .{
     .{ "!AAAAAAA8D8=", 12, 1, "MS:1000576", error.InvalidCharacter },
     .{ "!AAAAAAA8D8=", 11, 1, "MS:1000576", error.InvalidCharacter },
@@ -161,6 +165,7 @@ const DECODING_FAILURES = .{
     .{ "AB==", 4, 0, "MS:1000576", error.NonCanonicalTail },
     .{ "AA=A", 4, 0, "MS:1000576", error.InvalidPadding },
     .{ "AAAAAAAA8D8=", 12, 1, "X:unknown", error.MissingCompression },
+    .{ LATE_INVALID, LATE_INVALID.len, 1, "MS:1002747", error.InvalidCharacter },
 };
 
 test "[failure] - [mzML diagnostics]: retains selected source positions and physical event offsets" {
@@ -1928,6 +1933,17 @@ test "[integration] - [mzML lists]: reads absent and empty lists without requiri
     }
 }
 
+test "[failure] - [mzML lists]: refuses repeated lists and a spectrum list after chromatograms" {
+    inline for (.{
+        "<spectrumList count='0'/><spectrumList count='0'/>",
+        "<chromatogramList count='0'/><spectrumList count='0'/>",
+        "<spectrumList count='0'/><chromatogramList count='0'/><chromatogramList count='0'/>",
+    }) |lists| {
+        const source = support.HEADER ++ lists ++ "</run></mzML>";
+        try std.testing.expectError(error.InvalidStructure, support.readAll(std.testing.allocator, source, .{}));
+    }
+}
+
 test "[integration] - [mzML attributes]: preserves extras without requiring unused fields" {
     const source = "<mzML xmlns='http://psi.hupo.org/ms/mzml' version='1.1.0' extra='document'>" ++
         "<cvList><cv/></cvList><fileDescription><fileContent/><sourceFileList><sourceFile/></sourceFileList></fileDescription>" ++
@@ -3109,4 +3125,53 @@ test "[unit] - [mzML diagnostics]: names option, encoding, and work-cap errors f
     try std.testing.expectEqual(.limit_exceeded, expansion.id);
     try std.testing.expectEqual(.expansion_work, expansion.detail.limit.name);
     try std.testing.expectEqual(@as(u64, mzml.cv.EXPANSION_WORK), expansion.detail.limit.maximum);
+}
+
+test "[unit] - [mzML diagnostics]: formats limit and size details in full" {
+    const cases = .{
+        .{
+            mzml.Diagnostic{
+                .id = .limit_exceeded,
+                .code = error.LimitExceeded,
+                .operation = .read_record,
+                .stage = .metadata,
+                .location = .{ .input_event = 42 },
+                .element = .spectrum,
+                .record = .{ .kind = .spectrum, .ordinal = 3 },
+                .detail = .{ .limit = .{ .name = .record_bytes, .maximum = 16, .needed = 17 } },
+            },
+            "[ZMZ0002] read_record: configured limit exceeded (LimitExceeded); stage=metadata; input_event=42; " ++
+                "element=spectrum; spectrum_ordinal=3; limit=record_bytes; maximum=16; needed=17",
+        },
+        .{
+            mzml.Diagnostic{
+                .id = .limit_exceeded,
+                .code = error.LimitExceeded,
+                .operation = .read_event,
+                .stage = .xml,
+                .detail = .{ .limit = .{ .name = .depth, .maximum = 128 } },
+            },
+            "[ZMZ0002] read_event: configured limit exceeded (LimitExceeded); stage=xml; limit=depth; maximum=128",
+        },
+        .{
+            mzml.Diagnostic{
+                .id = .count_mismatch,
+                .code = error.CountMismatch,
+                .operation = .write_record,
+                .stage = .array,
+                .location = .{ .output_byte = 900 },
+                .element = .binary_data_array,
+                .array_position = 1,
+                .detail = .{ .size = .{ .expected = 2, .actual = 1, .unit = .arrays } },
+            },
+            "[ZMZ0029] write_record: count differs from the expected count (CountMismatch); stage=array; output_byte=900; " ++
+                "element=binaryDataArray; array_position=1; expected=2; actual=1; unit=arrays",
+        },
+    };
+    inline for (cases) |case| {
+        var buffer: [256]u8 = undefined;
+        var sink = std.Io.Writer.fixed(&buffer);
+        try case[0].format(&sink);
+        try std.testing.expectEqualStrings(case[1], sink.buffered());
+    }
 }

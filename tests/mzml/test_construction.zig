@@ -617,6 +617,8 @@ test "[integration] - [mzML construction]: cleans failed allocations and keeps s
     try std.testing.expectEqualStrings("", declaration.attribute("version").?);
     const param = try builder.number(.{ .cv_ref = "MS", .accession = mzml.model.Terms.SCAN_START_TIME, .name = "scan start time" }, -0.0);
     try std.testing.expect(std.math.signbit(try mzml.cv.parseFloat(f64, param.value)));
+    for ([_]f64{ std.math.nan(f64), std.math.inf(f64), -std.math.inf(f64) }, [_][]const u8{ "NaN", "INF", "-INF" }) |value, spelling|
+        try std.testing.expectEqualStrings(spelling, (try builder.number(.{}, value)).value.?);
     var encoder = mzml.arrays.Encoder.init(std.testing.allocator, .fast);
     defer encoder.deinit();
     const options: mzml.Builder.ArrayOptions = .{ .cv_ref = "MS", .role = .{ .cv_ref = "MS", .accession = mzml.model.Terms.MZ_ARRAY, .name = "m/z array" } };

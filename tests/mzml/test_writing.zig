@@ -85,6 +85,35 @@ test "[failure] - [mzML diagnostics]: reports writer counts, indexes, and alloca
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }
 
+test "[failure] - [mzML diagnostics]: names a non-integer index and an indexed record without an ID" {
+    const header: mzml.model.Header = .{ .document = .{ .kind = .mzml }, .run = .{ .kind = .run } };
+    for ([_]bool{ false, true }) |indexed| {
+        var bytes: [4096]u8 = undefined;
+        var sink = std.Io.Writer.fixed(&bytes);
+        var writer = if (indexed)
+            try mzml.Writer.initIndexed(std.testing.allocator, &sink, .{}, .{})
+        else
+            try mzml.Writer.init(std.testing.allocator, &sink, .{});
+        defer writer.deinit();
+        try writer.writeHeader(header);
+        try writer.beginListWithAttributes(.spectrum_list, 1, &.{});
+        const index: mzml.model.Attribute = .{ .name = "index", .value = if (indexed) "0" else "first" };
+        const result = writer.writeRecord(.{ .kind = .spectrum, .attributes = &.{index} });
+        const report = writer.diagnostic().?;
+        if (indexed) {
+            try std.testing.expectError(error.MissingAttribute, result);
+            try std.testing.expectEqual(.id, report.detail.attribute);
+            try std.testing.expectEqual(.index, report.stage);
+        } else {
+            try std.testing.expectError(error.InvalidValue, result);
+            try std.testing.expectEqual(.index, report.detail.attribute);
+            try std.testing.expectEqual(.metadata, report.stage);
+        }
+        try std.testing.expectEqual(.write_record, report.operation);
+        try std.testing.expectError(error.FailedState, writer.endList());
+    }
+}
+
 test "[integration] - [mzML items]: retains empty-list XML and indexes following chromatograms" {
     const source = "<mzML xmlns='http://psi.hupo.org/ms/mzml' xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance'><run>" ++
         "<spectrumList count='0'><first/><software/></spectrumList><between/><scan/>" ++
@@ -1693,6 +1722,29 @@ test "[failure] - [mzML streamed writing]: Numpress value errors write nothing t
         builder.reset();
         encoder.reset();
     }
+}
+
+test "[failure] - [mzML streamed writing]: an output failure while a source streams leaves the writer failed" {
+    var input = std.Io.Reader.fixed(support.DOCUMENT);
+    var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+    defer reader.deinit();
+    const header = try reader.readHeader();
+    const record = (try reader.nextRecord()).?;
+    var values: [4096]f64 = undefined;
+    for (&values, 0..) |*value, i| value.* = @floatFromInt(i * i);
+    const source = mzml.arrays.Source.of(f64, &values, .{ .pipeline = .linear, .fixed_point = 1000 }, null);
+    var bytes: [8192]u8 = undefined;
+    var sink = std.Io.Writer.fixed(&bytes);
+    var writer = try mzml.Writer.init(std.testing.allocator, &sink, .{});
+    defer writer.deinit();
+    try writer.writeHeader(header.*);
+    try writer.beginList(.spectrum_list, 1, "dp");
+    const payloads = [_]mzml.Writer.ArrayPayload{ .{ .source = source }, .{ .source = source } };
+    try std.testing.expectError(error.WriteFailed, writer.writeRecordWithArrays(record.node, &payloads));
+    const report = writer.diagnostic().?;
+    try std.testing.expectEqual(.write_failed, report.id);
+    try std.testing.expectEqual(.output, report.stage);
+    try std.testing.expectError(error.FailedState, writer.endList());
 }
 
 test "[failure] - [mzML streamed writing]: the text limit stops streams first and files after the text" {

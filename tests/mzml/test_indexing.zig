@@ -1363,6 +1363,22 @@ test "[failure] - [mzML index]: opening reports read failures and truncation at 
     }
 }
 
+fn openUtf16(allocator: std.mem.Allocator, bytes: []const u8) !void {
+    var index = try mzml.IndexedReader.build(allocator, .{ .bytes = bytes }, .{ .policy = .open_embedded });
+    defer index.deinit();
+    var record = (try index.at(allocator, .chromatogram, 0)).?;
+    defer record.deinit();
+    try std.testing.expectEqualStrings("tic", record.value.id);
+}
+
+test "[failure] - [mzML index]: opening UTF-16 cleans up after each failed allocation" {
+    for ([_]std.builtin.Endian{ .little, .big }) |endian| {
+        const document = try indentedDocument(std.testing.allocator, endian, false, 1);
+        defer std.testing.allocator.free(document.bytes);
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, openUtf16, .{document.bytes});
+    }
+}
+
 test "[integration] - [mzML index]: rebuilds without interpreting metadata numbers it does not use" {
     const allocator = std.testing.allocator;
     const source = @embedFile("data/writer_indexed.mzML");

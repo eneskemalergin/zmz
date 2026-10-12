@@ -468,6 +468,10 @@ test "[property] - [zlib]: reuses compression storage after success and capacity
                 error.OutputTooSmall,
                 compressor.compress(compressed[0..0], source[0..len]),
             );
+            try std.testing.expectError(
+                error.OutputTooSmall,
+                compressor.compress(compressed[0 .. wire.len - 1], source[0..len]),
+            );
         }
     }
 }
@@ -486,6 +490,25 @@ test "[property] - [zlib]: incompressible input fits the compression bound" {
             _ = try compressor.compress(output[0..zlib.compressBound(len)], source[0..len]);
         }
     }
+}
+
+test "[unit] - [zlib]: each preset compresses differently, and dense output is the smallest" {
+    var source: [65536]u8 = undefined;
+    const text = "the quick brown fox jumps over the lazy dog, ";
+    for (&source, 0..) |*byte, i| byte.* = text[i % text.len];
+    var outputs: [3][1024]u8 = undefined;
+    var wires: [3][]const u8 = undefined;
+    var decoded: [source.len]u8 = undefined;
+    inline for (.{ zlib.Preset.fast, .even, .dense }, 0..) |preset, i| {
+        var compressor = try zlib.Compressor.init(std.testing.allocator, preset);
+        defer compressor.deinit();
+        wires[i] = try compressor.compress(&outputs[i], &source);
+        try std.testing.expectEqualSlices(u8, &source, try zlib.decompress(&decoded, wires[i]));
+    }
+    try std.testing.expect(!std.mem.eql(u8, wires[0], wires[1]));
+    try std.testing.expect(!std.mem.eql(u8, wires[1], wires[2]));
+    try std.testing.expect(!std.mem.eql(u8, wires[0], wires[2]));
+    try std.testing.expect(wires[2].len <= wires[0].len and wires[2].len <= wires[1].len);
 }
 
 test "[failure] - [zlib]: streaming calls out of order fail with InvalidState" {

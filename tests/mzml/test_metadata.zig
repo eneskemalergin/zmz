@@ -30,6 +30,11 @@ test "[integration] - [mzML CV declarations]: borrows header fields across recor
         }
     }
     try std.testing.expectError(error.UnexpectedElement, header.run.cvDeclaration());
+    const misplaced: mzml.model.Header = .{
+        .document = .{ .kind = .mzml, .children = &.{.{ .kind = .cv_list, .children = &.{ nodes[0], header.run } }} },
+        .run = header.run,
+    };
+    try std.testing.expectError(error.UnexpectedElement, misplaced.cvDeclarations(std.testing.allocator));
 
     var records: usize = 0;
     while (try reader.nextRecord()) |_| {
