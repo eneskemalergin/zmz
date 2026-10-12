@@ -370,9 +370,11 @@ test "[property] - [mzML events]: skipping whitespace text drops exactly the bla
         "<r>   <a/>  t  <b/>   </r>",
         "<r>\n  <a></b>\n</r>",
         "<r> x </r> y",
+        // Indentation across 16-byte steps, and a long blank run before text.
+        "<r>\n" ++ " " ** 15 ++ "<a/>\r\n" ++ " " ** 16 ++ "<b/>\n" ++ "\t" ** 33 ++ "<c/>" ++ " " ** 47 ++ "x</r>",
     };
     for (cases) |source| {
-        var buffer: [128]u8 = undefined;
+        var buffer: [256]u8 = undefined;
         for (1..source.len + 1) |size| {
             var expected: std.Io.Writer.Allocating = .init(std.testing.allocator);
             defer expected.deinit();

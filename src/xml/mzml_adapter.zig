@@ -465,8 +465,7 @@ pub const Cursor = struct {
         const reader = self.source.reader orelse return;
         const bytes = reader.buffered();
         const bound = @min(bytes.len, TEXT_CHUNK_BYTES);
-        var length: usize = 0;
-        while (length < bound and isXmlWhitespace(bytes[length])) : (length += 1) {}
+        const length = whitespaceRun(bytes[0..bound]);
         // A complete run preserves the original text event's failure order.
         if (length == 0 or length == bound or bytes[length] != '<') return;
         const end = std.math.add(u64, self.source.position, length) catch return;
@@ -1454,6 +1453,25 @@ fn optionalSliceEql(left: ?[]const u8, right: ?[]const u8) bool {
 
 fn isXmlWhitespace(value: u21) bool {
     return value == ' ' or value == '\t' or value == '\r' or value == '\n';
+}
+
+// The length of the leading run of XML whitespace; indentation runs are long, so 16 bytes at
+// a time.
+fn whitespaceRun(bytes: []const u8) usize {
+    // Unindented markup has no run at all; one byte decides that.
+    if (bytes.len == 0 or !isXmlWhitespace(bytes[0])) return 0;
+    const Vector = @Vector(16, u8);
+    var length: usize = 0;
+    while (bytes.len - length >= 16) {
+        const run: Vector = bytes[length..][0..16].*;
+        const space = (run == @as(Vector, @splat(' '))) | (run == @as(Vector, @splat('\n'))) |
+            (run == @as(Vector, @splat('\r'))) | (run == @as(Vector, @splat('\t')));
+        const mask: u16 = @bitCast(space);
+        if (mask != 0xffff) return length + @ctz(~mask);
+        length += 16;
+    }
+    while (length < bytes.len and isXmlWhitespace(bytes[length])) : (length += 1) {}
+    return length;
 }
 
 fn isXmlWhitespaceRun(bytes: []const u8) bool {
