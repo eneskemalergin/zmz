@@ -125,7 +125,7 @@ pub const Text = struct {
     bytes: []const u8,
 };
 
-pub const EventData = union(enum) {
+const EventData = union(enum) {
     start_element: StartElement,
     end_element: EndElement,
     text: Text,

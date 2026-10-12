@@ -74,7 +74,7 @@ pub const Pipeline = enum {
     }
 };
 
-pub const Term = struct { accession: []const u8, name: []const u8 };
+const Term = struct { accession: []const u8, name: []const u8 };
 
 /// A recognized established encoding. Unknown metadata remains in the source node.
 pub const Encoding = struct {

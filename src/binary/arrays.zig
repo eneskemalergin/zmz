@@ -2,6 +2,9 @@
 //!
 //! Only `Encoder` allocates. Caller buffers must be disjoint unless a function says otherwise
 //! (`OverlappingBuffers` otherwise), and their contents after a failure are unspecified.
+//!
+//! `Encoder.reuses` is internal: the writer uses it to refuse a payload that lives in the
+//! encoder's own storage.
 
 const std = @import("std");
 const base64 = @import("base64.zig");

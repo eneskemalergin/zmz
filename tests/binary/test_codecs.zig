@@ -5,6 +5,7 @@ const mzml = @import("zmz").mzml;
 const base64 = mzml.base64;
 const zlib = mzml.zlib;
 const arrays = mzml.arrays;
+const sha1 = mzml.sha1;
 
 // Decodes text in one call: the reference for split updates.
 fn decodeWhole(text: []const u8) base64.Decoder.Error!base64.Counts {
@@ -1114,5 +1115,45 @@ test "[integration] - [arrays]: round trips every established pipeline" {
             .fixed_point = fixed_point,
         }, scratch, &compressor);
         try arrays.decode(f64, output[0..0], wire, pipeline, scratch);
+    }
+}
+
+// Without SHA extensions update is std's own, so this checks the extension path where the CPU
+// has it.
+test "[property] - [SHA-1]: matches std across lengths and splits" {
+    var source: [1200]u8 = undefined;
+    var random = std.Random.DefaultPrng.init(std.testing.random_seed);
+    random.random().bytes(&source);
+    for (0..source.len + 1) |len| {
+        var expected: [20]u8 = undefined;
+        std.crypto.hash.Sha1.hash(source[0..len], &expected, .{});
+        var whole: sha1.Sha1 = .{};
+        whole.update(source[0..len]);
+        try std.testing.expectEqualSlices(u8, &expected, &whole.finalResult());
+        for ([_]usize{ 1, 63, 64, 65, 127, 200 }) |split| {
+            if (split > len) continue;
+            var parts: sha1.Sha1 = .{};
+            parts.update(source[0..split]);
+            parts.update(source[split..len]);
+            try std.testing.expectEqualSlices(u8, &expected, &parts.finalResult());
+        }
+    }
+    var bytes: sha1.Sha1 = .{};
+    for (source) |byte| bytes.update(&.{byte});
+    var expected: [20]u8 = undefined;
+    std.crypto.hash.Sha1.hash(&source, &expected, .{});
+    try std.testing.expectEqualSlices(u8, &expected, &bytes.finalResult());
+}
+
+test "[unit] - [SHA-1]: matches the FIPS 180 vectors" {
+    const cases = .{
+        .{ "", "da39a3ee5e6b4b0d3255bfef95601890afd80709" },
+        .{ "abc", "a9993e364706816aba3e25717850c26c9cd0d89d" },
+        .{ "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq", "84983e441c3bd26ebaae4aa1f95129e5e54670f1" },
+    };
+    inline for (cases) |case| {
+        var hasher: sha1.Sha1 = .{};
+        hasher.update(case[0]);
+        try std.testing.expectEqualStrings(case[1], &std.fmt.bytesToHex(hasher.finalResult(), .lower));
     }
 }

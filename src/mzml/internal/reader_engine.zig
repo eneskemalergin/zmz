@@ -69,13 +69,13 @@ pub const Error = xml.Error || model.MetadataError || DecodedArrays.Error || std
     FailedState,
     InvalidOptions,
 };
-pub const FragmentError = Error || error{InvalidIndex};
+const FragmentError = Error || error{InvalidIndex};
 
 pub const Scope = struct { start: u64, end: u64, name: []const u8 };
-pub const FragmentTarget = struct { kind: model.Kind, id: []const u8 };
+const FragmentTarget = struct { kind: model.Kind, id: []const u8 };
 
 // Parsed indexed-wrapper children. Release its arena once.
-pub const ParsedFooter = struct {
+const ParsedFooter = struct {
     arena: std.heap.ArenaAllocator,
     nodes: [2]model.Node,
 };

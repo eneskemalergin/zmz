@@ -5,7 +5,7 @@ const xml = @import("../xml/mzml_adapter.zig");
 const model = @import("model.zig");
 
 // A child kind a parent allows, at most once unless many.
-pub const Rule = struct { kind: model.Kind, many: bool = false };
+const Rule = struct { kind: model.Kind, many: bool = false };
 
 pub const CHILD_KINDS = blk: {
     @setEvalBranchQuota(2000);
