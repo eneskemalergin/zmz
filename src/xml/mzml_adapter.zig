@@ -1501,7 +1501,10 @@ fn ordinaryRun(comptime max_width: usize, bytes: []const u8, stops: [3]u8) usize
         const run: Vector = bytes[length..][0..width].*;
         var exceptional = (run < @as(Vector, @splat(0x20))) | (run >= @as(Vector, @splat(0x80)));
         inline for (stops) |stop| exceptional |= run == @as(Vector, @splat(stop));
-        if (std.simd.firstTrue(exceptional)) |lane| return length + lane;
+        // A lane mask finds the first exceptional byte with one bit count, where std.simd.firstTrue
+        // takes a horizontal minimum.
+        const mask: std.meta.Int(.unsigned, width) = @bitCast(exceptional);
+        if (mask != 0) return length + @ctz(mask);
         length += width;
     }
     while (length < bytes.len) : (length += 1) {
