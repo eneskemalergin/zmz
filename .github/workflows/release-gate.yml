@@ -1,0 +1,67 @@
+name: Release gate
+
+# The expensive matrix, run where it decides something: on pull requests into main and by hand
+# (Actions, Release gate, Run workflow). ReleaseFast for both kernel backends, macOS, and
+# big-endian under QEMU. See README.md beside this file.
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: gate-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    continue-on-error: ${{ matrix.allowed-to-fail }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: x86_64-linux ReleaseFast
+            runner: ubuntu-24.04
+            allowed-to-fail: false
+            command: >-
+              zig build test -Doptimize=ReleaseFast --summary all &&
+              zig build test -Doptimize=ReleaseFast -Dkernel_backend=portable --summary all
+          - name: aarch64-linux ReleaseFast
+            runner: ubuntu-24.04-arm
+            allowed-to-fail: false
+            command: zig build test -Doptimize=ReleaseFast --summary all
+          # The OS is what differs here; Linux already covers aarch64 code generation.
+          - name: aarch64-macos Debug
+            runner: macos-15
+            allowed-to-fail: false
+            command: zig build test --summary all
+          # Not a claimed target: it runs the byte-swapping paths no little-endian runner reaches.
+          - name: s390x-linux Debug (big-endian, QEMU)
+            runner: ubuntu-24.04
+            allowed-to-fail: true
+            qemu: true
+            command: zig build test -Dtarget=s390x-linux -fqemu --summary all
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: $/.github/actions/setup-zig
+      - name: Install QEMU
+        if: matrix.qemu
+        # The package registers binfmt, so the tests' child processes run too; -fqemu calls the
+        # binary by its plain name.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-user-static
+          sudo ln -sf /usr/bin/qemu-s390x-static /usr/local/bin/qemu-s390x
+      - name: Test
+        env:
+          COMMAND: ${{ matrix.command }}
+        run: bash -c "${COMMAND}"
