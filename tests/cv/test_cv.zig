@@ -188,7 +188,12 @@ test "[edge] - [CV resolver]: classifies only explicitly catalogued historical a
     try std.testing.expectEqual(.unrecognized_resource, unknown.term.version);
     try std.testing.expect(unknown.term.issues.unrecognized_resource);
     try std.testing.expectEqual(null, unknown.term.match);
-    resolver.max_work = 0;
+}
+
+test "[failure] - [CV resolver]: rejects exhausted work, duplicate declarations, and missing bindings" {
+    const declarations = [_]cv.Declaration{.{ .id = "local", .version = null }};
+    var resolver: cv.Resolver = .{ .resources = &.{GRAPH}, .declarations = &declarations, .max_work = 0 };
+    const parameter: cv.Param = .{ .cv_ref = "local", .accession = .{ .raw = "X:02" }, .name = "old label" };
     try std.testing.expectError(error.LimitExceeded, resolver.resolve(parameter));
     resolver.max_work = 100;
     resolver.declarations = &.{ declarations[0], declarations[0] };

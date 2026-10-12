@@ -1196,66 +1196,58 @@ test "[integration] - [mzML index]: opens embedded targets without checking unre
     }
 }
 
-test "[integration] - [mzML index]: opens indented encoded targets and restores list namespaces" {
-    const FailedRead = struct {
-        start: u64,
-        stop: u64,
-        truncated: bool,
-        active: bool = false,
-        failed: bool = false,
+// An indexedmzML document in UTF-8 or UTF-16 whose targets follow indentation and optional
+// padding, with a namespace declared on the chromatogram list and a correct checksum.
+const IndentedDocument = struct { bytes: []u8, spectrum_start: usize, chromatogram_start: usize, index_start: usize };
 
-        fn stat(_: ?*anyopaque, file: std.Io.File) std.Io.File.StatError!std.Io.File.Stat {
-            return file.stat(std.testing.io);
-        }
-
-        fn read(data: ?*anyopaque, file: std.Io.File, slices: []const []u8, offset: u64) std.Io.File.ReadPositionalError!usize {
-            const self: *@This() = @ptrCast(@alignCast(data.?));
-            if (offset == self.start) self.active = true;
-            if (self.active and offset >= self.stop) {
-                self.failed = true;
-                if (self.truncated) return 0;
-                return error.InputOutput;
-            }
-            const length: usize = @intCast(@min(slices[0].len, 113, if (self.active) self.stop - offset else std.math.maxInt(u64)));
-            return std.testing.io.vtable.fileReadPositional(std.testing.io.userdata, file, &.{slices[0][0..length]}, offset);
-        }
-    };
-    const allocator = std.testing.allocator;
+fn indentedDocument(allocator: std.mem.Allocator, endian: ?std.builtin.Endian, padded: bool, spectra: usize) !IndentedDocument {
     const spaces: [65537]u8 = @splat(' ');
+    const padding: usize = if (padded) spaces.len else 0;
+    const width: usize = if (endian != null) 2 else 1;
+    const bom: usize = if (endian != null) 2 else 0;
+    var source: std.Io.Writer.Allocating = .init(allocator);
+    defer source.deinit();
+    try source.writer.writeAll("<p:indexedmzML xmlns:p='http://psi.hupo.org/ms/mzml'>" ++ support.HEADER);
+    try source.writer.print("<spectrumList count='{d}' defaultDataProcessingRef='dp'>", .{spectra});
+    const spectrum_start = bom + width * source.written().len;
+    if (spectra != 0) try source.writer.writeAll("\r\n \t<spectrum id='a&amp;b' index='0' defaultArrayLength='0'/>");
+    try source.writer.writeAll(spaces[0..padding]);
+    try source.writer.writeAll("</spectrumList><chromatogramList xmlns:q='http://psi.hupo.org/ms/mzml' count='1' defaultDataProcessingRef='dp'>");
+    const chromatogram_start = bom + width * source.written().len;
+    try source.writer.writeAll(spaces[0..padding]);
+    try source.writer.writeAll("\r\n \t<q:chromatogram id='tic' index='0' defaultArrayLength='1'>" ++ support.ARRAYS ++ "</q:chromatogram></chromatogramList></run></mzML>");
+    const index_start = bom + width * source.written().len;
+    try source.writer.writeAll(spaces[0..padding]);
+    try source.writer.print("\r\n \t<p:indexList count='2'><p:index name='chromatogram'><p:offset idRef='tic'>{d}</p:offset></p:index><p:index name='spectrum'>", .{chromatogram_start});
+    try source.writer.writeAll(spaces[0..padding]);
+    if (spectra != 0) try source.writer.print("<p:offset idRef='a&amp;b'>{d}</p:offset>", .{spectrum_start});
+    try source.writer.print("</p:index></p:indexList><p:indexListOffset>{d}</p:indexListOffset><p:fileChecksum>0000000000000000000000000000000000000000</p:fileChecksum></p:indexedmzML><!-- <indexListOffset>fake -->", .{index_start});
+    const bytes = try allocator.alloc(u8, bom + width * source.written().len);
+    errdefer allocator.free(bytes);
+    if (endian) |order| support.utf16(bytes, source.written(), order) else @memcpy(bytes, source.written());
+    const checksum_start = bom + width * ((std.mem.indexOf(u8, source.written(), "<p:fileChecksum>") orelse return error.TestUnexpectedResult) + "<p:fileChecksum>".len);
+    var digest: [20]u8 = undefined;
+    std.crypto.hash.Sha1.hash(bytes[0..checksum_start], &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    if (endian) |order| {
+        for (hex, 0..) |byte, i| std.mem.writeInt(u16, bytes[checksum_start + 2 * i ..][0..2], byte, order);
+    } else @memcpy(bytes[checksum_start..][0..hex.len], &hex);
+    return .{ .bytes = bytes, .spectrum_start = spectrum_start, .chromatogram_start = chromatogram_start, .index_start = index_start };
+}
+
+test "[integration] - [mzML index]: opens indented encoded targets and restores list namespaces" {
+    const allocator = std.testing.allocator;
     var directory = std.testing.tmpDir(.{});
     defer directory.cleanup();
     for ([_]?std.builtin.Endian{ null, .little, .big }) |endian| {
-        for ([_]usize{ 0, spaces.len }) |padding| {
+        for ([_]bool{ false, true }) |padded| {
             for (0..2) |spectra| {
-                const width: usize = if (endian != null) 2 else 1;
-                const bom: usize = if (endian != null) 2 else 0;
-                var source: std.Io.Writer.Allocating = .init(allocator);
-                defer source.deinit();
-                try source.writer.writeAll("<p:indexedmzML xmlns:p='http://psi.hupo.org/ms/mzml'>" ++ support.HEADER);
-                try source.writer.print("<spectrumList count='{d}' defaultDataProcessingRef='dp'>", .{spectra});
-                const spectrum_start = bom + width * source.written().len;
-                if (spectra != 0) try source.writer.writeAll("\r\n \t<spectrum id='a&amp;b' index='0' defaultArrayLength='0'/>");
-                try source.writer.writeAll(spaces[0..padding]);
-                try source.writer.writeAll("</spectrumList><chromatogramList xmlns:q='http://psi.hupo.org/ms/mzml' count='1' defaultDataProcessingRef='dp'>");
-                const chromatogram_start = bom + width * source.written().len;
-                try source.writer.writeAll(spaces[0..padding]);
-                try source.writer.writeAll("\r\n \t<q:chromatogram id='tic' index='0' defaultArrayLength='1'>" ++ support.ARRAYS ++ "</q:chromatogram></chromatogramList></run></mzML>");
-                const index_start = bom + width * source.written().len;
-                try source.writer.writeAll(spaces[0..padding]);
-                try source.writer.print("\r\n \t<p:indexList count='2'><p:index name='chromatogram'><p:offset idRef='tic'>{d}</p:offset></p:index><p:index name='spectrum'>", .{chromatogram_start});
-                try source.writer.writeAll(spaces[0..padding]);
-                if (spectra != 0) try source.writer.print("<p:offset idRef='a&amp;b'>{d}</p:offset>", .{spectrum_start});
-                try source.writer.print("</p:index></p:indexList><p:indexListOffset>{d}</p:indexListOffset><p:fileChecksum>0000000000000000000000000000000000000000</p:fileChecksum></p:indexedmzML><!-- <indexListOffset>fake -->", .{index_start});
-                const bytes = try allocator.alloc(u8, bom + width * source.written().len);
-                defer allocator.free(bytes);
-                if (endian) |order| support.utf16(bytes, source.written(), order) else @memcpy(bytes, source.written());
-                const checksum_start = bom + width * ((std.mem.indexOf(u8, source.written(), "<p:fileChecksum>") orelse return error.TestUnexpectedResult) + "<p:fileChecksum>".len);
-                var digest: [20]u8 = undefined;
-                std.crypto.hash.Sha1.hash(bytes[0..checksum_start], &digest, .{});
-                const hex = std.fmt.bytesToHex(digest, .lower);
-                if (endian) |order| {
-                    for (hex, 0..) |byte, i| std.mem.writeInt(u16, bytes[checksum_start + 2 * i ..][0..2], byte, order);
-                } else @memcpy(bytes[checksum_start..][0..hex.len], &hex);
+                const document = try indentedDocument(allocator, endian, padded, spectra);
+                defer allocator.free(document.bytes);
+                const bytes = document.bytes;
+                const spectrum_start = document.spectrum_start;
+                const chromatogram_start = document.chromatogram_start;
+                const index_start = document.index_start;
                 const file = try directory.dir.createFile(std.testing.io, "opening.mzML", .{ .read = true });
                 defer file.close(std.testing.io);
                 try file.writeStreamingAll(std.testing.io, bytes);
@@ -1289,47 +1281,85 @@ test "[integration] - [mzML index]: opens indented encoded targets and restores 
                         .index_bytes = bytes.len - index_start - 1,
                     }, .index_bytes);
                 }
-                if (padding != 0 and spectra != 0) {
-                    var vtable = std.Io.failing.vtable.*;
-                    vtable.fileStat = FailedRead.stat;
-                    vtable.fileReadPositional = FailedRead.read;
-                    for ([_]usize{ index_start, spectrum_start }) |start| {
-                        for ([_]bool{ false, true }) |malformed| {
-                            const damaged: u8 = if (start == index_start) '<' else 'x';
-                            var name: [2]u8 = .{ damaged, 0 };
-                            if (endian) |order| std.mem.writeInt(u16, &name, damaged, order);
-                            const damage_offset = start + "\r\n \t<".len * width;
-                            if (malformed) try file.writePositionalAll(std.testing.io, name[0..width], damage_offset);
-                            for ([_]bool{ false, true }) |truncated| {
-                                var failure: FailedRead = .{ .start = start, .stop = start + 65536, .truncated = truncated };
-                                const io: std.Io = .{ .userdata = &failure, .vtable = &vtable };
-                                const expected = if (malformed)
-                                    (if (start == index_start) error.InvalidXml else error.InvalidStructure)
-                                else if (truncated) error.TruncatedSource else error.InputOutput;
-                                var report: ?mzml.Diagnostic = null;
-                                try std.testing.expectError(expected, mzml.IndexedReader.buildWithDiagnostic(allocator, .{ .file = .{ .handle = file, .io = io } }, .{ .policy = .open_embedded }, &report));
-                                try std.testing.expectEqual(expected, report.?.code);
-                                try std.testing.expectEqual(.open_index, report.?.operation);
-                                if (malformed) {
-                                    try std.testing.expect(report.?.location.?.input_event >= start);
-                                    try std.testing.expect(report.?.location.?.input_event < start + 113);
-                                } else try std.testing.expectEqual(null, report.?.location);
-                                try std.testing.expectEqual(!malformed, failure.failed);
-                            }
-                            try file.writePositionalAll(std.testing.io, bytes[damage_offset..][0..width], damage_offset);
-                        }
-                    }
-                    var opened = try mzml.IndexedReader.build(allocator, .{ .file = .{ .handle = file, .io = std.testing.io } }, .{});
-                    defer opened.deinit();
-                    var failure: FailedRead = .{ .start = spectrum_start, .stop = spectrum_start + 65536, .truncated = false };
-                    opened.source.file.io = .{ .userdata = &failure, .vtable = &vtable };
-                    var record = (try opened.at(allocator, .spectrum, 0)).?;
-                    defer record.deinit();
-                    try std.testing.expectEqualStrings("a&b", record.value.id);
-                    try std.testing.expect(!failure.failed);
-                }
             }
         }
+    }
+}
+
+test "[failure] - [mzML index]: opening reports read failures and truncation at targets, and lookups read only their spans" {
+    const FailedRead = struct {
+        start: u64,
+        stop: u64,
+        truncated: bool,
+        active: bool = false,
+        failed: bool = false,
+
+        fn stat(_: ?*anyopaque, file: std.Io.File) std.Io.File.StatError!std.Io.File.Stat {
+            return file.stat(std.testing.io);
+        }
+
+        fn read(data: ?*anyopaque, file: std.Io.File, slices: []const []u8, offset: u64) std.Io.File.ReadPositionalError!usize {
+            const self: *@This() = @ptrCast(@alignCast(data.?));
+            if (offset == self.start) self.active = true;
+            if (self.active and offset >= self.stop) {
+                self.failed = true;
+                if (self.truncated) return 0;
+                return error.InputOutput;
+            }
+            const length: usize = @intCast(@min(slices[0].len, 113, if (self.active) self.stop - offset else std.math.maxInt(u64)));
+            return std.testing.io.vtable.fileReadPositional(std.testing.io.userdata, file, &.{slices[0][0..length]}, offset);
+        }
+    };
+    const allocator = std.testing.allocator;
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    for ([_]?std.builtin.Endian{ null, .little, .big }) |endian| {
+        const width: usize = if (endian != null) 2 else 1;
+        const document = try indentedDocument(allocator, endian, true, 1);
+        defer allocator.free(document.bytes);
+        const bytes = document.bytes;
+        const spectrum_start = document.spectrum_start;
+        const index_start = document.index_start;
+        const file = try directory.dir.createFile(std.testing.io, "opening.mzML", .{ .read = true });
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, bytes);
+        var vtable = std.Io.failing.vtable.*;
+        vtable.fileStat = FailedRead.stat;
+        vtable.fileReadPositional = FailedRead.read;
+        for ([_]usize{ index_start, spectrum_start }) |start| {
+            for ([_]bool{ false, true }) |malformed| {
+                const damaged: u8 = if (start == index_start) '<' else 'x';
+                var name: [2]u8 = .{ damaged, 0 };
+                if (endian) |order| std.mem.writeInt(u16, &name, damaged, order);
+                const damage_offset = start + "\r\n \t<".len * width;
+                if (malformed) try file.writePositionalAll(std.testing.io, name[0..width], damage_offset);
+                for ([_]bool{ false, true }) |truncated| {
+                    var failure: FailedRead = .{ .start = start, .stop = start + 65536, .truncated = truncated };
+                    const io: std.Io = .{ .userdata = &failure, .vtable = &vtable };
+                    const expected = if (malformed)
+                        (if (start == index_start) error.InvalidXml else error.InvalidStructure)
+                    else if (truncated) error.TruncatedSource else error.InputOutput;
+                    var report: ?mzml.Diagnostic = null;
+                    try std.testing.expectError(expected, mzml.IndexedReader.buildWithDiagnostic(allocator, .{ .file = .{ .handle = file, .io = io } }, .{ .policy = .open_embedded }, &report));
+                    try std.testing.expectEqual(expected, report.?.code);
+                    try std.testing.expectEqual(.open_index, report.?.operation);
+                    if (malformed) {
+                        try std.testing.expect(report.?.location.?.input_event >= start);
+                        try std.testing.expect(report.?.location.?.input_event < start + 113);
+                    } else try std.testing.expectEqual(null, report.?.location);
+                    try std.testing.expectEqual(!malformed, failure.failed);
+                }
+                try file.writePositionalAll(std.testing.io, bytes[damage_offset..][0..width], damage_offset);
+            }
+        }
+        var opened = try mzml.IndexedReader.build(allocator, .{ .file = .{ .handle = file, .io = std.testing.io } }, .{});
+        defer opened.deinit();
+        var failure: FailedRead = .{ .start = spectrum_start, .stop = spectrum_start + 65536, .truncated = false };
+        opened.source.file.io = .{ .userdata = &failure, .vtable = &vtable };
+        var record = (try opened.at(allocator, .spectrum, 0)).?;
+        defer record.deinit();
+        try std.testing.expectEqualStrings("a&b", record.value.id);
+        try std.testing.expect(!failure.failed);
     }
 }
 

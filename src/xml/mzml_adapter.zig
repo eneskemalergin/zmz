@@ -2673,7 +2673,7 @@ test "[property] - [mzML XML cursor]: leaves QName delimiters unread at exact to
     }
 }
 
-test "[unit] - [mzML XML cursor]: enforces expanded names, document CDATA, text delimiters, and declaration order" {
+test "[failure] - [mzML XML cursor]: enforces expanded names, document CDATA, text delimiters, and declaration order" {
     const cases = .{
         .{ "<mzML xmlns='" ++ NAMESPACE ++ "' xmlns:a='urn:test' xmlns:b='urn:test' a:x='1' b:x='2'/>", 0 },
         .{ "<![CDATA[outside]]><mzML xmlns='" ++ NAMESPACE ++ "'/>", 0 },
