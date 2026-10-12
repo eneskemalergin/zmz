@@ -645,18 +645,11 @@ fn slofGuard(fixed_point: f64) f64 {
 }
 
 inline fn loadCodes(bytes: *const [2 * SLOF_LANES]u8) SlofCodes {
-    if (comptime builtin.cpu.arch.endian() == .little) return @bitCast(bytes.*);
-    var codes: SlofCodes = undefined;
-    inline for (0..SLOF_LANES) |lane| codes[lane] = std.mem.readInt(u16, bytes[2 * lane ..][0..2], .little);
-    return codes;
+    return @bitCast(bytes.*);
 }
 
 inline fn storeCodes(bytes: *[2 * SLOF_LANES]u8, codes: SlofCodes) void {
-    if (comptime builtin.cpu.arch.endian() == .little) {
-        bytes.* = @bitCast(codes);
-        return;
-    }
-    inline for (0..SLOF_LANES) |lane| std.mem.writeInt(u16, bytes[2 * lane ..][0..2], codes[lane], .little);
+    bytes.* = @bitCast(codes);
 }
 
 // --- Decoding ---

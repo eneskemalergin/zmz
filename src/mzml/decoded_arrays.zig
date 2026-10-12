@@ -20,7 +20,6 @@
 //! call them while they parse a record. Callers use the reads and the decode functions.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const cv = @import("../cv/source.zig");
 const arrays = @import("../binary/arrays.zig");
 const base64 = @import("../binary/base64.zig");
@@ -340,7 +339,6 @@ fn finishArray(self: *DecodedArrays) Error!void {
     }
     if (output.encoding.pipeline.isNumpress()) return self.finishNumpress();
     if (counts.decoded_bytes != output.bytes) return error.DecodedSizeMismatch;
-    output.toNative();
 }
 
 fn finishNumpress(self: *DecodedArrays) Error!void {
@@ -417,7 +415,6 @@ fn decompressInto(self: *DecodedArrays, decompressor: *zlib.Decompressor, output
     }
     var extra: [1]u8 = undefined;
     if (try decompressor.read(&extra) != null) return error.DecodedSizeMismatch;
-    output.toNative();
 }
 
 // A reader over binary text that Base64-decodes into a window as the decompressor pulls.
@@ -533,18 +530,6 @@ const Output = struct {
 
     fn primitive(self: *const Output) model.Primitive {
         return if (self.narrowed) .float32 else self.encoding.decodedPrimitive();
-    }
-
-    // Values arrive as little-endian bytes; big-endian targets swap them in place.
-    fn toNative(self: *const Output) void {
-        if (comptime builtin.cpu.arch.endian() == .little) return;
-        switch (self.primitive()) {
-            inline else => |kind| {
-                const T = kind.Type();
-                const Bits = @Int(.unsigned, @bitSizeOf(T));
-                for (std.mem.bytesAsSlice(Bits, std.mem.sliceAsBytes(self.values(T)))) |*bits| bits.* = @byteSwap(bits.*);
-            },
-        }
     }
 
     fn values(self: *const Output, comptime T: type) []T {

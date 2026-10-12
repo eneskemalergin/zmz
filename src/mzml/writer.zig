@@ -8,7 +8,6 @@
 //! returns InvalidState and leaves the running call unharmed.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const cv = @import("../cv/source.zig");
 const base64 = @import("../binary/base64.zig");
 const arrays = @import("../binary/arrays.zig");
@@ -529,7 +528,7 @@ fn planSource(self: *Writer, source: arrays.Source, payloads: anytype) Error!Pla
 fn writeSource(self: *Writer, source: arrays.Source) Error!void {
     try self.engine.binaryPart(&.{});
     const start = self.engine.byteOffset() orelse return error.LimitExceeded;
-    if (source.options.pipeline == .none and builtin.cpu.arch.endian() == .little) {
+    if (source.options.pipeline == .none) {
         switch (source.values) {
             inline else => |values| try self.engine.binary(std.mem.sliceAsBytes(values)),
         }

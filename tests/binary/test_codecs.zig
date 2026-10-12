@@ -1,7 +1,6 @@
 //! Verifies binary-array wire boundaries through the public package.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const mzml = @import("zmz").mzml;
 const base64 = mzml.base64;
 const zlib = mzml.zlib;
@@ -718,10 +717,8 @@ test "[integration] - [arrays]: matches fixed little-endian Base64 vectors" {
         @memcpy(std.mem.sliceAsBytes(&output), prepared);
         try arrays.decodeWire(T, &output, std.mem.sliceAsBytes(&output), .none, &.{});
         try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&expected), std.mem.sliceAsBytes(&output));
-        if (builtin.cpu.arch.endian() == .little) {
-            const borrowed = try arrays.encodeWire(T, &expected, .{}, .{ .wire = &.{}, .transformed = &.{} }, null);
-            try std.testing.expectEqual(@intFromPtr(expected[0..].ptr), @intFromPtr(borrowed.ptr));
-        }
+        const borrowed = try arrays.encodeWire(T, &expected, .{}, .{ .wire = &.{}, .transformed = &.{} }, null);
+        try std.testing.expectEqual(@intFromPtr(expected[0..].ptr), @intFromPtr(borrowed.ptr));
         // A zlib envelope can decode into typed output without transformed scratch.
         var compressor = try zlib.Compressor.init(std.testing.allocator, .even);
         defer compressor.deinit();
@@ -962,8 +959,7 @@ test "[integration] - [array encoder]: keeps every wire until reset for all pipe
             for (values, output) |value, decoded| try std.testing.expectApproxEqAbs(value, decoded, 0.5 / 1000.0);
         if (pipeline == .slof or pipeline == .slof_zlib) try expectSlofBound(&values, &output, 10000);
     }
-    if (builtin.cpu.arch.endian() == .little)
-        try std.testing.expectEqual(@intFromPtr(&values), @intFromPtr(wires[0].ptr));
+    try std.testing.expectEqual(@intFromPtr(&values), @intFromPtr(wires[0].ptr));
     encoder.reset();
     inline for (.{ f32, i32, i64 }) |T| {
         const typed = [_]T{ 1, 2, 3 };

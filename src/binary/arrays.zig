@@ -4,7 +4,6 @@
 //! (`OverlappingBuffers` otherwise), and their contents after a failure are unspecified.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const base64 = @import("base64.zig");
 const zlib = @import("zlib.zig");
 const numpress = @import("numpress.zig");
@@ -16,9 +15,9 @@ pub const Pipeline = encoding.Pipeline;
 /// Caller-owned scratch, disjoint from each other and from input and output.
 /// Decoding: wire holds the Base64-decoded bytes of any pipeline except none, and
 /// transformed holds zlib output for Numpress with zlib; primitive zlib expands straight
-/// into the typed output. Encoding: transformed holds Numpress or big-endian primitive bytes
-/// without zlib; with zlib they stream into the compressor and wire holds its output.
-/// Little-endian primitives without zlib borrow the values' bytes.
+/// into the typed output. Encoding: transformed holds Numpress bytes without zlib; with zlib
+/// they stream into the compressor and wire holds its output. Primitives without zlib borrow
+/// the values' bytes.
 pub const Scratch = struct {
     wire: []u8,
     transformed: []u8,
@@ -129,7 +128,7 @@ pub const Encoder = struct {
     }
 
     /// Encodes values into wire bytes (primitive or Numpress, then optional zlib), valid
-    /// until reset or deinit. Little-endian primitives without zlib borrow values instead.
+    /// until reset or deinit. Primitives without zlib borrow values instead.
     pub fn encode(
         self: *Encoder,
         comptime T: type,
@@ -139,8 +138,7 @@ pub const Encoder = struct {
         // Bad options fail before the compressor or an output slot is allocated.
         try checkOptions(T, values.len, options, true);
         const bound = try wireBound(T, values.len, options.pipeline);
-        const transformed = options.pipeline.isNumpress() or
-            builtin.cpu.arch.endian() == .big;
+        const transformed = options.pipeline.isNumpress();
         if (!options.pipeline.hasZlib()) {
             if (!transformed) return encodeWire(T, values, options, .{ .wire = &.{}, .transformed = &.{} }, null);
             const output = try self.nextOutput(bound);
@@ -236,8 +234,8 @@ pub fn encode(
     return base64.encode(output, try encodeWire(T, values, options, scratch, compressor));
 }
 
-/// Like encode, stopping before Base64. The result borrows values for little-endian
-/// primitives without zlib, and scratch otherwise.
+/// Like encode, stopping before Base64. The result borrows values for primitives without zlib,
+/// and scratch otherwise.
 pub fn encodeWire(
     comptime T: type,
     values: []const T,
@@ -264,12 +262,7 @@ pub fn encodeWire(
         if (T != f64 and T != f32) return error.TypeMismatch;
         return scratch.transformed[0..try numpress.encode(transform, values, options.fixed_point orelse 0, scratch.transformed)];
     }
-    if (builtin.cpu.arch.endian() == .little) return std.mem.sliceAsBytes(values);
-    const required = try wireBound(T, values.len, options.pipeline);
-    if (scratch.transformed.len < required) return error.OutputTooSmall;
-    var writer = std.Io.Writer.fixed(scratch.transformed[0..required]);
-    writePrimitives(T, values, &writer) catch unreachable;
-    return writer.buffered();
+    return std.mem.sliceAsBytes(values);
 }
 
 /// Returns the primitive or Numpress wire capacity before optional zlib compression.
@@ -298,16 +291,8 @@ fn decodeWireInner(comptime T: type, output: []T, source: []const u8, pipeline: 
         return numpress.decodeExact(transform, wire, output);
     }
     if (wire.len != array_bytes) return error.DecodedSizeMismatch;
-    if (builtin.cpu.arch.endian() == .little) {
-        const bytes = std.mem.sliceAsBytes(output);
-        if (bytes.ptr != wire.ptr) @memcpy(bytes, wire);
-        return;
-    }
-    const Bits = @Int(.unsigned, @bitSizeOf(T));
-    for (output, 0..) |*value, index| {
-        const offset = index * @sizeOf(T);
-        value.* = @bitCast(std.mem.readInt(Bits, wire[offset..][0..@sizeOf(T)], .little));
-    }
+    const bytes = std.mem.sliceAsBytes(output);
+    if (bytes.ptr != wire.ptr) @memcpy(bytes, wire);
 }
 
 fn writeWire(
@@ -319,13 +304,7 @@ fn writeWire(
     if (options.pipeline.transform()) |transform| {
         if (T != f64 and T != f32) return error.TypeMismatch;
         _ = try numpress.encodeTo(transform, values, options.fixed_point orelse 0, writer);
-    } else try writePrimitives(T, values, writer);
-}
-
-fn writePrimitives(comptime T: type, values: []const T, writer: *std.Io.Writer) std.Io.Writer.Error!void {
-    if (builtin.cpu.arch.endian() == .little) return writer.writeAll(std.mem.sliceAsBytes(values));
-    const Bits = @Int(.unsigned, @bitSizeOf(T));
-    for (values) |value| try writer.writeInt(Bits, @bitCast(value), .little);
+    } else try writer.writeAll(std.mem.sliceAsBytes(values));
 }
 
 fn checkOptions(comptime T: type, count: usize, options: EncodeOptions, has_compressor: bool) OptionsError!void {
