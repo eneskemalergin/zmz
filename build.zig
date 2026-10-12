@@ -22,18 +22,16 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run the library, example, and tool tests");
     const empty_run = b.path("tests/data/gates/empty_run.mzML");
-    for (LIBRARY_TESTS) |root_source_file| {
-        const test_module = b.createModule(.{
-            .root_source_file = b.path(root_source_file),
-            .target = target,
-            .optimize = optimize,
-            .strip = strip,
-        });
-        test_module.addImport("zmz", zmz);
-        test_module.addAnonymousImport("empty_run", .{ .root_source_file = empty_run });
-        const library_test_artifact = b.addTest(.{ .root_module = test_module });
-        test_step.dependOn(&b.addRunArtifact(library_test_artifact).step);
-    }
+    const library_tests_module = b.createModule(.{
+        .root_source_file = b.path("tests/library.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = strip,
+    });
+    library_tests_module.addImport("zmz", zmz);
+    library_tests_module.addAnonymousImport("empty_run", .{ .root_source_file = empty_run });
+    const library_tests = b.addTest(.{ .root_module = library_tests_module });
+    test_step.dependOn(&b.addRunArtifact(library_tests).step);
 
     const package_tests_module = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
@@ -136,18 +134,6 @@ const KernelBackend = enum { dispatch, portable };
 // module's own decoder is that fast), a separate object chosen at run time, or not at all.
 const FastZlib = enum { direct, object, absent };
 const V3_FEATURES = [_]std.Target.x86.Feature{ .avx, .avx2, .bmi, .bmi2, .f16c, .fma, .lzcnt, .movbe };
-const LIBRARY_TESTS = [_][]const u8{
-    "tests/binary/test_numpress.zig",
-    "tests/binary/test_codecs.zig",
-    "tests/cv/test_cv.zig",
-    "tests/mzml/test_metadata.zig",
-    "tests/mzml/test_construction.zig",
-    "tests/mzml/test_indexing.zig",
-    "tests/mzml/test_ownership.zig",
-    "tests/mzml/test_writing.zig",
-    "tests/mzml/test_reader.zig",
-    "tests/mzml/test_events.zig",
-};
 
 const Kernels = struct {
     options: *std.Build.Step.Options,
