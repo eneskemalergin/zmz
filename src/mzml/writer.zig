@@ -629,6 +629,8 @@ fn writeEncodedLength(self: *Writer, text_length: ?usize, width: usize) Error!?u
     return (self.engine.byteOffset() orelse return error.LimitExceeded) - 1 - width;
 }
 
+// --- Node writing ---
+
 fn writeNode(self: *Writer, node: model.Node, comptime replace_arrays: bool, remaining: *[]const Plan, budget: *usize) Error!void {
     errdefer |err| {
         self.capture(err, .metadata, .none);
@@ -882,6 +884,8 @@ fn writeUnit(self: *Writer, unit: cv.Unit, record: bool) Error!void {
 fn optionalAttribute(self: *Writer, name: []const u8, value: ?[]const u8, record: bool) Error!void {
     if (value) |text| try self.engine.attributeTrusted(name, text, record);
 }
+
+// --- Indexed output ---
 
 // Copies a record's ID into the index's ID list and returns where it starts.
 fn listId(self: *Writer, state: *Index, id: []const u8) Error!u32 {

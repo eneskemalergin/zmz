@@ -16,8 +16,9 @@
 //! While a read decodes into this owner, as from one of its selection callbacks, the decode
 //! calls return `InvalidState` and `reset` does nothing.
 //!
-//! `beginArray`, `decodeText`, and `complete` are internal: the reader engine and `IndexedReader`
-//! call them while they parse a record. Callers use the reads and the decode functions.
+//! `beginArray`, `decodeText`, `complete`, and the `busy` and `failure` fields are internal: the
+//! reader engine and `IndexedReader` use them while they parse a record. Callers use the reads and
+//! the decode functions.
 
 const std = @import("std");
 const cv = @import("../cv/source.zig");

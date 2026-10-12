@@ -1,6 +1,6 @@
 //! Hash maps that store entry positions and find them by the entries' IDs. An entry addresses its
 //! ID by `id_start` and `id_len` in one byte list its owner keeps, so a position and a map key
-//! are each 32 bits.
+//! are each 32 bits. The module is internal: the writer and `IndexedReader` index records with it.
 
 const std = @import("std");
 
