@@ -429,7 +429,7 @@ test "[integration] - [mzML index]: keeps lookup ordinals separate from source i
                     defer decoded.deinit();
                     try expectDecodedRecord(record, header.groups, decoded.value, &output);
                 }
-                try std.testing.expectEqualDeep(counts, index.counts);
+                try std.testing.expectEqualDeep(counts, support.kindCounts(&index));
                 try std.testing.expectEqual(null, try index.at(allocator, .spectrum, 9));
                 try std.testing.expectEqual(null, try index.at(allocator, .chromatogram, 9));
             }
@@ -462,7 +462,7 @@ test "[integration] - [mzML index]: traverses entries without trusting declared 
                 for (std.enums.values(mzml.IndexedReader.Policy)) |policy| {
                     var index = try mzml.IndexedReader.build(allocator, source, .{ .policy = policy });
                     defer index.deinit();
-                    try std.testing.expectEqualDeep([_]usize{ spectra, 1 }, index.counts);
+                    try std.testing.expectEqualDeep([_]usize{ spectra, 1 }, support.kindCounts(&index));
                     try std.testing.expectEqual(if (count) |value| @as(?usize, value - '0') else null, index.header().spectrum_list.?.declared_count);
                     try std.testing.expectEqual(if (count) |value| @as(?usize, value - '0') else null, index.header().chromatogram_list.?.declared_count);
                     var input = std.Io.Reader.fixed(bytes);
@@ -1801,7 +1801,7 @@ test "[property] - [mzML indexed writer]: preserves IDs and offsets across index
         try Growing.write(std.testing.allocator, &sink, counts, false);
         var index = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = sink.buffered() }, .{});
         defer index.deinit();
-        try std.testing.expectEqualDeep(counts, index.counts);
+        try std.testing.expectEqualDeep(counts, support.kindCounts(&index));
         for ([_]mzml.model.Kind{ .spectrum, .chromatogram }, counts) |kind, count| {
             for (0..count) |position| {
                 var id: [32]u8 = undefined;

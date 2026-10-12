@@ -222,7 +222,7 @@ test "[integration] - [mzML children]: copies retained XML without indexing nest
             if (!indexed and policy == .open_embedded) continue;
             var index = try mzml.IndexedReader.build(allocator, .{ .bytes = sink.written() }, .{ .policy = policy });
             defer index.deinit();
-            try std.testing.expectEqualDeep([_]usize{ 1, 1 }, index.counts);
+            try std.testing.expectEqualDeep([_]usize{ 1, 1 }, support.kindCounts(&index));
             try std.testing.expectEqual(null, try index.byId(allocator, "not-a-record"));
             var decoded = mzml.DecodedArrays.init(allocator, .{});
             defer decoded.deinit();
@@ -568,6 +568,35 @@ test "[failure] - [mzML lists]: attribute errors leave the writer failed" {
         try std.testing.expectError(error.FailedState, writer.beginListWithAttributes(.spectrum_list, 0, &.{}));
         try std.testing.expectError(error.FailedState, writer.finish());
     }
+}
+
+test "[integration] - [mzML writer]: matches frozen XML and preserves attribute characters" {
+    const expected = std.mem.trimEnd(u8, @embedFile("empty_run"), "\n");
+    var input = std.Io.Reader.fixed(expected);
+    var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+    defer reader.deinit();
+    const header = try reader.readHeader();
+    const params = header.document.child(.file_description).?.child(.file_content).?.params;
+    try std.testing.expectEqualStrings("\xc2\xb5 < & \"", params[0].cv.name.?);
+    try std.testing.expectEqualStrings("\t\n\r", params[0].cv.value.?);
+    try std.testing.expectEqual(null, params[1].user.value);
+    try std.testing.expectEqualStrings("", params[1].user.unit.name.?);
+    const declaration_node = header.document.child(.cv_list).?.children[0];
+    const declarations = [_]mzml.cv.Declaration{try declaration_node.cvDeclaration()};
+    const resolver = mzml.cv.Resolver.init(&declarations);
+    const resolved = try resolver.resolve(params[0].cv);
+    try std.testing.expectEqualDeep(params[0].cv, resolved.source);
+    try std.testing.expectEqual(null, resolved.term.match);
+    try std.testing.expectEqual(null, try reader.nextRecord());
+
+    var bytes: [2048]u8 = undefined;
+    var sink = std.Io.Writer.fixed(&bytes);
+    var writer = try mzml.Writer.init(std.testing.allocator, &sink, .{});
+    defer writer.deinit();
+    try writer.writeHeader(header.*);
+    try writer.finish();
+    try std.testing.expectEqualStrings(expected, sink.buffered());
+    try std.testing.expectError(error.InvalidState, writer.finish());
 }
 
 test "[failure] - [mzML writer]: a parameter attribute repeating a fixed field is a duplicate" {
@@ -1228,7 +1257,7 @@ test "[integration] - [mzML file writer]: patches counts without changing record
             if (indexed) {
                 var index = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = bytes }, .{ .policy = .open_embedded });
                 defer index.deinit();
-                try std.testing.expectEqualDeep(case.counts, index.counts);
+                try std.testing.expectEqualDeep(case.counts, support.kindCounts(&index));
                 for (0..index.entryCount()) |position| {
                     const entry = index.entryAt(position).?;
                     var found = (try index.byId(std.testing.allocator, entry.id)).?;
@@ -1476,7 +1505,7 @@ test "[integration] - [mzML declarations]: preserves version metadata across rea
             });
             defer index.deinit();
             try std.testing.expectEqualDeep(version, index.header().document.attribute("version"));
-            try std.testing.expectEqualDeep([2]usize{ 1, 1 }, index.counts);
+            try std.testing.expectEqualDeep([2]usize{ 1, 1 }, support.kindCounts(&index));
             var decoded = mzml.DecodedArrays.init(std.testing.allocator, .{});
             defer decoded.deinit();
             var record = (try index.byIdDecoded(std.testing.allocator, "native=a&b", &decoded)).?;

@@ -1913,7 +1913,7 @@ test "[integration] - [mzML lists]: reads absent and empty lists without requiri
                 var index = try mzml.IndexedReader.build(std.testing.allocator, source, .{ .policy = policy, .records = 0 });
                 defer index.deinit();
                 try std.testing.expectEqual(@as(usize, 0), index.entryCount());
-                try std.testing.expectEqualDeep([_]usize{ 0, 0 }, index.counts);
+                try std.testing.expectEqualDeep([_]usize{ 0, 0 }, support.kindCounts(&index));
                 try std.testing.expectEqual(@as(usize, 0), index.header().chromatogram_list.?.declared_count);
                 try std.testing.expectEqual(null, try index.byId(std.testing.allocator, "missing"));
                 try std.testing.expectEqual(null, try index.at(std.testing.allocator, .spectrum, 0));
@@ -2620,35 +2620,6 @@ test "[integration] - [mzML reader]: keeps declared and observed counts separate
         try std.testing.expectEqual(@as(usize, 1), header.chromatogram_list.?.observed_count);
         try std.testing.expectEqual(null, reader.diagnostic());
     }
-}
-
-test "[integration] - [mzML writer]: matches frozen XML and preserves attribute characters" {
-    const expected = std.mem.trimEnd(u8, @embedFile("empty_run"), "\n");
-    var input = std.Io.Reader.fixed(expected);
-    var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
-    defer reader.deinit();
-    const header = try reader.readHeader();
-    const params = header.document.child(.file_description).?.child(.file_content).?.params;
-    try std.testing.expectEqualStrings("\xc2\xb5 < & \"", params[0].cv.name.?);
-    try std.testing.expectEqualStrings("\t\n\r", params[0].cv.value.?);
-    try std.testing.expectEqual(null, params[1].user.value);
-    try std.testing.expectEqualStrings("", params[1].user.unit.name.?);
-    const declaration_node = header.document.child(.cv_list).?.children[0];
-    const declarations = [_]mzml.cv.Declaration{try declaration_node.cvDeclaration()};
-    const resolver = mzml.cv.Resolver.init(&declarations);
-    const resolved = try resolver.resolve(params[0].cv);
-    try std.testing.expectEqualDeep(params[0].cv, resolved.source);
-    try std.testing.expectEqual(null, resolved.term.match);
-    try std.testing.expectEqual(null, try reader.nextRecord());
-
-    var bytes: [2048]u8 = undefined;
-    var sink = std.Io.Writer.fixed(&bytes);
-    var writer = try mzml.Writer.init(std.testing.allocator, &sink, .{});
-    defer writer.deinit();
-    try writer.writeHeader(header.*);
-    try writer.finish();
-    try std.testing.expectEqualStrings(expected, sink.buffered());
-    try std.testing.expectError(error.InvalidState, writer.finish());
 }
 
 test "[integration] - [mzML reader]: reads indexed trailers only when requested" {
