@@ -1475,10 +1475,15 @@ fn isAsciiNameStart(value: u8) bool {
 }
 
 fn isAsciiNameChar(value: u8) bool {
-    return isAsciiNameStart(value) or
-        (value >= '0' and value <= '9') or
-        value == '-' or value == '.';
+    return NAME_CHARS[value];
 }
+
+// One table entry per byte, so a name scan tests each byte once instead of by ranges.
+const NAME_CHARS = blk: {
+    var table: [256]bool = @splat(false);
+    for (0..256) |byte| table[byte] = isAsciiNameStart(byte) or (byte >= '0' and byte <= '9') or byte == '-' or byte == '.';
+    break :blk table;
+};
 
 fn isNameDelimiter(value: u21) bool {
     return isXmlWhitespace(value) or value == '/' or value == '>' or value == '=' or value == '?';
