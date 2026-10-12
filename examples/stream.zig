@@ -1,6 +1,6 @@
 //! Reads spectra and chromatograms through EOF, decoding modeled arrays or returning metadata only.
 //! The first record's metadata and header are copied so they can outlive the reader.
-//! Numeric slices belong to DecodedArrays and are consumed before its next use.
+//! Numeric slices belong to `DecodedArrays` and are consumed before its next use.
 
 const std = @import("std");
 const mzml = @import("zmz").mzml;

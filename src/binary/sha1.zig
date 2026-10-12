@@ -6,7 +6,7 @@ const builtin = @import("builtin");
 const kernel = @import("kernel_options");
 const core = @import("core.zig");
 
-/// Streaming SHA-1 with std's update and finalResult. It keeps std's state, partial block,
+/// Streaming SHA-1 with std's update and `finalResult`. It keeps std's state, partial block,
 /// and padding; only whole blocks take the SHA extension path.
 pub const Sha1 = struct {
     inner: std.crypto.hash.Sha1 = .init(.{}),
@@ -64,7 +64,7 @@ const ROUNDS = rounds: {
     break :rounds text;
 };
 
-// The CPU must have SHA and SSSE3 (core.hasSha).
+// Callers check core.hasSha first: these instructions need SHA and SSSE3.
 noinline fn compress(state: *[5]u32, data: []const u8) void {
     var abcd: [4]u32 align(16) = state[0..4].*;
     var e: [4]u32 align(16) = .{ 0, 0, 0, state[4] };

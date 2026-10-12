@@ -63,12 +63,12 @@ pub const Parameter = struct {
     term: Resolution,
     unit: Resolution,
     unit_fields: enum { absent, partial, complete },
-    /// `not_declared` means no direct has_units relation, not a unit prohibition.
+    /// `not_declared` means no direct `has_units` relation, not a unit prohibition.
     unit_allowed: enum { unresolved, not_declared, allowed, disallowed },
 };
 
-/// A number of the caller's chosen type with its resolved parameter. Check parameter.unit_fields,
-/// unit, and unit_allowed before interpreting its units; the value is not converted.
+/// A number of the caller's chosen type with its resolved parameter. Check `parameter.unit_fields`,
+/// unit, and `unit_allowed` before interpreting its units; the value is not converted.
 pub fn Quantity(comptime T: type) type {
     if (@typeInfo(T) != .int and T != f32 and T != f64)
         @compileError("quantity requires an integer, f32, or f64");

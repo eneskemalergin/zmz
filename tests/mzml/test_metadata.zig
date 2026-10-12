@@ -169,7 +169,7 @@ test "[property] - [mzML scientific metadata]: preserves independent fields and 
 test "[failure] - [mzML scientific metadata]: reports each selected-ion and window field on its own" {
     const model = mzml.model;
     var ion: model.Node = .{ .kind = .selected_ion };
-    // F114727's shape: a malformed peak intensity beside a valid m/z and charge.
+    // A malformed peak intensity beside a valid m/z and charge, as some real files hold.
     ion.params = &.{
         .{ .cv = .{ .accession = model.Terms.CHARGE_STATE, .value = "1" } },
         .{ .cv = .{ .accession = model.Terms.SELECTED_ION_MZ, .value = "977.4697" } },
@@ -181,7 +181,8 @@ test "[failure] - [mzML scientific metadata]: reports each selected-ion and wind
     try std.testing.expectEqual(@as(?i32, 1), try fields.charge);
     try std.testing.expectError(error.InvalidValue, fields.intensity);
 
-    // Absent fields stay absent; the historical m/z term fills in only when the current one is absent.
+    // Absent fields stay absent; the historical m/z term fills in only when the current one is
+    // absent.
     ion.params = &.{.{ .cv = .{ .accession = model.Terms.HISTORICAL_SELECTED_ION_MZ, .value = "445.3" } }};
     const historical = try ion.selectedIonFields(&.{});
     try std.testing.expectEqual(@as(f64, 445.3), (try historical.mz).?.value);

@@ -9,7 +9,7 @@ const std = @import("std");
 pub const XML_WHITESPACE = " \t\r\n";
 
 /// Attribute text after XML normalization. Names may include a source prefix;
-/// namespace_uri identifies its namespace. Declarations use the XMLNS URI.
+/// `namespace_uri` identifies its namespace. Declarations use the XMLNS URI.
 pub const Attribute = struct {
     name: []const u8,
     namespace_uri: ?[]const u8 = null,
@@ -80,7 +80,7 @@ pub const Unit = struct {
     }
 };
 
-/// A cvParam with its source labels and lexical value.
+/// A `cvParam` with its source labels and lexical value.
 pub const Param = struct {
     cv_ref: ?[]const u8 = null,
     accession: ?Accession = null,
@@ -90,7 +90,7 @@ pub const Param = struct {
     xml: ?*const ParameterXml = null,
 };
 
-/// A userParam with its declared type and lexical value as written.
+/// A `userParam` with its declared type and lexical value as written.
 pub const UserParam = struct {
     name: ?[]const u8 = null,
     value: ?[]const u8 = null,
@@ -115,7 +115,7 @@ pub const Entry = union(enum) {
     user: UserParam,
 };
 
-/// A referenceableParamGroup definition; a group reference inside it is an error when expanded.
+/// A `referenceableParamGroup` definition; a group reference inside it is an error when expanded.
 pub const Group = struct {
     id: []const u8,
     entries: []const Entry,
@@ -129,7 +129,7 @@ pub const ExpansionError = error{
     ExpansionLimit,
 };
 
-/// The work budget of one parameter expansion, which ExpansionLimit reports as exhausted.
+/// The work budget of one parameter expansion, which `ExpansionLimit` reports as exhausted.
 pub const EXPANSION_WORK = 1_000_000;
 
 /// Yields local parameters with each group reference replaced by its group's parameters,
@@ -196,7 +196,6 @@ pub const EffectiveIterator = struct {
 /// The matches for one accession: none, one, or repeated.
 pub const Match = union(enum) { missing, one: Param, repeated };
 
-/// Lexical failures: a missing, empty, invalid, or out-of-range value.
 pub const ValueError = error{ MissingValue, EmptyValue, InvalidValue, Overflow };
 
 // IDs and IDREFs compare after collapsing surrounding XML whitespace.

@@ -167,7 +167,6 @@ pub const Decoder = struct {
     }
 };
 
-/// Returns the padded encoded length with checked arithmetic.
 pub fn encodedSize(source_len: usize) error{LengthOverflow}!usize {
     const groups = source_len / 3 + @intFromBool(source_len % 3 != 0);
     return std.math.mul(usize, groups, 4) catch error.LengthOverflow;
@@ -183,7 +182,7 @@ pub fn encode(output: []u8, source: []const u8) EncodeError![]u8 {
 }
 
 /// Decodes XML text, allowing XML whitespace between Base64 characters, and returns the
-/// written prefix of output. Decoding past output's capacity fails with OutputTooSmall.
+/// written prefix of output. Decoding past output's capacity fails with `OutputTooSmall`.
 pub fn decode(output: []u8, source: []const u8) DecodeError![]u8 {
     var decoder = Decoder.init(output);
     try decoder.consume(source);

@@ -2,6 +2,9 @@
 //!
 //! Only `Encoder` allocates. Caller buffers must be disjoint unless a function says otherwise
 //! (`OverlappingBuffers` otherwise), and their contents after a failure are unspecified.
+//!
+//! `Encoder.reuses` is internal: the writer checks with it that a payload is not in a slot the
+//! next encode reuses.
 
 const std = @import("std");
 const base64 = @import("base64.zig");
@@ -23,7 +26,7 @@ pub const Scratch = struct {
     transformed: []u8,
 };
 
-/// Linear and SLOF need fixed_point; every other pipeline rejects one.
+/// Linear and SLOF need `fixed_point`; every other pipeline rejects one.
 pub const EncodeOptions = struct {
     pipeline: Pipeline = .none,
     fixed_point: ?f64 = null,
@@ -103,8 +106,7 @@ pub const WriteError = OptionsError || numpress.WriteError || std.mem.Allocator.
 /// Encodes arrays with storage it owns: the zlib compressor (allocated on first use) and one output
 /// buffer per array encoded since the last reset. With zlib, primitive or Numpress bytes go
 /// straight into the compressor, so no buffer holds them whole. Do not copy an initialized encoder:
-/// a copy and the original would free the same storage on deinit. `reuses` is internal: the writer
-/// checks a reused slot with it.
+/// a copy and the original would free the same storage on deinit.
 pub const Encoder = struct {
     allocator: std.mem.Allocator,
     preset: zlib.Preset,
@@ -178,7 +180,7 @@ pub const Encoder = struct {
     }
 };
 
-/// Decodes exactly output.len values. T is f32, f64, i32, or i64, and Numpress needs f64.
+/// Decodes exactly `output.len` values. T is f32, f64, i32, or i64, and Numpress needs f64.
 /// Primitive bytes are little endian, and float bits are kept exactly.
 pub fn decode(
     comptime T: type,

@@ -37,7 +37,7 @@ pub const DecodeError = error{
 };
 
 /// The three MS-Numpress transforms. The functions below select one at run time; PIC ignores
-/// fixed_point.
+/// `fixed_point`.
 pub const Transform = enum { linear, pic, slof };
 
 pub fn encodedBound(transform: Transform, value_count: usize) error{LengthOverflow}!usize {
@@ -68,7 +68,6 @@ pub fn decodeExact(transform: Transform, input: []const u8, output: []f64) Decod
     _ = try decodeWhole(transform, true, input, output);
 }
 
-/// Returns a safe upper bound for a linear encoding of `value_count` values.
 pub fn linearEncodedBound(value_count: usize) error{LengthOverflow}!usize {
     const initial_count: usize = @min(value_count, 2);
     const tail_count = value_count - initial_count;
@@ -77,12 +76,10 @@ pub fn linearEncodedBound(value_count: usize) error{LengthOverflow}!usize {
     return std.math.add(usize, 8 + initial_bytes, tail_bytes) catch error.LengthOverflow;
 }
 
-/// Returns a safe upper bound for a positive-integer encoding.
 pub fn picEncodedBound(value_count: usize) error{LengthOverflow}!usize {
     return maxNibbleBytes(value_count);
 }
 
-/// Returns the exact encoded length of a short-logged-float array.
 pub fn slofEncodedSize(value_count: usize) error{LengthOverflow}!usize {
     const body_len = std.math.mul(usize, value_count, 2) catch return error.LengthOverflow;
     return std.math.add(usize, 8, body_len) catch error.LengthOverflow;
@@ -691,13 +688,13 @@ pub const Decoder = struct {
     failed: bool = false,
     finished: bool = false,
 
-    /// Decodes at most output.len values, like the decode functions.
+    /// Decodes at most `output.len` values, like the decode functions.
     pub fn init(transform: Transform, output: []f64) Decoder {
         return .{ .transform = transform, .output = output, .exact = false };
     }
 
-    /// Decodes exactly output.len values, like the decode*Exact functions: a payload holding
-    /// a different count fails with DecodedSizeMismatch.
+    /// Decodes exactly `output.len` values, like the decode*Exact functions: a payload holding
+    /// a different count fails with `DecodedSizeMismatch`.
     pub fn initExact(transform: Transform, output: []f64) Decoder {
         return .{ .transform = transform, .output = output, .exact = true };
     }
@@ -986,7 +983,8 @@ pub const Decoder = struct {
     }
 };
 
-/// Decodes an MS-Numpress linear payload into caller-owned storage.
+/// Decodes into the start of `output` and returns the value count; a payload with more values
+/// than `output.len` is `OutputTooSmall`.
 pub fn decodeLinear(input: []const u8, output: []f64) DecodeError!usize {
     return decodeWhole(.linear, false, input, output);
 }
@@ -996,7 +994,8 @@ pub fn decodeLinearExact(input: []const u8, output: []f64) DecodeError!void {
     _ = try decodeWhole(.linear, true, input, output);
 }
 
-/// Decodes an MS-Numpress positive-integer payload into doubles.
+/// Decodes into the start of `output` and returns the value count; a payload with more values
+/// than `output.len` is `OutputTooSmall`.
 pub fn decodePic(input: []const u8, output: []f64) DecodeError!usize {
     return decodeWhole(.pic, false, input, output);
 }
@@ -1006,7 +1005,8 @@ pub fn decodePicExact(input: []const u8, output: []f64) DecodeError!void {
     _ = try decodeWhole(.pic, true, input, output);
 }
 
-/// Decodes an MS-Numpress short-logged-float payload into caller-owned storage.
+/// Decodes into the start of `output` and returns the value count; a payload with more values
+/// than `output.len` is `OutputTooSmall`.
 pub fn decodeSlof(input: []const u8, output: []f64) DecodeError!usize {
     return decodeWhole(.slof, false, input, output);
 }

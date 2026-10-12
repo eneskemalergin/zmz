@@ -68,7 +68,7 @@ pub const Decompressor = struct {
     }
 
     /// Starts decoding a stream pulled from input, which stays borrowed until the stream ends
-    /// or fails. A failed read of input is InvalidData here; its owner keeps the cause.
+    /// or fails. A failed read of input is `InvalidData` here; its owner keeps the cause.
     pub fn startReader(self: *Decompressor, input: *std.Io.Reader) void {
         self.source = .stream;
         switch (self.state) {
@@ -151,7 +151,6 @@ pub const Compressor = struct {
     // Which start began the open stream; finish needs start's output.
     open: enum { none, output, writer } = .none,
 
-    /// Allocates one zipir compressor.
     pub fn init(allocator: std.mem.Allocator, preset: Preset) std.mem.Allocator.Error!Compressor {
         return .{ .allocator = allocator, .state = try allocator.create(zipir.zlib.Compressor), .preset = preset };
     }
@@ -189,7 +188,7 @@ pub const Compressor = struct {
         return self.finishOutput();
     }
 
-    /// Starts one zlib stream into destination, which stays borrowed until finishWriter, and
+    /// Starts one zlib stream into destination, which stays borrowed until `finishWriter`, and
     /// returns the writer for its source. Write errors are destination's.
     pub fn startWriter(self: *Compressor, destination: *std.Io.Writer) std.Io.Writer.Error!*std.Io.Writer {
         self.open = .none;
@@ -207,7 +206,7 @@ pub const Compressor = struct {
         self.open = .none;
     }
 
-    /// Ends the stream begun by startWriter. The stream is closed even when a write fails.
+    /// Ends the stream begun by `startWriter`. The stream is closed even when a write fails.
     pub fn finishWriter(self: *Compressor) (std.Io.Writer.Error || error{InvalidState})!void {
         if (self.open == .none) return error.InvalidState;
         self.open = .none;
@@ -224,7 +223,7 @@ pub const Compressor = struct {
 };
 
 /// Decodes exactly one zlib stream into output, checking its Adler-32. Trailing bytes, such as
-/// a second stream, are an error, and expanding past output's capacity is OutputTooSmall.
+/// a second stream, are an error, and expanding past output's capacity is `OutputTooSmall`.
 pub fn decompress(output: []u8, source: []const u8) DecompressError![]u8 {
     return decompressWith(useFast(), output, source);
 }

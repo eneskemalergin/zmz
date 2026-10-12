@@ -1,4 +1,7 @@
 //! Defines supported mzML parent/child relationships.
+//!
+//! The module is internal: the readers, the writer, and the builder check structure with it, and
+//! only `MAX_DEPTH` reaches callers, as `mzml.MAX_DEPTH`.
 
 const std = @import("std");
 const xml = @import("../xml/mzml_adapter.zig");

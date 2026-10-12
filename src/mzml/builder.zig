@@ -61,8 +61,8 @@ pub const Reencoding = struct {
     owner: *const Builder,
     generation: usize,
 
-    /// Like builder.prepareArrayFrom, moving references to the prepared group definitions.
-    /// InvalidState once the creating builder was reset.
+    /// Like `builder.prepareArrayFrom`, moving references to the prepared group definitions.
+    /// `InvalidState` once the creating builder was reset.
     pub fn prepareArray(
         self: Reencoding,
         builder: *Builder,
@@ -129,7 +129,7 @@ pub fn cvDeclaration(self: *Builder, declaration: cv.Declaration) (copy.Error ||
     return self.node(.{ .kind = .cv, .attributes = attrs[0..if (declaration.version == null) @as(usize, 3) else 4] });
 }
 
-/// Builds a spectrum or chromatogram with new id, index, and defaultArrayLength attributes, for
+/// Builds a spectrum or chromatogram with new id, index, and `defaultArrayLength` attributes, for
 /// `writeRecordWithArrays` with the arrays' payloads. Arrays from another builder, or prepared
 /// before this builder's last reset, are `InvalidState`; default arrays must match
 /// `default_length`. To keep a source record's attributes, edit a view of its node instead.
@@ -189,7 +189,7 @@ pub fn header(self: *Builder, source: model.Header) (owned.Error || schema.Error
     return copier.header(.{ .document = source.document, .run = source.run, .namespace_uri = source.namespace_uri });
 }
 
-/// Builds a cvParam whose value is the number in XML Schema spelling, with the caller's
+/// Builds a `cvParam` whose value is the number in XML Schema spelling, with the caller's
 /// accession, name, and unit as given.
 pub fn number(self: *Builder, parameter: cv.Param, value: f64) copy.Error!cv.Param {
     var buffer: [64]u8 = undefined;
@@ -205,8 +205,8 @@ pub fn number(self: *Builder, parameter: cv.Param, value: f64) copy.Error!cv.Par
 /// Builds array metadata with its primitive and codec terms, and a payload that the writer
 /// encodes while writing (with encoder's compressor or buffer when needed). Options are
 /// checked here; Numpress value errors surface when the record is written. Default arrays
-/// (m/z, intensity, time) omit arrayLength; others carry it. The metadata has no
-/// encodedLength: the writer writes it first, from the text it writes.
+/// (m/z, intensity, time) omit `arrayLength`; others carry it. The metadata has no
+/// `encodedLength`: the writer writes it first, from the text it writes.
 pub fn prepareArray(
     self: *Builder,
     comptime T: type,
@@ -223,11 +223,11 @@ pub fn prepareArray(
     };
 }
 
-/// Prepares values under a copy of the source array's metadata, like prepareArray, replacing its
-/// primitive, codec, and arrayLength and keeping other fields in order; the writer replaces
-/// encodedLength. Bare group references become local parameters; changing an annotated group's
-/// encoding needs a Reencoding header and otherwise returns GroupRewriteRequired. If a default
-/// array omits arrayLength, update the record's defaultArrayLength when the length changes.
+/// Prepares values under a copy of the source array's metadata, like `prepareArray`, replacing its
+/// primitive, codec, and `arrayLength` and keeping other fields in order; the writer replaces
+/// `encodedLength`. Bare group references become local parameters; changing an annotated group's
+/// encoding needs a `Reencoding` header and otherwise returns `GroupRewriteRequired`. If a default
+/// array omits `arrayLength`, update the record's `defaultArrayLength` when the length changes.
 pub fn prepareArrayFrom(
     self: *Builder,
     comptime T: type,

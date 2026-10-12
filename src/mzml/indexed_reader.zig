@@ -32,14 +32,14 @@ pub const Options = struct {
     index_bytes: usize = 256 * 1024 * 1024,
     /// Largest raw XML record span a lookup reads.
     record_span_bytes: usize = 256 * 1024 * 1024,
-    /// Bounded backward search for indexListOffset when opening an embedded index.
+    /// Bounded backward search for `indexListOffset` when opening an embedded index.
     tail_bytes: usize = 64 * 1024,
     /// Applies to headers and returned records; index building skips payload text.
     reader: StreamReader.Options = .{},
 };
 
 /// Physical span and ID, borrowed from this index. `ordinal` is the zero-based lookup position
-/// within the record kind (as `at` takes it), not the source record's index. With open_embedded,
+/// within the record kind (as `at` takes it), not the source record's index. With `open_embedded`,
 /// start may precede XML whitespace and end bounds the span at the next target or trailer.
 pub const Entry = struct { kind: model.Kind, id: []const u8, ordinal: usize, start: u64, end: u64 };
 
@@ -198,7 +198,7 @@ pub fn diagnostic(self: *const IndexedReader) ?Diagnostic {
 }
 
 /// Finds an exact ID and returns an independent record owner, or null when absent.
-/// Returns AmbiguousId when both a spectrum and a chromatogram use this ID.
+/// Returns `AmbiguousId` when both a spectrum and a chromatogram use this ID.
 /// Lookups reuse parser storage: concurrent lookups on one reader are a data race, and a lookup
 /// made inside another returns `InvalidState`.
 pub fn byId(self: *IndexedReader, allocator: std.mem.Allocator, id: []const u8) Error!?owned.Record {
@@ -206,18 +206,19 @@ pub fn byId(self: *IndexedReader, allocator: std.mem.Allocator, id: []const u8) 
 }
 
 /// Looks up a zero-based ordinal within spectra or chromatograms; other kinds are
-/// InvalidOptions.
+/// `InvalidOptions`.
 pub fn at(self: *IndexedReader, allocator: std.mem.Allocator, kind: model.Kind, ordinal: usize) Error!?owned.Record {
     return self.lookup(allocator, .{ .ordinal = .{ .kind = kind, .ordinal = ordinal } }, null);
 }
 
-/// Like byId, decoding the selected arrays into output as StreamReader.nextDecodedRecord does,
+/// Like `byId`, decoding the selected arrays into output as `StreamReader.nextDecodedRecord` does,
 /// without their binary text. An absent ID or a failure leaves output empty.
 pub fn byIdDecoded(self: *IndexedReader, allocator: std.mem.Allocator, id: []const u8, output: *DecodedArrays) Error!?owned.Record {
     return self.lookup(allocator, .{ .id = id }, output);
 }
 
-/// Uses byIdDecoded's storage and failure rules for a zero-based spectrum or chromatogram ordinal.
+/// Uses `byIdDecoded`'s storage and failure rules for a zero-based spectrum or chromatogram
+/// ordinal.
 pub fn atDecoded(
     self: *IndexedReader,
     allocator: std.mem.Allocator,

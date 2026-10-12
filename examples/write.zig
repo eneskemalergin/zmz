@@ -1,7 +1,7 @@
 //! Constructs one example spectrum from numeric values and writes plain or indexed mzML.
-//! The values and the encoder stay borrowed until writeRecordWithArrays returns. File output
+//! The values and the encoder stay borrowed until `writeRecordWithArrays` returns. File output
 //! streams each array through the encoder's compressor into the file and patches its
-//! encodedLength afterwards, so no buffer holds a compressed array whole.
+//! `encodedLength` afterwards, so no buffer holds a compressed array whole.
 //! Output creation is exclusive; failed writes remove only the new partial file.
 
 const std = @import("std");

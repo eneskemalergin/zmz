@@ -3,9 +3,9 @@
 //!
 //! Arguments are borrowed only until each call returns. The writer borrows its sink until
 //! deinit, and the caller flushes and closes the sink, including after finish. Failures are
-//! sticky: the first sets diagnostic() and later calls return FailedState, and partial output
+//! sticky: the first sets `diagnostic()` and later calls return `FailedState`, and partial output
 //! is never a complete document. A call made while another runs, as from the sink's drain,
-//! returns InvalidState and leaves the running call unharmed.
+//! returns `InvalidState` and leaves the running call unharmed.
 
 const std = @import("std");
 const cv = @import("../cv/source.zig");
@@ -32,17 +32,17 @@ pub const IndexOptions = struct {
     records: usize = 1_000_000,
     id_bytes: usize = 64 * 1024 * 1024,
     /// Namespaced attributes for indexedmzML, such as the index schema's `xsi:schemaLocation`,
-    /// written and checked as on the mzML root; borrowed until writeHeader. None by default.
+    /// written and checked as on the mzML root; borrowed until `writeHeader`. None by default.
     wrapper_attributes: []const model.Attribute = &.{},
 };
 
-/// One modeled array for writeRecordWithArrays. The writer sets each written array's
-/// encodedLength from the text it writes, whatever the node declares.
+/// One modeled array for `writeRecordWithArrays`. The writer sets each written array's
+/// `encodedLength` from the text it writes, whatever the node declares.
 pub const ArrayPayload = union(enum) {
     /// Finished wire bytes, written as Base64.
     wire: []const u8,
     /// Values encoded while they are written. File output streams every source, writing a
-    /// placeholder encodedLength as wide as the longest possible text and patching it after the
+    /// placeholder `encodedLength` as wide as the longest possible text and patching it after the
     /// text, so it may carry leading zeros. Other output streams sources whose length is known
     /// without encoding (primitives without zlib) or after a counting pass (Numpress without zlib),
     /// and encodes zlib sources into the source's encoder first, so a failing source writes nothing
@@ -93,7 +93,7 @@ pub fn init(allocator: std.mem.Allocator, sink: *std.Io.Writer, limits: Limits) 
     return .{ .engine = xml.Writer.init(allocator, sink, .{}), .allocator = allocator, .limits = limits };
 }
 
-/// Writes indexedmzML, keeping each record's ID and offset (within index_options) until deinit.
+/// Writes indexedmzML, keeping each record's ID and offset (within `index_options`) until deinit.
 pub fn initIndexed(
     allocator: std.mem.Allocator,
     sink: *std.Io.Writer,
@@ -116,7 +116,7 @@ pub fn initIndexed(
 }
 
 /// Writes to a positional file writer at offset zero on an empty file; nothing else may write
-/// through it until finish. List counts may be null. Null index_options selects plain mzML;
+/// through it until finish. List counts may be null. Null `index_options` selects plain mzML;
 /// indexed output needs a readable file, whose prefix finish rereads for the checksum.
 pub fn initFile(
     allocator: std.mem.Allocator,
@@ -143,7 +143,7 @@ pub fn deinit(self: *Writer) void {
     self.* = undefined;
 }
 
-/// Returns the first failure; later FailedState returns leave it unchanged. The caller's own
+/// Returns the first failure; later `FailedState` returns leave it unchanged. The caller's own
 /// final flush is not covered.
 pub fn diagnostic(self: *const Writer) ?Diagnostic {
     return self.failure;
@@ -203,14 +203,14 @@ pub fn beginList(self: *Writer, kind: model.Kind, count: ?usize, processing_ref:
 
 /// Opens a list with source attributes, writing the supplied count first in place of any
 /// source count; other attributes keep their order and values, and an absent processing
-/// reference stays absent. Count and list order follow beginList.
+/// reference stays absent. Count and list order follow `beginList`.
 pub fn beginListWithAttributes(self: *Writer, kind: model.Kind, count: ?usize, attributes: []const model.Attribute) ListError!void {
     try self.enter();
     defer self.active = false;
     return self.openList(kind, count, attributes);
 }
 
-/// Writes a record with its retained binary text, escaped as XML; the Base64 and encodedLength
+/// Writes a record with its retained binary text, escaped as XML; the Base64 and `encodedLength`
 /// are not checked.
 pub fn writeRecord(self: *Writer, node: model.Node) Error!void {
     try self.enter();
@@ -219,8 +219,8 @@ pub fn writeRecord(self: *Writer, node: model.Node) Error!void {
 }
 
 /// Writes one forward item. List openings keep their source counts; use
-/// beginListWithAttributes when filtering changes a count or leaves it unknown. Records from
-/// decoded reads have no binary text; write them with writeRecordWithArrays.
+/// `beginListWithAttributes` when filtering changes a count or leaves it unknown. Records from
+/// decoded reads have no binary text; write them with `writeRecordWithArrays`.
 pub fn writeItem(self: *Writer, item: model.Item) Error!void {
     try self.enter();
     defer self.active = false;
@@ -252,7 +252,7 @@ pub fn writeRecordWithArrays(self: *Writer, node: model.Node, payloads: []const 
     return self.writeRecordInner(node, true, payloads);
 }
 
-/// Like writeRecordWithArrays with one choice per modeled array: null keeps that array's
+/// Like `writeRecordWithArrays` with one choice per modeled array: null keeps that array's
 /// binary text, and a payload, even an empty one, replaces it. Only supplied payloads are
 /// checked.
 pub fn writeRecordWithSelectedArrays(self: *Writer, node: model.Node, payloads: []const ?ArrayPayload) Error!void {

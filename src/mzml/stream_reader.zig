@@ -23,7 +23,7 @@ pub const StreamReader = struct {
     inner: Engine,
 
     /// Checks the options without consuming input; nothing is allocated until the first read.
-    /// Streaming input needs buffer capacity for peekGreedy(1), otherwise InvalidOptions; an
+    /// Streaming input needs buffer capacity for `peekGreedy(1)`, otherwise `InvalidOptions`; an
     /// empty fixed reader reads as malformed XML.
     pub fn init(allocator: std.mem.Allocator, input: *std.Io.Reader, options: Options) error{InvalidOptions}!StreamReader {
         return .{ .inner = try Engine.init(allocator, input, options) };
@@ -42,27 +42,27 @@ pub const StreamReader = struct {
     }
 
     /// Returns the next spectrum or chromatogram, or null after the mzML content, skipping list
-    /// transitions and XML between records (nextItem keeps them). The indexed trailer is read
-    /// only with retain_index and its offsets and checksum are not verified; buffered input may
+    /// transitions and XML between records (`nextItem` keeps them). The indexed trailer is read
+    /// only with `retain_index` and its offsets and checksum are not verified; buffered input may
     /// already hold bytes past the mzML content.
     pub fn nextRecord(self: *StreamReader) Error!?model.Record {
         return self.inner.nextRecord();
     }
 
     /// Returns list transitions, records, and XML after the header in source order, or null at
-    /// the mzML end; the trailer follows the nextRecord rules.
+    /// the mzML end; the trailer follows the `nextRecord` rules.
     pub fn nextItem(self: *StreamReader) Error!?model.Item {
         return self.inner.nextItem();
     }
 
-    /// Like nextItem, decoding each record's selected arrays as nextDecodedRecord does. Other
+    /// Like `nextItem`, decoding each record's selected arrays as `nextDecodedRecord` does. Other
     /// items, EOF, and errors leave output empty.
     pub fn nextDecodedItem(self: *StreamReader, output: *DecodedArrays) Error!?model.Item {
         return self.inner.nextDecodedItem(output);
     }
 
-    /// Like nextRecord, decoding the selected arrays into output instead of retaining their
-    /// Base64 text: every modeled array without array_selector, whatever payload says. Skipped
+    /// Like `nextRecord`, decoding the selected arrays into output instead of retaining their
+    /// Base64 text: every modeled array without `array_selector`, whatever payload says. Skipped
     /// arrays keep their metadata. Output slices last until output is reused, reset, or
     /// deinitialized; EOF and errors leave it empty. A failed record is not skipped.
     pub fn nextDecodedRecord(self: *StreamReader, output: *DecodedArrays) Error!?model.Record {
@@ -74,7 +74,7 @@ pub const StreamReader = struct {
         return self.inner.diagnostic();
     }
 
-    /// Returns the indexed wrapper nodes kept by retain_index once traversal ends, valid until
+    /// Returns the indexed wrapper nodes kept by `retain_index` once traversal ends, valid until
     /// deinit; null otherwise.
     pub fn indexTrailer(self: *const StreamReader) ?[]const model.Node {
         if (!self.inner.done or !self.inner.header.indexed or !self.inner.options.retain_index)

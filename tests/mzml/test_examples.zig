@@ -383,7 +383,7 @@ test "[cli] - [mzml-rewrite]: replaces and removes ordered record parameters wit
 test "[cli] - [mzml-rewrite]: a wrong source count is replaced by the count written" {
     var dir = std.testing.tmpDir(.{});
     defer dir.cleanup();
-    // The source declares two spectra and holds one (MS1_30minLC_scan2s declares 1 for 2,029).
+    // The source declares two spectra and holds one, as some real files miscount.
     try dir.dir.writeFile(std.testing.io, .{ .sub_path = "input.mzML", .data = support.HEADER ++
         "<spectrumList count='2' defaultDataProcessingRef='dp'><spectrum index='0' id='scan=1' defaultArrayLength='0'>" ++
         "<binaryDataArrayList count='0'/></spectrum></spectrumList></run></mzML>" });

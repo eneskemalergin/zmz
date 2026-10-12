@@ -41,7 +41,7 @@ pub const Array = struct { source_position: usize, encoding: model.Encoding, rol
 
 pub const Options = struct {
     /// Bounds each array's decoded typed bytes, allocated from its declared length. The reader's
-    /// binary_text_bytes bounds the Base64 text.
+    /// `binary_text_bytes` bounds the Base64 text.
     array_bytes: usize = 192 * 1024 * 1024,
     /// Bounds the decoded typed bytes of all of a record's arrays together, so the memory one
     /// record takes does not grow with its array count.
@@ -110,14 +110,15 @@ pub fn get(self: *const DecodedArrays, position: usize) ?Array {
 }
 
 /// Decodes every modeled array of a record read with its Base64 text retained (for example
-/// from nextRecord or an IndexedReader lookup), replacing earlier results. Order, types,
-/// and limits follow nextDecodedRecord; after a failure no results are visible.
+/// from `nextRecord` or an `IndexedReader` lookup), replacing earlier results. Order, types,
+/// and limits follow `nextDecodedRecord`; after a failure no results are visible.
 pub fn decodeRecord(self: *DecodedArrays, record: model.Record, groups: []const cv.Group) Error!void {
     return self.decodeNodes(record.binaryArrays(), record.default_array_length, groups);
 }
 
 /// Decodes one binary array node with retained text, replacing earlier results, and returns
-/// its values; get(0) returns the same array. default_length is the record's defaultArrayLength.
+/// its values; `get(0)` returns the same array. `default_length` is the record's
+/// `defaultArrayLength`.
 pub fn decodeArray(self: *DecodedArrays, node: model.Node, default_length: ?usize, groups: []const cv.Group) Error!Values {
     try self.decodeNodes(&.{node}, default_length, groups);
     return self.get(0).?.values;
@@ -145,7 +146,7 @@ pub fn decodeArrayText(self: *DecodedArrays, encoding: model.Encoding, length: u
     return self.get(0).?.values;
 }
 
-/// Returns the failure of the last decodeRecord, decodeArray, or decodeArrayText call, with
+/// Returns the failure of the last `decodeRecord`, `decodeArray`, or `decodeArrayText` call, with
 /// its stage, the failing array's position, and size or limit detail; null after a success.
 /// Decoding while reading reports through the reader's `diagnostic()` instead.
 pub fn diagnostic(self: *const DecodedArrays) ?Diagnostic {

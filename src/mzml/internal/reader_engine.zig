@@ -23,7 +23,7 @@ pub const Limits = struct {
     record_bytes: usize = 256 * 1024 * 1024,
     nodes: usize = 100_000,
     list_entries: usize = 100_000,
-    /// Also bounds the text of the index's offset, indexListOffset, and fileChecksum elements.
+    /// Also bounds the text of the index's offset, `indexListOffset`, and `fileChecksum` elements.
     binary_text_bytes: usize = 256 * 1024 * 1024,
 };
 
@@ -32,18 +32,18 @@ pub const Payload = enum { retain, skip };
 
 /// What a selection callback sees. Every slice borrows only for the call.
 pub const Selection = struct {
-    /// The binaryDataArray for select, the record for select_record: its attributes and the
+    /// The `binaryDataArray` for select, the record for `select_record`: its attributes and the
     /// unexpanded parameters read so far, without children or text.
     node: model.Node,
-    /// Zero-based array position within the record; zero for select_record.
+    /// Zero-based array position within the record; zero for `select_record`.
     position: usize = 0,
-    /// The header's parameter groups, for lookups such as node.parameter.
+    /// The header's parameter groups, for lookups such as `node.parameter`.
     groups: []const cv.Group,
 };
 
 /// Chooses arrays after their leading parameters and before their binary text.
-/// Keep user_data valid while reading. Reentering the reader, or reusing the decoded output it
-/// fills, returns InvalidState and leaves the read in progress unharmed. A returned error
+/// Keep `user_data` valid while reading. Reentering the reader, or reusing the decoded output it
+/// fills, returns `InvalidState` and leaves the read in progress unharmed. A returned error
 /// fails the read with a diagnostic. Later checks can still fail a selected array.
 pub const ArraySelector = struct {
     user_data: ?*anyopaque = null,
@@ -59,7 +59,7 @@ pub const Options = struct {
     /// Chooses the arrays whose text ordinary reads keep (with payload retain) or whose
     /// values decoded reads decode.
     array_selector: ?ArraySelector = null,
-    /// Retains the index trailer within header limits for StreamReader.indexTrailer().
+    /// Retains the index trailer within header limits for `StreamReader.indexTrailer()`.
     retain_index: bool = false,
 };
 
