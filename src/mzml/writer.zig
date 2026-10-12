@@ -195,7 +195,7 @@ pub fn writeHeader(self: *Writer, header: model.Header) Error!void {
 /// otherwise) and is filled in by `endList`; other writers require an exact count before writing
 /// (a wrong count is `CountMismatch`). Spectra precede chromatograms, and each list can occur at
 /// most once.
-pub fn beginList(self: *Writer, kind: model.Kind, count: ?usize, processing_ref: []const u8) Error!void {
+pub fn beginList(self: *Writer, kind: model.Kind, count: ?usize, processing_ref: []const u8) ListError!void {
     try self.enter();
     defer self.active = false;
     return self.openList(kind, count, &.{.{ .name = "defaultDataProcessingRef", .value = processing_ref }});
@@ -204,7 +204,7 @@ pub fn beginList(self: *Writer, kind: model.Kind, count: ?usize, processing_ref:
 /// Opens a list with source attributes, writing the supplied count first in place of any
 /// source count; other attributes keep their order and values, and an absent processing
 /// reference stays absent. Count and list order follow beginList.
-pub fn beginListWithAttributes(self: *Writer, kind: model.Kind, count: ?usize, attributes: []const model.Attribute) Error!void {
+pub fn beginListWithAttributes(self: *Writer, kind: model.Kind, count: ?usize, attributes: []const model.Attribute) ListError!void {
     try self.enter();
     defer self.active = false;
     return self.openList(kind, count, attributes);
@@ -300,7 +300,7 @@ const Plan = union(enum) {
     source: struct { payload: arrays.Source, text_length: ?usize, width: usize = 0 },
 };
 
-fn enter(self: *Writer) Error!void {
+fn enter(self: *Writer) error{InvalidState}!void {
     if (self.active) return error.InvalidState;
     self.active = true;
 }
@@ -349,7 +349,9 @@ fn ioFailure(self: *Writer, err: Error) Error!noreturn {
     return err;
 }
 
-fn openList(self: *Writer, kind: model.Kind, count: ?usize, attributes: []const model.Attribute) Error!void {
+const ListError = xml.WriterError || error{ FailedState, InvalidOptions, InvalidStructure, UnknownAttribute };
+
+fn openList(self: *Writer, kind: model.Kind, count: ?usize, attributes: []const model.Attribute) ListError!void {
     if (self.failure != null) return error.FailedState;
     errdefer |err| {
         self.fail(err, .open_list);
@@ -751,7 +753,7 @@ noinline fn writeXml(self: *Writer, bytes: []const u8, budget: *usize) Error!voi
     if (cursor.current != null) return error.InvalidStructure;
 }
 
-fn writeAttributes(self: *Writer, attrs: []const model.Attribute) Error!void {
+fn writeAttributes(self: *Writer, attrs: []const model.Attribute) !void {
     for (attrs) |attr| {
         if (namespacePrefix(attr) != null) continue;
         if (attr.namespace_uri) |uri| {
@@ -777,7 +779,7 @@ fn namespacePrefix(attr: model.Attribute) ?[]const u8 {
     return null;
 }
 
-fn startKnown(self: *Writer, name: []const u8, attrs: []const model.Attribute, root: bool) Error!void {
+fn startKnown(self: *Writer, name: []const u8, attrs: []const model.Attribute, root: bool) !void {
     var source_default: ?[]const u8 = null;
     var has_namespaces = false;
     for (attrs) |attr| if (namespacePrefix(attr)) |prefix| {
@@ -819,7 +821,7 @@ fn checkNode(self: *Writer, node: model.Node) Error!void {
     if (node.content) |content| try self.checkParts(.{ std.mem.asBytes(content), content.items });
 }
 
-fn checkParts(self: *Writer, parts: anytype) Error!void {
+fn checkParts(self: *Writer, parts: anytype) !void {
     inline for (parts) |part| {
         if (self.engine.overlapsOutput(std.mem.sliceAsBytes(part))) return error.OverlappingBuffers;
     }

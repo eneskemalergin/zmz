@@ -2,9 +2,6 @@
 //!
 //! Only `Encoder` allocates. Caller buffers must be disjoint unless a function says otherwise
 //! (`OverlappingBuffers` otherwise), and their contents after a failure are unspecified.
-//!
-//! `Encoder.reuses` is internal: the writer uses it to refuse a payload that lives in the
-//! encoder's own storage.
 
 const std = @import("std");
 const base64 = @import("base64.zig");
@@ -96,7 +93,8 @@ pub const Source = struct {
     }
 };
 
-pub const DecodeError = base64.DecodeError || zlib.DecompressError || numpress.DecodeError || error{TypeMismatch};
+pub const DecodeError = base64.DecodeError || WireDecodeError;
+pub const WireDecodeError = zlib.DecompressError || numpress.DecodeError || error{TypeMismatch};
 pub const OptionsError = error{ TypeMismatch, MissingFixedPoint, UnexpectedFixedPoint, MissingCompressor, InvalidFixedPoint };
 
 pub const EncodeError = base64.EncodeError || zlib.Compressor.Error || numpress.EncodeError || OptionsError;
@@ -213,7 +211,7 @@ pub fn decodeWire(
     source: []const u8,
     pipeline: Pipeline,
     transformed: []u8,
-) DecodeError!void {
+) WireDecodeError!void {
     _ = encoding.Primitive.of(T);
     const bytes = std.mem.sliceAsBytes(output);
     const in_place = pipeline == .none and bytes.ptr == source.ptr;
@@ -275,10 +273,10 @@ pub fn wireBound(comptime T: type, count: usize, pipeline: Pipeline) error{ Leng
     const transform = pipeline.transform() orelse
         return std.math.mul(usize, count, @sizeOf(T)) catch error.LengthOverflow;
     if (T != f64 and T != f32) return error.TypeMismatch;
-    return numpress.maxEncodedLen(transform, count);
+    return numpress.encodedBound(transform, count);
 }
 
-fn decodeWireInner(comptime T: type, output: []T, source: []const u8, pipeline: Pipeline, transformed: []u8) DecodeError!void {
+fn decodeWireInner(comptime T: type, output: []T, source: []const u8, pipeline: Pipeline, transformed: []u8) WireDecodeError!void {
     const array_bytes = std.math.mul(usize, output.len, @sizeOf(T)) catch return error.LengthOverflow;
     var wire = source;
     if (pipeline.hasZlib()) {

@@ -125,12 +125,6 @@ pub const Text = struct {
     bytes: []const u8,
 };
 
-const EventData = union(enum) {
-    start_element: StartElement,
-    end_element: EndElement,
-    text: Text,
-};
-
 /// An event with physical source-byte offsets.
 pub const Event = struct {
     span: struct { start: u64, end: u64 },
@@ -1422,6 +1416,12 @@ const XML_NAMESPACE = "http://www.w3.org/XML/1998/namespace";
 const TEXT_CHUNK_BYTES = 64 * 1024;
 
 const ParserError = AdvanceError || error{EndOfStream};
+
+const EventData = union(enum) {
+    start_element: StartElement,
+    end_element: EndElement,
+    text: Text,
+};
 
 const Encoding = enum {
     utf8,

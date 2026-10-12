@@ -40,11 +40,11 @@ pub const DecodeError = error{
 /// fixed_point.
 pub const Transform = enum { linear, pic, slof };
 
-pub fn maxEncodedLen(transform: Transform, value_count: usize) error{LengthOverflow}!usize {
+pub fn encodedBound(transform: Transform, value_count: usize) error{LengthOverflow}!usize {
     return switch (transform) {
-        .linear => linearMaxEncodedLen(value_count),
-        .pic => picMaxEncodedLen(value_count),
-        .slof => slofEncodedLen(value_count),
+        .linear => linearEncodedBound(value_count),
+        .pic => picEncodedBound(value_count),
+        .slof => slofEncodedSize(value_count),
     };
 }
 
@@ -69,7 +69,7 @@ pub fn decodeExact(transform: Transform, input: []const u8, output: []f64) Decod
 }
 
 /// Returns a safe upper bound for a linear encoding of `value_count` values.
-pub fn linearMaxEncodedLen(value_count: usize) error{LengthOverflow}!usize {
+pub fn linearEncodedBound(value_count: usize) error{LengthOverflow}!usize {
     const initial_count: usize = @min(value_count, 2);
     const tail_count = value_count - initial_count;
     const tail_bytes = try maxNibbleBytes(tail_count);
@@ -78,12 +78,12 @@ pub fn linearMaxEncodedLen(value_count: usize) error{LengthOverflow}!usize {
 }
 
 /// Returns a safe upper bound for a positive-integer encoding.
-pub fn picMaxEncodedLen(value_count: usize) error{LengthOverflow}!usize {
+pub fn picEncodedBound(value_count: usize) error{LengthOverflow}!usize {
     return maxNibbleBytes(value_count);
 }
 
 /// Returns the exact encoded length of a short-logged-float array.
-pub fn slofEncodedLen(value_count: usize) error{LengthOverflow}!usize {
+pub fn slofEncodedSize(value_count: usize) error{LengthOverflow}!usize {
     const body_len = std.math.mul(usize, value_count, 2) catch return error.LengthOverflow;
     return std.math.add(usize, 8, body_len) catch error.LengthOverflow;
 }
@@ -203,10 +203,10 @@ fn fixedPointForMaximum(maximum: f64) error{ InvalidFixedPoint, InvalidValue }!f
 
 /// Encodes finite values from zero through `maxInt(u32)` by rounding to the nearest integer
 /// and applying the Numpress integer code.
-pub noinline fn encodePic(input: anytype, output: []u8) EncodeError!usize {
+pub noinline fn encodePic(input: anytype, output: []u8) error{ InvalidValue, OutputTooSmall, OverlappingBuffers, ValueOutOfRange }!usize {
     const values = slice(input);
     if (overlaps(output, std.mem.sliceAsBytes(values))) return error.OverlappingBuffers;
-    const bound = picMaxEncodedLen(values.len) catch return encodePicChecked(values, output);
+    const bound = picEncodedBound(values.len) catch return encodePicChecked(values, output);
     if (output.len < bound) return encodePicChecked(values, output);
     var writer = std.Io.Writer.fixed(output);
     return encodePicTo(values, &writer) catch |err| switch (err) {
@@ -216,10 +216,14 @@ pub noinline fn encodePic(input: anytype, output: []u8) EncodeError!usize {
 }
 
 /// Encodes nonnegative values with MS-Numpress linear prediction.
-pub noinline fn encodeLinear(input: anytype, fixed_point: f64, output: []u8) EncodeError!usize {
+pub noinline fn encodeLinear(
+    input: anytype,
+    fixed_point: f64,
+    output: []u8,
+) error{ InvalidFixedPoint, InvalidValue, OutputTooSmall, OverlappingBuffers, ValueOutOfRange }!usize {
     const values = slice(input);
     if (overlaps(output, std.mem.sliceAsBytes(values))) return error.OverlappingBuffers;
-    const bound = linearMaxEncodedLen(values.len) catch
+    const bound = linearEncodedBound(values.len) catch
         return encodeLinearChecked(values, fixed_point, output);
     if (output.len < bound) return encodeLinearChecked(values, fixed_point, output);
     var writer = std.Io.Writer.fixed(output);
@@ -233,7 +237,7 @@ pub noinline fn encodeLinear(input: anytype, fixed_point: f64, output: []u8) Enc
 pub noinline fn encodeSlof(input: anytype, fixed_point: f64, output: []u8) EncodeError!usize {
     const values = slice(input);
     if (overlaps(output, std.mem.sliceAsBytes(values))) return error.OverlappingBuffers;
-    const encoded_len = slofEncodedLen(values.len) catch
+    const encoded_len = slofEncodedSize(values.len) catch
         return encodeSlofChecked(values, fixed_point, output);
     if (output.len < encoded_len) return encodeSlofChecked(values, fixed_point, output);
     var writer = std.Io.Writer.fixed(output);
@@ -245,7 +249,10 @@ pub noinline fn encodeSlof(input: anytype, fixed_point: f64, output: []u8) Encod
 
 /// Writes the PIC encoding of `input` to `writer` and returns the bytes written. Errors match
 /// `encodePic`; after one, the writer holds an unspecified prefix.
-pub fn encodePicTo(input: anytype, writer: *std.Io.Writer) WriteError!usize {
+pub fn encodePicTo(
+    input: anytype,
+    writer: *std.Io.Writer,
+) (std.Io.Writer.Error || error{ InvalidValue, OverlappingBuffers, ValueOutOfRange })!usize {
     const values = slice(input);
     try checkDestination(values, writer);
     var blocks: Blocks = .{ .writer = writer };
@@ -457,13 +464,13 @@ const Blocks = struct {
 // The checked encoders: one value at a time, every check in the reference order. The block
 // encoders fall back to them for invalid input or an output below the worst-case bound, so
 // errors and short-output behavior come from one place.
-noinline fn encodePicChecked(values: anytype, output: []u8) EncodeError!usize {
+noinline fn encodePicChecked(values: anytype, output: []u8) !usize {
     var writer = NibbleWriter.init(output);
     for (values) |value| try writer.writeInt(try roundedPic(value));
     return writer.finish();
 }
 
-noinline fn encodeLinearChecked(values: anytype, fixed_point: f64, output: []u8) EncodeError!usize {
+noinline fn encodeLinearChecked(values: anytype, fixed_point: f64, output: []u8) !usize {
     try validateFixedPoint(fixed_point, values.len == 0);
     if (output.len < 8) return error.OutputTooSmall;
     writeFixedPoint(output[0..8], fixed_point);
@@ -490,7 +497,7 @@ noinline fn encodeLinearChecked(values: anytype, fixed_point: f64, output: []u8)
 
 noinline fn encodeSlofChecked(values: anytype, fixed_point: f64, output: []u8) EncodeError!usize {
     try validateFixedPoint(fixed_point, values.len == 0);
-    const encoded_len = try slofEncodedLen(values.len);
+    const encoded_len = try slofEncodedSize(values.len);
     if (output.len < encoded_len) return error.OutputTooSmall;
     writeFixedPoint(output[0..8], fixed_point);
     for (values, 0..) |value, index| {
@@ -1307,7 +1314,7 @@ const NibbleWriter = struct {
         return .{ .output = output };
     }
 
-    fn writeInt(writer: *NibbleWriter, value: u32) EncodeError!void {
+    fn writeInt(writer: *NibbleWriter, value: u32) !void {
         const most_significant = value & 0xf000_0000;
         if (most_significant == 0) {
             const leading: u4 = @intCast(@clz(value) / 4);
@@ -1323,14 +1330,14 @@ const NibbleWriter = struct {
         }
     }
 
-    fn writeBody(writer: *NibbleWriter, value: u32, leading: u4) EncodeError!void {
+    fn writeBody(writer: *NibbleWriter, value: u32, leading: u4) !void {
         for (leading..8) |index| {
             const shift: u5 = @intCast((index - leading) * 4);
             try writer.writeNibble(@truncate(value >> shift));
         }
     }
 
-    fn writeNibble(writer: *NibbleWriter, nibble: u4) EncodeError!void {
+    fn writeNibble(writer: *NibbleWriter, nibble: u4) !void {
         if (writer.byte_index == writer.output.len) return error.OutputTooSmall;
         if (!writer.low_half) {
             writer.output[writer.byte_index] = @as(u8, nibble) << 4;

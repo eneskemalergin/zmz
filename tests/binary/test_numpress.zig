@@ -5,24 +5,24 @@ const builtin = @import("builtin");
 const numpress = @import("zmz").mzml.numpress;
 
 test "[unit] - [numpress bounds]: reports exact or safe encoded capacities" {
-    try std.testing.expectEqual(@as(usize, 8), try numpress.linearMaxEncodedLen(0));
-    try std.testing.expectEqual(@as(usize, 12), try numpress.linearMaxEncodedLen(1));
-    try std.testing.expectEqual(@as(usize, 16), try numpress.linearMaxEncodedLen(2));
-    try std.testing.expectEqual(@as(usize, 21), try numpress.linearMaxEncodedLen(3));
-    try std.testing.expectEqual(@as(usize, 25), try numpress.linearMaxEncodedLen(4));
+    try std.testing.expectEqual(@as(usize, 8), try numpress.linearEncodedBound(0));
+    try std.testing.expectEqual(@as(usize, 12), try numpress.linearEncodedBound(1));
+    try std.testing.expectEqual(@as(usize, 16), try numpress.linearEncodedBound(2));
+    try std.testing.expectEqual(@as(usize, 21), try numpress.linearEncodedBound(3));
+    try std.testing.expectEqual(@as(usize, 25), try numpress.linearEncodedBound(4));
 
-    try std.testing.expectEqual(@as(usize, 0), try numpress.picMaxEncodedLen(0));
-    try std.testing.expectEqual(@as(usize, 5), try numpress.picMaxEncodedLen(1));
-    try std.testing.expectEqual(@as(usize, 9), try numpress.picMaxEncodedLen(2));
-    try std.testing.expectEqual(@as(usize, 14), try numpress.picMaxEncodedLen(3));
+    try std.testing.expectEqual(@as(usize, 0), try numpress.picEncodedBound(0));
+    try std.testing.expectEqual(@as(usize, 5), try numpress.picEncodedBound(1));
+    try std.testing.expectEqual(@as(usize, 9), try numpress.picEncodedBound(2));
+    try std.testing.expectEqual(@as(usize, 14), try numpress.picEncodedBound(3));
 
-    try std.testing.expectEqual(@as(usize, 8), try numpress.slofEncodedLen(0));
-    try std.testing.expectEqual(@as(usize, 10), try numpress.slofEncodedLen(1));
-    try std.testing.expectEqual(@as(usize, 14), try numpress.slofEncodedLen(3));
+    try std.testing.expectEqual(@as(usize, 8), try numpress.slofEncodedSize(0));
+    try std.testing.expectEqual(@as(usize, 10), try numpress.slofEncodedSize(1));
+    try std.testing.expectEqual(@as(usize, 14), try numpress.slofEncodedSize(3));
 
-    try std.testing.expectError(error.LengthOverflow, numpress.linearMaxEncodedLen(std.math.maxInt(usize)));
-    try std.testing.expectError(error.LengthOverflow, numpress.picMaxEncodedLen(std.math.maxInt(usize)));
-    try std.testing.expectError(error.LengthOverflow, numpress.slofEncodedLen(std.math.maxInt(usize)));
+    try std.testing.expectError(error.LengthOverflow, numpress.linearEncodedBound(std.math.maxInt(usize)));
+    try std.testing.expectError(error.LengthOverflow, numpress.picEncodedBound(std.math.maxInt(usize)));
+    try std.testing.expectError(error.LengthOverflow, numpress.slofEncodedSize(std.math.maxInt(usize)));
 }
 
 test "[unit] - [numpress wire format]: matches frozen Linear, PIC, and SLOF bytes" {
@@ -385,7 +385,7 @@ test "[property] - [numpress encoders]: block encoding matches the value-by-valu
         const pic_len = try numpress.encodePic(array, &block);
         try std.testing.expectEqual(pic_len, try numpress.encodePic(array, checked[0..pic_len]));
         try std.testing.expectEqualSlices(u8, block[0..pic_len], checked[0..pic_len]);
-        const pic_bound = try numpress.picMaxEncodedLen(count);
+        const pic_bound = try numpress.picEncodedBound(count);
         try std.testing.expectEqual(pic_len, try numpress.encodePic(array, checked[0..pic_bound]));
         try std.testing.expectEqualSlices(u8, block[0..pic_len], checked[0..pic_len]);
         const slof_len = try numpress.encodeSlof(array, slof_fixed_point, &block);
@@ -397,7 +397,7 @@ test "[property] - [numpress encoders]: block encoding matches the value-by-valu
         const linear_len = try numpress.encodeLinear(array, linear_fixed_point, &block);
         try std.testing.expectEqual(linear_len, try numpress.encodeLinear(array, linear_fixed_point, checked[0..linear_len]));
         try std.testing.expectEqualSlices(u8, block[0..linear_len], checked[0..linear_len]);
-        const linear_bound = try numpress.linearMaxEncodedLen(count);
+        const linear_bound = try numpress.linearEncodedBound(count);
         try std.testing.expectEqual(linear_len, try numpress.encodeLinear(array, linear_fixed_point, checked[0..linear_bound]));
         try std.testing.expectEqualSlices(u8, block[0..linear_len], checked[0..linear_len]);
     }
@@ -430,7 +430,7 @@ test "[regression] - [numpress Linear]: values falling below 2^62 at a block bou
     defer allocator.free(values);
     @memset(values[0..zeros], 0);
     for (scaled.items, values[zeros..]) |source, *destination| destination.* = @floatFromInt(source);
-    const encoded = try allocator.alloc(u8, try numpress.linearMaxEncodedLen(values.len));
+    const encoded = try allocator.alloc(u8, try numpress.linearEncodedBound(values.len));
     defer allocator.free(encoded);
     const length = try numpress.encodeLinear(values, 1, encoded);
     const decoded = try allocator.alloc(f64, values.len);

@@ -52,7 +52,7 @@ pub const Decoder = struct {
     }
 
     /// Consumes one text fragment. Empty fragments are valid before finish.
-    pub noinline fn update(self: *Decoder, text: []const u8) Error!void {
+    pub noinline fn update(self: *Decoder, text: []const u8) UpdateError!void {
         if (self.failed) return error.FailedState;
         if (self.finished) return error.AlreadyFinished;
         errdefer self.failed = true;
@@ -82,7 +82,7 @@ pub const Decoder = struct {
     }
 
     /// Checks the final quartet and returns the counts; call it once.
-    pub fn finish(self: *Decoder) Error!Counts {
+    pub fn finish(self: *Decoder) error{ TruncatedInput, AlreadyFinished, FailedState }!Counts {
         if (self.failed) return error.FailedState;
         if (self.finished) return error.AlreadyFinished;
         errdefer self.failed = true;
@@ -91,14 +91,25 @@ pub const Decoder = struct {
         return self.counts;
     }
 
+    const UpdateError = error{
+        InvalidCharacter,
+        InvalidPadding,
+        NonCanonicalTail,
+        OutputTooSmall,
+        LengthOverflow,
+        OverlappingBuffers,
+        AlreadyFinished,
+        FailedState,
+    };
+
     // One fragment without the sticky-state checks, which the one-shot decode does not need.
-    fn consume(self: *Decoder, text: []const u8) DecodeError!void {
+    fn consume(self: *Decoder, text: []const u8) !void {
         if (overlaps(self.output, text)) return error.OverlappingBuffers;
         if (text.len > std.math.maxInt(usize) - self.counts.text_bytes) return error.LengthOverflow;
         return self.updateParts(text);
     }
 
-    fn updateParts(self: *Decoder, text: []const u8) DecodeError!void {
+    fn updateParts(self: *Decoder, text: []const u8) !void {
         var index: usize = 0;
         while (index < text.len) {
             const consumed = self.decodeRun(text[index..]);
@@ -142,7 +153,7 @@ pub const Decoder = struct {
         return length;
     }
 
-    fn flushQuartet(self: *Decoder) DecodeError!void {
+    fn flushQuartet(self: *Decoder) !void {
         const group = try decodeQuartet(self.quartet);
         const end = std.math.add(usize, self.counts.decoded_bytes, group.len) catch
             return error.LengthOverflow;
@@ -286,7 +297,7 @@ fn decodePrefix(output: []u8, source: []const u8) usize {
     return position;
 }
 
-inline fn decodeQuartet(q: [4]u8) DecodeError!struct { bytes: [3]u8, len: usize } {
+inline fn decodeQuartet(q: [4]u8) !struct { bytes: [3]u8, len: usize } {
     const a = DECODE_TABLE[q[0]];
     if (a == 0xff) return error.InvalidPadding;
     const b = DECODE_TABLE[q[1]];

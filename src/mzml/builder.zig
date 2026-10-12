@@ -71,7 +71,7 @@ pub const Reencoding = struct {
         source: model.Node,
         options: arrays.EncodeOptions,
         encoder: *arrays.Encoder,
-    ) Error!PreparedArray {
+    ) (ReencodedArrayError || error{InvalidState})!PreparedArray {
         if (self.owner.generation != self.generation) return error.InvalidState;
         return builder.prepareArrayFromInner(T, values, source, self.source_groups, options, encoder, self.replacements);
     }
@@ -100,14 +100,14 @@ pub fn reset(self: *Builder) void {
 }
 
 /// Copies a node, including any binary text, within the byte limit and MAX_DEPTH.
-pub fn node(self: *Builder, source: model.Node) Error!model.Node {
+pub fn node(self: *Builder, source: model.Node) copy.Error!model.Node {
     var copier = self.makeCopier();
     defer self.remaining = copier.remaining;
     return copier.node(source, schema.MAX_DEPTH);
 }
 
 /// Generates a schema list's count from its children and copies their complete content.
-pub fn list(self: *Builder, kind: model.Kind, children: []const model.Node) Error!model.Node {
+pub fn list(self: *Builder, kind: model.Kind, children: []const model.Node) copy.Error!model.Node {
     var count: [32]u8 = undefined;
     return self.node(.{ .kind = kind, .attributes = &.{.{
         .name = "count",
@@ -117,7 +117,7 @@ pub fn list(self: *Builder, kind: model.Kind, children: []const model.Node) Erro
 
 /// Constructs a `cv` declaration from explicit source identity and version fields. `id`,
 /// `full_name`, and `uri` are required (`InvalidOptions` otherwise).
-pub fn cvDeclaration(self: *Builder, declaration: cv.Declaration) Error!model.Node {
+pub fn cvDeclaration(self: *Builder, declaration: cv.Declaration) (copy.Error || error{InvalidOptions})!model.Node {
     if (declaration.id == null or declaration.full_name == null or declaration.uri == null)
         return error.InvalidOptions;
     const attrs = [_]model.Attribute{
@@ -142,7 +142,7 @@ pub fn record(
     params: []const cv.Entry,
     children: []const model.Node,
     binary_arrays: []const Array,
-) Error!model.Record {
+) (copy.Error || error{ InvalidOptions, InvalidState })!model.Record {
     if ((kind != .spectrum and kind != .chromatogram) or id.len == 0) return error.InvalidOptions;
     for (children) |child| if (child.kind == .binary_data_array_list) return error.InvalidOptions;
     for (binary_arrays) |array| {
@@ -181,7 +181,7 @@ pub fn record(
 }
 
 /// Copies header metadata and derives group entries from the copied definitions.
-pub fn header(self: *Builder, source: model.Header) Error!model.Header {
+pub fn header(self: *Builder, source: model.Header) (owned.Error || schema.Error)!model.Header {
     try schema.checkHeader(source);
     var copier = self.makeCopier();
     defer self.remaining = copier.remaining;
@@ -191,7 +191,7 @@ pub fn header(self: *Builder, source: model.Header) Error!model.Header {
 
 /// Builds a cvParam whose value is the number in XML Schema spelling, with the caller's
 /// accession, name, and unit as given.
-pub fn number(self: *Builder, parameter: cv.Param, value: f64) Error!cv.Param {
+pub fn number(self: *Builder, parameter: cv.Param, value: f64) copy.Error!cv.Param {
     var buffer: [64]u8 = undefined;
     var param = parameter;
     param.value = if (std.math.isNan(value)) "NaN" else if (std.math.isInf(value))
@@ -213,7 +213,7 @@ pub fn prepareArray(
     values: []const T,
     options: ArrayOptions,
     encoder: *arrays.Encoder,
-) Error!PreparedArray {
+) (ArrayError || error{InvalidOptions})!PreparedArray {
     try checkArrayOptions(options);
     const source = arrays.Source.of(T, values, options.encoding, encoder);
     try source.check();
@@ -236,13 +236,13 @@ pub fn prepareArrayFrom(
     groups: []const cv.Group,
     options: arrays.EncodeOptions,
     encoder: *arrays.Encoder,
-) Error!PreparedArray {
+) ReencodedArrayError!PreparedArray {
     return self.prepareArrayFromInner(T, values, source, groups, options, encoder, null);
 }
 
 /// Copies a header and adds a group definition for each requested output encoding, keeping
 /// the originals for unchanged arrays; equivalent replacements share one definition.
-pub fn reencoding(self: *Builder, source: model.Header, targets: []const model.Encoding) Error!Reencoding {
+pub fn reencoding(self: *Builder, source: model.Header, targets: []const model.Encoding) (owned.Error || schema.Error)!Reencoding {
     var header_copy = try self.header(source);
     const source_groups = header_copy.groups;
     var count: usize = 0;
@@ -338,6 +338,9 @@ pub fn reencoding(self: *Builder, source: model.Header, targets: []const model.E
     };
 }
 
+const ArrayError = copy.Error || arrays.OptionsError || model.EncodingError;
+const ReencodedArrayError = ArrayError || schema.Error || error{GroupRewriteRequired};
+
 fn prepareArrayFromInner(
     self: *Builder,
     comptime T: type,
@@ -347,7 +350,7 @@ fn prepareArrayFromInner(
     options: arrays.EncodeOptions,
     encoder: *arrays.Encoder,
     replacements: ?[]const GroupReplacement,
-) Error!PreparedArray {
+) ReencodedArrayError!PreparedArray {
     _ = try model.arrayEncoding(source, groups);
     if (source.children.len != 1 or source.children[0].kind != .binary) return error.InvalidStructure;
     const target: model.Encoding = .{ .primitive = encoding.Primitive.of(T), .pipeline = options.pipeline };
@@ -408,12 +411,12 @@ fn prepareArrayFromInner(
     }, .payload = .{ .source = prepared } };
 }
 
-fn checkArrayOptions(options: ArrayOptions) Error!void {
+fn checkArrayOptions(options: ArrayOptions) error{InvalidOptions}!void {
     if (options.cv_ref.len == 0 or options.role.cv_ref == null or options.role.accession == null or
         options.role.name == null) return error.InvalidOptions;
 }
 
-fn arrayMetadata(self: *Builder, comptime T: type, value_count: usize, options: ArrayOptions) Error!Array {
+fn arrayMetadata(self: *Builder, comptime T: type, value_count: usize, options: ArrayOptions) ArrayError!Array {
     const is_default = isDefaultRole(options.role.accession.?);
     const primitive = encoding.primitiveTerm(encoding.Primitive.of(T));
     const codec = encoding.codecTerm(options.encoding.pipeline);
@@ -541,7 +544,7 @@ fn reencodedParams(
     target: model.Encoding,
     replacements: ?[]const GroupReplacement,
     limit: usize,
-) Error!ParamCount {
+) ReencodedArrayError!ParamCount {
     var result: ParamCount = .{};
     for (params, 0..) |entry, position| {
         if (entry == .group_ref and (entry.group_ref.xml != null or replacements != null)) {

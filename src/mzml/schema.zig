@@ -4,9 +4,6 @@ const std = @import("std");
 const xml = @import("../xml/mzml_adapter.zig");
 const model = @import("model.zig");
 
-// A child kind a parent allows, at most once unless many.
-const Rule = struct { kind: model.Kind, many: bool = false };
-
 pub const CHILD_KINDS = blk: {
     @setEvalBranchQuota(2000);
     var result: std.EnumArray(model.Kind, struct {
@@ -109,6 +106,9 @@ pub fn checkHeader(header: model.Header) Error!void {
     for (header.run.children) |child| if (child.kind != .source_file_ref_list) return error.InvalidStructure;
     if (header.document.text != null or header.run.text != null) return error.InvalidStructure;
 }
+
+// A child kind a parent allows, at most once unless many.
+const Rule = struct { kind: model.Kind, many: bool = false };
 
 const ELEMENT_KINDS = std.StaticStringMap(model.Kind).initComptime(blk: {
     const kinds = std.meta.tags(model.Kind);

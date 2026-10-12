@@ -175,7 +175,7 @@ pub const Compressor = struct {
     /// Starts one zlib stream into output and returns the writer for its source; finish
     /// ends it. A write error on the writer means output is full. output stays borrowed
     /// until finish.
-    pub fn start(self: *Compressor, output: []u8) CompressError!*std.Io.Writer {
+    pub fn start(self: *Compressor, output: []u8) error{OutputTooSmall}!*std.Io.Writer {
         self.destination = std.Io.Writer.fixed(output);
         // zipir's only compression error is a full output writer.
         const writer = self.startWriter(&self.destination) catch return error.OutputTooSmall;
@@ -184,7 +184,7 @@ pub const Compressor = struct {
     }
 
     /// Ends the stream begun by start and returns the written prefix of its output.
-    pub fn finish(self: *Compressor) Error![]u8 {
+    pub fn finish(self: *Compressor) error{ OutputTooSmall, InvalidState }![]u8 {
         if (self.open != .output) return error.InvalidState;
         return self.finishOutput();
     }
@@ -214,7 +214,7 @@ pub const Compressor = struct {
         _ = try self.state.finish();
     }
 
-    fn finishOutput(self: *Compressor) CompressError![]u8 {
+    fn finishOutput(self: *Compressor) ![]u8 {
         self.open = .none;
         _ = self.state.finish() catch |err| switch (err) {
             error.WriteFailed => return error.OutputTooSmall,

@@ -223,7 +223,7 @@ pub fn findOne(entries: []const Entry, groups: []const Group, accession: Accessi
 }
 
 /// Parses XML Schema boolean spellings after XML whitespace collapse.
-pub fn parseBoolean(value: ?[]const u8) ValueError!bool {
+pub fn parseBoolean(value: ?[]const u8) error{ MissingValue, EmptyValue, InvalidValue }!bool {
     const bytes = try lexical(value);
     if (std.mem.eql(u8, bytes, "true") or std.mem.eql(u8, bytes, "1")) return true;
     if (std.mem.eql(u8, bytes, "false") or std.mem.eql(u8, bytes, "0")) return false;
@@ -275,7 +275,7 @@ pub fn parseFloat(comptime T: type, value: ?[]const u8) ValueError!T {
     return result;
 }
 
-fn lexical(value: ?[]const u8) ValueError![]const u8 {
+fn lexical(value: ?[]const u8) error{ MissingValue, EmptyValue }![]const u8 {
     const bytes = std.mem.trim(u8, value orelse return error.MissingValue, XML_WHITESPACE);
     if (bytes.len == 0) return error.EmptyValue;
     return bytes;

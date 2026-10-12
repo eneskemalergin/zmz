@@ -342,7 +342,7 @@ pub const Record = struct {
 
     /// Reads record polarity, or the single scan's polarity in an mzML 1.0 description.
     /// Absence of both flags returns null; repeats and opposing flags return distinct errors.
-    pub fn polarity(self: Record, groups: []const cv.Group) (FieldError || error{ConflictingParameter})!?Polarity {
+    pub fn polarity(self: Record, groups: []const cv.Group) (ParameterError || error{ UnexpectedElement, ConflictingParameter })!?Polarity {
         if (self.node.kind != .spectrum and self.node.kind != .chromatogram)
             return error.UnexpectedElement;
         const node = if (self.node.child(.spectrum_description)) |description| description.child(.scan) orelse return null else self.node;
@@ -351,7 +351,10 @@ pub const Record = struct {
     }
 
     /// Reads centroid/profile flags from the record or its mzML 1.0 description.
-    pub fn representation(self: Record, groups: []const cv.Group) (FieldError || error{ConflictingParameter})!?Representation {
+    pub fn representation(
+        self: Record,
+        groups: []const cv.Group,
+    ) (ParameterError || error{ UnexpectedElement, ConflictingParameter })!?Representation {
         if (self.node.kind != .spectrum) return error.UnexpectedElement;
         const node = self.node.child(.spectrum_description) orelse self.node;
         const centroid = try exclusiveFlags(node, groups, Terms.CENTROID_SPECTRUM, Terms.PROFILE_SPECTRUM) orelse return null;
@@ -543,7 +546,7 @@ fn exclusiveFlags(
     groups: []const cv.Group,
     first: cv.Accession,
     second: cv.Accession,
-) (FieldError || error{ConflictingParameter})!?bool {
+) (ParameterError || error{ConflictingParameter})!?bool {
     const a = try node.parameter(groups, first);
     const b = try node.parameter(groups, second);
     if (a != null and b != null) return error.ConflictingParameter;

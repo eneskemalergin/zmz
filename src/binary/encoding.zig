@@ -74,8 +74,6 @@ pub const Pipeline = enum {
     }
 };
 
-const Term = struct { accession: []const u8, name: []const u8 };
-
 /// A recognized established encoding. Unknown metadata remains in the source node.
 pub const Encoding = struct {
     primitive: Primitive,
@@ -198,3 +196,5 @@ pub fn classify(params: []const cv.Entry, groups: []const cv.Group) Error!Encodi
     var terms: Terms = .{};
     return terms.add(params, groups);
 }
+
+const Term = struct { accession: []const u8, name: []const u8 };
