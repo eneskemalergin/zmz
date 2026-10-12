@@ -1,0 +1,16 @@
+version: 2
+updates:
+  # Zig packages have no Dependabot ecosystem: the zipir pin and the Zig checksums in
+  # .github/actions/setup-zig are reviewed by hand.
+  - package-ecosystem: github-actions
+    directories: ["/", "/.github/actions/*"]
+    schedule:
+      interval: monthly
+    # Propose a release only once it is a week old.
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: ci
