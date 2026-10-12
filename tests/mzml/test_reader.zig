@@ -5,6 +5,169 @@ const zmz = @import("zmz");
 const support = @import("support.zig");
 const mzml = zmz.mzml;
 
+const Selection = struct {
+    mode: enum { second, named, group, all, none },
+    calls: usize = 0,
+    wrong_position: bool = false,
+
+    fn select(user_data: ?*anyopaque, view: mzml.StreamReader.Selection) mzml.model.MetadataError!mzml.StreamReader.Payload {
+        const self: *Selection = @ptrCast(@alignCast(user_data.?));
+        self.wrong_position = self.wrong_position or view.position != self.calls % 2;
+        self.calls += 1;
+        const keep = switch (self.mode) {
+            .second => view.position == 1,
+            .named, .group => blk: {
+                const accession = if (self.mode == .named) "X:unknown-role" else "MS:1000523";
+                const parameter = try view.node.parameter(view.groups, .{ .raw = accession }) orelse break :blk false;
+                break :blk self.mode == .group or (std.mem.eql(u8, parameter.name.?, "future array") and parameter.value == null);
+            },
+            .all => true,
+            .none => false,
+        };
+        return if (keep) .retain else .skip;
+    }
+};
+
+fn selectSecond(_: ?*anyopaque, view: mzml.StreamReader.Selection) mzml.model.MetadataError!mzml.StreamReader.Payload {
+    return if (view.position == 1) .retain else .skip;
+}
+
+fn expectSelectedNode(expected: mzml.model.Node, actual: mzml.model.Node) !void {
+    try std.testing.expectEqual(expected.kind, actual.kind);
+    try std.testing.expectEqualDeep(expected.attributes, actual.attributes);
+    try std.testing.expectEqualDeep(expected.params, actual.params);
+    try std.testing.expectEqualDeep(expected.content, actual.content);
+    try std.testing.expectEqual(expected.start_offset, actual.start_offset);
+    try std.testing.expectEqual(expected.content_offset, actual.content_offset);
+    try std.testing.expectEqual(expected.end_offset, actual.end_offset);
+    if (expected.kind != .binary or actual.text != null)
+        try std.testing.expectEqualDeep(expected.text, actual.text);
+    try std.testing.expectEqual(expected.children.len, actual.children.len);
+    for (expected.children, actual.children) |left, right| try expectSelectedNode(left, right);
+}
+
+fn readDecoded(allocator: std.mem.Allocator, source: []const u8, limits: mzml.DecodedArrays.Options) !void {
+    var input = std.Io.Reader.fixed(source);
+    var reader = try mzml.StreamReader.init(allocator, &input, .{});
+    defer reader.deinit();
+    var output = mzml.DecodedArrays.init(allocator, limits);
+    defer output.deinit();
+    while (try reader.nextDecodedRecord(&output)) |_| {}
+    try std.testing.expectEqual(@as(usize, 0), output.len());
+    try std.testing.expectEqual(null, output.get(0));
+}
+
+fn readDecodedRecord(allocator: std.mem.Allocator, source: []const u8, limits: mzml.DecodedArrays.Options) !void {
+    var input = std.Io.Reader.fixed(source);
+    var reader = try mzml.StreamReader.init(allocator, &input, .{});
+    defer reader.deinit();
+    var output = mzml.DecodedArrays.init(allocator, limits);
+    defer output.deinit();
+    errdefer std.debug.assert(output.len() == 0);
+    const record = reader.nextDecodedRecord(&output) catch |err| {
+        const report = reader.diagnostic().?;
+        try std.testing.expectEqual(err, report.code);
+        if (err == error.OutOfMemory) try std.testing.expectEqual(.out_of_memory, report.id);
+        var bytes: [512]u8 = undefined;
+        var sink = std.Io.Writer.fixed(&bytes);
+        try report.format(&sink);
+        return err;
+    };
+    try std.testing.expect(record != null);
+    try std.testing.expectEqual(@as(usize, 2), output.len());
+}
+
+fn compareDecoded(source: []const u8, chunk: usize) !void {
+    try compareDecodedWithSelection(source, chunk, false);
+}
+
+fn compareDecodedWithSelection(source: []const u8, chunk: usize, selected: bool) !void {
+    var storage: [31]u8 = undefined;
+    var a_input = std.Io.Reader.fixed(source);
+    var b_input: std.testing.Reader = .init(storage[0..chunk], &.{.{ .buffer = source }});
+    b_input.artificial_limit = .limited(chunk);
+    var a = try mzml.StreamReader.init(std.testing.allocator, &a_input, .{});
+    defer a.deinit();
+    var b = try mzml.StreamReader.init(std.testing.allocator, &b_input.interface, .{
+        .array_selector = if (selected) .{ .select = selectSecond } else null,
+    });
+    defer b.deinit();
+    const header = try a.readHeader();
+    var output = mzml.DecodedArrays.init(std.testing.allocator, .{});
+    defer output.deinit();
+    while (try a.nextRecord()) |record| {
+        const other = (try b.nextDecodedRecord(&output)).?;
+        try expectSelectedNode(record.node, other.node);
+        try std.testing.expectEqual(if (selected) @intFromBool(record.binaryArrays().len > 1) else record.binaryArrays().len, output.len());
+        var arrays = record.arrays(header.groups);
+        var position: usize = 0;
+        while (try arrays.next()) |array| : (position += 1) {
+            if (selected and position != 1) continue;
+            const actual = output.get(if (selected) 0 else position).?;
+            try std.testing.expectEqual(position, actual.source_position);
+            try std.testing.expectEqualDeep(array.encoding, actual.encoding);
+            switch (actual.values) {
+                inline else => |values| {
+                    const T = @typeInfo(@TypeOf(values)).pointer.child;
+                    try std.testing.expectEqual(array.length, values.len);
+                    const expected = try std.testing.allocator.alloc(T, values.len);
+                    defer std.testing.allocator.free(expected);
+                    const wire_buffer = try std.testing.allocator.alloc(u8, array.node.child(.binary).?.text.?.len);
+                    defer std.testing.allocator.free(wire_buffer);
+                    const transformed = try std.testing.allocator.alloc(u8, try mzml.arrays.wireBound(T, values.len, array.encoding.pipeline));
+                    defer std.testing.allocator.free(transformed);
+                    _ = try array.decode(T, expected, .{ .wire = wire_buffer, .transformed = transformed });
+                    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(expected), std.mem.sliceAsBytes(values));
+                },
+            }
+        }
+        for (other.binaryArrays()) |array| try std.testing.expectEqual(null, array.child(.binary).?.text);
+    }
+    try std.testing.expectEqual(null, try b.nextDecodedRecord(&output));
+    try std.testing.expectEqual(@as(usize, 0), output.len());
+}
+
+fn decodedDocument(allocator: std.mem.Allocator, text: []const u8, encoded: usize, length: usize, codec: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, support.HEADER ++
+        "<spectrumList count='1' defaultDataProcessingRef='dp'><spectrum id='x' index='0' defaultArrayLength='{d}'>" ++
+        "<binaryDataArrayList count='2'><binaryDataArray encodedLength='{d}'>" ++
+        "<cvParam cvRef='MS' accession='MS:1000523' name='64-bit float'/>" ++
+        "<cvParam cvRef='MS' accession='{s}' name='codec'/><binary>{s}</binary>" ++
+        "</binaryDataArray><binaryDataArray encodedLength='0' arrayLength='0'><referenceableParamGroupRef ref='encoding'/><binary/></binaryDataArray>" ++
+        "</binaryDataArrayList></spectrum></spectrumList></run></mzML>", .{ length, encoded, codec, text });
+}
+
+fn readSelectedDecoded(allocator: std.mem.Allocator, source: []const u8) !void {
+    var input = std.Io.Reader.fixed(source);
+    var reader = try mzml.StreamReader.init(allocator, &input, .{ .array_selector = .{ .select = selectSecond } });
+    defer reader.deinit();
+    var output = mzml.DecodedArrays.init(allocator, .{});
+    defer output.deinit();
+    errdefer std.debug.assert(output.len() == 0);
+    while (try reader.nextDecodedRecord(&output)) |_| {
+        try std.testing.expectEqual(@as(usize, 1), output.len());
+        try std.testing.expectEqual(@as(usize, 1), output.get(0).?.source_position);
+    }
+}
+
+// Payload, encodedLength, defaultArrayLength, compression term, and the expected error.
+// A PIC zlib stream of one value, then valid Base64 past the first decoded window, then an invalid
+// character: the zlib stream ends first, and the rest of the text is still checked.
+const LATE_INVALID = "eJwrBAAAcgBy" ++ "AAAA" ** 25_000 ++ "!AAA";
+
+const DECODING_FAILURES = .{
+    .{ "!AAAAAAA8D8=", 12, 1, "MS:1000576", error.InvalidCharacter },
+    .{ "!AAAAAAA8D8=", 11, 1, "MS:1000576", error.InvalidCharacter },
+    .{ "!AAAAAAA8D8=</broken>", 12, 1, "MS:1000576", error.InvalidCharacter },
+    .{ "AAAAAAAA8D8=", 12, 0, "MS:1000576", error.DecodedSizeMismatch },
+    .{ "AAAAAAAA8D8=!AAA", 16, 0, "MS:1000576", error.DecodedSizeMismatch },
+    .{ "AAAAAAAA8D8", 11, 1, "MS:1000576", error.TruncatedInput },
+    .{ "AB==", 4, 0, "MS:1000576", error.NonCanonicalTail },
+    .{ "AA=A", 4, 0, "MS:1000576", error.InvalidPadding },
+    .{ "AAAAAAAA8D8=", 12, 1, "X:unknown", error.MissingCompression },
+    .{ LATE_INVALID, LATE_INVALID.len, 1, "MS:1002747", error.InvalidCharacter },
+};
+
 test "[failure] - [mzML diagnostics]: retains selected source positions and physical event offsets" {
     const source = try std.mem.replaceOwned(u8, std.testing.allocator, support.DOCUMENT, "<binary>AAAAAAAA8D8=</binary>", "<binary>&#33;AAAAAAA8D8=</binary>");
     defer std.testing.allocator.free(source);
@@ -847,151 +1010,6 @@ test "[failure] - [mzML 1.0 reading]: stops at truncated historical metadata or 
     }
 }
 
-const Selection = struct {
-    mode: enum { second, named, group, all, none },
-    calls: usize = 0,
-    wrong_position: bool = false,
-
-    fn select(user_data: ?*anyopaque, view: mzml.StreamReader.Selection) mzml.model.MetadataError!mzml.StreamReader.Payload {
-        const self: *Selection = @ptrCast(@alignCast(user_data.?));
-        self.wrong_position = self.wrong_position or view.position != self.calls % 2;
-        self.calls += 1;
-        const keep = switch (self.mode) {
-            .second => view.position == 1,
-            .named, .group => blk: {
-                const accession = if (self.mode == .named) "X:unknown-role" else "MS:1000523";
-                const parameter = try view.node.parameter(view.groups, .{ .raw = accession }) orelse break :blk false;
-                break :blk self.mode == .group or (std.mem.eql(u8, parameter.name.?, "future array") and parameter.value == null);
-            },
-            .all => true,
-            .none => false,
-        };
-        return if (keep) .retain else .skip;
-    }
-};
-
-fn selectSecond(_: ?*anyopaque, view: mzml.StreamReader.Selection) mzml.model.MetadataError!mzml.StreamReader.Payload {
-    return if (view.position == 1) .retain else .skip;
-}
-
-fn expectSelectedNode(expected: mzml.model.Node, actual: mzml.model.Node) !void {
-    try std.testing.expectEqual(expected.kind, actual.kind);
-    try std.testing.expectEqualDeep(expected.attributes, actual.attributes);
-    try std.testing.expectEqualDeep(expected.params, actual.params);
-    try std.testing.expectEqualDeep(expected.content, actual.content);
-    try std.testing.expectEqual(expected.start_offset, actual.start_offset);
-    try std.testing.expectEqual(expected.content_offset, actual.content_offset);
-    try std.testing.expectEqual(expected.end_offset, actual.end_offset);
-    if (expected.kind != .binary or actual.text != null)
-        try std.testing.expectEqualDeep(expected.text, actual.text);
-    try std.testing.expectEqual(expected.children.len, actual.children.len);
-    for (expected.children, actual.children) |left, right| try expectSelectedNode(left, right);
-}
-
-fn readDecoded(allocator: std.mem.Allocator, source: []const u8, limits: mzml.DecodedArrays.Options) !void {
-    var input = std.Io.Reader.fixed(source);
-    var reader = try mzml.StreamReader.init(allocator, &input, .{});
-    defer reader.deinit();
-    var output = mzml.DecodedArrays.init(allocator, limits);
-    defer output.deinit();
-    while (try reader.nextDecodedRecord(&output)) |_| {}
-    try std.testing.expectEqual(@as(usize, 0), output.len());
-    try std.testing.expectEqual(null, output.get(0));
-}
-
-fn readDecodedRecord(allocator: std.mem.Allocator, source: []const u8, limits: mzml.DecodedArrays.Options) !void {
-    var input = std.Io.Reader.fixed(source);
-    var reader = try mzml.StreamReader.init(allocator, &input, .{});
-    defer reader.deinit();
-    var output = mzml.DecodedArrays.init(allocator, limits);
-    defer output.deinit();
-    errdefer std.debug.assert(output.len() == 0);
-    const record = reader.nextDecodedRecord(&output) catch |err| {
-        const report = reader.diagnostic().?;
-        try std.testing.expectEqual(err, report.code);
-        if (err == error.OutOfMemory) try std.testing.expectEqual(.out_of_memory, report.id);
-        var bytes: [512]u8 = undefined;
-        var sink = std.Io.Writer.fixed(&bytes);
-        try report.format(&sink);
-        return err;
-    };
-    try std.testing.expect(record != null);
-    try std.testing.expectEqual(@as(usize, 2), output.len());
-}
-
-fn compareDecoded(source: []const u8, chunk: usize) !void {
-    try compareDecodedWithSelection(source, chunk, false);
-}
-
-fn compareDecodedWithSelection(source: []const u8, chunk: usize, selected: bool) !void {
-    var storage: [31]u8 = undefined;
-    var a_input = std.Io.Reader.fixed(source);
-    var b_input: std.testing.Reader = .init(storage[0..chunk], &.{.{ .buffer = source }});
-    b_input.artificial_limit = .limited(chunk);
-    var a = try mzml.StreamReader.init(std.testing.allocator, &a_input, .{});
-    defer a.deinit();
-    var b = try mzml.StreamReader.init(std.testing.allocator, &b_input.interface, .{
-        .array_selector = if (selected) .{ .select = selectSecond } else null,
-    });
-    defer b.deinit();
-    const header = try a.readHeader();
-    var output = mzml.DecodedArrays.init(std.testing.allocator, .{});
-    defer output.deinit();
-    while (try a.nextRecord()) |record| {
-        const other = (try b.nextDecodedRecord(&output)).?;
-        try expectSelectedNode(record.node, other.node);
-        try std.testing.expectEqual(if (selected) @intFromBool(record.binaryArrays().len > 1) else record.binaryArrays().len, output.len());
-        var arrays = record.arrays(header.groups);
-        var position: usize = 0;
-        while (try arrays.next()) |array| : (position += 1) {
-            if (selected and position != 1) continue;
-            const actual = output.get(if (selected) 0 else position).?;
-            try std.testing.expectEqual(position, actual.source_position);
-            try std.testing.expectEqualDeep(array.encoding, actual.encoding);
-            switch (actual.values) {
-                inline else => |values| {
-                    const T = @typeInfo(@TypeOf(values)).pointer.child;
-                    try std.testing.expectEqual(array.length, values.len);
-                    const expected = try std.testing.allocator.alloc(T, values.len);
-                    defer std.testing.allocator.free(expected);
-                    const wire_buffer = try std.testing.allocator.alloc(u8, array.node.child(.binary).?.text.?.len);
-                    defer std.testing.allocator.free(wire_buffer);
-                    const transformed = try std.testing.allocator.alloc(u8, try mzml.arrays.wireBound(T, values.len, array.encoding.pipeline));
-                    defer std.testing.allocator.free(transformed);
-                    _ = try array.decode(T, expected, .{ .wire = wire_buffer, .transformed = transformed });
-                    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(expected), std.mem.sliceAsBytes(values));
-                },
-            }
-        }
-        for (other.binaryArrays()) |array| try std.testing.expectEqual(null, array.child(.binary).?.text);
-    }
-    try std.testing.expectEqual(null, try b.nextDecodedRecord(&output));
-    try std.testing.expectEqual(@as(usize, 0), output.len());
-}
-
-fn decodedDocument(allocator: std.mem.Allocator, text: []const u8, encoded: usize, length: usize, codec: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, support.HEADER ++
-        "<spectrumList count='1' defaultDataProcessingRef='dp'><spectrum id='x' index='0' defaultArrayLength='{d}'>" ++
-        "<binaryDataArrayList count='2'><binaryDataArray encodedLength='{d}'>" ++
-        "<cvParam cvRef='MS' accession='MS:1000523' name='64-bit float'/>" ++
-        "<cvParam cvRef='MS' accession='{s}' name='codec'/><binary>{s}</binary>" ++
-        "</binaryDataArray><binaryDataArray encodedLength='0' arrayLength='0'><referenceableParamGroupRef ref='encoding'/><binary/></binaryDataArray>" ++
-        "</binaryDataArrayList></spectrum></spectrumList></run></mzML>", .{ length, encoded, codec, text });
-}
-
-fn readSelectedDecoded(allocator: std.mem.Allocator, source: []const u8) !void {
-    var input = std.Io.Reader.fixed(source);
-    var reader = try mzml.StreamReader.init(allocator, &input, .{ .array_selector = .{ .select = selectSecond } });
-    defer reader.deinit();
-    var output = mzml.DecodedArrays.init(allocator, .{});
-    defer output.deinit();
-    errdefer std.debug.assert(output.len() == 0);
-    while (try reader.nextDecodedRecord(&output)) |_| {
-        try std.testing.expectEqual(@as(usize, 1), output.len());
-        try std.testing.expectEqual(@as(usize, 1), output.get(0).?.source_position);
-    }
-}
-
 test "[integration] - [mzML parameters]: preserves source order and absent fields" {
     const params = "<userParam value=''/><cvParam accession='X:first'/>" ++
         "<referenceableParamGroupRef ref='encoding'/><cvParam/><userParam name='' unitName=''/>" ++
@@ -1390,19 +1408,6 @@ test "[failure] - [mzML reader]: returns completed results before a broken next 
         }
     }
 }
-
-// Payload, encodedLength, defaultArrayLength, compression term, and the expected error.
-const DECODING_FAILURES = .{
-    .{ "!AAAAAAA8D8=", 12, 1, "MS:1000576", error.InvalidCharacter },
-    .{ "!AAAAAAA8D8=", 11, 1, "MS:1000576", error.InvalidCharacter },
-    .{ "!AAAAAAA8D8=</broken>", 12, 1, "MS:1000576", error.InvalidCharacter },
-    .{ "AAAAAAAA8D8=", 12, 0, "MS:1000576", error.DecodedSizeMismatch },
-    .{ "AAAAAAAA8D8=!AAA", 16, 0, "MS:1000576", error.DecodedSizeMismatch },
-    .{ "AAAAAAAA8D8", 11, 1, "MS:1000576", error.TruncatedInput },
-    .{ "AB==", 4, 0, "MS:1000576", error.NonCanonicalTail },
-    .{ "AA=A", 4, 0, "MS:1000576", error.InvalidPadding },
-    .{ "AAAAAAAA8D8=", 12, 1, "X:unknown", error.MissingCompression },
-};
 
 test "[failure] - [mzML decoded reading]: stops at the first error and clears failed output" {
     inline for (DECODING_FAILURES) |case| {
@@ -1913,7 +1918,7 @@ test "[integration] - [mzML lists]: reads absent and empty lists without requiri
                 var index = try mzml.IndexedReader.build(std.testing.allocator, source, .{ .policy = policy, .records = 0 });
                 defer index.deinit();
                 try std.testing.expectEqual(@as(usize, 0), index.entryCount());
-                try std.testing.expectEqualDeep([_]usize{ 0, 0 }, index.counts);
+                try std.testing.expectEqualDeep([_]usize{ 0, 0 }, support.kindCounts(&index));
                 try std.testing.expectEqual(@as(usize, 0), index.header().chromatogram_list.?.declared_count);
                 try std.testing.expectEqual(null, try index.byId(std.testing.allocator, "missing"));
                 try std.testing.expectEqual(null, try index.at(std.testing.allocator, .spectrum, 0));
@@ -1925,6 +1930,17 @@ test "[integration] - [mzML lists]: reads absent and empty lists without requiri
                 try std.testing.expectEqual(@as(usize, 0), output.len());
             }
         }
+    }
+}
+
+test "[failure] - [mzML lists]: refuses repeated lists and a spectrum list after chromatograms" {
+    inline for (.{
+        "<spectrumList count='0'/><spectrumList count='0'/>",
+        "<chromatogramList count='0'/><spectrumList count='0'/>",
+        "<spectrumList count='0'/><chromatogramList count='0'/><chromatogramList count='0'/>",
+    }) |lists| {
+        const source = support.HEADER ++ lists ++ "</run></mzML>";
+        try std.testing.expectError(error.InvalidStructure, support.readAll(std.testing.allocator, source, .{}));
     }
 }
 
@@ -2622,35 +2638,6 @@ test "[integration] - [mzML reader]: keeps declared and observed counts separate
     }
 }
 
-test "[integration] - [mzML writer]: matches frozen XML and preserves attribute characters" {
-    const expected = std.mem.trimEnd(u8, @embedFile("empty_run"), "\n");
-    var input = std.Io.Reader.fixed(expected);
-    var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
-    defer reader.deinit();
-    const header = try reader.readHeader();
-    const params = header.document.child(.file_description).?.child(.file_content).?.params;
-    try std.testing.expectEqualStrings("\xc2\xb5 < & \"", params[0].cv.name.?);
-    try std.testing.expectEqualStrings("\t\n\r", params[0].cv.value.?);
-    try std.testing.expectEqual(null, params[1].user.value);
-    try std.testing.expectEqualStrings("", params[1].user.unit.name.?);
-    const declaration_node = header.document.child(.cv_list).?.children[0];
-    const declarations = [_]mzml.cv.Declaration{try declaration_node.cvDeclaration()};
-    const resolver = mzml.cv.Resolver.init(&declarations);
-    const resolved = try resolver.resolve(params[0].cv);
-    try std.testing.expectEqualDeep(params[0].cv, resolved.source);
-    try std.testing.expectEqual(null, resolved.term.match);
-    try std.testing.expectEqual(null, try reader.nextRecord());
-
-    var bytes: [2048]u8 = undefined;
-    var sink = std.Io.Writer.fixed(&bytes);
-    var writer = try mzml.Writer.init(std.testing.allocator, &sink, .{});
-    defer writer.deinit();
-    try writer.writeHeader(header.*);
-    try writer.finish();
-    try std.testing.expectEqualStrings(expected, sink.buffered());
-    try std.testing.expectError(error.InvalidState, writer.finish());
-}
-
 test "[integration] - [mzML reader]: reads indexed trailers only when requested" {
     const allocator = std.testing.allocator;
     const document = "<indexedmzML xmlns='http://psi.hupo.org/ms/mzml'>" ++ support.DOCUMENT;
@@ -2852,6 +2839,59 @@ test "[integration] - [mzML arrays]: classifies explicit encodings without guess
     }
 }
 
+fn expectStreamedMatchesWhole(
+    comptime T: type,
+    allocator: std.mem.Allocator,
+    decoded: *mzml.DecodedArrays,
+    text: []const u8,
+    primitive: []const u8,
+    accession: []const u8,
+    length: usize,
+    source: std.Random,
+) !void {
+    const node: mzml.model.Node = .{
+        .kind = .binary_data_array,
+        .params = &.{
+            .{ .cv = .{ .accession = .{ .raw = primitive }, .name = "primitive" } },
+            .{ .cv = .{ .accession = .{ .raw = accession }, .name = "compression" } },
+        },
+        .children = &.{.{ .kind = .binary, .text = text }},
+    };
+    const array = try mzml.model.BinaryArray.init(node, length, &.{});
+    const expected_values = try allocator.alloc(T, length);
+    defer allocator.free(expected_values);
+    const wire_buffer = try allocator.alloc(u8, text.len / 4 * 3 + 3);
+    defer allocator.free(wire_buffer);
+    const transformed = try allocator.alloc(u8, try mzml.arrays.wireBound(T, length, array.encoding.pipeline));
+    defer allocator.free(transformed);
+    const expected = array.decode(T, expected_values, .{ .wire = wire_buffer, .transformed = transformed });
+
+    var fragments: Fragments = .{ .rest = text, .source = source };
+    const actual = decoded.decodeArrayText(array.encoding, length, &fragments);
+    if (expected) |_| {
+        _ = try actual;
+        const values = switch (decoded.get(0).?.values) {
+            inline else => |v| std.mem.sliceAsBytes(v),
+        };
+        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(expected_values), values);
+    } else |err| {
+        try std.testing.expectError(err, actual);
+    }
+}
+
+// Text fragments of random sizes, as the reader hands them over.
+const Fragments = struct {
+    rest: []const u8,
+    source: std.Random,
+
+    pub fn next(self: *Fragments) error{}!?[]const u8 {
+        if (self.rest.len == 0) return null;
+        const piece = @min(self.rest.len, 1 + self.source.uintLessThan(usize, 40_000));
+        defer self.rest = self.rest[piece..];
+        return self.rest[0..piece];
+    }
+};
+
 test "[property] - [mzML decoded arrays]: streamed decoding matches whole-payload decoding" {
     const allocator = std.testing.allocator;
     var random = std.Random.DefaultPrng.init(0x4e55_4d50_4152_5259);
@@ -2922,59 +2962,6 @@ test "[property] - [mzML decoded arrays]: streamed decoding matches whole-payloa
         }
     }
 }
-
-fn expectStreamedMatchesWhole(
-    comptime T: type,
-    allocator: std.mem.Allocator,
-    decoded: *mzml.DecodedArrays,
-    text: []const u8,
-    primitive: []const u8,
-    accession: []const u8,
-    length: usize,
-    source: std.Random,
-) !void {
-    const node: mzml.model.Node = .{
-        .kind = .binary_data_array,
-        .params = &.{
-            .{ .cv = .{ .accession = .{ .raw = primitive }, .name = "primitive" } },
-            .{ .cv = .{ .accession = .{ .raw = accession }, .name = "compression" } },
-        },
-        .children = &.{.{ .kind = .binary, .text = text }},
-    };
-    const array = try mzml.model.BinaryArray.init(node, length, &.{});
-    const expected_values = try allocator.alloc(T, length);
-    defer allocator.free(expected_values);
-    const wire_buffer = try allocator.alloc(u8, text.len / 4 * 3 + 3);
-    defer allocator.free(wire_buffer);
-    const transformed = try allocator.alloc(u8, try mzml.arrays.wireBound(T, length, array.encoding.pipeline));
-    defer allocator.free(transformed);
-    const expected = array.decode(T, expected_values, .{ .wire = wire_buffer, .transformed = transformed });
-
-    var fragments: Fragments = .{ .rest = text, .source = source };
-    const actual = decoded.decodeArrayText(array.encoding, length, &fragments);
-    if (expected) |_| {
-        _ = try actual;
-        const values = switch (decoded.get(0).?.values) {
-            inline else => |v| std.mem.sliceAsBytes(v),
-        };
-        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(expected_values), values);
-    } else |err| {
-        try std.testing.expectError(err, actual);
-    }
-}
-
-// Text fragments of random sizes, as the reader hands them over.
-const Fragments = struct {
-    rest: []const u8,
-    source: std.Random,
-
-    pub fn next(self: *Fragments) error{}!?[]const u8 {
-        if (self.rest.len == 0) return null;
-        const piece = @min(self.rest.len, 1 + self.source.uintLessThan(usize, 40_000));
-        defer self.rest = self.rest[piece..];
-        return self.rest[0..piece];
-    }
-};
 
 test "[failure] - [mzML array selection]: callbacks cannot reenter the reader or reset its output" {
     const Reentry = struct {
@@ -3138,4 +3125,53 @@ test "[unit] - [mzML diagnostics]: names option, encoding, and work-cap errors f
     try std.testing.expectEqual(.limit_exceeded, expansion.id);
     try std.testing.expectEqual(.expansion_work, expansion.detail.limit.name);
     try std.testing.expectEqual(@as(u64, mzml.cv.EXPANSION_WORK), expansion.detail.limit.maximum);
+}
+
+test "[unit] - [mzML diagnostics]: formats limit and size details in full" {
+    const cases = .{
+        .{
+            mzml.Diagnostic{
+                .id = .limit_exceeded,
+                .code = error.LimitExceeded,
+                .operation = .read_record,
+                .stage = .metadata,
+                .location = .{ .input_event = 42 },
+                .element = .spectrum,
+                .record = .{ .kind = .spectrum, .ordinal = 3 },
+                .detail = .{ .limit = .{ .name = .record_bytes, .maximum = 16, .needed = 17 } },
+            },
+            "[ZMZ0002] read_record: configured limit exceeded (LimitExceeded); stage=metadata; input_event=42; " ++
+                "element=spectrum; spectrum_ordinal=3; limit=record_bytes; maximum=16; needed=17",
+        },
+        .{
+            mzml.Diagnostic{
+                .id = .limit_exceeded,
+                .code = error.LimitExceeded,
+                .operation = .read_event,
+                .stage = .xml,
+                .detail = .{ .limit = .{ .name = .depth, .maximum = 128 } },
+            },
+            "[ZMZ0002] read_event: configured limit exceeded (LimitExceeded); stage=xml; limit=depth; maximum=128",
+        },
+        .{
+            mzml.Diagnostic{
+                .id = .count_mismatch,
+                .code = error.CountMismatch,
+                .operation = .write_record,
+                .stage = .array,
+                .location = .{ .output_byte = 900 },
+                .element = .binary_data_array,
+                .array_position = 1,
+                .detail = .{ .size = .{ .expected = 2, .actual = 1, .unit = .arrays } },
+            },
+            "[ZMZ0029] write_record: count differs from the expected count (CountMismatch); stage=array; output_byte=900; " ++
+                "element=binaryDataArray; array_position=1; expected=2; actual=1; unit=arrays",
+        },
+    };
+    inline for (cases) |case| {
+        var buffer: [256]u8 = undefined;
+        var sink = std.Io.Writer.fixed(&buffer);
+        try case[0].format(&sink);
+        try std.testing.expectEqualStrings(case[1], sink.buffered());
+    }
 }

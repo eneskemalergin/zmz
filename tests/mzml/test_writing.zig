@@ -4,6 +4,24 @@ const std = @import("std");
 const mzml = @import("zmz").mzml;
 const support = @import("support.zig");
 
+fn rewriteFixture(allocator: std.mem.Allocator, sink: *std.Io.Writer) !void {
+    var input = std.Io.Reader.fixed(support.DOCUMENT);
+    var reader = try mzml.StreamReader.init(allocator, &input, .{});
+    defer reader.deinit();
+    var writer = try mzml.Writer.init(allocator, sink, .{});
+    defer writer.deinit();
+    const header = try reader.readHeader();
+    try writer.writeHeader(header.*);
+    try writer.beginList(.spectrum_list, 1, "dp");
+    try writer.writeRecord((try reader.nextRecord()).?.node);
+    try writer.endList();
+    try writer.beginList(.chromatogram_list, 1, "dp");
+    try writer.writeRecord((try reader.nextRecord()).?.node);
+    try writer.endList();
+    try std.testing.expectEqual(null, try reader.nextRecord());
+    try writer.finish();
+}
+
 test "[failure] - [mzML diagnostics]: reports writer counts, indexes, and allocation failures" {
     const header: mzml.model.Header = .{ .document = .{ .kind = .mzml }, .run = .{ .kind = .run } };
     for (0..4) |case| {
@@ -65,6 +83,35 @@ test "[failure] - [mzML diagnostics]: reports writer counts, indexes, and alloca
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
+test "[failure] - [mzML diagnostics]: names a non-integer index and an indexed record without an ID" {
+    const header: mzml.model.Header = .{ .document = .{ .kind = .mzml }, .run = .{ .kind = .run } };
+    for ([_]bool{ false, true }) |indexed| {
+        var bytes: [4096]u8 = undefined;
+        var sink = std.Io.Writer.fixed(&bytes);
+        var writer = if (indexed)
+            try mzml.Writer.initIndexed(std.testing.allocator, &sink, .{}, .{})
+        else
+            try mzml.Writer.init(std.testing.allocator, &sink, .{});
+        defer writer.deinit();
+        try writer.writeHeader(header);
+        try writer.beginListWithAttributes(.spectrum_list, 1, &.{});
+        const index: mzml.model.Attribute = .{ .name = "index", .value = if (indexed) "0" else "first" };
+        const result = writer.writeRecord(.{ .kind = .spectrum, .attributes = &.{index} });
+        const report = writer.diagnostic().?;
+        if (indexed) {
+            try std.testing.expectError(error.MissingAttribute, result);
+            try std.testing.expectEqual(.id, report.detail.attribute);
+            try std.testing.expectEqual(.index, report.stage);
+        } else {
+            try std.testing.expectError(error.InvalidValue, result);
+            try std.testing.expectEqual(.index, report.detail.attribute);
+            try std.testing.expectEqual(.metadata, report.stage);
+        }
+        try std.testing.expectEqual(.write_record, report.operation);
+        try std.testing.expectError(error.FailedState, writer.endList());
+    }
 }
 
 test "[integration] - [mzML items]: retains empty-list XML and indexes following chromatograms" {
@@ -222,7 +269,7 @@ test "[integration] - [mzML children]: copies retained XML without indexing nest
             if (!indexed and policy == .open_embedded) continue;
             var index = try mzml.IndexedReader.build(allocator, .{ .bytes = sink.written() }, .{ .policy = policy });
             defer index.deinit();
-            try std.testing.expectEqualDeep([_]usize{ 1, 1 }, index.counts);
+            try std.testing.expectEqualDeep([_]usize{ 1, 1 }, support.kindCounts(&index));
             try std.testing.expectEqual(null, try index.byId(allocator, "not-a-record"));
             var decoded = mzml.DecodedArrays.init(allocator, .{});
             defer decoded.deinit();
@@ -570,6 +617,35 @@ test "[failure] - [mzML lists]: attribute errors leave the writer failed" {
     }
 }
 
+test "[integration] - [mzML writer]: matches frozen XML and preserves attribute characters" {
+    const expected = std.mem.trimEnd(u8, @embedFile("empty_run"), "\n");
+    var input = std.Io.Reader.fixed(expected);
+    var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+    defer reader.deinit();
+    const header = try reader.readHeader();
+    const params = header.document.child(.file_description).?.child(.file_content).?.params;
+    try std.testing.expectEqualStrings("\xc2\xb5 < & \"", params[0].cv.name.?);
+    try std.testing.expectEqualStrings("\t\n\r", params[0].cv.value.?);
+    try std.testing.expectEqual(null, params[1].user.value);
+    try std.testing.expectEqualStrings("", params[1].user.unit.name.?);
+    const declaration_node = header.document.child(.cv_list).?.children[0];
+    const declarations = [_]mzml.cv.Declaration{try declaration_node.cvDeclaration()};
+    const resolver = mzml.cv.Resolver.init(&declarations);
+    const resolved = try resolver.resolve(params[0].cv);
+    try std.testing.expectEqualDeep(params[0].cv, resolved.source);
+    try std.testing.expectEqual(null, resolved.term.match);
+    try std.testing.expectEqual(null, try reader.nextRecord());
+
+    var bytes: [2048]u8 = undefined;
+    var sink = std.Io.Writer.fixed(&bytes);
+    var writer = try mzml.Writer.init(std.testing.allocator, &sink, .{});
+    defer writer.deinit();
+    try writer.writeHeader(header.*);
+    try writer.finish();
+    try std.testing.expectEqualStrings(expected, sink.buffered());
+    try std.testing.expectError(error.InvalidState, writer.finish());
+}
+
 test "[failure] - [mzML writer]: a parameter attribute repeating a fixed field is a duplicate" {
     const extra = mzml.cv.ParameterXml{ .attributes = &.{.{ .name = "accession", .value = "MS:2" }} };
     var bytes: [4096]u8 = undefined;
@@ -584,35 +660,6 @@ test "[failure] - [mzML writer]: a parameter attribute repeating a fixed field i
         .params = &.{.{ .cv = .{ .cv_ref = "MS", .accession = .{ .raw = "MS:1" }, .name = "term", .xml = &extra } }},
     }));
     try std.testing.expectError(error.FailedState, writer.endList());
-}
-
-fn rewriteFixture(allocator: std.mem.Allocator, sink: *std.Io.Writer) !void {
-    var input = std.Io.Reader.fixed(support.DOCUMENT);
-    var reader = try mzml.StreamReader.init(allocator, &input, .{});
-    defer reader.deinit();
-    var writer = try mzml.Writer.init(allocator, sink, .{});
-    defer writer.deinit();
-    const header = try reader.readHeader();
-    try writer.writeHeader(header.*);
-    try writer.beginList(.spectrum_list, 1, "dp");
-    try writer.writeRecord((try reader.nextRecord()).?.node);
-    try writer.endList();
-    try writer.beginList(.chromatogram_list, 1, "dp");
-    try writer.writeRecord((try reader.nextRecord()).?.node);
-    try writer.endList();
-    try std.testing.expectEqual(null, try reader.nextRecord());
-    try writer.finish();
-}
-
-fn rewriteAllocated(allocator: std.mem.Allocator) !void {
-    var bytes: [8192]u8 = undefined;
-    var sink = std.Io.Writer.fixed(&bytes);
-    try rewriteFixture(allocator, &sink);
-}
-
-fn indexedRewriteAllocated(allocator: std.mem.Allocator) !void {
-    var discard: std.Io.Writer.Discarding = .init(&.{});
-    try support.rewriteDocument(allocator, support.REFERENCED_DOCUMENT, &discard.writer, true);
 }
 
 test "[integration] - [mzML writer]: preserves metadata and records through a plain rewrite" {
@@ -676,6 +723,17 @@ test "[failure] - [mzML writer]: rejects counts and keeps output failures sticky
     try std.testing.expectError(error.InvalidCharacter, invalid.writeRecord(malformed));
     try std.testing.expect(invalid_sink.buffered().len > before);
     try std.testing.expectError(error.FailedState, invalid.finish());
+}
+
+fn rewriteAllocated(allocator: std.mem.Allocator) !void {
+    var bytes: [8192]u8 = undefined;
+    var sink = std.Io.Writer.fixed(&bytes);
+    try rewriteFixture(allocator, &sink);
+}
+
+fn indexedRewriteAllocated(allocator: std.mem.Allocator) !void {
+    var discard: std.Io.Writer.Discarding = .init(&.{});
+    try support.rewriteDocument(allocator, support.REFERENCED_DOCUMENT, &discard.writer, true);
 }
 
 test "[failure] - [mzML writer]: releases partial allocations during rewrite" {
@@ -1228,7 +1286,7 @@ test "[integration] - [mzML file writer]: patches counts without changing record
             if (indexed) {
                 var index = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = bytes }, .{ .policy = .open_embedded });
                 defer index.deinit();
-                try std.testing.expectEqualDeep(case.counts, index.counts);
+                try std.testing.expectEqualDeep(case.counts, support.kindCounts(&index));
                 for (0..index.entryCount()) |position| {
                     const entry = index.entryAt(position).?;
                     var found = (try index.byId(std.testing.allocator, entry.id)).?;
@@ -1476,7 +1534,7 @@ test "[integration] - [mzML declarations]: preserves version metadata across rea
             });
             defer index.deinit();
             try std.testing.expectEqualDeep(version, index.header().document.attribute("version"));
-            try std.testing.expectEqualDeep([2]usize{ 1, 1 }, index.counts);
+            try std.testing.expectEqualDeep([2]usize{ 1, 1 }, support.kindCounts(&index));
             var decoded = mzml.DecodedArrays.init(std.testing.allocator, .{});
             defer decoded.deinit();
             var record = (try index.byIdDecoded(std.testing.allocator, "native=a&b", &decoded)).?;
@@ -1664,6 +1722,29 @@ test "[failure] - [mzML streamed writing]: Numpress value errors write nothing t
         builder.reset();
         encoder.reset();
     }
+}
+
+test "[failure] - [mzML streamed writing]: an output failure while a source streams leaves the writer failed" {
+    var input = std.Io.Reader.fixed(support.DOCUMENT);
+    var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+    defer reader.deinit();
+    const header = try reader.readHeader();
+    const record = (try reader.nextRecord()).?;
+    var values: [4096]f64 = undefined;
+    for (&values, 0..) |*value, i| value.* = @floatFromInt(i * i);
+    const source = mzml.arrays.Source.of(f64, &values, .{ .pipeline = .linear, .fixed_point = 1000 }, null);
+    var bytes: [8192]u8 = undefined;
+    var sink = std.Io.Writer.fixed(&bytes);
+    var writer = try mzml.Writer.init(std.testing.allocator, &sink, .{});
+    defer writer.deinit();
+    try writer.writeHeader(header.*);
+    try writer.beginList(.spectrum_list, 1, "dp");
+    const payloads = [_]mzml.Writer.ArrayPayload{ .{ .source = source }, .{ .source = source } };
+    try std.testing.expectError(error.WriteFailed, writer.writeRecordWithArrays(record.node, &payloads));
+    const report = writer.diagnostic().?;
+    try std.testing.expectEqual(.write_failed, report.id);
+    try std.testing.expectEqual(.output, report.stage);
+    try std.testing.expectError(error.FailedState, writer.endList());
 }
 
 test "[failure] - [mzML streamed writing]: the text limit stops streams first and files after the text" {

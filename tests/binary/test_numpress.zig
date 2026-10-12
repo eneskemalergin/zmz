@@ -4,6 +4,52 @@ const std = @import("std");
 const builtin = @import("builtin");
 const numpress = @import("zmz").mzml.numpress;
 
+fn decodeCount(transform: numpress.Transform, input: []const u8, output: []f64) numpress.DecodeError!usize {
+    return switch (transform) {
+        .linear => numpress.decodeLinear(input, output),
+        .pic => numpress.decodePic(input, output),
+        .slof => numpress.decodeSlof(input, output),
+    };
+}
+
+fn expectLinearErrorBound(expected: []const f64, actual: []const f64, fixed_point: f64) !void {
+    try std.testing.expectEqual(expected.len, actual.len);
+    for (expected, actual) |expected_value, actual_value| {
+        try std.testing.expectApproxEqAbs(expected_value, actual_value, 0.5 / fixed_point);
+    }
+}
+
+// Values of every nibble width, with fractions.
+fn fillMixedWidths(values: []f64, source: std.Random) void {
+    for (values) |*value| {
+        value.* = @as(f64, @floatFromInt(source.int(u32) >> source.int(u5))) + source.float(f64);
+    }
+}
+
+// Ascending values with irregular steps, the shape of m/z arrays.
+fn fillAscending(values: []f64, source: std.Random) void {
+    var current: f64 = 100 + source.float(f64) * 1_000;
+    for (values) |*value| {
+        current += source.float(f64) * @as(f64, @floatFromInt(@as(u32, 1) << source.int(u4)));
+        value.* = current;
+    }
+}
+
+fn expectSlofErrorBound(expected: []const f64, actual: []const f64, fixed_point: f64) !void {
+    try std.testing.expectEqual(expected.len, actual.len);
+    const relative_bound = @exp(0.5 / fixed_point) - 1.0;
+    for (expected, actual) |expected_value, actual_value| {
+        if (expected_value == 0) {
+            try std.testing.expectEqual(@as(f64, 0), actual_value);
+        } else {
+            try std.testing.expect(
+                @abs(actual_value - expected_value) / (expected_value + 1.0) <=
+                    relative_bound * 1.000001,
+            );
+        }
+    }
+}
+
 test "[unit] - [numpress bounds]: reports exact or safe encoded capacities" {
     try std.testing.expectEqual(@as(usize, 8), try numpress.linearEncodedBound(0));
     try std.testing.expectEqual(@as(usize, 12), try numpress.linearEncodedBound(1));
@@ -61,39 +107,311 @@ test "[unit] - [numpress wire format]: matches frozen Linear, PIC, and SLOF byte
     try expectSlofErrorBound(&slof_values, &slof_decoded, 4_000);
 }
 
-test "[edge] - [numpress arrays]: handles empty, one-value, and two-value inputs" {
-    var encoded: [32]u8 = undefined;
-    var empty: [0]f64 = .{};
+// Bytes and decoded values from C++ ms-numpress at 61acddb (g++ -O3): zmz writes the same bytes
+// and decodes them to the same bits, in both glibc FMA forms. The SLOF block's codes sit on
+// rounding boundaries, where zmz recomputes each lane with the glibc-exact log.
+const BOUNDARY_BLOCK = [_]f64{ 1.718281828459045, 1.0 } ** 8;
+const BOUNDARY_DECODED = [_]u64{ 0x3ffbb59d247326ea, 0x3ff01ba7d02c1a52 } ** 8;
 
-    const empty_linear_len = try numpress.encodeLinear(&.{}, 0, &encoded);
-    try std.testing.expectEqual(@as(usize, 8), empty_linear_len);
-    try numpress.decodeLinearExact(encoded[0..empty_linear_len], &empty);
-
-    const empty_pic_len = try numpress.encodePic(&.{}, &encoded);
-    try std.testing.expectEqual(@as(usize, 0), empty_pic_len);
-    try numpress.decodePicExact(encoded[0..empty_pic_len], &empty);
-
-    const empty_slof_len = try numpress.encodeSlof(&.{}, 0, &encoded);
-    try std.testing.expectEqual(@as(usize, 8), empty_slof_len);
-    try numpress.decodeSlofExact(encoded[0..empty_slof_len], &empty);
-
-    const linear_values = [_]f64{ 100, 200 };
-    for (1..linear_values.len + 1) |count| {
-        const len = try numpress.encodeLinear(linear_values[0..count], 1_000, &encoded);
-        var decoded: [linear_values.len]f64 = undefined;
-        try numpress.decodeLinearExact(encoded[0..len], decoded[0..count]);
-        try std.testing.expectEqualSlices(f64, linear_values[0..count], decoded[0..count]);
+test "[property] - [numpress wire format]: matches C++ ms-numpress on empty, one-value, extreme, and boundary inputs" {
+    // A null decoded list means the values themselves.
+    const Row = struct {
+        transform: numpress.Transform,
+        fixed_point: f64,
+        values: []const f64,
+        wire: []const u8,
+        decoded: ?[]const u64 = null,
+    };
+    const rows = [_]Row{
+        .{ .transform = .linear, .fixed_point = 0.0, .values = &.{}, .wire = "\x00\x00\x00\x00\x00\x00\x00\x00" },
+        .{
+            .transform = .linear,
+            .fixed_point = std.math.floatTrueMin(f64),
+            .values = &.{},
+            .wire = "\x00\x00\x00\x00\x00\x00\x00\x01",
+        },
+        .{
+            .transform = .linear,
+            .fixed_point = std.math.floatMax(f64),
+            .values = &.{},
+            .wire = "\x7f\xef\xff\xff\xff\xff\xff\xff",
+        },
+        .{
+            .transform = .linear,
+            .fixed_point = 1.0,
+            .values = &.{0.0},
+            .wire = "\x3f\xf0\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+        },
+        .{
+            .transform = .linear,
+            .fixed_point = 1.0,
+            .values = &.{-0.0},
+            .wire = "\x3f\xf0\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+            .decoded = &.{0x0000000000000000},
+        },
+        .{
+            .transform = .linear,
+            .fixed_point = 1000.0,
+            .values = &.{100.0},
+            .wire = "\x40\x8f\x40\x00\x00\x00\x00\x00\xa0\x86\x01\x00",
+        },
+        .{
+            .transform = .linear,
+            .fixed_point = 1000.0,
+            .values = &.{ 100.0, 200.0 },
+            .wire = "\x40\x8f\x40\x00\x00\x00\x00\x00\xa0\x86\x01\x00\x40\x0d\x03\x00",
+        },
+        .{
+            .transform = .linear,
+            .fixed_point = 1.0,
+            .values = &.{4294967295.0},
+            .wire = "\x3f\xf0\x00\x00\x00\x00\x00\x00\xff\xff\xff\xff",
+        },
+        .{
+            .transform = .linear,
+            .fixed_point = 1.0,
+            .values = &.{4294967294.4},
+            .wire = "\x3f\xf0\x00\x00\x00\x00\x00\x00\xfe\xff\xff\xff",
+            .decoded = &.{0x41efffffffc00000},
+        },
+        .{
+            .transform = .linear,
+            .fixed_point = 2147483647.0,
+            .values = &.{1.0},
+            .wire = "\x41\xdf\xff\xff\xff\xc0\x00\x00\xff\xff\xff\x7f",
+        },
+        .{
+            .transform = .linear,
+            .fixed_point = 1.0,
+            .values = &.{ 0.0, 4294967295.0 },
+            .wire = "\x3f\xf0\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff\xff\xff",
+        },
+        .{
+            .transform = .linear,
+            .fixed_point = std.math.floatTrueMin(f64),
+            .values = &.{ 1.0, 2.0, 3.0 },
+            .wire = "\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x80",
+            .decoded = &.{ 0x0000000000000000, 0x0000000000000000, 0x0000000000000000 },
+        },
+        .{
+            .transform = .linear,
+            .fixed_point = std.math.floatMax(f64),
+            .values = &.{ 0.0, 0.0, 0.0 },
+            .wire = "\x7f\xef\xff\xff\xff\xff\xff\xff\x00\x00\x00\x00\x00\x00\x00\x00\x80",
+        },
+        .{
+            .transform = .linear,
+            .fixed_point = 1.0,
+            .values = &.{ 0.0, 0.0, 2147483647.0 },
+            .wire = "\x3f\xf0\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x0f\xff\xff\xff" ++
+                "\x70",
+        },
+        .{
+            .transform = .linear,
+            .fixed_point = 1.0,
+            .values = &.{ 0.0, 1073741824.0, 0.0 },
+            .wire = "\x3f\xf0\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00" ++
+                "\x80",
+        },
+        .{
+            .transform = .linear,
+            .fixed_point = 1.0,
+            .values = &.{ 4294967295.0, 4294967295.0, 6442450942.0 },
+            .wire = "\x3f\xf0\x00\x00\x00\x00\x00\x00\xff\xff\xff\xff\xff\xff\xff\xff\x0f\xff\xff\xff" ++
+                "\x70",
+        },
+        .{
+            .transform = .linear,
+            .fixed_point = 1000000000.0,
+            .values = &.{ 0.5, 1.5, 2.5, 3.5 },
+            .wire = "\x41\xcd\xcd\x65\x00\x00\x00\x00\x00\x65\xcd\x1d\x00\x2f\x68\x59\x88",
+        },
+        .{
+            .transform = .linear,
+            .fixed_point = 0.5,
+            .values = &.{ 1.0, 2.0, 3.0, 4.0, 5.0 },
+            .wire = "\x3f\xe0\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x01\x00\x00\x00\x71\xff\x71",
+            .decoded = &.{
+                0x4000000000000000,
+                0x4000000000000000,
+                0x4010000000000000,
+                0x4010000000000000,
+                0x4018000000000000,
+            },
+        },
+        .{ .transform = .pic, .fixed_point = 0.0, .values = &.{}, .wire = "" },
+        .{ .transform = .pic, .fixed_point = 0.0, .values = &.{0.0}, .wire = "\x80" },
+        .{
+            .transform = .pic,
+            .fixed_point = 0.0,
+            .values = &.{-0.0},
+            .wire = "\x80",
+            .decoded = &.{0x0000000000000000},
+        },
+        .{
+            .transform = .pic,
+            .fixed_point = 0.0,
+            .values = &.{0.49999999999999994},
+            .wire = "\x71",
+            .decoded = &.{0x3ff0000000000000},
+        },
+        .{
+            .transform = .pic,
+            .fixed_point = 0.0,
+            .values = &.{0.5},
+            .wire = "\x71",
+            .decoded = &.{0x3ff0000000000000},
+        },
+        .{
+            .transform = .pic,
+            .fixed_point = 0.0,
+            .values = &.{1.5},
+            .wire = "\x72",
+            .decoded = &.{0x4000000000000000},
+        },
+        .{
+            .transform = .pic,
+            .fixed_point = 0.0,
+            .values = &.{2.5},
+            .wire = "\x73",
+            .decoded = &.{0x4008000000000000},
+        },
+        .{ .transform = .pic, .fixed_point = 0.0, .values = &.{42.0}, .wire = "\x6a\x20" },
+        .{
+            .transform = .pic,
+            .fixed_point = 0.0,
+            .values = &.{2147483646.5},
+            .wire = "\x0f\xff\xff\xff\x70",
+            .decoded = &.{0x41dfffffffc00000},
+        },
+        .{
+            .transform = .pic,
+            .fixed_point = 0.0,
+            .values = &.{2147483646.4},
+            .wire = "\x0e\xff\xff\xff\x70",
+            .decoded = &.{0x41dfffffff800000},
+        },
+        .{
+            .transform = .pic,
+            .fixed_point = 0.0,
+            .values = &.{ 0.0, 2147483646.0, 0.0, 1.0 },
+            .wire = "\x80\xef\xff\xff\xf7\x87\x10",
+        },
+        .{ .transform = .slof, .fixed_point = 0.0, .values = &.{}, .wire = "\x00\x00\x00\x00\x00\x00\x00\x00" },
+        .{ .transform = .slof, .fixed_point = 1.0, .values = &.{}, .wire = "\x3f\xf0\x00\x00\x00\x00\x00\x00" },
+        .{
+            .transform = .slof,
+            .fixed_point = std.math.floatMax(f64),
+            .values = &.{},
+            .wire = "\x7f\xef\xff\xff\xff\xff\xff\xff",
+        },
+        .{
+            .transform = .slof,
+            .fixed_point = 1.0,
+            .values = &.{0.0},
+            .wire = "\x3f\xf0\x00\x00\x00\x00\x00\x00\x00\x00",
+        },
+        .{
+            .transform = .slof,
+            .fixed_point = 1.0,
+            .values = &.{-0.0},
+            .wire = "\x3f\xf0\x00\x00\x00\x00\x00\x00\x00\x00",
+            .decoded = &.{0x0000000000000000},
+        },
+        .{
+            .transform = .slof,
+            .fixed_point = 65535.0,
+            .values = &.{1.718281828459045},
+            .wire = "\x40\xef\xff\xe0\x00\x00\x00\x00\xff\xff",
+        },
+        .{
+            .transform = .slof,
+            .fixed_point = 65535.0,
+            .values = &.{ 0.0, 1.0 },
+            .wire = "\x40\xef\xff\xe0\x00\x00\x00\x00\x00\x00\x71\xb1",
+            .decoded = &.{ 0x0000000000000000, 0x3fefffe65e7d0a72 },
+        },
+        .{
+            .transform = .slof,
+            .fixed_point = std.math.floatTrueMin(f64),
+            .values = &.{ 1.0, 1e300 },
+            .wire = "\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00",
+            .decoded = &.{ 0x0000000000000000, 0x0000000000000000 },
+        },
+        .{
+            .transform = .slof,
+            .fixed_point = 94.87162957176537,
+            .values = &.{1e300},
+            .wire = "\x40\x57\xb7\xc8\xc7\x66\x3d\x5c\xff\xff",
+            .decoded = &.{0x7e37e43c880074fc},
+        },
+        .{
+            .transform = .slof,
+            .fixed_point = 1.0,
+            .values = &.{1e308},
+            .wire = "\x3f\xf0\x00\x00\x00\x00\x00\x00\xc5\x02",
+            .decoded = &.{0x7fdd422d2be5dc9b},
+        },
+        .{
+            .transform = .slof,
+            .fixed_point = 4000.0,
+            .values = &.{10.0},
+            .wire = "\x40\xaf\x40\x00\x00\x00\x00\x00\x78\x25",
+            .decoded = &.{0x4024009700b41e87},
+        },
+        .{
+            .transform = .slof,
+            .fixed_point = 100.5,
+            .values = &BOUNDARY_BLOCK,
+            .wire = "\x40\x59\x20\x00\x00\x00\x00\x00\x65\x00\x46\x00\x65\x00\x46\x00\x65\x00\x46\x00" ++
+                "\x65\x00\x46\x00\x65\x00\x46\x00\x65\x00\x46\x00\x65\x00\x46\x00\x65\x00\x46\x00",
+            .decoded = &BOUNDARY_DECODED,
+        },
+    };
+    var encoded: [64]u8 = undefined;
+    var decoded: [16]f64 = undefined;
+    for (rows) |row| {
+        const length = try numpress.encode(row.transform, row.values, row.fixed_point, &encoded);
+        try std.testing.expectEqualSlices(u8, row.wire, encoded[0..length]);
+        try numpress.decodeExact(row.transform, row.wire, decoded[0..row.values.len]);
+        for (decoded[0..row.values.len], 0..) |value, i| {
+            const expected = if (row.decoded) |bits| bits[i] else @as(u64, @bitCast(row.values[i]));
+            try std.testing.expectEqual(expected, @as(u64, @bitCast(value)));
+        }
     }
 
-    const pic_len = try numpress.encodePic(&.{42}, &encoded);
-    var pic_decoded: [1]f64 = undefined;
-    try numpress.decodePicExact(encoded[0..pic_len], &pic_decoded);
-    try std.testing.expectEqual(@as(f64, 42), pic_decoded[0]);
+    // C++ refuses to encode PIC values above INT_MAX. zmz takes the whole u32 range, and C++
+    // decodes these bytes to the same values.
+    for ([_]f64{ 2147483647, 4294967294.5, 4294967295 }, [_][]const u8{ "\x0f\xff\xff\xff\x70", "\xff", "\xff" }) |value, wire| {
+        try std.testing.expectEqualSlices(u8, wire, encoded[0..try numpress.encodePic(&[_]f64{value}, &encoded)]);
+        try numpress.decodePicExact(wire, decoded[0..1]);
+        try std.testing.expectEqual(@round(value), decoded[0]);
+    }
 
-    const slof_len = try numpress.encodeSlof(&.{10}, 4_000, &encoded);
-    var slof_decoded: [1]f64 = undefined;
-    try numpress.decodeSlofExact(encoded[0..slof_len], &slof_decoded);
-    try expectSlofErrorBound(&.{10}, &slof_decoded, 4_000);
+    // Both refuse a residual past i32, a value past i64 once scaled, and a SLOF code past 65535;
+    // C++ throws where zmz returns ValueOutOfRange.
+    try std.testing.expectError(error.ValueOutOfRange, numpress.encodeLinear(&[_]f64{ 0, 0, 2147483648 }, 1, &encoded));
+    try std.testing.expectError(error.ValueOutOfRange, numpress.encodeLinear(&[_]f64{ 4294967295, 4294967295, 6442450943 }, 1, &encoded));
+    try std.testing.expectError(error.ValueOutOfRange, numpress.encodeSlof(&[_]f64{2}, 65535, &encoded));
+
+    // Fixed points chosen by both agree. Where C++ returns infinity (1e-300) or 0 (the others),
+    // neither usable, zmz returns InvalidFixedPoint; for all-zero input see `numpress selectors`.
+    try std.testing.expectEqual(@as(f64, 429496729), try numpress.optimalLinearFixedPoint(&[_]f64{5}));
+    try std.testing.expectEqual(@as(f64, 1073741823), try numpress.optimalLinearFixedPoint(&[_]f64{ 1, 2 }));
+    for ([_][]const f64{ &.{1e-300}, &.{1e300}, &.{ 0, 4294967295 }, &.{ 0, 0, 1e300 } }) |values|
+        try std.testing.expectError(error.InvalidFixedPoint, numpress.optimalLinearFixedPoint(values));
+    const slof_cases = [_]struct { []const f64, f64 }{
+        .{ &.{0}, 65535 },      .{ &.{5}, 36575 },      .{ &.{1e-300}, 65535 },         .{ &.{1e300}, 94 },
+        .{ &.{ 0, 0 }, 65535 }, .{ &.{ 1, 2 }, 59652 }, .{ &.{ 0, 4294967295 }, 2954 }, .{ &.{ 0, 0, 1e300 }, 94 },
+    };
+    for (slof_cases) |case| try std.testing.expectEqual(case[1], try numpress.optimalSlofFixedPoint(case[0]));
+
+    // A SLOF code that decodes past the largest f64 is infinity in C++ and InvalidData in zmz.
+    // Both refuse PIC bytes that end inside a value.
+    try std.testing.expectError(error.InvalidData, numpress.decodeSlofExact("\x3f\xf0\x00\x00\x00\x00\x00\x00\xff\xff", decoded[0..1]));
+    try std.testing.expectError(error.InvalidData, numpress.decodeSlofExact("\x00\x00\x00\x00\x00\x00\x00\x01\x01\x00", decoded[0..1]));
+    for ([_][]const u8{ "\x10", "\x50" }) |wire|
+        try std.testing.expectError(error.InvalidData, numpress.decodePic(wire, &decoded));
 }
 
 test "[edge] - [numpress selectors]: handles degenerate arrays and requested Linear error" {
@@ -256,12 +574,16 @@ test "[failure] - [numpress encoders]: reject invalid values, scales, capacities
     try std.testing.expectEqual(@as(usize, 0), writer.end);
 }
 
-fn decodeCount(transform: numpress.Transform, input: []const u8, output: []f64) numpress.DecodeError!usize {
-    return switch (transform) {
-        .linear => numpress.decodeLinear(input, output),
-        .pic => numpress.decodePic(input, output),
-        .slof => numpress.decodeSlof(input, output),
-    };
+test "[failure] - [numpress encoders]: reject non-finite values and fixed points" {
+    var output: [64]u8 = undefined;
+    for ([_]f64{ std.math.nan(f64), std.math.inf(f64), -std.math.inf(f64) }) |bad| {
+        for (std.meta.tags(numpress.Transform)) |transform|
+            try std.testing.expectError(error.InvalidValue, numpress.encode(transform, &[_]f64{ 1, bad }, 100, &output));
+        try std.testing.expectError(error.InvalidFixedPoint, numpress.encode(.linear, &[_]f64{1}, bad, &output));
+        try std.testing.expectError(error.InvalidFixedPoint, numpress.encode(.slof, &[_]f64{1}, bad, &output));
+    }
+    try std.testing.expectError(error.InvalidFixedPoint, numpress.encode(.linear, &[_]f64{1}, -1, &output));
+    try std.testing.expectError(error.InvalidFixedPoint, numpress.encode(.slof, &[_]f64{1}, -1, &output));
 }
 
 test "[failure] - [numpress decoders]: reject malformed bytes and short destinations" {
@@ -304,6 +626,11 @@ test "[failure] - [numpress decoders]: reject malformed bytes and short destinat
     }
 }
 
+fn expectFinitePrefix(values: []const f64, count: usize) !void {
+    try std.testing.expect(count <= values.len);
+    for (values[0..count]) |value| try std.testing.expect(std.math.isFinite(value));
+}
+
 test "[property] - [numpress decoders]: bounded arbitrary bytes stay within output spans" {
     var random = std.Random.DefaultPrng.init(0x4e55_4d50_4259_5445);
     const source = random.random();
@@ -328,13 +655,6 @@ test "[property] - [numpress decoders]: bounded arbitrary bytes stay within outp
 
         try std.testing.expectEqual(@as(f64, -1), guarded_output[0]);
         try std.testing.expectEqual(@as(f64, -1), guarded_output[guarded_output.len - 1]);
-    }
-}
-
-fn expectLinearErrorBound(expected: []const f64, actual: []const f64, fixed_point: f64) !void {
-    try std.testing.expectEqual(expected.len, actual.len);
-    for (expected, actual) |expected_value, actual_value| {
-        try std.testing.expectApproxEqAbs(expected_value, actual_value, 0.5 / fixed_point);
     }
 }
 
@@ -439,6 +759,12 @@ test "[regression] - [numpress Linear]: values falling below 2^62 at a block bou
     try std.testing.expectEqualSlices(f64, values, decoded);
 }
 
+fn expectSameBytes(narrow: numpress.EncodeError!usize, wide: numpress.EncodeError!usize, narrow_bytes: []const u8, wide_bytes: []const u8) !void {
+    const length = try wide;
+    try std.testing.expectEqual(length, try narrow);
+    try std.testing.expectEqualSlices(u8, wide_bytes[0..length], narrow_bytes[0..length]);
+}
+
 test "[property] - [numpress encoders]: f32 input encodes as its f64 copy" {
     var random = std.Random.DefaultPrng.init(0x4e55_4d50_4633_3200);
     const source = random.random();
@@ -482,12 +808,6 @@ test "[property] - [numpress encoders]: f32 input encodes as its f64 copy" {
     try std.testing.expectError(error.InvalidValue, numpress.encodePic(&invalid, &from_narrow));
     invalid[1] = -1;
     try std.testing.expectError(error.InvalidValue, numpress.encodeLinear(&invalid, 1, &from_narrow));
-}
-
-fn expectSameBytes(narrow: numpress.EncodeError!usize, wide: numpress.EncodeError!usize, narrow_bytes: []const u8, wide_bytes: []const u8) !void {
-    const length = try wide;
-    try std.testing.expectEqual(length, try narrow);
-    try std.testing.expectEqualSlices(u8, wide_bytes[0..length], narrow_bytes[0..length]);
 }
 
 test "[property] - [numpress SLOF]: vector blocks and tails give the frozen codes" {
@@ -566,6 +886,46 @@ test "[unit] - [numpress SLOF]: decodes to glibc's exp bit for bit" {
     }
 }
 
+fn decodeWhole(transform: numpress.Transform, exact: bool, input: []const u8, output: []f64) numpress.DecodeError!usize {
+    if (!exact) return decodeCount(transform, input, output);
+    try numpress.decodeExact(transform, input, output);
+    return output.len;
+}
+
+fn decodeFed(
+    transform: numpress.Transform,
+    exact: bool,
+    input: []const u8,
+    output: []f64,
+    max_piece: usize,
+    source: std.Random,
+) numpress.Decoder.Error!usize {
+    var decoder = if (exact) numpress.Decoder.initExact(transform, output) else numpress.Decoder.init(transform, output);
+    var at: usize = 0;
+    while (at < input.len) {
+        const piece = @min(1 + source.uintLessThan(usize, max_piece), input.len - at);
+        try decoder.update(input[at..][0..piece]);
+        try decoder.update(input[at..][0..0]);
+        at += piece;
+    }
+    return decoder.finish();
+}
+
+fn expectSameDecode(
+    expected: numpress.Decoder.Error!usize,
+    expected_values: []const f64,
+    actual: numpress.Decoder.Error!usize,
+    actual_values: []const f64,
+) !void {
+    const count = expected catch |err| return std.testing.expectError(err, actual);
+    try std.testing.expectEqual(count, try actual);
+    try std.testing.expectEqualSlices(
+        u8,
+        std.mem.sliceAsBytes(expected_values[0..count]),
+        std.mem.sliceAsBytes(actual_values[0..count]),
+    );
+}
+
 test "[property] - [numpress Decoder]: every fragment split gives the one-shot result" {
     var random = std.Random.DefaultPrng.init(0x4e55_4d50_5354_524d);
     const source = random.random();
@@ -631,6 +991,27 @@ test "[failure] - [numpress Decoder]: calls after an error or finish report the 
     try std.testing.expectError(error.FailedState, exact.finish());
 }
 
+// A writer with a small buffer that forwards every drain, so encoders see partial drains.
+const Forward = struct {
+    target: *std.Io.Writer,
+    interface: std.Io.Writer,
+
+    const vtable: std.Io.Writer.VTable = .{ .drain = drain };
+
+    fn drain(writer: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *Forward = @alignCast(@fieldParentPtr("interface", writer));
+        try self.target.writeAll(writer.buffered());
+        writer.end = 0;
+        var written: usize = 0;
+        for (data[0 .. data.len - 1]) |bytes| {
+            try self.target.writeAll(bytes);
+            written += bytes.len;
+        }
+        for (0..splat) |_| try self.target.writeAll(data[data.len - 1]);
+        return written + data[data.len - 1].len * splat;
+    }
+};
+
 test "[property] - [numpress writer encoders]: match the slice encoders' bytes and errors" {
     var random = std.Random.DefaultPrng.init(0x4e55_4d50_5752_4954);
     const source = random.random();
@@ -672,101 +1053,4 @@ test "[property] - [numpress writer encoders]: match the slice encoders' bytes a
             }
         }
     }
-}
-
-// Values of every nibble width, with fractions.
-fn fillMixedWidths(values: []f64, source: std.Random) void {
-    for (values) |*value| {
-        value.* = @as(f64, @floatFromInt(source.int(u32) >> source.int(u5))) + source.float(f64);
-    }
-}
-
-// Ascending values with irregular steps, the shape of m/z arrays.
-fn fillAscending(values: []f64, source: std.Random) void {
-    var current: f64 = 100 + source.float(f64) * 1_000;
-    for (values) |*value| {
-        current += source.float(f64) * @as(f64, @floatFromInt(@as(u32, 1) << source.int(u4)));
-        value.* = current;
-    }
-}
-
-fn decodeWhole(transform: numpress.Transform, exact: bool, input: []const u8, output: []f64) numpress.DecodeError!usize {
-    if (!exact) return decodeCount(transform, input, output);
-    try numpress.decodeExact(transform, input, output);
-    return output.len;
-}
-
-fn decodeFed(
-    transform: numpress.Transform,
-    exact: bool,
-    input: []const u8,
-    output: []f64,
-    max_piece: usize,
-    source: std.Random,
-) numpress.Decoder.Error!usize {
-    var decoder = if (exact) numpress.Decoder.initExact(transform, output) else numpress.Decoder.init(transform, output);
-    var at: usize = 0;
-    while (at < input.len) {
-        const piece = @min(1 + source.uintLessThan(usize, max_piece), input.len - at);
-        try decoder.update(input[at..][0..piece]);
-        try decoder.update(input[at..][0..0]);
-        at += piece;
-    }
-    return decoder.finish();
-}
-
-fn expectSameDecode(
-    expected: numpress.Decoder.Error!usize,
-    expected_values: []const f64,
-    actual: numpress.Decoder.Error!usize,
-    actual_values: []const f64,
-) !void {
-    const count = expected catch |err| return std.testing.expectError(err, actual);
-    try std.testing.expectEqual(count, try actual);
-    try std.testing.expectEqualSlices(
-        u8,
-        std.mem.sliceAsBytes(expected_values[0..count]),
-        std.mem.sliceAsBytes(actual_values[0..count]),
-    );
-}
-
-// A writer with a small buffer that forwards every drain, so encoders see partial drains.
-const Forward = struct {
-    target: *std.Io.Writer,
-    interface: std.Io.Writer,
-
-    const vtable: std.Io.Writer.VTable = .{ .drain = drain };
-
-    fn drain(writer: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
-        const self: *Forward = @alignCast(@fieldParentPtr("interface", writer));
-        try self.target.writeAll(writer.buffered());
-        writer.end = 0;
-        var written: usize = 0;
-        for (data[0 .. data.len - 1]) |bytes| {
-            try self.target.writeAll(bytes);
-            written += bytes.len;
-        }
-        for (0..splat) |_| try self.target.writeAll(data[data.len - 1]);
-        return written + data[data.len - 1].len * splat;
-    }
-};
-
-fn expectSlofErrorBound(expected: []const f64, actual: []const f64, fixed_point: f64) !void {
-    try std.testing.expectEqual(expected.len, actual.len);
-    const relative_bound = @exp(0.5 / fixed_point) - 1.0;
-    for (expected, actual) |expected_value, actual_value| {
-        if (expected_value == 0) {
-            try std.testing.expectEqual(@as(f64, 0), actual_value);
-        } else {
-            try std.testing.expect(
-                @abs(actual_value - expected_value) / (expected_value + 1.0) <=
-                    relative_bound * 1.000001,
-            );
-        }
-    }
-}
-
-fn expectFinitePrefix(values: []const f64, count: usize) !void {
-    try std.testing.expect(count <= values.len);
-    for (values[0..count]) |value| try std.testing.expect(std.math.isFinite(value));
 }

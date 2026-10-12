@@ -375,7 +375,7 @@ test "[cli] - [mzml-rewrite]: replaces and removes ordered record parameters wit
         var record = (try index.byIdDecoded(std.testing.allocator, "s0", &decoded)).?;
         defer record.deinit();
         try std.testing.expectEqualSlices(f64, &.{1}, decoded.get(0).?.values.float64);
-        try std.testing.expectEqualDeep([_]usize{ 3, 1 }, index.counts);
+        try std.testing.expectEqualDeep([_]usize{ 3, 1 }, support.kindCounts(&index));
         try dir.dir.deleteFile(std.testing.io, "edited.mzML");
     }
 }
@@ -541,7 +541,7 @@ test "[cli] - [mzml-rewrite]: reencodes all codecs without changing values or re
                 try std.testing.expectEqual(null, try changed_entries.next());
             }
         }
-        try std.testing.expectEqualDeep(ordinals, index.counts);
+        try std.testing.expectEqualDeep(ordinals, support.kindCounts(&index));
         var output = std.Io.Reader.fixed(bytes);
         var written = try mzml.StreamReader.init(std.testing.allocator, &output, .{ .payload = .skip });
         defer written.deinit();
@@ -584,7 +584,7 @@ test "[cli] - [mzml-rewrite]: filtering assigns missing indexes and retains attr
     defer std.testing.allocator.free(bytes);
     var index = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = bytes }, .{ .policy = .open_embedded });
     defer index.deinit();
-    try std.testing.expectEqualDeep([2]usize{ 2, 1 }, index.counts);
+    try std.testing.expectEqualDeep([2]usize{ 2, 1 }, support.kindCounts(&index));
     try std.testing.expectEqual(@as(usize, 2), index.header().spectrum_list.?.declared_count);
     try std.testing.expectEqual(null, try index.byId(std.testing.allocator, "scan=0"));
     var input = std.Io.Reader.fixed(indexed_source);

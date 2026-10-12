@@ -191,6 +191,13 @@ pub fn expectWritten(expected: []const u8, actual: []const u8) !void {
     }
 }
 
+// Spectrum and chromatogram entry counts, read through the index's public entries.
+pub fn kindCounts(index: *const mzml.IndexedReader) [2]usize {
+    var counts: [2]usize = .{ 0, 0 };
+    for (0..index.entryCount()) |position| counts[if (index.entryAt(position).?.kind == .spectrum) 0 else 1] += 1;
+    return counts;
+}
+
 pub fn checksumStart(bytes: []const u8) !usize {
     const tag = "<fileChecksum>";
     const start = (std.mem.indexOf(u8, bytes, tag) orelse return error.TestUnexpectedResult) + tag.len;
