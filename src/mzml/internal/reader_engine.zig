@@ -924,11 +924,13 @@ const ParamAttributes = struct {
     unit_name: ?[]const u8 = null,
 };
 const ParamKind = std.meta.Tag(cv.Entry);
-const PARAM_ATTRIBUTES = std.StaticStringMap(std.meta.FieldEnum(ParamAttributes)).initComptime(.{
-    .{ "ref", .ref },               .{ "cvRef", .cv_ref },                 .{ "accession", .accession },
-    .{ "name", .name },             .{ "value", .value },                  .{ "type", .value_type },
-    .{ "unitCvRef", .unit_cv_ref }, .{ "unitAccession", .unit_accession }, .{ "unitName", .unit_name },
-});
+// Compared in order, each against a name of known length, so a match costs one length check per
+// earlier entry and one fixed-size comparison; the common fields come first.
+const PARAM_ATTRIBUTES = [_]struct { []const u8, std.meta.FieldEnum(ParamAttributes) }{
+    .{ "cvRef", .cv_ref },       .{ "accession", .accession },   .{ "name", .name },
+    .{ "value", .value },        .{ "unitCvRef", .unit_cv_ref }, .{ "unitAccession", .unit_accession },
+    .{ "unitName", .unit_name }, .{ "type", .value_type },       .{ "ref", .ref },
+};
 
 fn paramKind(self: *const Engine, start: xml.StartElement) ?ParamKind {
     if (!std.mem.eql(u8, start.name.expanded.namespace_uri orelse "", self.cursor.mzml_namespace)) return null;
@@ -1056,7 +1058,9 @@ fn copyParamAttributes(
 
 fn parameterAttribute(name: xml.ExpandedName, selected: ParamKind) ?std.meta.FieldEnum(ParamAttributes) {
     if (name.namespace_uri != null) return null;
-    const field = PARAM_ATTRIBUTES.get(name.local) orelse return null;
+    const field = inline for (PARAM_ATTRIBUTES) |entry| {
+        if (std.mem.eql(u8, name.local, entry[0])) break entry[1];
+    } else return null;
     if (selected == .group_ref) return if (field == .ref) field else null;
     return switch (field) {
         .ref => null,
