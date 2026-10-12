@@ -1897,8 +1897,7 @@ pub const Writer = struct {
         self.frame_count += 1;
         if (self.frame_count == 1) self.root_written = true;
         self.state = .start_tag;
-        try self.writeByte('<');
-        try self.writeBytes(name);
+        try self.writeParts(.{ "<", name });
     }
 
     pub fn namespace(self: *Writer, prefix: ?[]const u8, uri: []const u8) WriterError!void {
@@ -2029,9 +2028,7 @@ pub const Writer = struct {
             try self.checkOpeningName();
             try self.writeBytes("/>");
         } else {
-            try self.writeBytes("</");
-            try self.writeBytes(name);
-            try self.writeByte('>');
+            try self.writeParts(.{ "</", name, ">" });
         }
         self.frame_count -= 1;
         self.open_names.items.len = frame.name_start;
@@ -2130,6 +2127,8 @@ pub const Writer = struct {
             self.attribute_names.appendSlice(self.allocator, std.mem.asBytes(&name.len)) catch return self.fail(error.OutOfMemory);
             self.attribute_names.appendSlice(self.allocator, name) catch return self.fail(error.OutOfMemory);
         }
+        // A value with nothing to escape is written with its name in one step.
+        if (ordinaryAttributeRun(value, '"') == value.len) return self.writeParts(.{ " ", name, "=\"", value, "\"" });
         try self.writeByte(' ');
         try self.writeBytes(name);
         try self.writeBytes("=\"");
@@ -2152,6 +2151,26 @@ pub const Writer = struct {
     fn writeBytes(self: *Writer, bytes: []const u8) WriterError!void {
         const next = std.math.add(u64, self.logical_offset, @intCast(bytes.len)) catch return self.fail(error.LimitExceeded);
         self.sink.writeAll(bytes) catch return self.fail(error.WriteFailed);
+        self.logical_offset = next;
+    }
+
+    // Copies the parts straight into the sink's free buffer when they all fit, so a tag or an
+    // attribute costs one capacity check instead of one write per part.
+    fn writeParts(self: *Writer, parts: anytype) WriterError!void {
+        var total: usize = 0;
+        inline for (parts) |part| total += part.len;
+        const available = self.sink.unusedCapacitySlice();
+        if (available.len < total) {
+            inline for (parts) |part| try self.writeBytes(part);
+            return;
+        }
+        const next = std.math.add(u64, self.logical_offset, total) catch return self.fail(error.LimitExceeded);
+        var position: usize = 0;
+        inline for (parts) |part| {
+            @memcpy(available[position..][0..part.len], part);
+            position += part.len;
+        }
+        self.sink.advance(total);
         self.logical_offset = next;
     }
 
@@ -2954,6 +2973,58 @@ test "[failure] - [mzML XML writer]: keeps duplicate-attribute failures sticky" 
     try writer.attribute("id", "one");
     try std.testing.expectError(error.DuplicateAttribute, writer.attribute("id", "two"));
     try std.testing.expectError(error.DuplicateAttribute, writer.text("later"));
+}
+
+test "[property] - [mzML XML writer]: gives the same bytes and offsets at every sink buffer size" {
+    // A sink whose small buffer drains into one list, so writes stop fitting at every point.
+    const Collect = struct {
+        writer: std.Io.Writer,
+        bytes: std.ArrayList(u8) = .empty,
+
+        fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+            const self: *@This() = @alignCast(@fieldParentPtr("writer", w));
+            self.bytes.appendSlice(std.testing.allocator, w.buffered()) catch return error.WriteFailed;
+            w.end = 0;
+            var written: usize = 0;
+            for (data[0 .. data.len - 1]) |bytes| {
+                self.bytes.appendSlice(std.testing.allocator, bytes) catch return error.WriteFailed;
+                written += bytes.len;
+            }
+            for (0..splat) |_| self.bytes.appendSlice(std.testing.allocator, data[data.len - 1]) catch return error.WriteFailed;
+            return written + data[data.len - 1].len * splat;
+        }
+
+        fn write(sink: *std.Io.Writer) !u64 {
+            var writer = Writer.init(std.testing.allocator, sink, .{});
+            defer writer.deinit();
+            try writer.startDocument();
+            try writer.startElement("mzML");
+            try writer.namespace(null, NAMESPACE);
+            try writer.attributeTrusted("id", "plain value", false);
+            try writer.attribute("note", "needs <escaping> & \"quotes\"");
+            try writer.startElementTrusted("cvParam");
+            try writer.attributeTrusted("accession", "MS:1000511", false);
+            try writer.endElement();
+            try writer.startElementTrusted("run");
+            try writer.text("text\n");
+            try writer.endElement();
+            try writer.endElement();
+            try writer.endDocument();
+            return writer.byteOffset().?;
+        }
+    };
+    var whole: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer whole.deinit();
+    const length = try Collect.write(&whole.writer);
+    try std.testing.expectEqual(@as(u64, whole.written().len), length);
+    var buffer: [256]u8 = undefined;
+    for (1..whole.written().len + 2) |size| {
+        var collect: Collect = .{ .writer = .{ .vtable = &.{ .drain = Collect.drain }, .buffer = buffer[0..size] } };
+        defer collect.bytes.deinit(std.testing.allocator);
+        try std.testing.expectEqual(length, try Collect.write(&collect.writer));
+        try collect.writer.flush();
+        try std.testing.expectEqualStrings(whole.written(), collect.bytes.items);
+    }
 }
 
 test "[property] - [mzML XML writer]: copies attribute names and permits reuse on child and sibling tags" {
