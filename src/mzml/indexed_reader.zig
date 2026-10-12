@@ -278,7 +278,7 @@ fn captureAncestors(self: *IndexedReader, reader: *Engine, k: usize) Error!Fragm
         };
         defer self.allocator.free(units);
         const encoded = try self.alloc(units.len * 2);
-        for (units, 0..) |unit, i| std.mem.writeInt(u16, encoded[i * 2 ..][0..2], std.mem.littleToNative(u16, unit), order);
+        for (units, 0..) |unit, i| std.mem.writeInt(u16, encoded[i * 2 ..][0..2], unit, order);
         return .{ .prefix = prefix, .suffix = encoded, .ancestors = count };
     }
     return .{ .prefix = prefix, .suffix = try self.copy(suffix.written()), .ancestors = count };
