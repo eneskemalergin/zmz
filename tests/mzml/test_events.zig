@@ -7,18 +7,6 @@ const support = @import("support.zig");
 const Kind = enum { start, end, text };
 const Seen = struct { kind: Kind, start: u64, end: u64, value: []const u8 };
 
-fn collect(allocator: std.mem.Allocator, events: *mzml.Events, seen: *std.ArrayList(Seen), text: *std.ArrayList(u8)) !void {
-    while (try events.next()) |event| {
-        const kind: Kind, const value: []const u8 = switch (event.data) {
-            .start_element => |start| .{ .start, start.name.raw },
-            .end_element => |end| .{ .end, end.name.raw },
-            .text => |run| .{ .text, run.bytes },
-        };
-        if (kind == .text) try text.appendSlice(allocator, value);
-        try seen.append(allocator, .{ .kind = kind, .start = event.span.start, .end = event.span.end, .value = if (kind == .text) "" else try allocator.dupe(u8, value) });
-    }
-}
-
 test "[unit] - [mzML events]: report source spans of every element in any root and any split" {
     const source = "<?xml version='1.0'?>\n<!-- c --><root a='&lt;1&gt;'><x/><p:y xmlns:p='urn:p'>t&amp;u</p:y></root>\n";
     var buffer: [64]u8 = undefined;
@@ -31,7 +19,16 @@ test "[unit] - [mzML events]: report source spans of every element in any root a
         defer events.deinit();
         var seen: std.ArrayList(Seen) = .empty;
         var text: std.ArrayList(u8) = .empty;
-        try collect(arena.allocator(), &events, &seen, &text);
+        const allocator = arena.allocator();
+        while (try events.next()) |event| {
+            const kind: Kind, const value: []const u8 = switch (event.data) {
+                .start_element => |start| .{ .start, start.name.raw },
+                .end_element => |end| .{ .end, end.name.raw },
+                .text => |run| .{ .text, run.bytes },
+            };
+            if (kind == .text) try text.appendSlice(allocator, value);
+            try seen.append(allocator, .{ .kind = kind, .start = event.span.start, .end = event.span.end, .value = if (kind == .text) "" else try allocator.dupe(u8, value) });
+        }
         const root = std.mem.indexOf(u8, source, "<root").?;
         const x = std.mem.indexOf(u8, source, "<x/>").?;
         const y = std.mem.indexOf(u8, source, "<p:y").?;
@@ -195,36 +192,6 @@ test "[failure] - [mzML events]: name the broken rule and where, keep the first 
     }
 }
 
-// Writes every event, then the failure if any, with names, spans, attribute offsets, and the
-// broken rule and its offset.
-fn trace(allocator: std.mem.Allocator, input: *std.Io.Reader, out: *std.Io.Writer) !void {
-    return traceWith(allocator, input, out, .{}, false);
-}
-
-// As trace; with drop_blank, leaves out text events that hold only XML whitespace.
-fn traceWith(allocator: std.mem.Allocator, input: *std.Io.Reader, out: *std.Io.Writer, options: mzml.Events.Options, drop_blank: bool) !void {
-    var events = try mzml.Events.init(allocator, input, options);
-    defer events.deinit();
-    while (true) {
-        const event = (events.next() catch |err| {
-            const report = events.diagnostic().?;
-            try out.print("{s} {any} {any}\n", .{ @errorName(err), report.detail, report.location });
-            return;
-        }) orelse return;
-        if (drop_blank and event.data == .text and std.mem.trim(u8, event.data.text.bytes, " \t\r\n").len == 0) continue;
-        try out.print("{d}-{d} ", .{ event.span.start, event.span.end });
-        switch (event.data) {
-            .start_element => |start| {
-                try out.print("<{s} {}", .{ start.name.raw, start.empty_element_syntax });
-                for (start.attributes) |attribute| try out.print(" {s}@{d}", .{ attribute.name.raw, attribute.offset });
-            },
-            .end_element => |end| try out.print("</{s}", .{end.name.raw}),
-            .text => |run| try out.print("'{s}'", .{run.bytes}),
-        }
-        try out.writeByte('\n');
-    }
-}
-
 test "[failure] - [mzML events]: report a broken encoding at the byte that cannot continue it" {
     // A broken encoding is reported at the first byte that cannot continue a well-formed
     // sequence (the end of input when cut off); in UTF-16, offsets count two bytes per unit.
@@ -276,6 +243,36 @@ test "[failure] - [mzML events]: report a broken encoding at the byte that canno
         };
         try std.testing.expectEqual(case[1], failure);
         try std.testing.expectEqual(@as(u64, case[2]), events.diagnostic().?.location.?.input_event);
+    }
+}
+
+// Writes every event, then the failure if any, with names, spans, attribute offsets, and the
+// broken rule and its offset.
+fn trace(allocator: std.mem.Allocator, input: *std.Io.Reader, out: *std.Io.Writer) !void {
+    return traceWith(allocator, input, out, .{}, false);
+}
+
+// As trace; with drop_blank, leaves out text events that hold only XML whitespace.
+fn traceWith(allocator: std.mem.Allocator, input: *std.Io.Reader, out: *std.Io.Writer, options: mzml.Events.Options, drop_blank: bool) !void {
+    var events = try mzml.Events.init(allocator, input, options);
+    defer events.deinit();
+    while (true) {
+        const event = (events.next() catch |err| {
+            const report = events.diagnostic().?;
+            try out.print("{s} {any} {any}\n", .{ @errorName(err), report.detail, report.location });
+            return;
+        }) orelse return;
+        if (drop_blank and event.data == .text and std.mem.trim(u8, event.data.text.bytes, " \t\r\n").len == 0) continue;
+        try out.print("{d}-{d} ", .{ event.span.start, event.span.end });
+        switch (event.data) {
+            .start_element => |start| {
+                try out.print("<{s} {}", .{ start.name.raw, start.empty_element_syntax });
+                for (start.attributes) |attribute| try out.print(" {s}@{d}", .{ attribute.name.raw, attribute.offset });
+            },
+            .end_element => |end| try out.print("</{s}", .{end.name.raw}),
+            .text => |run| try out.print("'{s}'", .{run.bytes}),
+        }
+        try out.writeByte('\n');
     }
 }
 

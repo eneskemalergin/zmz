@@ -4,6 +4,24 @@ const std = @import("std");
 const mzml = @import("zmz").mzml;
 const support = @import("support.zig");
 
+fn rewriteFixture(allocator: std.mem.Allocator, sink: *std.Io.Writer) !void {
+    var input = std.Io.Reader.fixed(support.DOCUMENT);
+    var reader = try mzml.StreamReader.init(allocator, &input, .{});
+    defer reader.deinit();
+    var writer = try mzml.Writer.init(allocator, sink, .{});
+    defer writer.deinit();
+    const header = try reader.readHeader();
+    try writer.writeHeader(header.*);
+    try writer.beginList(.spectrum_list, 1, "dp");
+    try writer.writeRecord((try reader.nextRecord()).?.node);
+    try writer.endList();
+    try writer.beginList(.chromatogram_list, 1, "dp");
+    try writer.writeRecord((try reader.nextRecord()).?.node);
+    try writer.endList();
+    try std.testing.expectEqual(null, try reader.nextRecord());
+    try writer.finish();
+}
+
 test "[failure] - [mzML diagnostics]: reports writer counts, indexes, and allocation failures" {
     const header: mzml.model.Header = .{ .document = .{ .kind = .mzml }, .run = .{ .kind = .run } };
     for (0..4) |case| {
@@ -615,35 +633,6 @@ test "[failure] - [mzML writer]: a parameter attribute repeating a fixed field i
     try std.testing.expectError(error.FailedState, writer.endList());
 }
 
-fn rewriteFixture(allocator: std.mem.Allocator, sink: *std.Io.Writer) !void {
-    var input = std.Io.Reader.fixed(support.DOCUMENT);
-    var reader = try mzml.StreamReader.init(allocator, &input, .{});
-    defer reader.deinit();
-    var writer = try mzml.Writer.init(allocator, sink, .{});
-    defer writer.deinit();
-    const header = try reader.readHeader();
-    try writer.writeHeader(header.*);
-    try writer.beginList(.spectrum_list, 1, "dp");
-    try writer.writeRecord((try reader.nextRecord()).?.node);
-    try writer.endList();
-    try writer.beginList(.chromatogram_list, 1, "dp");
-    try writer.writeRecord((try reader.nextRecord()).?.node);
-    try writer.endList();
-    try std.testing.expectEqual(null, try reader.nextRecord());
-    try writer.finish();
-}
-
-fn rewriteAllocated(allocator: std.mem.Allocator) !void {
-    var bytes: [8192]u8 = undefined;
-    var sink = std.Io.Writer.fixed(&bytes);
-    try rewriteFixture(allocator, &sink);
-}
-
-fn indexedRewriteAllocated(allocator: std.mem.Allocator) !void {
-    var discard: std.Io.Writer.Discarding = .init(&.{});
-    try support.rewriteDocument(allocator, support.REFERENCED_DOCUMENT, &discard.writer, true);
-}
-
 test "[integration] - [mzML writer]: preserves metadata and records through a plain rewrite" {
     var bytes: [8192]u8 = undefined;
     var sink = std.Io.Writer.fixed(&bytes);
@@ -705,6 +694,17 @@ test "[failure] - [mzML writer]: rejects counts and keeps output failures sticky
     try std.testing.expectError(error.InvalidCharacter, invalid.writeRecord(malformed));
     try std.testing.expect(invalid_sink.buffered().len > before);
     try std.testing.expectError(error.FailedState, invalid.finish());
+}
+
+fn rewriteAllocated(allocator: std.mem.Allocator) !void {
+    var bytes: [8192]u8 = undefined;
+    var sink = std.Io.Writer.fixed(&bytes);
+    try rewriteFixture(allocator, &sink);
+}
+
+fn indexedRewriteAllocated(allocator: std.mem.Allocator) !void {
+    var discard: std.Io.Writer.Discarding = .init(&.{});
+    try support.rewriteDocument(allocator, support.REFERENCED_DOCUMENT, &discard.writer, true);
 }
 
 test "[failure] - [mzML writer]: releases partial allocations during rewrite" {
