@@ -1,6 +1,6 @@
-//! Defines the zmz module and its `-Dkernel_backend` option (`dispatch` also builds a separate
+//! Defines the zmz module and its `-Dkernel-backend` option (`dispatch` also builds a separate
 //! x86-64-v3 zlib decoder object), the example programs, the `check-mzml`, `vocabulary`, and
-//! `libm-data` tool steps, and the test steps.
+//! `libm-data` tool steps, the `bench` step, and the test steps.
 
 const std = @import("std");
 
@@ -10,7 +10,7 @@ pub fn build(b: *std.Build) void {
     const strip = optimize == .ReleaseFast or optimize == .ReleaseSmall;
     const kernel_backend = b.option(
         KernelBackend,
-        "kernel_backend",
+        "kernel-backend",
         "dispatch: pick CPU-specific code for the running CPU; portable: never use it",
     ) orelse .dispatch;
     const library_kernels = buildKernels(b, target, optimize, kernel_backend);
@@ -20,7 +20,7 @@ pub fn build(b: *std.Build) void {
     });
     configureLibraryModule(zmz, library_kernels);
 
-    const test_step = b.step("test", "Run the library, example, and tool tests");
+    const test_step = b.step("test", "Run the library, example, tool, and benchmark tests");
     const empty_run = b.path("tests/data/gates/empty_run.mzML");
     const library_tests_module = b.createModule(.{
         .root_source_file = b.path("tests/library.zig"),
@@ -154,7 +154,7 @@ pub fn build(b: *std.Build) void {
     const vocabulary = b.addExecutable(.{ .name = "vocabulary", .root_module = vocabulary_module });
     const vocabulary_run = b.addRunArtifact(vocabulary);
     if (b.args) |args| vocabulary_run.addArgs(args);
-    b.step("vocabulary", "Inspect, review, or generate vocabulary resources, or scan explicit mzML files, offline").dependOn(&vocabulary_run.step);
+    b.step("vocabulary", "Prepare, review, and generate vocabulary tables and their release history, or scan explicit mzML files, offline").dependOn(&vocabulary_run.step);
     const vocabulary_tests = b.addTest(.{ .root_module = vocabulary_module });
     test_step.dependOn(&b.addRunArtifact(vocabulary_tests).step);
 
@@ -168,7 +168,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "vocabulary_test_options", .module = vocabulary_test_options.createModule() }},
     });
     vocabulary_cli_test_module.addAnonymousImport("empty_run", .{ .root_source_file = empty_run });
-    vocabulary_cli_test_module.addAnonymousImport("manifest", .{ .root_source_file = b.path("vocabularies/manifest.json") });
+    vocabulary_cli_test_module.addAnonymousImport("pinned_manifest", .{ .root_source_file = b.path("vocabularies/manifest.json") });
     const vocabulary_cli_tests = b.addTest(.{ .root_module = vocabulary_cli_test_module });
     test_step.dependOn(&b.addRunArtifact(vocabulary_cli_tests).step);
 }

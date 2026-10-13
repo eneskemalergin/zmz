@@ -49,24 +49,31 @@ The project stays centered on mzML for the foreseeable future. Once that work is
 
 ## Start
 
-Use Zig 0.16.0. Run the library checks with:
+Use Zig 0.16.0. Add zmz to a project with `zig fetch --save git+https://github.com/eneskemalergin/zmz`, then import its module in `build.zig`:
 
-```sh
-zig build test --summary all
-zig build test -Doptimize=ReleaseFast --summary all
+```zig
+const zmz = b.dependency("zmz", .{ .target = target, .optimize = optimize });
+executable.root_module.addImport("zmz", zmz.module("zmz"));
 ```
 
-CPU-specific code is chosen at run time (`-Dkernel_backend=dispatch`, the default): Base64 uses AVX2, SHA-1 the SHA extensions, and zlib decoding a second zipir build for x86-64-v3, each only when the CPU has the features; `-Dkernel_backend=portable` uses none of them. Builds default to the baseline CPU; `-Dcpu=native` explicitly targets the build machine. Zig 0.16's self-hosted Debug backend uses scalar; ReleaseFast uses LLVM and runtime selection.
+The package holds the library and its notices; tests, examples, tools, and the benchmark stay in this repository. The public entry point is [`src/root.zig`](src/root.zig).
 
-The public entry point is [`src/root.zig`](src/root.zig). Vocabulary resources and their source notices are described in [`vocabularies/README.md`](vocabularies/README.md).
+CPU-specific code is chosen at run time (`-Dkernel-backend=dispatch`, the default): Base64 uses AVX2, SHA-1 the SHA extensions, and zlib decoding a second zipir build for x86-64-v3, each only when the CPU has the features; `-Dkernel-backend=portable` uses none of them. Builds default to the baseline CPU; `-Dcpu=native` explicitly targets the build machine. Zig 0.16's self-hosted Debug backend uses scalar; ReleaseFast uses LLVM and runtime selection.
 
-[Complete, compiled examples](examples/README.md) show streamed reading, selected decoding, indexed access, array construction, and payload rewriting, with cleanup and buffer lifetimes. Build them with `zig build examples -Doptimize=ReleaseFast`. Their checks also run under `zig build test`.
+The build steps in this repository:
 
-`zig build bench` times zmz on generated data, with nothing to download. It writes mzML of five shapes (metadata-heavy, centroid, profile, zlib, and MS-Numpress) at two sizes into `.zig-cache/zmz-bench/` (about 200 MiB, reused by later runs), then times forward reading, full decoding, XML events, indexed lookup, copying, and writing, each in its own process, always in ReleaseFast. It reports wall time, throughput, peak memory, and a checksum of what each case read, and uses `zebrac`, a perf-counter benchmark runner, for instruction counts when it is on the `PATH`. Peak memory stays near 1 to 2 MiB from the small inputs to the four-times-larger ones.
+- `zig build test --summary all`: the library, example, tool, and benchmark tests. Add `-Doptimize=ReleaseFast` to test release builds.
+- `zig build examples -Doptimize=ReleaseFast`: [complete, compiled examples](examples/README.md) of streamed reading, selected decoding, indexed access, array construction, and payload rewriting, with cleanup and buffer lifetimes. `zig build test-examples` runs them on small fixtures.
+- `zig build check-mzml -Doptimize=ReleaseFast -- FILE.mzML [FILE.mzML ...]`: reads each file whole, resolves its scientific metadata, decodes every array, rebuilds its index and compares the first, middle, and last records looked up through it with the forward read, then prints totals. Malformed selected-ion and isolation-window fields are counted, not fatal; any other failure names the file and exits with status 1.
+- `zig build bench`: times zmz on generated data (below).
+- `zig build vocabulary -- ...`: prepares, reviews, and generates the bundled PSI-MS and Unit Ontology tables, or scans explicit files' vocabulary use; see [`vocabularies/README.md`](vocabularies/README.md).
+- `zig build libm-data -- MUSL_MATH_DIR OUTPUT.zig`: regenerates `src/binary/libm_data.zig`, the `exp` and `log` tables SLOF uses, from `src/math` of a musl source tree that has `exp_data.c` and `log_data.c`.
+
+`zig build bench` needs nothing to download. It writes mzML of five shapes (metadata-heavy, centroid, profile, zlib, and MS-Numpress) at two sizes into `.zig-cache/zmz-bench/` (about 200 MiB, reused by later runs), then times forward reading, full decoding, XML events, indexed lookup, copying, and writing, each in its own process, always in ReleaseFast. It reports wall time, throughput, peak memory, and a checksum of what each case read, and uses `zebrac`, a perf-counter benchmark runner, for instruction counts when it is on the `PATH`. Peak memory stays near 1 to 2 MiB from the small inputs to the four-times-larger ones.
 
 ## License
 
-zmz is licensed under the [Apache License, Version 2.0](LICENSE). The third-party notices are in [`NOTICE`](NOTICE): zlib support uses zipir under the MIT license, and SLOF's `exp` and `log` tables (`src/binary/libm_data.zig`) come from Arm's optimized-routines under the MIT license. Include `LICENSE` and `NOTICE` with source and binary distributions. The bundled vocabulary resources keep their own source terms and attribution requirements; see [`vocabularies/README.md`](vocabularies/README.md).
+zmz is licensed under the [Apache License, Version 2.0](LICENSE). The third-party notices are in [`NOTICE`](NOTICE): zlib support uses zipir under the MIT license, and SLOF's `exp` and `log` tables (`src/binary/libm_data.zig`) come from Arm's optimized-routines under the MIT license. Include `LICENSE` and `NOTICE` with source and binary distributions. The bundled PSI-MS and Unit Ontology tables are under Creative Commons Attribution 4.0; `NOTICE` carries their attribution, and [`vocabularies/README.md`](vocabularies/README.md) describes the sources.
 
 ---
 
