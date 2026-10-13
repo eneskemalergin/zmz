@@ -3175,3 +3175,133 @@ test "[unit] - [mzML diagnostics]: formats limit and size details in full" {
         try std.testing.expectEqualStrings(case[1], sink.buffered());
     }
 }
+
+// Writes each record's kind, ID, and decoded values, then the failure if any, so two reads of the
+// same bytes compare exactly.
+fn summarizeDecoded(input: *std.Io.Reader, out: *std.Io.Writer) !void {
+    var reader = try mzml.StreamReader.init(std.testing.allocator, input, .{});
+    defer reader.deinit();
+    var output = mzml.DecodedArrays.init(std.testing.allocator, .{});
+    defer output.deinit();
+    while (true) {
+        const record = (reader.nextDecodedRecord(&output) catch |err| {
+            const report = reader.diagnostic().?;
+            try out.print("{s} {any} {any}\n", .{ @errorName(err), report.detail, report.location });
+            return;
+        }) orelse return;
+        try out.print("{t} {s}:", .{ record.node.kind, record.id });
+        for (0..output.len()) |i| switch (output.get(i).?.values) {
+            inline else => |values| try out.print(" {x}", .{std.mem.sliceAsBytes(values)}),
+        };
+        try out.writeByte('\n');
+    }
+}
+
+// Bytes fuzzed documents are drawn from: markup and Base64 most often, any byte sometimes.
+const DOCUMENT_BYTES = [_]std.testing.Smith.Weight{
+    .rangeAtMost(u8, 0x00, 0xff, 1), .rangeAtMost(u8, 'a', 'z', 4), .rangeAtMost(u8, 'A', 'Z', 2),
+    .rangeAtMost(u8, '0', '9', 3),   .value(u8, '<', 6),            .value(u8, '>', 6),
+    .value(u8, '/', 4),              .value(u8, '=', 4),            .value(u8, '\'', 4),
+    .value(u8, ' ', 4),              .value(u8, '+', 1),            .value(u8, '&', 1),
+};
+
+fn readingAtAnySplit(_: void, smith: *std.testing.Smith) !void {
+    var source: [4096]u8 = undefined;
+    const bytes = source[0..smith.sliceWeightedBytes(&source, &DOCUMENT_BYTES)];
+    const size = smith.valueRangeAtMost(u8, 1, 64);
+    var whole: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer whole.deinit();
+    var fixed = std.Io.Reader.fixed(bytes);
+    try summarizeDecoded(&fixed, &whole.writer);
+    var split: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer split.deinit();
+    var buffer: [64]u8 = undefined;
+    var input: std.testing.Reader = .init(buffer[0..size], &.{.{ .buffer = bytes }});
+    input.artificial_limit = .limited(size);
+    try summarizeDecoded(&input.interface, &split.writer);
+    try std.testing.expectEqualStrings(whole.written(), split.written());
+}
+
+// A fuzz corpus entry for a document read with sliceWeightedBytes: its length, then its bytes.
+fn corpusDocument(comptime document: []const u8) []const u8 {
+    return comptime std.mem.toBytes(@as(u32, document.len)) ++ document;
+}
+
+const READING_CORPUS = [_][]const u8{
+    corpusDocument(support.DOCUMENT),
+    corpusDocument(support.REFERENCED_DOCUMENT),
+    corpusDocument(support.HEADER ++ "<spectrumList count='1'><spectrum id='s' index='0' defaultArrayLength='2'><binaryDataArrayList count='1'>" ++
+        "<binaryDataArray encodedLength='20'><cvParam accession='MS:1000523'/><cvParam accession='MS:1000574'/>" ++
+        "<binary>eJxjYAABBgQIAP//AwAJ+AGi</binary></binaryDataArray></binaryDataArrayList></spectrum></spectrumList></run></mzML>"),
+};
+
+test "[fuzz] - [mzML reader]: any bytes decode to the same records and failure at any split" {
+    try std.testing.fuzz({}, readingAtAnySplit, .{ .corpus = &READING_CORPUS });
+    try support.fuzzSeeded({}, readingAtAnySplit, &READING_CORPUS, 300);
+}
+
+// Bytes fuzzed array text is drawn from: the Base64 alphabet most often, any byte sometimes.
+const BASE64_BYTES = [_]std.testing.Smith.Weight{
+    .rangeAtMost(u8, 0x00, 0xff, 1), .rangeAtMost(u8, 'A', 'Z', 8), .rangeAtMost(u8, 'a', 'z', 8),
+    .rangeAtMost(u8, '0', '9', 4),   .value(u8, '+', 2),            .value(u8, '/', 2),
+    .value(u8, '=', 3),              .value(u8, ' ', 1),            .value(u8, '\n', 1),
+};
+
+// Writes the decoded values or the failure.
+fn decodeText(encoding: mzml.model.Encoding, length: usize, runs: []const []const u8, out: *std.Io.Writer) !void {
+    var output = mzml.DecodedArrays.init(std.testing.allocator, .{});
+    defer output.deinit();
+    const Runs = struct {
+        parts: []const []const u8,
+        pub fn next(self: *@This()) error{}!?[]const u8 {
+            if (self.parts.len == 0) return null;
+            defer self.parts = self.parts[1..];
+            return self.parts[0];
+        }
+    };
+    var source: Runs = .{ .parts = runs };
+    const values = output.decodeArrayText(encoding, length, &source) catch |err| {
+        try out.print("{s} {any}\n", .{ @errorName(err), output.diagnostic().?.detail });
+        return;
+    };
+    switch (values) {
+        inline else => |decoded| {
+            try std.testing.expectEqual(length, decoded.len);
+            try out.print("{x}\n", .{std.mem.sliceAsBytes(decoded)});
+        },
+    }
+}
+
+fn arrayTextInAnyRuns(_: void, smith: *std.testing.Smith) !void {
+    var text: [1024]u8 = undefined;
+    const bytes = text[0..smith.sliceWeightedBytes(&text, &BASE64_BYTES)];
+    const encoding: mzml.model.Encoding = .{
+        .primitive = smith.value(@FieldType(mzml.model.Encoding, "primitive")),
+        .pipeline = smith.value(@FieldType(mzml.model.Encoding, "pipeline")),
+    };
+    const length = smith.valueRangeAtMost(u16, 0, 512);
+    var whole: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer whole.deinit();
+    try decodeText(encoding, length, &.{bytes}, &whole.writer);
+    // The same text cut into runs at chosen places.
+    var runs: [16][]const u8 = undefined;
+    var count: usize = 0;
+    var rest = bytes;
+    while (count < runs.len - 1 and rest.len != 0 and !smith.eosWeightedSimple(1, 2)) : (count += 1) {
+        const cut = smith.index(rest.len + 1);
+        runs[count] = rest[0..cut];
+        rest = rest[cut..];
+    }
+    runs[count] = rest;
+    var split: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer split.deinit();
+    try decodeText(encoding, length, runs[0 .. count + 1], &split.writer);
+    try std.testing.expectEqualStrings(whole.written(), split.written());
+}
+
+const ARRAY_TEXT_CORPUS = [_][]const u8{ corpusDocument("AAAAAAAA8D8="), corpusDocument("eJxjYAABBgQIAP//AwAJ+AGi") };
+
+test "[fuzz] - [mzML decoded arrays]: any array text decodes to the same values or failure in any runs" {
+    try std.testing.fuzz({}, arrayTextInAnyRuns, .{ .corpus = &ARRAY_TEXT_CORPUS });
+    try support.fuzzSeeded({}, arrayTextInAnyRuns, &ARRAY_TEXT_CORPUS, 400);
+}

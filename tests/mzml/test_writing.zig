@@ -1669,6 +1669,80 @@ test "[property] - [mzML streamed writing]: every pipeline round trips through s
     }
 }
 
+fn writtenArraysReadBack(header: *const mzml.model.Header, smith: *std.testing.Smith) !void {
+    const allocator = std.testing.allocator;
+    var bits: [256]u64 = undefined;
+    var count: usize = 0;
+    while (count < bits.len and !smith.eosWeightedSimple(1, 8)) : (count += 1) bits[count] = smith.value(u64);
+    var doubles: [256]f64 = undefined;
+    var ints: [256]i32 = undefined;
+    for (bits[0..count], doubles[0..count], ints[0..count]) |value, *double, *int| {
+        double.* = @bitCast(value);
+        int.* = @truncate(@as(i64, @bitCast(value)));
+    }
+    const pipeline = smith.value(mzml.arrays.Pipeline);
+    // Numpress takes nonnegative finite values; other pipelines keep any bit pattern.
+    if (pipeline.isNumpress()) for (doubles[0..count]) |*double| {
+        double.* = if (std.math.isFinite(double.*)) @abs(double.*) else 0;
+    };
+    const fixed_point: ?f64 = if (pipeline.transform()) |transform| switch (transform) {
+        .linear => mzml.numpress.optimalLinearFixedPoint(doubles[0..count]) catch return,
+        .slof => mzml.numpress.optimalSlofFixedPoint(doubles[0..count]) catch return,
+        .pic => null,
+    } else null;
+    var encoder = mzml.arrays.Encoder.init(allocator, .fast);
+    defer encoder.deinit();
+    var builder = mzml.Builder.init(allocator, .{});
+    defer builder.deinit();
+    const options: mzml.arrays.EncodeOptions = .{ .pipeline = pipeline, .fixed_point = fixed_point };
+    const first = builder.prepareArray(f64, doubles[0..count], .{
+        .cv_ref = "MS",
+        .encoding = options,
+        .role = .{ .cv_ref = "MS", .accession = mzml.model.Terms.MZ_ARRAY, .name = "m/z array" },
+    }, &encoder) catch |err| switch (err) {
+        error.InvalidFixedPoint => return,
+        else => return err,
+    };
+    const lossless: mzml.arrays.EncodeOptions = .{ .pipeline = if (pipeline.isNumpress()) .zlib else pipeline };
+    const second = try builder.prepareArray(i32, ints[0..count], .{
+        .cv_ref = "MS",
+        .encoding = lossless,
+        .role = .{ .cv_ref = "MS", .accession = mzml.model.Terms.INTENSITY_ARRAY, .name = "intensity array" },
+    }, &encoder);
+    const record = try builder.record(.spectrum, "scan=1", 0, count, &.{}, &.{}, &.{ first.array, second.array });
+    var stream: std.Io.Writer.Allocating = .init(allocator);
+    defer stream.deinit();
+    {
+        var writer = try mzml.Writer.initIndexed(allocator, &stream.writer, .{}, .{});
+        defer writer.deinit();
+        // Numpress value errors surface when the record is written.
+        writeStreamedRecord(&writer, header.*, record.node, &.{ first.payload, second.payload }) catch |err| switch (err) {
+            error.ValueOutOfRange, error.InvalidValue => return,
+            else => return err,
+        };
+    }
+    var input = std.Io.Reader.fixed(stream.written());
+    var reader = try mzml.StreamReader.init(allocator, &input, .{});
+    defer reader.deinit();
+    _ = try reader.readHeader();
+    var decoded = mzml.DecodedArrays.init(allocator, .{});
+    defer decoded.deinit();
+    _ = (try reader.nextDecodedRecord(&decoded)).?;
+    var reference = mzml.arrays.Encoder.init(allocator, .fast);
+    defer reference.deinit();
+    try expectArray(f64, decoded.get(0).?.values, doubles[0..count], options, &reference);
+    try expectArray(i32, decoded.get(1).?.values, ints[0..count], lossless, &reference);
+}
+
+test "[fuzz] - [mzML streamed writing]: arrays of any values read back as written" {
+    var input = std.Io.Reader.fixed(support.DOCUMENT);
+    var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+    defer reader.deinit();
+    const header = try reader.readHeader();
+    try std.testing.fuzz(header, writtenArraysReadBack, .{});
+    try support.fuzzSeeded(header, writtenArraysReadBack, &.{}, 300);
+}
+
 test "[failure] - [mzML streamed writing]: Numpress value errors write nothing to streams and stop files" {
     const allocator = std.testing.allocator;
     var input = std.Io.Reader.fixed(support.DOCUMENT);

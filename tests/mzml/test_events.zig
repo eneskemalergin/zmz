@@ -368,6 +368,53 @@ test "[property] - [mzML events]: every input split gives the same tags, spans, 
     }
 }
 
+// Bytes fuzzed XML is drawn from: markup punctuation, names, and whitespace most often, any byte
+// sometimes.
+const XML_BYTES = [_]std.testing.Smith.Weight{
+    .rangeAtMost(u8, 0x00, 0xff, 1), .rangeAtMost(u8, 'a', 'z', 6), .rangeAtMost(u8, '0', '9', 2),
+    .value(u8, '<', 12),             .value(u8, '>', 10),           .value(u8, '/', 6),
+    .value(u8, '=', 5),              .value(u8, '\'', 6),           .value(u8, '"', 2),
+    .value(u8, '&', 3),              .value(u8, ';', 3),            .value(u8, ':', 3),
+    .value(u8, '!', 2),              .value(u8, '?', 2),            .value(u8, '[', 2),
+    .value(u8, ']', 2),              .value(u8, '-', 2),            .value(u8, ' ', 6),
+    .value(u8, '\n', 3),             .value(u8, '\r', 2),           .value(u8, '#', 1),
+};
+
+// A fuzz corpus entry for a document read with sliceWeightedBytes: its length, then its bytes.
+fn corpusDocument(comptime document: []const u8) []const u8 {
+    return comptime std.mem.toBytes(@as(u32, document.len)) ++ document;
+}
+
+fn eventsAtAnySplit(_: void, smith: *std.testing.Smith) !void {
+    var source: [768]u8 = undefined;
+    const bytes = source[0..smith.sliceWeightedBytes(&source, &XML_BYTES)];
+    const size = smith.valueRangeAtMost(u8, 1, 64);
+    var whole: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer whole.deinit();
+    var fixed = std.Io.Reader.fixed(bytes);
+    try trace(std.testing.allocator, &fixed, &whole.writer);
+    var split: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer split.deinit();
+    var buffer: [64]u8 = undefined;
+    var input: std.testing.Reader = .init(buffer[0..size], &.{.{ .buffer = bytes }});
+    input.artificial_limit = .limited(size);
+    try trace(std.testing.allocator, &input.interface, &split.writer);
+    try std.testing.expectEqualStrings(whole.written(), split.written());
+}
+
+const EVENTS_CORPUS = [_][]const u8{
+    corpusDocument("<r xmlns:p='urn:p'><a x='1'/><p:b p:y='&lt;'>t&#x41;u<![CDATA[]]>]]></p:b><!-- c --><?pi x?></r>"),
+    corpusDocument("<?xml version='1.0' encoding='UTF-8'?>\r\n<r>\r\n\t<a>one\ttwo\r\nthree</a>\n</r>\n"),
+    corpusDocument("\xff\xfe<\x00r\x00/\x00>\x00"),
+    corpusDocument("<r><a></b></r>"),
+    corpusDocument(support.DOCUMENT),
+};
+
+test "[fuzz] - [mzML events]: any bytes give the same events and failure at any split" {
+    try std.testing.fuzz({}, eventsAtAnySplit, .{ .corpus = &EVENTS_CORPUS });
+    try support.fuzzSeeded({}, eventsAtAnySplit, &EVENTS_CORPUS, 400);
+}
+
 test "[failure] - [mzML events]: release every allocation when one fails during a read" {
     const Read = struct {
         fn run(allocator: std.mem.Allocator, document: []const u8) !void {

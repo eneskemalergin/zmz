@@ -1908,6 +1908,30 @@ test "[failure] - [mzML index]: releases every allocation when one fails while o
         try std.testing.checkAllAllocationFailures(std.testing.allocator, useIndex, .{ document.written(), policy });
 }
 
+fn indexAfterMutation(base: []const u8, smith: *std.testing.Smith) !void {
+    var bytes: [8192]u8 = undefined;
+    @memcpy(bytes[0..base.len], base);
+    // A few bytes changed, most often in the trailer, where the index and its offsets are.
+    const trailer = std.mem.indexOf(u8, base, "<indexList").?;
+    while (!smith.eosWeightedSimple(1, 3)) {
+        const at = if (smith.boolWeighted(1, 3)) trailer + smith.index(base.len - trailer) else smith.index(base.len);
+        bytes[at] = smith.valueWeighted(u8, &.{ .rangeAtMost(u8, 0, 255, 1), .rangeAtMost(u8, '0', '9', 4), .value(u8, '"', 2), .value(u8, '<', 2) });
+    }
+    const policy: mzml.IndexedReader.Policy = if (smith.boolWeighted(3, 1)) .open_embedded else .rebuild;
+    useIndex(std.testing.allocator, bytes[0..base.len], policy) catch |err| switch (err) {
+        error.TestUnexpectedResult, error.TestExpectedEqual => return err,
+        else => {},
+    };
+}
+
+test "[fuzz] - [mzML index]: mutated indexes open, look up, or fail with a documented error" {
+    var document: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer document.deinit();
+    try support.rewriteDocument(std.testing.allocator, support.REFERENCED_DOCUMENT, &document.writer, true);
+    try std.testing.fuzz(@as([]const u8, document.written()), indexAfterMutation, .{});
+    try support.fuzzSeeded(@as([]const u8, document.written()), indexAfterMutation, &.{}, 300);
+}
+
 // Writes empty spectra whose IDs are fixed text around integers, as instrument vendors write them.
 fn writeTemplated(allocator: std.mem.Allocator, sink: *std.Io.Writer, count: usize, indexed: bool) !void {
     var writer = if (indexed) try mzml.Writer.initIndexed(allocator, sink, .{}, .{}) else try mzml.Writer.init(allocator, sink, .{});
