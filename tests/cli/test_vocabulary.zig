@@ -12,6 +12,7 @@ test "[cli] - [vocabulary]: rejects bad arguments and unreadable inputs without 
         .{ &[_][]const u8{ executable, "generate", "missing", "history", "ms", "uo", "result.zig" }, "vocabulary: FileNotFound\n" },
         .{ &[_][]const u8{ executable, "candidate", "missing", "ms", "0000000000000000000000000000000000000000", "uo", "0000000000000000000000000000000000000000", "2026-01-01", "result.json" }, "vocabulary: FileNotFound\n" },
         .{ &[_][]const u8{ executable, "history", "result.json", "psi-ms", "missing.txt" }, "vocabulary: FileNotFound\n" },
+        .{ &[_][]const u8{ executable, "extend", "missing.json", "result.json", "psi-ms", "missing.txt" }, "vocabulary: FileNotFound\n" },
         .{ &[_][]const u8{ executable, "review", "missing", "ms", "uo" }, "vocabulary: FileNotFound\n" },
         .{ &[_][]const u8{ executable, "inspect", "missing", "ms", "uo" }, "vocabulary: FileNotFound\n" },
         .{ &[_][]const u8{ executable, "scan", "missing.mzML" }, "vocabulary: FileNotFound\n" },
@@ -32,6 +33,7 @@ test "[cli] - [vocabulary]: rejects bad arguments and unreadable inputs without 
     try std.testing.expectEqualStrings("usage: zig build vocabulary -- inspect|review MANIFEST.json PSI-MS.obo UO.obo\n" ++
         "       zig build vocabulary -- candidate MANIFEST.json PSI-MS.obo PSI-MS-COMMIT UO.obo UO-COMMIT DATE OUTPUT.json\n" ++
         "       zig build vocabulary -- history OUTPUT.json KEY LIST.txt [KEY LIST.txt ...]\n" ++
+        "       zig build vocabulary -- extend HISTORY.json OUTPUT.json KEY LIST.txt [KEY LIST.txt ...]\n" ++
         "       zig build vocabulary -- generate MANIFEST.json HISTORY.json PSI-MS.obo UO.obo OUTPUT.zig\n" ++
         "       zig build vocabulary -- scan FILE.mzML [FILE.mzML ...]\n" ++
         "vocabulary: InvalidArguments\n", invalid.stderr);

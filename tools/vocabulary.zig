@@ -25,12 +25,13 @@ pub fn main(init: std.process.Init) void {
     };
 }
 
-const Command = enum { inspect, candidate, review, history, generate, scan };
+const Command = enum { inspect, candidate, review, history, extend, generate, scan };
 
 fn usage(io: std.Io) !void {
     try std.Io.File.stderr().writeStreamingAll(io, "usage: zig build vocabulary -- inspect|review MANIFEST.json PSI-MS.obo UO.obo\n" ++
         "       zig build vocabulary -- candidate MANIFEST.json PSI-MS.obo PSI-MS-COMMIT UO.obo UO-COMMIT DATE OUTPUT.json\n" ++
         "       zig build vocabulary -- history OUTPUT.json KEY LIST.txt [KEY LIST.txt ...]\n" ++
+        "       zig build vocabulary -- extend HISTORY.json OUTPUT.json KEY LIST.txt [KEY LIST.txt ...]\n" ++
         "       zig build vocabulary -- generate MANIFEST.json HISTORY.json PSI-MS.obo UO.obo OUTPUT.zig\n" ++
         "       zig build vocabulary -- scan FILE.mzML [FILE.mzML ...]\n");
     return error.InvalidArguments;
@@ -54,10 +55,11 @@ fn run(init: std.process.Init) !void {
                 try out.flush();
             }
         },
-        .history => {
-            if (args.len < 5 or (args.len - 3) % 2 != 0) return usage(init.io);
-            var history: History = .{};
-            var pair: usize = 3;
+        .history, .extend => {
+            const first: usize = if (command == .extend) 4 else 3;
+            if (args.len < first + 2 or (args.len - first) % 2 != 0) return usage(init.io);
+            var history: History = if (command == .extend) try History.parse(allocator, try readFile(allocator, init.io, args[2])) else .{};
+            var pair = first;
             while (pair < args.len) : (pair += 2) {
                 const list = try readFile(allocator, init.io, args[pair + 1]);
                 var paths: std.ArrayList([]const u8) = .empty;
@@ -65,7 +67,7 @@ fn run(init: std.process.Init) !void {
                 while (lines.next()) |line| try paths.append(allocator, line);
                 try recordReleases(allocator, init.io, &history, args[pair], paths.items);
             }
-            try publish(init.io, std.Io.Dir.cwd(), args[2], try history.render(allocator));
+            try publish(init.io, std.Io.Dir.cwd(), args[first - 1], try history.render(allocator));
         },
         .candidate => {
             if (args.len != 9) return usage(init.io);
@@ -858,20 +860,31 @@ const Release = struct {
     }
 };
 
-// Records one resource's releases from its OBO files, oldest first; a file repeating the previous
-// file's data-version adds nothing.
+// Records one resource's releases from its OBO files, oldest first; a file repeating a recorded
+// release adds nothing. A resource the history already holds is extended: its list starts with
+// the last recorded release, the baseline the next release is compared with.
 fn recordReleases(allocator: std.mem.Allocator, io: std.Io, history: *History, key: []const u8, paths: []const []const u8) !void {
-    if (history.findConst(key) != null) return error.DuplicateResource;
-    try history.resources.append(allocator, .{ .key = try allocator.dupe(u8, key) });
-    const resource = &history.resources.items[history.resources.items.len - 1];
+    const resource = for (history.resources.items) |*found| {
+        if (std.mem.eql(u8, found.key, key)) break found;
+    } else added: {
+        try history.resources.append(allocator, .{ .key = try allocator.dupe(u8, key) });
+        break :added &history.resources.items[history.resources.items.len - 1];
+    };
     var previous: ?Release = null;
     var previous_release: u16 = 0;
     for (paths) |path| {
         const release = try Release.read(allocator, try readFile(allocator, io, path));
-        const known = for (resource.releases.items) |item| {
-            if (std.mem.eql(u8, item, release.version)) break true;
-        } else false;
-        if (known) continue;
+        const recorded = for (resource.releases.items, 0..) |item, index| {
+            if (std.mem.eql(u8, item, release.version)) break index;
+        } else null;
+        if (recorded) |index| {
+            if (index + 1 == resource.releases.items.len) {
+                previous = release;
+                previous_release = @intCast(index);
+            }
+            continue;
+        }
+        if (previous == null and resource.releases.items.len != 0) return error.MissingBaselineRelease;
         previous_release = try History.record(allocator, resource, if (previous) |*old| old else null, previous_release, &release);
         previous = release;
     }
@@ -880,6 +893,12 @@ fn recordReleases(allocator: std.mem.Allocator, io: std.Io, history: *History, k
 // --- Generated tables ---
 
 fn generate(allocator: std.mem.Allocator, writer: *std.Io.Writer, resources: []const *const Vocabulary, history: *const History) !void {
+    // A history ends at the release it describes, or its first releases and names would be stale.
+    for (resources) |resource| if (history.findConst(resource.identity.key)) |recorded| {
+        const releases = recorded.releases.items;
+        if (releases.len == 0 or !std.mem.eql(u8, releases[releases.len - 1], dataVersion(resource)))
+            return error.HistoryNotCurrent;
+    };
     var raw: std.Io.Writer.Allocating = .init(allocator);
     const w = &raw.writer;
     try w.writeAll("//! Generated vocabulary tables, artifact format 2; regenerate with the vocabulary command.\n\n" ++
@@ -1075,6 +1094,10 @@ test "[unit] - [vocabulary generation]: emits repeatable tables that parse back 
     try std.testing.expect(std.mem.indexOf(u8, first.written(), "child name") != null);
     var short = std.Io.Writer.fixed(&.{});
     try std.testing.expectError(error.WriteFailed, generate(allocator, &short, &.{resource}, &history));
+    var stale: History = .{};
+    try stale.resources.append(allocator, .{ .key = "example" });
+    try stale.resources.items[0].releases.append(allocator, "older");
+    try std.testing.expectError(error.HistoryNotCurrent, generate(allocator, &first.writer, &.{resource}, &stale));
 }
 
 test "[unit] - [vocabulary history]: records new, newly obsolete, and renamed terms by release" {
@@ -1105,6 +1128,36 @@ test "[unit] - [vocabulary history]: records new, newly obsolete, and renamed te
     const round_trip = try History.parse(allocator, try history.render(allocator));
     try std.testing.expectEqualStrings(try history.render(allocator), try round_trip.render(allocator));
     try std.testing.expectError(error.ReleaseAlreadyRecorded, History.record(allocator, &history.resources.items[0], null, 0, &previous.?));
+}
+
+test "[unit] - [vocabulary history]: extending a history from its last release equals one replay" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    const header = "format-version: 1.2\nontology: example\n";
+    const files = [_][]const u8{ "1.obo", "2.obo", "3.obo" };
+    const contents = [_][]const u8{
+        header ++ "data-version: 1\n[Term]\nid: X:1\nname: one\n",
+        header ++ "data-version: 2\n[Term]\nid: X:1\nname: uno\n[Term]\nid: X:2\nname: two\n",
+        header ++ "data-version: 3\n[Term]\nid: X:1\nname: eins\nis_obsolete: true\n[Term]\nid: X:2\nname: two\n[Term]\nid: X:3\nname: three\n",
+    };
+    var paths: [3][]const u8 = undefined;
+    for (files, contents, &paths) |name, bytes, *path| {
+        try dir.dir.writeFile(std.testing.io, .{ .sub_path = name, .data = bytes });
+        path.* = try dir.dir.realPathFileAlloc(std.testing.io, name, allocator);
+    }
+    var whole: History = .{};
+    try recordReleases(allocator, std.testing.io, &whole, "example", &paths);
+    var extended: History = .{};
+    try recordReleases(allocator, std.testing.io, &extended, "example", paths[0..2]);
+    var resumed = try History.parse(allocator, try extended.render(allocator));
+    try recordReleases(allocator, std.testing.io, &resumed, "example", paths[1..3]);
+    try std.testing.expectEqualStrings(try whole.render(allocator), try resumed.render(allocator));
+    // Without the last recorded release there is nothing to compare the next one with.
+    var missing = try History.parse(allocator, try extended.render(allocator));
+    try std.testing.expectError(error.MissingBaselineRelease, recordReleases(allocator, std.testing.io, &missing, "example", paths[2..3]));
 }
 
 test "[unit] - [vocabulary history]: reads names as the library does, from releases it refuses" {
