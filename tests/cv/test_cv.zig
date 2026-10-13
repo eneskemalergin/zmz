@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const cv = @import("zmz").mzml.cv;
+const support = @import("../mzml/support.zig");
 
 // A small resource with every modeled field, parsed as a newer release would be at run time.
 const GRAPH_OBO =
@@ -531,4 +532,66 @@ test "[edge] - [CV floating values]: checks decimal syntax, range, and special s
     }
     try std.testing.expectError(error.Overflow, cv.parseFloat(f32, "3.5e38"));
     try std.testing.expect(std.math.isFinite(try cv.parseFloat(f64, "3.5e38")));
+}
+
+// Bytes fuzzed OBO is drawn from: stanza and field punctuation, names, and line breaks most often,
+// any byte sometimes.
+const OBO_BYTES = [_]std.testing.Smith.Weight{
+    .rangeAtMost(u8, 0x00, 0xff, 1), .rangeAtMost(u8, 'a', 'z', 6), .rangeAtMost(u8, '0', '9', 3),
+    .value(u8, '\n', 10),            .value(u8, ':', 8),            .value(u8, ' ', 6),
+    .value(u8, '[', 3),              .value(u8, ']', 3),            .value(u8, 'X', 4),
+    .value(u8, '"', 3),              .value(u8, '\\', 2),           .value(u8, '!', 2),
+    .value(u8, '{', 2),              .value(u8, '}', 2),            .value(u8, '_', 2),
+};
+
+// Parsed tables either fail with a parse error or keep their invariants: IDs sorted and unique,
+// every ID found as itself, ancestors sorted and exactly the terms a parent walk reaches.
+fn parseAnyObo(_: void, smith: *std.testing.Smith) !void {
+    var source: [1024]u8 = undefined;
+    const bytes = source[0..smith.sliceWeightedBytes(&source, &OBO_BYTES)];
+    const owned = cv.Vocabulary.parseObo(std.testing.allocator, bytes, .{ .key = "fuzz", .version = "", .namespace = "X" }) catch return;
+    defer owned.deinit();
+    const resource = &owned.vocabulary;
+    try std.testing.expect(resource.count() != 0);
+    for (0..resource.count()) |index| {
+        const term = resource.term(index);
+        if (index != 0) try std.testing.expect(std.mem.lessThan(u8, resource.term(index - 1).id(), term.id()));
+        const found = resource.lookup(term.id()).?;
+        try std.testing.expect(found.term.eql(term) and !found.alternate_id);
+        var ancestors = term.ancestors();
+        var previous: ?[]const u8 = null;
+        var count: usize = 0;
+        while (ancestors.next()) |ancestor| : (count += 1) {
+            try std.testing.expect(!ancestor.eql(term));
+            if (previous) |id| try std.testing.expect(std.mem.lessThan(u8, id, ancestor.id()));
+            previous = ancestor.id();
+            try std.testing.expect(reaches(term, ancestor));
+            try std.testing.expect(try resource.isA(term.id(), ancestor.id()));
+        }
+        var reached: usize = 0;
+        for (0..resource.count()) |other| reached += @intFromBool(reaches(term, resource.term(other)));
+        try std.testing.expectEqual(reached, count);
+        var types: [4][]const u8 = undefined;
+        _ = resource.valueTypes(term.id(), &types, 64) catch {};
+    }
+}
+
+// Whether a parent walk from `from` reaches `to`; parsed graphs have no cycles.
+fn reaches(from: cv.Vocabulary.Term, to: cv.Vocabulary.Term) bool {
+    var parents = from.parents();
+    while (parents.next()) |parent| if (parent.eql(to) or reaches(parent, to)) return true;
+    return false;
+}
+
+const OBO_CORPUS = [_][]const u8{
+    support.corpusDocument(GRAPH_OBO),
+    support.corpusDocument("format-version: 1.2\ndata-version: 1\n[Term]\nid: X:1\nname: a\nis_a: X:2\n[Term]\nid: X:2\nname: b\nis_a: X:1\n"),
+    support.corpusDocument("format-version: 1.4\ndata-version: 1\n[Term]\nid: X:1\nname: a\\\n b {x=\"y\"} ! c\n[Term]\nid: X:1\nname: again\n"),
+    support.corpusDocument("format-version: 1.2\ndata-version: 1\n[Term]\nid: X:4\nname: d\nis_a: X:3\n[Term]\nid: X:3\nname: c\nis_a: X:2\n[Term]\nid: X:2\nname: b\nis_a: X:1\n[Term]\nid: X:1\nname: a\n"),
+    support.corpusDocument("format-version: 1.2\ndata-version: 1\n[Typedef]\nid: part_of\nname: part of\n[Term]\nid: X:3\nname: c\nis_a: X:1\nis_a: X:2\n[Term]\nid: X:1\nname: a\n[Term]\nid: X:2\nname: b\nis_a: X:1\n"),
+};
+
+test "[fuzz] - [CV vocabulary]: any OBO bytes parse to consistent tables or a parse error" {
+    try std.testing.fuzz({}, parseAnyObo, .{ .corpus = &OBO_CORPUS });
+    try support.fuzzSeeded({}, parseAnyObo, &OBO_CORPUS, 400);
 }
