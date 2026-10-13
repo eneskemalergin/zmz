@@ -94,7 +94,7 @@ fn checkFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Totals
         if (totals.records == 0 or totals.records == count / 2 or totals.records == count -| 1) {
             var found = (try index.at(allocator, record.node.kind, ordinal)) orelse return error.MissingIndexedRecord;
             defer found.deinit();
-            std.testing.expectEqualDeep(record.node, found.value.node) catch return error.IndexedRecordMismatch;
+            if (!same(record.node, found.value.node)) return error.IndexedRecordMismatch;
             totals.lookups += 1;
         }
         totals.records += 1;
@@ -113,6 +113,44 @@ fn checkFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Totals
     }
     if (totals.records != count) return error.RecordCountMismatch;
     return totals;
+}
+
+// Field-by-field equality through slices, optionals, pointers, and unions: a forward-read node and
+// its indexed lookup must agree on everything, offsets included.
+fn same(a: anytype, b: @TypeOf(a)) bool {
+    const T = @TypeOf(a);
+    switch (@typeInfo(T)) {
+        .pointer => |pointer| switch (pointer.size) {
+            .slice => {
+                if (pointer.child == u8) return std.mem.eql(u8, a, b);
+                if (a.len != b.len) return false;
+                for (a, b) |x, y| if (!same(x, y)) return false;
+                return true;
+            },
+            .one => return same(a.*, b.*),
+            else => @compileError("no comparison for " ++ @typeName(T)),
+        },
+        .optional => {
+            const x = a orelse return b == null;
+            const y = b orelse return false;
+            return same(x, y);
+        },
+        .@"struct" => |info| {
+            inline for (info.fields) |field| if (!same(@field(a, field.name), @field(b, field.name))) return false;
+            return true;
+        },
+        .@"union" => {
+            if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+            return switch (a) {
+                inline else => |value, tag| same(value, @field(b, @tagName(tag))),
+            };
+        },
+        .array => {
+            for (a, b) |x, y| if (!same(x, y)) return false;
+            return true;
+        },
+        else => return a == b,
+    }
 }
 
 fn reportReaderFailure(reader: *mzml.StreamReader, err: anyerror) void {

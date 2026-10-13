@@ -36,6 +36,6 @@ jobs:
       - uses: $/.github/actions/setup-zig
       - name: Format
         if: matrix.target == 'x86_64-linux'
-        run: zig fmt --check build.zig src tests tools examples
+        run: zig fmt --check build.zig src tests tools examples bench
       - name: Test
         run: zig build test --summary all

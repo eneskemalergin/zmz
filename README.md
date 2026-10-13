@@ -62,6 +62,8 @@ The public entry point is [`src/root.zig`](src/root.zig). Vocabulary resources a
 
 [Complete, compiled examples](examples/README.md) show streamed reading, selected decoding, indexed access, array construction, and payload rewriting, with cleanup and buffer lifetimes. Build them with `zig build examples -Doptimize=ReleaseFast`. Their checks also run under `zig build test`.
 
+`zig build bench` times zmz on generated data, with nothing to download. It writes mzML of five shapes (metadata-heavy, centroid, profile, zlib, and MS-Numpress) at two sizes into `.zig-cache/zmz-bench/` (about 200 MiB, reused by later runs), then times forward reading, full decoding, XML events, indexed lookup, copying, and writing, each in its own process, always in ReleaseFast. It reports wall time, throughput, peak memory, and a checksum of what each case read, and uses `zebrac`, a perf-counter benchmark runner, for instruction counts when it is on the `PATH`. Peak memory stays near 1 to 2 MiB from the small inputs to the four-times-larger ones.
+
 ## License
 
 zmz is licensed under the [Apache License, Version 2.0](LICENSE). The third-party notices are in [`NOTICE`](NOTICE): zlib support uses zipir under the MIT license, and SLOF's `exp` and `log` tables (`src/binary/libm_data.zig`) come from Arm's optimized-routines under the MIT license. Include `LICENSE` and `NOTICE` with source and binary distributions. The bundled vocabulary resources keep their own source terms and attribution requirements; see [`vocabularies/README.md`](vocabularies/README.md).
