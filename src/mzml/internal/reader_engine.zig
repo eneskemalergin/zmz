@@ -979,41 +979,45 @@ fn parseParams(self: *Engine, storage: *Storage, comptime retain: bool, count: *
         };
         if (retain) try entries.append(self.allocator, entry);
         count.* += 1;
-        try self.cursor.advance(has_content);
-        if (has_content) {
-            var content: std.ArrayList(cv.ParameterXml.Part) = .empty;
-            defer content.deinit(self.allocator);
-            while (self.cursor.current) |current| {
-                const part: cv.ParameterXml.Part = switch (current.data) {
-                    .end_element => break,
-                    .start_element => .{ .xml = try self.readXml(storage, retain) },
-                    .text => blk: {
-                        var bytes: std.ArrayList(u8) = .empty;
-                        while (self.cursor.current) |text| {
-                            if (text.data != .text) break;
-                            if (retain) {
-                                if (text.data.text.bytes.len > storage.limit -| storage.used -| bytes.items.len)
-                                    return try storage.limitError(bytes.items.len +| text.data.text.bytes.len);
-                                try bytes.appendSlice(storage.arena.allocator(), text.data.text.bytes);
-                            }
-                            try self.cursor.advance(true);
-                        }
-                        storage.used += bytes.items.len;
-                        break :blk .{ .text = bytes.items };
-                    },
-                };
-                if (retain) {
-                    if (content.items.len == self.options.limits.list_entries)
-                        return try self.limitError(.metadata, .list_entries, self.options.limits.list_entries, null);
-                    try content.append(self.allocator, part);
-                }
-                if (part != .text) try self.cursor.advance(true);
-            }
-            if (retain) extra.?.content = try storage.copy(cv.ParameterXml.Part, content.items);
-            if (retain and !has_extra and content.items.len == 0) switch (entries.items[entries.items.len - 1]) {
-                inline else => |*param| param.xml = null,
-            };
+        if (!has_content) {
+            // An empty parameter's end event carries nothing, so the cursor closes it in place.
+            self.cursor.closeEmpty();
+            try self.cursor.advance(false);
+            continue;
         }
+        try self.cursor.advance(true);
+        var content: std.ArrayList(cv.ParameterXml.Part) = .empty;
+        defer content.deinit(self.allocator);
+        while (self.cursor.current) |current| {
+            const part: cv.ParameterXml.Part = switch (current.data) {
+                .end_element => break,
+                .start_element => .{ .xml = try self.readXml(storage, retain) },
+                .text => blk: {
+                    var bytes: std.ArrayList(u8) = .empty;
+                    while (self.cursor.current) |text| {
+                        if (text.data != .text) break;
+                        if (retain) {
+                            if (text.data.text.bytes.len > storage.limit -| storage.used -| bytes.items.len)
+                                return try storage.limitError(bytes.items.len +| text.data.text.bytes.len);
+                            try bytes.appendSlice(storage.arena.allocator(), text.data.text.bytes);
+                        }
+                        try self.cursor.advance(true);
+                    }
+                    storage.used += bytes.items.len;
+                    break :blk .{ .text = bytes.items };
+                },
+            };
+            if (retain) {
+                if (content.items.len == self.options.limits.list_entries)
+                    return try self.limitError(.metadata, .list_entries, self.options.limits.list_entries, null);
+                try content.append(self.allocator, part);
+            }
+            if (part != .text) try self.cursor.advance(true);
+        }
+        if (retain) extra.?.content = try storage.copy(cv.ParameterXml.Part, content.items);
+        if (retain and !has_extra and content.items.len == 0) switch (entries.items[entries.items.len - 1]) {
+            inline else => |*param| param.xml = null,
+        };
         const end = self.cursor.current orelse return error.UnexpectedEnd;
         if (end.data != .end_element) return error.InvalidStructure;
         try self.cursor.advance(false);

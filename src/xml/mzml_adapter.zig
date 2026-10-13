@@ -341,6 +341,14 @@ pub const Cursor = struct {
         return error.UnexpectedEnd;
     }
 
+    // Closes the current start element, written as <name/>, without producing its end event,
+    // for a reader that keeps nothing from that event.
+    pub fn closeEmpty(self: *Cursor) void {
+        std.debug.assert(self.pending_empty and self.depth != 0);
+        self.pending_empty = false;
+        self.popFrame(self.frames[self.depth - 1]);
+    }
+
     // Starts at a current start element and leaves the subtree's end event current.
     pub fn skipElement(self: *Cursor, remaining_nodes: *usize) (AdvanceError || error{UnexpectedEnd})!void {
         std.debug.assert(self.current.?.data == .start_element);
