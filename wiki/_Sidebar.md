@@ -24,4 +24,5 @@
 **Under the hood**
 
 - [Performance](Performance)
+- [Benchmarks](Benchmarks)
 - [Development](Development)

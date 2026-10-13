@@ -62,4 +62,4 @@ Every case runs in its own process, so peak memory is per case, and always in Re
 
 The generated inputs are kept between runs and reused while the generator is unchanged, so two commits are measured on the same bytes.
 
-Comparisons with other mzML readers, on real instrument files, live in a separate benchmark project, correctness first and then speed and memory.
+How zmz compares with other mzML readers on real instrument files, correctness first and then speed and memory, is on the [Benchmarks](Benchmarks) page.

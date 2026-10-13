@@ -41,4 +41,5 @@ flowchart LR
 ## Under the hood
 
 - [Performance](Performance): what makes zmz fast, how to measure it, and what to expect.
+- [Benchmarks](Benchmarks): zmz next to five other mzML readers on the same real files, correctness first.
 - [Development](Development): building, testing, the source layout, and the tools in the repository.
