@@ -4,6 +4,8 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+  # The release workflow runs it on the tagged commit.
+  workflow_call:
 
 permissions: {}
 
