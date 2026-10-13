@@ -61,3 +61,14 @@ decoded, OBO comments and typedef stanzas are omitted, and each term's ancestors
 history are derived. The release, source commit, and SHA-256 of each file used are recorded in the
 tables' resource identities. The material is provided as is, without warranties, as the license
 states.
+
+== Zig logo (CC BY-SA 4.0), assets/ ==
+
+The Z in assets/zmz-icon.svg, assets/logo-readme.svg, and assets/social-preview.svg (and its PNG
+export) is the logomark of the Zig logo, https://github.com/ziglang/logo, by the Zig Software
+Foundation, licensed under the Creative Commons Attribution-ShareAlike 4.0 International License,
+https://creativecommons.org/licenses/by-sa/4.0/.
+
+Changes: the Z is scaled and recolored, and combined with zmz's own drawing. These adapted files
+are licensed under CC BY-SA 4.0 as well, not under the Apache License; the assets/ directory is not
+part of the Zig package. The material is provided as is, without warranties, as the license states.
