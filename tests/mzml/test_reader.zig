@@ -3222,15 +3222,10 @@ fn readingAtAnySplit(_: void, smith: *std.testing.Smith) !void {
     try std.testing.expectEqualStrings(whole.written(), split.written());
 }
 
-// A fuzz corpus entry for a document read with sliceWeightedBytes: its length, then its bytes.
-fn corpusDocument(comptime document: []const u8) []const u8 {
-    return comptime std.mem.toBytes(@as(u32, document.len)) ++ document;
-}
-
 const READING_CORPUS = [_][]const u8{
-    corpusDocument(support.DOCUMENT),
-    corpusDocument(support.REFERENCED_DOCUMENT),
-    corpusDocument(support.HEADER ++ "<spectrumList count='1'><spectrum id='s' index='0' defaultArrayLength='2'><binaryDataArrayList count='1'>" ++
+    support.corpusDocument(support.DOCUMENT),
+    support.corpusDocument(support.REFERENCED_DOCUMENT),
+    support.corpusDocument(support.HEADER ++ "<spectrumList count='1'><spectrum id='s' index='0' defaultArrayLength='2'><binaryDataArrayList count='1'>" ++
         "<binaryDataArray encodedLength='20'><cvParam accession='MS:1000523'/><cvParam accession='MS:1000574'/>" ++
         "<binary>eJxjYAABBgQIAP//AwAJ+AGi</binary></binaryDataArray></binaryDataArrayList></spectrum></spectrumList></run></mzML>"),
 };
@@ -3299,7 +3294,7 @@ fn arrayTextInAnyRuns(_: void, smith: *std.testing.Smith) !void {
     try std.testing.expectEqualStrings(whole.written(), split.written());
 }
 
-const ARRAY_TEXT_CORPUS = [_][]const u8{ corpusDocument("AAAAAAAA8D8="), corpusDocument("eJxjYAABBgQIAP//AwAJ+AGi") };
+const ARRAY_TEXT_CORPUS = [_][]const u8{ support.corpusDocument("AAAAAAAA8D8="), support.corpusDocument("eJxjYAABBgQIAP//AwAJ+AGi") };
 
 test "[fuzz] - [mzML decoded arrays]: any array text decodes to the same values or failure in any runs" {
     try std.testing.fuzz({}, arrayTextInAnyRuns, .{ .corpus = &ARRAY_TEXT_CORPUS });

@@ -380,11 +380,6 @@ const XML_BYTES = [_]std.testing.Smith.Weight{
     .value(u8, '\n', 3),             .value(u8, '\r', 2),           .value(u8, '#', 1),
 };
 
-// A fuzz corpus entry for a document read with sliceWeightedBytes: its length, then its bytes.
-fn corpusDocument(comptime document: []const u8) []const u8 {
-    return comptime std.mem.toBytes(@as(u32, document.len)) ++ document;
-}
-
 fn eventsAtAnySplit(_: void, smith: *std.testing.Smith) !void {
     var source: [768]u8 = undefined;
     const bytes = source[0..smith.sliceWeightedBytes(&source, &XML_BYTES)];
@@ -403,11 +398,11 @@ fn eventsAtAnySplit(_: void, smith: *std.testing.Smith) !void {
 }
 
 const EVENTS_CORPUS = [_][]const u8{
-    corpusDocument("<r xmlns:p='urn:p'><a x='1'/><p:b p:y='&lt;'>t&#x41;u<![CDATA[]]>]]></p:b><!-- c --><?pi x?></r>"),
-    corpusDocument("<?xml version='1.0' encoding='UTF-8'?>\r\n<r>\r\n\t<a>one\ttwo\r\nthree</a>\n</r>\n"),
-    corpusDocument("\xff\xfe<\x00r\x00/\x00>\x00"),
-    corpusDocument("<r><a></b></r>"),
-    corpusDocument(support.DOCUMENT),
+    support.corpusDocument("<r xmlns:p='urn:p'><a x='1'/><p:b p:y='&lt;'>t&#x41;u<![CDATA[]]>]]></p:b><!-- c --><?pi x?></r>"),
+    support.corpusDocument("<?xml version='1.0' encoding='UTF-8'?>\r\n<r>\r\n\t<a>one\ttwo\r\nthree</a>\n</r>\n"),
+    support.corpusDocument("\xff\xfe<\x00r\x00/\x00>\x00"),
+    support.corpusDocument("<r><a></b></r>"),
+    support.corpusDocument(support.DOCUMENT),
 };
 
 test "[fuzz] - [mzML events]: any bytes give the same events and failure at any split" {
