@@ -94,6 +94,38 @@ pub const PeakAllocator = struct {
     }
 };
 
+/// Runs a fuzz target on `count` inputs drawn from the test seed: each a corpus entry with a few
+/// bytes changed or cut, or random bytes when there is no corpus. Zig 0.16.0 does not build tests
+/// in fuzz mode, so this is the generated input each ordinary test run gives the target.
+pub fn fuzzSeeded(
+    context: anytype,
+    comptime testOne: fn (@TypeOf(context), *std.testing.Smith) anyerror!void,
+    corpus: []const []const u8,
+    count: usize,
+) !void {
+    var prng = std.Random.DefaultPrng.init(std.testing.random_seed);
+    const random = prng.random();
+    var bytes: [8192]u8 = undefined;
+    for (0..count) |_| {
+        var len: usize = 0;
+        if (corpus.len == 0) {
+            len = random.uintAtMost(usize, 1024);
+            random.bytes(bytes[0..len]);
+        } else {
+            const entry = corpus[random.uintLessThan(usize, corpus.len)];
+            len = entry.len;
+            @memcpy(bytes[0..len], entry);
+            // Past the 4-byte length the Smith reads first, so the entry keeps its shape.
+            if (len > 4) for (0..random.uintAtMost(usize, 8)) |_| {
+                bytes[4 + random.uintLessThan(usize, len - 4)] = random.int(u8);
+            };
+            if (random.uintLessThan(u8, 8) == 0) len = random.uintAtMost(usize, len);
+        }
+        var smith: std.testing.Smith = .{ .in = bytes[0..len] };
+        try testOne(context, &smith);
+    }
+}
+
 // Links nodes into one chain, each the only child of the one before, and returns the outermost.
 pub fn nest(nodes: []mzml.model.Node) mzml.model.Node {
     var index = nodes.len - 1;

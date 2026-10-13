@@ -1875,6 +1875,63 @@ test "[property] - [mzML indexed writer]: preserves IDs and offsets across index
 
 // Six spectra with 40 KB arrays: output spans many writer chunks, and each uncompressed
 // array's Base64 crosses chunk boundaries on the writer's direct encoding path.
+// Opens or rebuilds an index, lists every entry, and looks each one up by ID (through the listed
+// ID, which lookups leave alone) and decoded by ordinal.
+fn useIndex(allocator: std.mem.Allocator, bytes: []const u8, policy: mzml.IndexedReader.Policy) !void {
+    var index = try mzml.IndexedReader.build(allocator, .{ .bytes = bytes }, .{ .policy = policy });
+    defer index.deinit();
+    var decoded = mzml.DecodedArrays.init(allocator, .{});
+    defer decoded.deinit();
+    const counts = support.kindCounts(&index);
+    for (0..index.entryCount()) |position| {
+        const entry = index.entryAt(position).?;
+        const listed = try allocator.dupe(u8, entry.id);
+        defer allocator.free(listed);
+        var by_id = (try index.byId(allocator, entry.id)) orelse return error.TestUnexpectedResult;
+        defer by_id.deinit();
+        try std.testing.expectEqualStrings(entry.id, by_id.value.id);
+        var by_ordinal = (try index.atDecoded(allocator, entry.kind, entry.ordinal, &decoded)) orelse return error.TestUnexpectedResult;
+        by_ordinal.deinit();
+        const kind_count = counts[if (entry.kind == .spectrum) 0 else 1];
+        var neighbour = (try index.at(allocator, entry.kind, (entry.ordinal + 1) % kind_count)) orelse return error.TestUnexpectedResult;
+        neighbour.deinit();
+        // Lookups decode IDs elsewhere, so the listed ID is still the entry's.
+        try std.testing.expectEqualStrings(listed, entry.id);
+    }
+}
+
+test "[failure] - [mzML index]: releases every allocation when one fails while opening, listing, or looking up" {
+    var document: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer document.deinit();
+    try support.rewriteDocument(std.testing.allocator, support.REFERENCED_DOCUMENT, &document.writer, true);
+    for ([_]mzml.IndexedReader.Policy{ .open_embedded, .rebuild }) |policy|
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, useIndex, .{ document.written(), policy });
+}
+
+fn indexAfterMutation(base: []const u8, smith: *std.testing.Smith) !void {
+    var bytes: [8192]u8 = undefined;
+    @memcpy(bytes[0..base.len], base);
+    // A few bytes changed, most often in the trailer, where the index and its offsets are.
+    const trailer = std.mem.indexOf(u8, base, "<indexList").?;
+    while (!smith.eosWeightedSimple(1, 3)) {
+        const at = if (smith.boolWeighted(1, 3)) trailer + smith.index(base.len - trailer) else smith.index(base.len);
+        bytes[at] = smith.valueWeighted(u8, &.{ .rangeAtMost(u8, 0, 255, 1), .rangeAtMost(u8, '0', '9', 4), .value(u8, '"', 2), .value(u8, '<', 2) });
+    }
+    const policy: mzml.IndexedReader.Policy = if (smith.boolWeighted(3, 1)) .open_embedded else .rebuild;
+    useIndex(std.testing.allocator, bytes[0..base.len], policy) catch |err| switch (err) {
+        error.TestUnexpectedResult, error.TestExpectedEqual => return err,
+        else => {},
+    };
+}
+
+test "[fuzz] - [mzML index]: mutated indexes open, look up, or fail with a documented error" {
+    var document: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer document.deinit();
+    try support.rewriteDocument(std.testing.allocator, support.REFERENCED_DOCUMENT, &document.writer, true);
+    try std.testing.fuzz(@as([]const u8, document.written()), indexAfterMutation, .{});
+    try support.fuzzSeeded(@as([]const u8, document.written()), indexAfterMutation, &.{}, 300);
+}
+
 // Writes empty spectra whose IDs are fixed text around integers, as instrument vendors write them.
 fn writeTemplated(allocator: std.mem.Allocator, sink: *std.Io.Writer, count: usize, indexed: bool) !void {
     var writer = if (indexed) try mzml.Writer.initIndexed(allocator, sink, .{}, .{}) else try mzml.Writer.init(allocator, sink, .{});

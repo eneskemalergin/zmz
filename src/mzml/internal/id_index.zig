@@ -520,6 +520,66 @@ test "[edge] - [mzML ID index]: tells IDs apart when their stored hashes collide
     try std.testing.expect(index.encoded.items.len < count * 7);
 }
 
+fn idsAgainstReference(_: void, smith: *std.testing.Smith) !void {
+    const allocator = std.testing.allocator;
+    var index: IdIndex = .{};
+    defer index.deinit(allocator);
+    // The IDs added, in order, and every ID seen, so each add's outcome is known beforehand.
+    var added: std.ArrayList([]u8) = .empty;
+    defer {
+        for (added.items) |id| allocator.free(id);
+        added.deinit(allocator);
+    }
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer seen.deinit(allocator);
+    // Digits most often, so IDs share templates and integers change, overflow, and gain zeros.
+    const weights = [_]std.testing.Smith.Weight{
+        .rangeAtMost(u8, '0', '9', 12), .value(u8, '=', 2),          .value(u8, ' ', 2),
+        .rangeAtMost(u8, 'a', 'c', 2),  .rangeAtMost(u8, 0, 255, 1),
+    };
+    var buffer: [24]u8 = undefined;
+    while (added.items.len < 400 and !smith.eosWeightedSimple(1, 40)) {
+        // Often a small change to the last ID, as consecutive mzML IDs are.
+        const len = if (added.items.len != 0 and smith.boolWeighted(1, 3)) len: {
+            const last = added.items[added.items.len - 1];
+            @memcpy(buffer[0..last.len], last);
+            buffer[smith.index(last.len + 1) -| 1] = smith.valueWeighted(u8, &weights);
+            break :len last.len;
+        } else smith.sliceWeightedBytes(&buffer, &weights);
+        const id = buffer[0..len];
+        const before = index.encoded.items.len;
+        const prepared = index.prepare(id);
+        if (seen.contains(id)) {
+            try std.testing.expectError(error.DuplicateId, index.add(allocator, id, prepared));
+            continue;
+        }
+        try index.add(allocator, id, prepared);
+        try std.testing.expectEqual(prepared.length, index.encoded.items.len - before);
+        try added.ensureUnusedCapacity(allocator, 1);
+        try seen.ensureUnusedCapacity(allocator, 1);
+        const copy = try allocator.dupe(u8, id);
+        added.appendAssumeCapacity(copy);
+        seen.putAssumeCapacity(copy, {});
+    }
+    for (added.items, 0..) |id, position| {
+        try std.testing.expectEqualStrings(id, index.get(position));
+        try std.testing.expectEqual(@as(?u32, @intCast(position)), index.find(id));
+    }
+}
+
+test "[fuzz] - [mzML ID index]: stores any IDs exactly and finds each, rejecting exactly the repeats" {
+    try std.testing.fuzz({}, idsAgainstReference, .{});
+    // Zig 0.16.0 does not build tests in fuzz mode, so ordinary runs also try seeded random inputs.
+    var prng = std.Random.DefaultPrng.init(std.testing.random_seed);
+    var bytes: [4096]u8 = undefined;
+    for (0..300) |_| {
+        const len = prng.random().uintAtMost(usize, bytes.len);
+        prng.random().bytes(bytes[0..len]);
+        var smith: std.testing.Smith = .{ .in = bytes[0..len] };
+        try idsAgainstReference({}, &smith);
+    }
+}
+
 test "[failure] - [mzML ID index]: leaves the index unchanged when adding fails" {
     const Check = struct {
         fn run(allocator: std.mem.Allocator) !void {
