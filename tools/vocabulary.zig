@@ -18,7 +18,7 @@ const Vocabulary = mzml.cv.Vocabulary;
 pub fn main(init: std.process.Init) void {
     run(init) catch |err| {
         var buffer: [256]u8 = undefined;
-        var stderr = std.Io.File.stderr().writer(init.io, &buffer);
+        var stderr = std.Io.File.stderr().writerStreaming(init.io, &buffer);
         stderr.interface.print("vocabulary: {s}\n", .{@errorName(err)}) catch {};
         stderr.interface.flush() catch {};
         std.process.exit(1);
@@ -42,7 +42,7 @@ fn run(init: std.process.Init) !void {
     const command = std.meta.stringToEnum(Command, args[1]) orelse return usage(init.io);
     const allocator = init.arena.allocator();
     var stdout_buffer: [8192]u8 = undefined;
-    var stdout = std.Io.File.stdout().writer(init.io, &stdout_buffer);
+    var stdout = std.Io.File.stdout().writerStreaming(init.io, &stdout_buffer);
     const out = &stdout.interface;
     defer out.flush() catch {};
     switch (command) {

@@ -17,11 +17,11 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     }
     var buffer: [4096]u8 = undefined;
-    var output = std.Io.File.stdout().writer(init.io, &buffer);
+    var output = std.Io.File.stdout().writerStreaming(init.io, &buffer);
     for (args[1..]) |path| {
         const totals = checkFile(init.gpa, init.io, path) catch |err| {
             var error_buffer: [4096]u8 = undefined;
-            var diagnostic = std.Io.File.stderr().writer(init.io, &error_buffer);
+            var diagnostic = std.Io.File.stderr().writerStreaming(init.io, &error_buffer);
             try diagnostic.interface.print("{s}: {s}\n", .{ path, @errorName(err) });
             try diagnostic.interface.flush();
             std.process.exit(1);

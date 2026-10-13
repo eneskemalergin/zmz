@@ -66,6 +66,28 @@ test "[cli] - [vocabulary scan]: reports source metadata, with or without CV dec
     }
 }
 
+test "[cli] - [vocabulary scan]: appends to an output file that earlier processes wrote" {
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    const executable = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, options.executable, std.testing.allocator);
+    defer std.testing.allocator.free(executable);
+    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "input.mzML", .data = "<mzML xmlns='http://psi.hupo.org/ms/mzml' version='1.1.0'><run/></mzML>" });
+    // As a shell's `{ scan; scan; } > report` shares one file between both processes.
+    const report = try dir.dir.createFile(std.testing.io, "report.jsonl", .{});
+    for (0..2) |_| {
+        var child = try std.process.spawn(std.testing.io, .{
+            .argv = &.{ executable, "scan", "input.mzML" },
+            .cwd = .{ .dir = dir.dir },
+            .stdout = .{ .file = report },
+        });
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try child.wait(std.testing.io));
+    }
+    report.close(std.testing.io);
+    var buffer: [2048]u8 = undefined;
+    const written = try dir.dir.readFile(std.testing.io, "report.jsonl", &buffer);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, written, "\"kind\":\"scan\""));
+}
+
 test "[cli] - [vocabulary scan]: reports where an unreadable file broke and exits with status 1" {
     var dir = std.testing.tmpDir(.{});
     defer dir.cleanup();

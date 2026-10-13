@@ -13,7 +13,7 @@ pub fn main(init: std.process.Init) !void {
         return error.InvalidArguments;
     }
     var output_buffer: [4096]u8 = undefined;
-    var output = std.Io.File.stdout().writer(init.io, &output_buffer);
+    var output = std.Io.File.stdout().writerStreaming(init.io, &output_buffer);
     var retained_header: ?mzml.owned.Header = null;
     defer if (retained_header) |*header| header.deinit();
     var retained_record: ?mzml.owned.Record = null;
