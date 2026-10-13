@@ -778,7 +778,9 @@ const History = struct {
 
 // What history needs from one release: its version, and each term's name and obsolete flag.
 // Read tolerantly, because old releases repeat IDs and fields the library parser refuses: the
-// first stanza for an ID wins. Names decode as the library decodes them.
+// first stanza for an ID wins. Names decode as the library decodes them. A file without a
+// `data-version` is named by the day of its `date:` header, as documents declare such releases
+// (Unit Ontology files before 2023 say `date: 09:04:2014 13:37`, and documents `09:04:2014`).
 const Release = struct {
     version: []const u8,
     terms: std.StringArrayHashMapUnmanaged(State) = .empty,
@@ -787,6 +789,7 @@ const Release = struct {
 
     fn read(allocator: std.mem.Allocator, bytes: []const u8) !Release {
         var release: Release = .{ .version = "" };
+        var day: []const u8 = "";
         var in_term = false;
         var id: ?[]const u8 = null;
         var state: State = .{ .name = "", .obsolete = false };
@@ -807,6 +810,7 @@ const Release = struct {
             const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
             if (!in_term) {
                 if (std.mem.eql(u8, tag, "data-version") and release.version.len == 0) release.version = value;
+                if (std.mem.eql(u8, tag, "date") and day.len == 0) day = std.mem.sliceTo(value, ' ');
             } else if (std.mem.eql(u8, tag, "id")) {
                 if (id == null) id = value;
             } else if (std.mem.eql(u8, tag, "name")) {
@@ -815,6 +819,7 @@ const Release = struct {
                 state.obsolete = std.mem.eql(u8, value, "true");
             }
         }
+        if (release.version.len == 0) release.version = day;
         if (release.version.len == 0) return error.MissingField;
         return release;
     }
@@ -1124,6 +1129,7 @@ test "[unit] - [vocabulary history]: reads names as the library does, from relea
     try std.testing.expectEqual(@as(usize, 1), repeated.terms.count());
     try std.testing.expectEqualStrings("first name", repeated.terms.get("X:1").?.name);
     try std.testing.expect(!repeated.terms.get("X:1").?.obsolete);
+    try std.testing.expectEqualStrings("09:04:2014", (try Release.read(allocator, "format-version: 1.2\ndate: 09:04:2014 13:37\n[Term]\nid: X:1\n")).version);
     try std.testing.expectError(error.MissingField, Release.read(allocator, "format-version: 1.2\n[Term]\nid: X:1\n"));
 }
 
