@@ -550,6 +550,41 @@ test "[integration] - [mzML 1.0 writing]: retains the namespace hierarchy and pa
     }
 }
 
+test "[integration] - [mzML 1.1.1]: reads, indexes, and writes a run ID that is any nonempty string" {
+    // mzML 1.1.1 keeps the 1.1 namespace and relaxes run/@id from xs:ID to any nonempty string.
+    const run_id = "2024-01-01 run: A/B #1";
+    const versioned = try std.mem.replaceOwned(u8, std.testing.allocator, support.DOCUMENT, "version='1.1.0'", "version='1.1.1'");
+    defer std.testing.allocator.free(versioned);
+    const source = try std.mem.replaceOwned(u8, std.testing.allocator, versioned, "<run id='r'", "<run id='" ++ run_id ++ "'");
+    defer std.testing.allocator.free(source);
+    for ([_]bool{ false, true }) |indexed| {
+        var sink: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer sink.deinit();
+        try support.rewriteDocument(std.testing.allocator, source, &sink.writer, indexed);
+        const bytes = sink.written();
+        try std.testing.expect(std.mem.indexOf(u8, bytes, "version=\"1.1.1\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, bytes, "<run id=\"" ++ run_id ++ "\"") != null);
+        var original = std.Io.Reader.fixed(source);
+        var copied = std.Io.Reader.fixed(bytes);
+        var a = try mzml.StreamReader.init(std.testing.allocator, &original, .{});
+        defer a.deinit();
+        var b = try mzml.StreamReader.init(std.testing.allocator, &copied, .{});
+        defer b.deinit();
+        try std.testing.expectEqualStrings(run_id, (try a.readHeader()).run.attribute("id").?);
+        try std.testing.expectEqualStrings("1.1.1", (try b.readHeader()).document.attribute("version").?);
+        try support.expectNode((try a.readHeader()).run, (try b.readHeader()).run);
+        while (try a.nextRecord()) |record| try support.expectNode(record.node, (try b.nextRecord()).?.node);
+        try std.testing.expectEqual(null, try b.nextRecord());
+        if (!indexed) continue;
+        var index = try mzml.IndexedReader.build(std.testing.allocator, .{ .bytes = bytes }, .{});
+        defer index.deinit();
+        try std.testing.expectEqualStrings(run_id, index.header().run.attribute("id").?);
+        var record = (try index.byId(std.testing.allocator, "tic")).?;
+        defer record.deinit();
+        try std.testing.expectEqualStrings("tic", record.value.id);
+    }
+}
+
 test "[integration] - [mzML lists]: retains attributes and uses the requested output count" {
     inline for (.{
         .{ "", "" },
