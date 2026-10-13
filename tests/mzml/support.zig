@@ -50,6 +50,50 @@ pub const REFERENCED_DOCUMENT = HEADER ++ "<spectrumList count='2' defaultDataPr
     "<precursor spectrumRef='scan=1'><activation/></precursor>" ++ ARRAYS ++
     "</chromatogram></chromatogramList></run></mzML>";
 
+/// Passes allocations to another allocator and tracks the bytes held and the most held at once,
+/// for footprint bounds.
+pub const PeakAllocator = struct {
+    child: std.mem.Allocator,
+    held: usize = 0,
+    peak: usize = 0,
+
+    pub fn allocator(self: *PeakAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn change(self: *PeakAllocator, old_len: usize, new_len: usize) void {
+        self.held = self.held - old_len + new_len;
+        self.peak = @max(self.peak, self.held);
+    }
+
+    fn alloc(context: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *PeakAllocator = @ptrCast(@alignCast(context));
+        const memory = self.child.rawAlloc(len, alignment, ret_addr) orelse return null;
+        self.change(0, len);
+        return memory;
+    }
+
+    fn resize(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *PeakAllocator = @ptrCast(@alignCast(context));
+        if (!self.child.rawResize(memory, alignment, new_len, ret_addr)) return false;
+        self.change(memory.len, new_len);
+        return true;
+    }
+
+    fn remap(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *PeakAllocator = @ptrCast(@alignCast(context));
+        const moved = self.child.rawRemap(memory, alignment, new_len, ret_addr) orelse return null;
+        self.change(memory.len, new_len);
+        return moved;
+    }
+
+    fn free(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *PeakAllocator = @ptrCast(@alignCast(context));
+        self.child.rawFree(memory, alignment, ret_addr);
+        self.held -= memory.len;
+    }
+};
+
 // Links nodes into one chain, each the only child of the one before, and returns the outermost.
 pub fn nest(nodes: []mzml.model.Node) mzml.model.Node {
     var index = nodes.len - 1;
@@ -192,7 +236,7 @@ pub fn expectWritten(expected: []const u8, actual: []const u8) !void {
 }
 
 // Spectrum and chromatogram entry counts, read through the index's public entries.
-pub fn kindCounts(index: *const mzml.IndexedReader) [2]usize {
+pub fn kindCounts(index: *mzml.IndexedReader) [2]usize {
     var counts: [2]usize = .{ 0, 0 };
     for (0..index.entryCount()) |position| counts[if (index.entryAt(position).?.kind == .spectrum) 0 else 1] += 1;
     return counts;

@@ -17,7 +17,7 @@ const xml = @import("../xml/mzml_adapter.zig");
 const model = @import("model.zig");
 const schema = @import("schema.zig");
 const Diagnostic = @import("diagnostic.zig");
-const Ids = @import("internal/id_index.zig").IdIndex(IndexEntry);
+const IdIndex = @import("internal/id_index.zig").IdIndex;
 
 const Writer = @This();
 
@@ -26,11 +26,14 @@ const Writer = @This();
 /// text), not the whole output.
 pub const Limits = struct { nodes: usize = 100_000, text_bytes: usize = 256 * 1024 * 1024 };
 
-/// Indexed output: bounds on retained index entries and ID bytes (including historical
-/// native/spot IDs), and the indexedmzML element's attributes.
+/// Indexed output: bounds on retained index entries and on the bytes of their IDs (including
+/// historical native/spot IDs, counted as given), and the indexedmzML element's attributes. The
+/// index keeps about 25 bytes a record for IDs that are fixed text around integers, and about the
+/// ID's length more for others. Both bounds default to their largest values, since the index holds
+/// the caller's own records.
 pub const IndexOptions = struct {
-    records: usize = 1_000_000,
-    id_bytes: usize = 64 * 1024 * 1024,
+    records: usize = std.math.maxInt(u32),
+    id_bytes: usize = std.math.maxInt(u32),
     /// Namespaced attributes for indexedmzML, such as the index schema's `xsi:schemaLocation`,
     /// written and checked as on the mzML root; borrowed until `writeHeader`. None by default.
     wrapper_attributes: []const model.Attribute = &.{},
@@ -104,7 +107,7 @@ pub fn initIndexed(
     index_options: IndexOptions,
 ) (std.mem.Allocator.Error || error{InvalidOptions})!Writer {
     if (limits.nodes == 0) return error.InvalidOptions;
-    // Entry positions and ID offsets are 32 bits.
+    // Entry positions are 32 bits; the ID-byte bound has the same range.
     if (index_options.records > std.math.maxInt(u32) or index_options.id_bytes > std.math.maxInt(u32))
         return error.InvalidOptions;
     for (index_options.wrapper_attributes) |attr| if (attr.namespace_uri == null) return error.InvalidOptions;
@@ -455,8 +458,9 @@ fn writeRecordInner(self: *Writer, node: model.Node, comptime replace_arrays: bo
             self.capture(error.MissingAttribute, .index, .{ .attribute = .id });
             return error.MissingAttribute;
         };
-        if (state.entries.items.len == state.options.records) return try self.limitError(.index, .records, state.options.records, null);
-        const id_start = try self.listId(state, id);
+        if (state.offsets.items.len == state.options.records) return try self.limitError(.index, .records, state.options.records, null);
+        try self.chargeId(state, id.len);
+        state.id_bytes += id.len;
         // Historical IDs are copied and reserved first, so they stay parallel to the entries.
         var native_id: ?[]const u8 = null;
         var spot_id: ?[]const u8 = null;
@@ -465,16 +469,11 @@ fn writeRecordInner(self: *Writer, node: model.Node, comptime replace_arrays: bo
             if (node.attribute("spotID")) |value| spot_id = try self.copyId(state, value);
             try state.historical_ids.ensureUnusedCapacity(state.allocator, 1);
         }
+        try state.offsets.ensureUnusedCapacity(state.allocator, 1);
         const ids = &state.ids[if (node.kind == .spectrum) @as(usize, 0) else 1];
-        try Ids.insert(
-            ids,
-            state.allocator,
-            &state.entries,
-            state.id_list.items,
-            .{ .id_start = id_start, .id_len = @intCast(id.len), .offset = offset },
-        );
+        try ids.add(state.allocator, id, ids.prepare(id));
+        state.offsets.appendAssumeCapacity(offset);
         if (state.historical) state.historical_ids.appendAssumeCapacity(.{ .native_id = native_id, .spot_id = spot_id });
-        if (node.kind == .spectrum) state.spectra += 1;
     }
     var remaining: []const Plan = self.plans.items;
     var budget = self.limits.nodes;
@@ -893,18 +892,6 @@ fn optionalAttribute(self: *Writer, name: []const u8, value: ?[]const u8, record
 
 // --- Indexed output ---
 
-// Copies a record's ID into the index's ID list and returns where it starts.
-fn listId(self: *Writer, state: *Index, id: []const u8) Error!u32 {
-    try self.chargeId(state, id.len);
-    const start = state.id_list.items.len;
-    state.id_list.appendSlice(state.allocator, id) catch |err| {
-        self.capture(err, .index, .none);
-        return err;
-    };
-    state.id_bytes += id.len;
-    return @intCast(start);
-}
-
 fn copyId(self: *Writer, state: *Index, id: []const u8) Error![]const u8 {
     try self.chargeId(state, id.len);
     const result = state.arena.allocator().dupe(u8, id) catch |err| {
@@ -933,24 +920,26 @@ fn writeIndex(self: *Writer, state: *Index) Error!void {
     errdefer |err| self.capture(err, .index, .none);
     const offset = self.engine.byteOffset() orelse return error.LimitExceeded;
     if (offset > std.math.maxInt(i64)) return error.LimitExceeded;
-    const spectrum = state.spectra != 0 or state.entries.items.len == 0;
-    const chromatogram = state.spectra != state.entries.items.len;
+    const spectra = state.ids[0].count();
+    const spectrum = spectra != 0 or state.offsets.items.len == 0;
+    const chromatogram = spectra != state.offsets.items.len;
     try self.engine.startElement("indexList");
     try self.engine.attribute("count", if (spectrum and chromatogram) "2" else "1");
     inline for (.{ model.Kind.spectrum, model.Kind.chromatogram }) |kind| {
         if (if (kind == .spectrum) spectrum else chromatogram) {
             try self.engine.startElement("index");
             try self.engine.attribute("name", kind.xmlName());
-            const entries = if (kind == .spectrum) state.entries.items[0..state.spectra] else state.entries.items[state.spectra..];
-            for (entries, if (kind == .spectrum) @as(usize, 0) else state.spectra..) |entry, i| {
+            const offsets = if (kind == .spectrum) state.offsets.items[0..spectra] else state.offsets.items[spectra..];
+            const ids = &state.ids[if (kind == .spectrum) @as(usize, 0) else 1];
+            for (offsets, 0.., if (kind == .spectrum) @as(usize, 0) else spectra..) |entry_offset, ordinal, i| {
                 try self.engine.startElement("offset");
-                try self.engine.attribute("idRef", Ids.idOf(entry, state.id_list.items));
+                try self.engine.attribute("idRef", ids.get(ordinal));
                 if (state.historical) {
                     try self.optionalAttribute("nativeID", state.historical_ids.items[i].native_id, false);
                     try self.optionalAttribute("spotID", state.historical_ids.items[i].spot_id, false);
                 }
                 var text: [32]u8 = undefined;
-                try self.engine.text(text[0..std.fmt.printInt(&text, entry.offset, 10, .lower, .{})]);
+                try self.engine.text(text[0..std.fmt.printInt(&text, entry_offset, 10, .lower, .{})]);
                 try self.engine.endElement();
             }
             try self.engine.endElement();
@@ -988,8 +977,6 @@ fn writeIndex(self: *Writer, state: *Index) Error!void {
     try self.engine.endElement();
 }
 
-const IndexEntry = struct { id_start: u32, id_len: u32, offset: u64 };
-
 // Indexed stream output is hashed and forwarded, and file output reread, in chunks of this
 // size. Rewrite time was flat from 8 to 256 KiB; 16 KiB kept peak RSS at the unhashed level.
 const CHUNK_BYTES = 16 * 1024;
@@ -1000,17 +987,15 @@ const Index = struct {
     hashed: std.Io.Writer.Hashed(Sha1),
     arena: std.heap.ArenaAllocator,
     options: IndexOptions,
-    entries: std.ArrayList(IndexEntry) = .empty,
-    id_list: std.ArrayList(u8) = .empty,
+    // Each record's offset, spectra first; its ID is at the same position in its kind's `ids`.
+    offsets: std.ArrayList(u64) = .empty,
     historical: bool = false,
     historical_ids: std.ArrayList(struct { native_id: ?[]const u8, spot_id: ?[]const u8 }) = .empty,
-    ids: [2]Ids.Map = .{ .empty, .empty },
-    spectra: usize = 0,
+    ids: [2]IdIndex = .{ .{}, .{} },
     id_bytes: usize = 0,
 
     fn deinit(self: *Index) void {
-        self.entries.deinit(self.allocator);
-        self.id_list.deinit(self.allocator);
+        self.offsets.deinit(self.allocator);
         self.historical_ids.deinit(self.allocator);
         for (&self.ids) |*ids| ids.deinit(self.allocator);
         self.arena.deinit();

@@ -1875,6 +1875,70 @@ test "[property] - [mzML indexed writer]: preserves IDs and offsets across index
 
 // Six spectra with 40 KB arrays: output spans many writer chunks, and each uncompressed
 // array's Base64 crosses chunk boundaries on the writer's direct encoding path.
+// Writes empty spectra whose IDs are fixed text around integers, as instrument vendors write them.
+fn writeTemplated(allocator: std.mem.Allocator, sink: *std.Io.Writer, count: usize, indexed: bool) !void {
+    var writer = if (indexed) try mzml.Writer.initIndexed(allocator, sink, .{}, .{}) else try mzml.Writer.init(allocator, sink, .{});
+    defer writer.deinit();
+    try writer.writeHeader(.{
+        .document = .{ .kind = .mzml, .attributes = &.{.{ .name = "version", .value = "1.1.0" }} },
+        .run = .{ .kind = .run },
+    });
+    try writer.beginList(.spectrum_list, count, "dp");
+    for (0..count) |position| {
+        var id: [64]u8 = undefined;
+        var ordinal: [32]u8 = undefined;
+        try writer.writeRecord(.{ .kind = .spectrum, .attributes = &.{
+            .{ .name = "id", .value = try std.fmt.bufPrint(&id, "controllerType=0 controllerNumber=1 scan={d}", .{position + 1}) },
+            .{ .name = "index", .value = try std.fmt.bufPrint(&ordinal, "{d}", .{position}) },
+            .{ .name = "defaultArrayLength", .value = "0" },
+        } });
+    }
+    try writer.endList();
+    try writer.finish();
+}
+
+// The most a call held at once while it handled `count` templated records.
+fn peakFor(count: usize, comptime run: fn (std.mem.Allocator, usize, []const u8) anyerror!void, bytes: []const u8) !usize {
+    var tracker: support.PeakAllocator = .{ .child = std.testing.allocator };
+    try run(tracker.allocator(), count, bytes);
+    try std.testing.expectEqual(@as(usize, 0), tracker.held);
+    return tracker.peak;
+}
+
+test "[property] - [mzML index]: keeps IDs that are text around integers in a few bytes a record" {
+    const Run = struct {
+        fn indexed(allocator: std.mem.Allocator, count: usize, _: []const u8) !void {
+            var sink: std.Io.Writer.Discarding = .init(&.{});
+            try writeTemplated(allocator, &sink.writer, count, true);
+        }
+        fn plain(allocator: std.mem.Allocator, count: usize, _: []const u8) !void {
+            var sink: std.Io.Writer.Discarding = .init(&.{});
+            try writeTemplated(allocator, &sink.writer, count, false);
+        }
+        fn open(allocator: std.mem.Allocator, _: usize, bytes: []const u8) !void {
+            var index = try mzml.IndexedReader.build(allocator, .{ .bytes = bytes }, .{});
+            index.deinit();
+        }
+        fn rebuild(allocator: std.mem.Allocator, _: usize, bytes: []const u8) !void {
+            var index = try mzml.IndexedReader.build(allocator, .{ .bytes = bytes }, .{ .policy = .rebuild });
+            index.deinit();
+        }
+    };
+    // At peak, with growth: about 30 bytes a record writing and 41 reading, where IDs kept whole
+    // cost 83 and 92.
+    const few = 1_000;
+    const many = 21_000;
+    const writer = (try peakFor(many, Run.indexed, "")) - (try peakFor(many, Run.plain, ""));
+    try std.testing.expect(writer <= many * 36);
+    var documents: [2]std.Io.Writer.Allocating = .{ .init(std.testing.allocator), .init(std.testing.allocator) };
+    defer for (&documents) |*document| document.deinit();
+    for (&documents, [_]usize{ few, many }) |*document, count| try writeTemplated(std.testing.allocator, &document.writer, count, true);
+    inline for (.{ Run.open, Run.rebuild }) |run| {
+        const grown = (try peakFor(many, run, documents[1].written())) - (try peakFor(few, run, documents[0].written()));
+        try std.testing.expect(grown <= (many - few) * 48);
+    }
+}
+
 const LARGE_RECORDS = 6;
 const LARGE_VALUES = 5000;
 
