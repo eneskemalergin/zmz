@@ -368,6 +368,20 @@ test "[property] - [mzML events]: every input split gives the same tags, spans, 
     }
 }
 
+test "[failure] - [mzML events]: release every allocation when one fails during a read" {
+    const Read = struct {
+        fn run(allocator: std.mem.Allocator, document: []const u8) !void {
+            var input = std.Io.Reader.fixed(document);
+            var events = try mzml.Events.init(allocator, &input, .{});
+            defer events.deinit();
+            while (try events.next()) |_| {}
+        }
+    };
+    const long_text = "<r xmlns='urn:r' xmlns:p='urn:p'><p:a p:x='&amp;'>" ++ "t" ** 70_000 ++ "</p:a><b/></r>";
+    for ([_][]const u8{ support.DOCUMENT, long_text }) |document|
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, Read.run, .{document});
+}
+
 test "[property] - [mzML events]: skipping whitespace text drops exactly the blank text events at every split" {
     const cases = [_][]const u8{
         "<r>\n  <a x='1'/>\r\n\t<b>  t u  </b>\n  <c><![CDATA[ ]]></c> <d> </d>\n</r>\n",
