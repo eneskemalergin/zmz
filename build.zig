@@ -1,6 +1,6 @@
 //! Defines the zmz module and its `-Dkernel-backend` option (`dispatch` also builds a separate
 //! x86-64-v3 zlib decoder object), the example programs, the `check-mzml`, `vocabulary`, and
-//! `libm-data` tool steps, and the test steps.
+//! `libm-data` tool steps, the `bench` step, and the test steps.
 
 const std = @import("std");
 
@@ -20,7 +20,7 @@ pub fn build(b: *std.Build) void {
     });
     configureLibraryModule(zmz, library_kernels);
 
-    const test_step = b.step("test", "Run the library, example, and tool tests");
+    const test_step = b.step("test", "Run the library, example, tool, and benchmark tests");
     const empty_run = b.path("tests/data/gates/empty_run.mzML");
     const library_tests_module = b.createModule(.{
         .root_source_file = b.path("tests/library.zig"),
