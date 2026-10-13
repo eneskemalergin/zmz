@@ -152,8 +152,8 @@ test "[unit] - [CV vocabulary]: bundled resources carry subsets and release hist
 
 test "[unit] - [CV resolver]: separates source metadata from current vocabulary interpretation" {
     const declarations = [_]cv.Declaration{
-        .{ .id = "mass-spec", .full_name = "PSI-MS", .uri = "urn:stale", .version = "4.1.258" },
-        .{ .id = "units", .full_name = "Unit Ontology", .version = "releases/2026-07-31" },
+        .{ .id = "mass-spec", .full_name = "PSI-MS", .uri = "urn:stale", .version = cv.Resolver.BUNDLED[0].identity.version },
+        .{ .id = "units", .full_name = "Unit Ontology", .version = cv.Resolver.BUNDLED[1].identity.source_version },
     };
     const resolver = cv.Resolver.init(&declarations);
     const source: cv.Param = .{
@@ -172,7 +172,7 @@ test "[unit] - [CV resolver]: separates source metadata from current vocabulary 
     try std.testing.expect(!result.term.issues.namespace_mismatch);
     try std.testing.expectEqual(.allowed, result.unit_allowed);
     try std.testing.expectEqualStrings("uo", result.unit.resource.?.identity.key);
-    try std.testing.expectEqualStrings("2026-07-31", result.unit.resource.?.identity.version);
+    try std.testing.expectEqualStrings(cv.Resolver.BUNDLED[1].identity.version, result.unit.resource.?.identity.version);
     var changed = source;
     changed.unit.accession = .{ .raw = "UO:0000008" };
     try std.testing.expectEqual(.disallowed, (try resolver.resolve(changed)).unit_allowed);
@@ -396,9 +396,13 @@ test "[unit] - [CV resolver]: recognizes recorded releases, earlier spellings, a
     try std.testing.expect(!renamed.term.issues.unrecognized_declaration_name);
     try std.testing.expect(renamed.term.issues.stale_name);
     try std.testing.expect(renamed.term.issues.former_name);
-    // A release before the recorded history is not guessed from its spelling.
-    try std.testing.expectEqual(.unrecognized_version, renamed.unit.version);
+    // Unit Ontology files before 2023 carry no data-version: documents name them by date.
+    try std.testing.expectEqual(.historical, renamed.unit.version);
     try std.testing.expect(!renamed.unit.issues.unrecognized_uri);
+    // A release before the recorded history is not guessed from its spelling.
+    const older = [_]cv.Declaration{.{ .id = "MS", .full_name = "PSI-MS", .version = "2.26.0" }};
+    const before_history = try cv.Resolver.init(&older).resolve(.{ .cv_ref = "MS", .accession = .{ .raw = "MS:1000189" } });
+    try std.testing.expectEqual(.unrecognized_version, before_history.term.version);
     const wrong = try resolver.resolve(.{ .cv_ref = "MS", .accession = .{ .raw = "MS:1000189" }, .name = "not a name" });
     try std.testing.expect(wrong.term.issues.stale_name);
     try std.testing.expect(!wrong.term.issues.former_name);

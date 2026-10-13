@@ -125,6 +125,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "vocabulary_test_options", .module = vocabulary_test_options.createModule() }},
     });
     vocabulary_cli_test_module.addAnonymousImport("empty_run", .{ .root_source_file = empty_run });
+    vocabulary_cli_test_module.addAnonymousImport("manifest", .{ .root_source_file = b.path("vocabularies/manifest.json") });
     const vocabulary_cli_tests = b.addTest(.{ .root_module = vocabulary_cli_test_module });
     test_step.dependOn(&b.addRunArtifact(vocabulary_cli_tests).step);
 }

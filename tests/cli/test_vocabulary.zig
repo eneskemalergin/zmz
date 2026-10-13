@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const options = @import("vocabulary_test_options");
+const manifest = @embedFile("manifest");
 
 test "[cli] - [vocabulary]: rejects bad arguments and unreadable inputs without creating output" {
     var dir = std.testing.tmpDir(.{ .iterate = true });
@@ -47,7 +48,7 @@ test "[cli] - [vocabulary scan]: reports source metadata, with or without CV dec
     const executable = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, options.executable, std.testing.allocator);
     defer std.testing.allocator.free(executable);
     const cases = .{
-        .{ @embedFile("empty_run"), "{\"format_version\":3,\"kind\":\"declaration\",\"resource\":\"input.mzML\",\"accession\":\"MS\",\"before\":{\"id\":\"MS\",\"full_name\":\"PSI-MS\",\"uri\":\"urn:test\",\"version\":null},\"after\":{\"resource\":\"psi-ms\",\"used_version\":\"4.1.258\",\"version_relationship\":\"absent\",\"unrecognized_uri\":true,\"unrecognized_name\":false}}\n" ++
+        .{ @embedFile("empty_run"), "{\"format_version\":3,\"kind\":\"declaration\",\"resource\":\"input.mzML\",\"accession\":\"MS\",\"before\":{\"id\":\"MS\",\"full_name\":\"PSI-MS\",\"uri\":\"urn:test\",\"version\":null},\"after\":{\"resource\":\"psi-ms\",\"used_version\":\"{VERSION}\",\"version_relationship\":\"absent\",\"unrecognized_uri\":true,\"unrecognized_name\":false}}\n" ++
             "{\"format_version\":3,\"kind\":\"term\",\"resource\":\"input.mzML\",\"accession\":\"X:unknown\\tµ < & \\\"\",\"before\":null,\"after\":{\"occurrences\":1,\"unknown\":true,\"obsolete\":false,\"stale_name\":false,\"former_name\":false,\"unit_disallowed\":false}}\n" ++
             "{\"format_version\":3,\"kind\":\"scan\",\"resource\":\"\",\"accession\":\"input.mzML\",\"before\":null,\"after\":{\"records\":0,\"parameters\":1,\"resolved\":0,\"missing_references\":0,\"unknown_resources\":0,\"unknown_accessions\":1,\"stale_names\":0,\"former_names\":0,\"obsolete\":0,\"units\":1,\"resolved_units\":0,\"partial_units\":1,\"disallowed_units\":0}}\n" },
         .{ "<mzML xmlns='http://psi.hupo.org/ms/mzml' version='1.1.0'><run/></mzML>", "{\"format_version\":3,\"kind\":\"scan\",\"resource\":\"\",\"accession\":\"input.mzML\",\"before\":null,\"after\":{\"records\":0,\"parameters\":0,\"resolved\":0,\"missing_references\":0,\"unknown_resources\":0,\"unknown_accessions\":0,\"stale_names\":0,\"former_names\":0,\"obsolete\":0,\"units\":0,\"resolved_units\":0,\"partial_units\":0,\"disallowed_units\":0}}\n" },
@@ -62,7 +63,11 @@ test "[cli] - [vocabulary scan]: reports source metadata, with or without CV dec
         defer std.testing.allocator.free(result.stderr);
         try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
         try std.testing.expectEqualStrings("", result.stderr);
-        try std.testing.expectEqualStrings(case[1], result.stdout);
+        const parsed = try std.json.parseFromSlice(struct { resources: []const struct { version: []const u8 } }, std.testing.allocator, manifest, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        const expected = try std.mem.replaceOwned(u8, std.testing.allocator, case[1], "{VERSION}", parsed.value.resources[0].version);
+        defer std.testing.allocator.free(expected);
+        try std.testing.expectEqualStrings(expected, result.stdout);
         var buffer: [2048]u8 = undefined;
         try std.testing.expectEqualStrings(case[0], try dir.dir.readFile(std.testing.io, "input.mzML", &buffer));
     }
