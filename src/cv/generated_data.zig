@@ -75,6 +75,7 @@ pub const RESOURCES = [_]Vocabulary{
         },
         .declaration_names = &.{
             "UNIT-ONTOLOGY",
+            "unit",
         },
     }, .core = &CORE_1, .tiers = .{ .bundled = 1 } },
 };

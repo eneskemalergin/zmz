@@ -72,7 +72,8 @@
         "http://ontologies.berkeleybop.org/uo.obo"
       ],
       "declaration_names": [
-        "UNIT-ONTOLOGY"
+        "UNIT-ONTOLOGY",
+        "unit"
       ]
     }
   ]
