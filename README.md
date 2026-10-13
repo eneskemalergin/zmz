@@ -1,9 +1,11 @@
 <!-- markdownlint-disable MD033 MD041 -->
 
-<h1 align="center">zmz</h1>
+<p align="center">
+  <img src="assets/logo-readme.svg" alt="zmz" width="180">
+</p>
 
 <p align="center">
-  <strong>A Zig mass-spectrometry data library, starting with mzML.</strong>
+  Mass Spectrometry Open Data Format Library for Zig
 </p>
 
 <p align="center">
