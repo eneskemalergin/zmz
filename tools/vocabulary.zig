@@ -475,7 +475,10 @@ fn review(allocator: std.mem.Allocator, writer: *std.Io.Writer, baseline: []cons
             }
             if (!sameBinaryXrefs(before.xrefs, after.xrefs))
                 try event(writer, "binary_xrefs", key, after.id, before.xrefs, after.xrefs);
-            if (!equal(before, after) and isKernel(after.id)) {
+            // Subsets group terms for distribution; the format kernel never reads them.
+            var kernel_after = after;
+            kernel_after.subsets = before.subsets;
+            if (!equal(before, kernel_after) and isKernel(after.id)) {
                 blocked = blocked or !approved(new.identity, after.id, .kernel);
                 try event(writer, "blocked_kernel", key, after.id, before.name, after.name);
             }
@@ -1186,6 +1189,15 @@ test "[failure] - [vocabulary update]: blocks removals, kernel changes, and new 
     try std.testing.expect(try review(allocator, &report.writer, &.{before.vocabulary}, &.{&after.vocabulary}));
     try std.testing.expect(std.mem.indexOf(u8, report.written(), "\"kind\":\"blocked_disposition\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, report.written(), "\"kind\":\"active_family\"") != null);
+    // A kernel term that only joins a subset is reported, not blocked.
+    const plain = try Vocabulary.parseObo(std.testing.allocator, header ++ "[Term]\nid: MS:1000523\nname: 64-bit float\n", probe);
+    defer plain.deinit();
+    const grouped = try Vocabulary.parseObo(std.testing.allocator, header ++ "[Term]\nid: MS:1000523\nname: 64-bit float\nsubset: core\n", probe);
+    defer grouped.deinit();
+    report.clearRetainingCapacity();
+    try std.testing.expect(!try review(allocator, &report.writer, &.{plain.vocabulary}, &.{&grouped.vocabulary}));
+    try std.testing.expect(std.mem.indexOf(u8, report.written(), "\"kind\":\"subsets\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, report.written(), "\"kind\":\"blocked_kernel\"") == null);
 }
 
 test "[property] - [vocabulary coverage]: every active monitored term has one reviewed disposition" {
