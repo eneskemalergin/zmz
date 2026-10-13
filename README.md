@@ -76,7 +76,7 @@ pub fn main(init: std.process.Init) !void {
 
 ## Documentation
 
-[The wiki](https://github.com/eneskemalergin/zmz/wiki) explains each part in depth: getting started, reading, writing, indexed access, binary arrays, vocabulary, errors and diagnostics, limits and safety, performance, and development.
+[The wiki](https://github.com/eneskemalergin/zmz/wiki) explains each part in depth: getting started, reading, writing, indexed access, binary arrays, vocabulary, errors and diagnostics, limits and safety, performance, benchmarks, and development.
 
 In this repository:
 
@@ -85,11 +85,29 @@ In this repository:
 
 ## Benchmarks
 
-<!-- Summary figure: assets/benchmark-summary.svg, from the release candidate's numbers. -->
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/benchmark-summary-dark.svg">
+    <img src="assets/benchmark-summary-light.svg" alt="zmz and five other mzML readers on the same real files: zmz decodes 221 MB/s, peaks at 2.8 MiB on a 673 MB file, and handles 69 of 69 damaged or unusual files" width="100%">
+  </picture>
+</p>
 
-`zig build bench` measures zmz on its own, with nothing to download. It generates about 200 MiB of mzML in five shapes (metadata-heavy, centroid, profile, zlib, and MS-Numpress) at two sizes, then times forward reading, full decoding, XML events, indexed lookup, copying, and writing, each case in its own process, always in ReleaseFast. It reports wall time, throughput, peak memory, and a checksum of what each case read, with instruction counts when `zebrac` is on the `PATH`. Peak memory stays near 1 to 2 MiB from the small inputs to the four-times-larger ones.
+Six mzML libraries read the same real files through their own public APIs. Every value they return is first checked against an independent reference reader, and a library is timed only on files where it did the same work.
 
-Comparisons with other mzML readers on real files, correctness first and then speed and memory, come from a separate benchmark project, linked here when it is published.
+| Library           | Language    | Full decode | Peak memory | Hard cases |
+| ----------------- | ----------- | ----------: | ----------: | ---------: |
+| **zmz**           | Zig         |    221 MB/s |     2.8 MiB |      69/69 |
+| mzdata            | Rust        |    130 MB/s |      29 MiB |      36/69 |
+| OpenMS (pyopenms) | C++, Python |     50 MB/s |     597 MiB |      64/69 |
+| mzmlpy            | Python      |     28 MB/s |     116 MiB |      65/69 |
+| pymzML            | Python      |     23 MB/s |     151 MiB |      62/69 |
+| pyteomics         | Python      |     10 MB/s |     118 MiB |      67/69 |
+
+- Full decode is the median over files from 15 MB to 4 GB (673 MB for the Python libraries); peak memory is on a 673 MB file. On a 4 GB file, zmz peaks at 3.8 MiB.
+- Hard cases are damaged files (cut, stale or missing index) and unusual but valid mzML (encodings, CDATA, comments, number spellings).
+- [Benchmarks](https://github.com/eneskemalergin/zmz/wiki/Benchmarks) in the wiki has the method, machine, versions, per-file numbers, and what each library got wrong.
+
+`zig build bench` measures zmz on its own, with nothing to download: forward reading, full decoding, XML events, indexed lookup, copying, and writing, on generated files in five shapes.
 
 ## Status and limits
 
