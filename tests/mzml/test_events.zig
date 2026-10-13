@@ -7,18 +7,6 @@ const support = @import("support.zig");
 const Kind = enum { start, end, text };
 const Seen = struct { kind: Kind, start: u64, end: u64, value: []const u8 };
 
-fn collect(allocator: std.mem.Allocator, events: *mzml.Events, seen: *std.ArrayList(Seen), text: *std.ArrayList(u8)) !void {
-    while (try events.next()) |event| {
-        const kind: Kind, const value: []const u8 = switch (event.data) {
-            .start_element => |start| .{ .start, start.name.raw },
-            .end_element => |end| .{ .end, end.name.raw },
-            .text => |run| .{ .text, run.bytes },
-        };
-        if (kind == .text) try text.appendSlice(allocator, value);
-        try seen.append(allocator, .{ .kind = kind, .start = event.span.start, .end = event.span.end, .value = if (kind == .text) "" else try allocator.dupe(u8, value) });
-    }
-}
-
 test "[unit] - [mzML events]: report source spans of every element in any root and any split" {
     const source = "<?xml version='1.0'?>\n<!-- c --><root a='&lt;1&gt;'><x/><p:y xmlns:p='urn:p'>t&amp;u</p:y></root>\n";
     var buffer: [64]u8 = undefined;
@@ -31,7 +19,17 @@ test "[unit] - [mzML events]: report source spans of every element in any root a
         defer events.deinit();
         var seen: std.ArrayList(Seen) = .empty;
         var text: std.ArrayList(u8) = .empty;
-        try collect(arena.allocator(), &events, &seen, &text);
+        const allocator = arena.allocator();
+        while (try events.next()) |event| {
+            const kind: Kind, const value: []const u8 = switch (event.data) {
+                .start_element => |start| .{ .start, start.name.raw },
+                .end_element => |end| .{ .end, end.name.raw },
+                .text => |run| .{ .text, run.bytes },
+            };
+            if (kind == .text) try text.appendSlice(allocator, value);
+            const kept = if (kind == .text) "" else try allocator.dupe(u8, value);
+            try seen.append(allocator, .{ .kind = kind, .start = event.span.start, .end = event.span.end, .value = kept });
+        }
         const root = std.mem.indexOf(u8, source, "<root").?;
         const x = std.mem.indexOf(u8, source, "<x/>").?;
         const y = std.mem.indexOf(u8, source, "<p:y").?;
@@ -107,6 +105,78 @@ test "[unit] - [mzML events]: list in-scope bindings without shadowed ones, rest
     try std.testing.expectEqual(expected.len, starts);
 }
 
+test "[unit] - [mzML events]: decode UTF-8 at the bounds of every well-formed range" {
+    // U+0080, U+07FF, U+0800, U+D7FF, U+E000, U+FFFD, U+10000, U+10FFFF.
+    const text = "\xc2\x80\xdf\xbf\xe0\xa0\x80\xed\x9f\xbf\xee\x80\x80\xef\xbf\xbd\xf0\x90\x80\x80\xf4\x8f\xbf\xbf";
+    for ([_]usize{ 0, 1 }) |buffer_size| {
+        var fixed = std.Io.Reader.fixed("<m>" ++ text ++ "</m>");
+        var small: [1]u8 = undefined;
+        var limited = fixed.limited(.unlimited, &small);
+        var events = try mzml.Events.init(std.testing.allocator, if (buffer_size == 0) &fixed else &limited.interface, .{});
+        defer events.deinit();
+        try std.testing.expectEqualStrings("m", (try events.next()).?.data.start_element.name.raw);
+        try std.testing.expectEqualStrings(text, (try events.next()).?.data.text.bytes);
+        try std.testing.expectEqualStrings("m", (try events.next()).?.data.end_element.name.raw);
+        for (0..3) |_| try std.testing.expectEqual(null, try events.next());
+    }
+}
+
+test "[edge] - [mzML events]: decode BOM-less UTF-16, surrogates, hex references, CDATA brackets, ? in instructions, a final CR" {
+    const Case = struct { source: []const u8, utf16: ?std.builtin.Endian = null, text: []const u8 };
+    const cases = [_]Case{
+        .{ .source = "<r>\u{e9}\u{1F600}</r>", .utf16 = .little, .text = "\u{e9}\u{1F600}" },
+        .{ .source = "<r>\u{e9}\u{1F600}</r>", .utf16 = .big, .text = "\u{e9}\u{1F600}" },
+        .{ .source = "<r>&#x1f600;&#xe9;</r>", .text = "\u{1F600}\u{e9}" },
+        .{ .source = "<r><![CDATA[a]]]><![CDATA[]]x]]></r>", .text = "a]]]x" },
+        .{ .source = "<?p a?b?><r>t</r>\r", .text = "t" },
+    };
+    var bytes: [64]u8 = undefined;
+    for (cases) |case| {
+        const source = if (case.utf16) |order| encoded: {
+            const units = try std.unicode.utf8ToUtf16LeAlloc(std.testing.allocator, case.source);
+            defer std.testing.allocator.free(units);
+            for (units, 0..) |unit, i| std.mem.writeInt(u16, bytes[2 * i ..][0..2], unit, order);
+            break :encoded bytes[0 .. 2 * units.len];
+        } else case.source;
+        var input = std.Io.Reader.fixed(source);
+        var events = try mzml.Events.init(std.testing.allocator, &input, .{});
+        defer events.deinit();
+        var text: std.ArrayList(u8) = .empty;
+        defer text.deinit(std.testing.allocator);
+        var elements: usize = 0;
+        while (try events.next()) |event| switch (event.data) {
+            .text => |run| try text.appendSlice(std.testing.allocator, run.bytes),
+            else => elements += 1,
+        };
+        try std.testing.expectEqualStrings(case.text, text.items);
+        try std.testing.expectEqual(@as(usize, 2), elements);
+    }
+}
+
+test "[failure] - [mzML events]: accept standalone only as yes or no, after version and encoding" {
+    for ([_][]const u8{
+        "<?xml version='1.0' standalone='yes'?><r/>",
+        "<?xml version='1.0' encoding='UTF-8' standalone='no'?><r/>",
+    }) |source| {
+        var input = std.Io.Reader.fixed(source);
+        var events = try mzml.Events.init(std.testing.allocator, &input, .{});
+        defer events.deinit();
+        try std.testing.expectEqualStrings("r", (try events.next()).?.data.start_element.name.raw);
+    }
+    for ([_][]const u8{
+        "<?xml version='1.0' standalone='maybe'?><r/>",
+        "<?xml version='1.0' standalone='yes' encoding='UTF-8'?><r/>",
+        "<?xml standalone='yes' version='1.0'?><r/>",
+        "<?xml version='1.0'?x?><r/>",
+    }) |source| {
+        var input = std.Io.Reader.fixed(source);
+        var events = try mzml.Events.init(std.testing.allocator, &input, .{});
+        defer events.deinit();
+        try std.testing.expectError(error.InvalidXml, events.next());
+        try std.testing.expectEqual(.xml, events.diagnostic().?.stage);
+    }
+}
+
 test "[unit] - [mzML events]: stream long text in bounded runs" {
     const payload_len = 200 * 1024 + 3;
     const source = try std.testing.allocator.alloc(u8, payload_len + "<b></b>".len);
@@ -179,6 +249,60 @@ test "[failure] - [mzML events]: name the broken rule and where, keep the first 
     }
 }
 
+test "[failure] - [mzML events]: report a broken encoding at the byte that cannot continue it" {
+    // A broken encoding is reported at the first byte that cannot continue a well-formed
+    // sequence (the end of input when cut off); in UTF-16, offsets count two bytes per unit.
+    const encoded = .{
+        .{ "<mzML>ab\xc3(</mzML>", error.InvalidEncoding, 9 },
+        .{ "<mzML a='\xe2\x82'/>", error.InvalidEncoding, 11 },
+        .{ "<mzML>\x80</mzML>", error.InvalidEncoding, 6 },
+        .{ "<mzML>\xc0\x80</mzML>", error.InvalidEncoding, 6 },
+        .{ "<mzML>\xe0\x9f\xbf</mzML>", error.InvalidEncoding, 7 },
+        .{ "<mzML>\xed\xa0\x80</mzML>", error.InvalidEncoding, 7 },
+        .{ "<mzML>\xf4\x90\x80\x80</mzML>", error.InvalidEncoding, 7 },
+        .{ "<mzML>\xf0\x9f\x98", error.InvalidEncoding, 9 },
+        .{ "<?xml version='1.1'?><mzML/>", error.UnsupportedVersion, 15 },
+        .{ "<?xml version='1.0' encoding='UTF-16'?><mzML/>", error.InvalidEncoding, 30 },
+    };
+    inline for (encoded) |case| {
+        var input = std.Io.Reader.fixed(case[0]);
+        var events = try mzml.Events.init(std.testing.allocator, &input, .{});
+        defer events.deinit();
+        const failure = while (true) {
+            _ = (events.next() catch |err| break err) orelse return error.TestUnexpectedResult;
+        };
+        try std.testing.expectEqual(case[1], failure);
+        try std.testing.expectEqual(@as(u64, case[2]), events.diagnostic().?.location.?.input_event);
+    }
+    const utf16 = .{
+        .{ "<?xml version='1.0' encoding='ISO-8859-1'?><mzML/>", error.InvalidEncoding, 2 + 30 * 2 },
+        .{ "<mzML>]]></mzML>", error.InvalidXml, 2 + 6 * 2 },
+        // '#' stands for a high surrogate unit and '%' for a low one.
+        .{ "<mzML>#a</mzML>", error.InvalidEncoding, 2 + 7 * 2 },
+        .{ "<mzML>%</mzML>", error.InvalidEncoding, 2 + 6 * 2 },
+    };
+    inline for (utf16) |case| {
+        var bytes: [2 + case[0].len * 2]u8 = undefined;
+        std.mem.writeInt(u16, bytes[0..2], 0xfeff, .little);
+        for (case[0], 0..) |byte, i| {
+            const unit: u16 = switch (byte) {
+                '#' => 0xD800,
+                '%' => 0xDC00,
+                else => byte,
+            };
+            std.mem.writeInt(u16, bytes[2 + i * 2 ..][0..2], unit, .little);
+        }
+        var input = std.Io.Reader.fixed(&bytes);
+        var events = try mzml.Events.init(std.testing.allocator, &input, .{});
+        defer events.deinit();
+        const failure = while (true) {
+            _ = (events.next() catch |err| break err) orelse return error.TestUnexpectedResult;
+        };
+        try std.testing.expectEqual(case[1], failure);
+        try std.testing.expectEqual(@as(u64, case[2]), events.diagnostic().?.location.?.input_event);
+    }
+}
+
 // Writes every event, then the failure if any, with names, spans, attribute offsets, and the
 // broken rule and its offset.
 fn trace(allocator: std.mem.Allocator, input: *std.Io.Reader, out: *std.Io.Writer) !void {
@@ -212,6 +336,8 @@ fn traceWith(allocator: std.mem.Allocator, input: *std.Io.Reader, out: *std.Io.W
 test "[property] - [mzML events]: every input split gives the same tags, spans, and failures" {
     const document = "<r xmlns:p='urn:p'><a/><a></a><b x='1' y='2'></b ><p:c p:z='3'></p:c>" ++
         "<d>t</d><!-- c --><?pi x?><e><![CDATA[<]]></e><f\n/><g><?pi y?></g></r>";
+    // Text with tabs, line ends, an entity, brackets, and runs past one 64-byte block.
+    const text = "<r>\n\t <a>one\ttwo\nthree\r\nfour&amp;five]]six</a>\r\n" ++ " " ** 40 ++ "<b>" ++ "x" ** 70 ++ "</b>\n</r>";
     const cases = [_][]const u8{
         document,
         "<r><a></ab></r>",
@@ -221,13 +347,15 @@ test "[property] - [mzML events]: every input split gives the same tags, spans, 
         "<r></r></r>",
         "<r><a/ ></r>",
         "<r><p:a></p:a></r>",
+        text,
     };
     for (cases) |source| {
         var whole: std.Io.Writer.Allocating = .init(std.testing.allocator);
         defer whole.deinit();
         var fixed = std.Io.Reader.fixed(source);
         try trace(std.testing.allocator, &fixed, &whole.writer);
-        try std.testing.expectEqual(source.ptr != document.ptr, std.mem.indexOf(u8, whole.written(), "InvalidXml") != null);
+        const valid = source.ptr == document.ptr or source.ptr == text.ptr;
+        try std.testing.expectEqual(!valid, std.mem.indexOf(u8, whole.written(), "InvalidXml") != null);
         var buffer: [256]u8 = undefined;
         for (1..source.len + 1) |size| {
             var split: std.Io.Writer.Allocating = .init(std.testing.allocator);
@@ -240,15 +368,73 @@ test "[property] - [mzML events]: every input split gives the same tags, spans, 
     }
 }
 
+// Bytes fuzzed XML is drawn from: markup punctuation, names, and whitespace most often, any byte
+// sometimes.
+const XML_BYTES = [_]std.testing.Smith.Weight{
+    .rangeAtMost(u8, 0x00, 0xff, 1), .rangeAtMost(u8, 'a', 'z', 6), .rangeAtMost(u8, '0', '9', 2),
+    .value(u8, '<', 12),             .value(u8, '>', 10),           .value(u8, '/', 6),
+    .value(u8, '=', 5),              .value(u8, '\'', 6),           .value(u8, '"', 2),
+    .value(u8, '&', 3),              .value(u8, ';', 3),            .value(u8, ':', 3),
+    .value(u8, '!', 2),              .value(u8, '?', 2),            .value(u8, '[', 2),
+    .value(u8, ']', 2),              .value(u8, '-', 2),            .value(u8, ' ', 6),
+    .value(u8, '\n', 3),             .value(u8, '\r', 2),           .value(u8, '#', 1),
+};
+
+fn eventsAtAnySplit(_: void, smith: *std.testing.Smith) !void {
+    var source: [768]u8 = undefined;
+    const bytes = source[0..smith.sliceWeightedBytes(&source, &XML_BYTES)];
+    const size = smith.valueRangeAtMost(u8, 1, 64);
+    var whole: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer whole.deinit();
+    var fixed = std.Io.Reader.fixed(bytes);
+    try trace(std.testing.allocator, &fixed, &whole.writer);
+    var split: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer split.deinit();
+    var buffer: [64]u8 = undefined;
+    var input: std.testing.Reader = .init(buffer[0..size], &.{.{ .buffer = bytes }});
+    input.artificial_limit = .limited(size);
+    try trace(std.testing.allocator, &input.interface, &split.writer);
+    try std.testing.expectEqualStrings(whole.written(), split.written());
+}
+
+const EVENTS_CORPUS = [_][]const u8{
+    support.corpusDocument("<r xmlns:p='urn:p'><a x='1'/><p:b p:y='&lt;'>t&#x41;u<![CDATA[]]>]]></p:b><!-- c --><?pi x?></r>"),
+    support.corpusDocument("<?xml version='1.0' encoding='UTF-8'?>\r\n<r>\r\n\t<a>one\ttwo\r\nthree</a>\n</r>\n"),
+    support.corpusDocument("\xff\xfe<\x00r\x00/\x00>\x00"),
+    support.corpusDocument("<r><a></b></r>"),
+    support.corpusDocument(support.DOCUMENT),
+};
+
+test "[fuzz] - [mzML events]: any bytes give the same events and failure at any split" {
+    try std.testing.fuzz({}, eventsAtAnySplit, .{ .corpus = &EVENTS_CORPUS });
+    try support.fuzzSeeded({}, eventsAtAnySplit, &EVENTS_CORPUS, 400);
+}
+
+test "[failure] - [mzML events]: release every allocation when one fails during a read" {
+    const Read = struct {
+        fn run(allocator: std.mem.Allocator, document: []const u8) !void {
+            var input = std.Io.Reader.fixed(document);
+            var events = try mzml.Events.init(allocator, &input, .{});
+            defer events.deinit();
+            while (try events.next()) |_| {}
+        }
+    };
+    const long_text = "<r xmlns='urn:r' xmlns:p='urn:p'><p:a p:x='&amp;'>" ++ "t" ** 70_000 ++ "</p:a><b/></r>";
+    for ([_][]const u8{ support.DOCUMENT, long_text }) |document|
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, Read.run, .{document});
+}
+
 test "[property] - [mzML events]: skipping whitespace text drops exactly the blank text events at every split" {
     const cases = [_][]const u8{
         "<r>\n  <a x='1'/>\r\n\t<b>  t u  </b>\n  <c><![CDATA[ ]]></c> <d> </d>\n</r>\n",
         "<r>   <a/>  t  <b/>   </r>",
         "<r>\n  <a></b>\n</r>",
         "<r> x </r> y",
+        // Indentation across 16-byte steps, and a long blank run before text.
+        "<r>\n" ++ " " ** 15 ++ "<a/>\r\n" ++ " " ** 16 ++ "<b/>\n" ++ "\t" ** 33 ++ "<c/>" ++ " " ** 47 ++ "x</r>",
     };
     for (cases) |source| {
-        var buffer: [128]u8 = undefined;
+        var buffer: [256]u8 = undefined;
         for (1..source.len + 1) |size| {
             var expected: std.Io.Writer.Allocating = .init(std.testing.allocator);
             defer expected.deinit();
@@ -266,13 +452,19 @@ test "[property] - [mzML events]: skipping whitespace text drops exactly the bla
 }
 
 test "[failure] - [mzML events]: report limits with their maximum" {
-    var input = std.Io.Reader.fixed("<root a='1' b='2' c='3'/>");
-    var events = try mzml.Events.init(std.testing.allocator, &input, .{ .attributes = 2 });
-    defer events.deinit();
-    try std.testing.expectError(error.LimitExceeded, events.next());
-    const limit = events.diagnostic().?.detail.limit;
-    try std.testing.expectEqual(mzml.Diagnostic.Limit.attributes, limit.name);
-    try std.testing.expectEqual(2, limit.maximum);
+    const cases = .{
+        .{ "<root a='1' b='2' c='3'/>", mzml.Diagnostic.Limit.attributes, 2 },
+        .{ "<?xml version='1.0'" ++ " " ** 4096 ++ "?><root/>", mzml.Diagnostic.Limit.xml_declaration_bytes, 4096 },
+    };
+    inline for (cases) |case| {
+        var input = std.Io.Reader.fixed(case[0]);
+        var events = try mzml.Events.init(std.testing.allocator, &input, .{ .attributes = 2 });
+        defer events.deinit();
+        try std.testing.expectError(error.LimitExceeded, events.next());
+        const limit = events.diagnostic().?.detail.limit;
+        try std.testing.expectEqual(case[1], limit.name);
+        try std.testing.expectEqual(case[2], limit.maximum);
+    }
 }
 
 test "[failure] - [mzML events]: readers report the same broken rule" {
@@ -327,13 +519,14 @@ test "[property] - [mzML encoding terms]: classify encoding terms with the reade
         if (std.mem.eql(u8, vocabulary.identity.key, "psi-ms")) break vocabulary;
     } else return error.TestUnexpectedResult;
     var classified: usize = 0;
-    for (ms.terms) |term| {
-        if (term.obsolete) continue;
-        const data_type = try ms.isA(term.id, "MS:1000518", 1000) and !std.mem.eql(u8, term.id, "MS:1000518");
-        const compression = try ms.isA(term.id, "MS:1000572", 1000) and !std.mem.eql(u8, term.id, "MS:1000572");
+    for (0..ms.count()) |index| {
+        const term = ms.term(index);
+        if (term.obsolete()) continue;
+        const data_type = try ms.isA(term.id(), "MS:1000518") and !std.mem.eql(u8, term.id(), "MS:1000518");
+        const compression = try ms.isA(term.id(), "MS:1000572") and !std.mem.eql(u8, term.id(), "MS:1000572");
         const Declaration = enum { primitive, compression };
         const expected: ?Declaration = if (data_type) .primitive else if (compression) .compression else null;
-        const kind: ?Declaration = if (mzml.model.encodingTerm(term.id)) |found| switch (found) {
+        const kind: ?Declaration = if (mzml.model.encodingTerm(term.id())) |found| switch (found) {
             .primitive => .primitive,
             .compression => .compression,
             .unsupported => |declaration| switch (declaration) {
@@ -342,7 +535,7 @@ test "[property] - [mzML encoding terms]: classify encoding terms with the reade
             },
         } else null;
         std.testing.expectEqual(expected, kind) catch |err| {
-            std.debug.print("{s} {s}\n", .{ term.id, term.name });
+            std.debug.print("{s} {s}\n", .{ term.id(), term.name() });
             return err;
         };
         classified += @intFromBool(kind != null);

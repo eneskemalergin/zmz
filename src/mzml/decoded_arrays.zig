@@ -16,11 +16,11 @@
 //! While a read decodes into this owner, as from one of its selection callbacks, the decode
 //! calls return `InvalidState` and `reset` does nothing.
 //!
-//! `beginArray`, `decodeText`, and `complete` are internal: the reader engine and `IndexedReader`
-//! call them while they parse a record. Callers use the reads and the decode functions.
+//! `beginArray`, `decodeText`, `complete`, and the `busy` and `failure` fields are internal: the
+//! reader engine and `IndexedReader` use them while they parse a record. Callers use the reads and
+//! the decode functions.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const cv = @import("../cv/source.zig");
 const arrays = @import("../binary/arrays.zig");
 const base64 = @import("../binary/base64.zig");
@@ -42,7 +42,7 @@ pub const Array = struct { source_position: usize, encoding: model.Encoding, rol
 
 pub const Options = struct {
     /// Bounds each array's decoded typed bytes, allocated from its declared length. The reader's
-    /// binary_text_bytes bounds the Base64 text.
+    /// `binary_text_bytes` bounds the Base64 text.
     array_bytes: usize = 192 * 1024 * 1024,
     /// Bounds the decoded typed bytes of all of a record's arrays together, so the memory one
     /// record takes does not grow with its array count.
@@ -111,32 +111,17 @@ pub fn get(self: *const DecodedArrays, position: usize) ?Array {
 }
 
 /// Decodes every modeled array of a record read with its Base64 text retained (for example
-/// from nextRecord or an IndexedReader lookup), replacing earlier results. Order, types,
-/// and limits follow nextDecodedRecord; after a failure no results are visible.
+/// from `nextRecord` or an `IndexedReader` lookup), replacing earlier results. Order, types,
+/// and limits follow `nextDecodedRecord`; after a failure no results are visible.
 pub fn decodeRecord(self: *DecodedArrays, record: model.Record, groups: []const cv.Group) Error!void {
-    if (self.busy) return error.InvalidState;
-    self.report = null;
-    self.reset();
-    errdefer self.reset();
-    self.busy = true;
-    defer self.busy = false;
-    errdefer |err| self.keepReport(err);
-    for (record.binaryArrays(), 0..) |node, position| try self.decodeRetained(node, record.default_array_length, groups, position);
-    self.complete();
+    return self.decodeNodes(record.binaryArrays(), record.default_array_length, groups);
 }
 
 /// Decodes one binary array node with retained text, replacing earlier results, and returns
-/// its values; get(0) returns the same array. default_length is the record's defaultArrayLength.
+/// its values; `get(0)` returns the same array. `default_length` is the record's
+/// `defaultArrayLength`.
 pub fn decodeArray(self: *DecodedArrays, node: model.Node, default_length: ?usize, groups: []const cv.Group) Error!Values {
-    if (self.busy) return error.InvalidState;
-    self.report = null;
-    self.reset();
-    errdefer self.reset();
-    self.busy = true;
-    defer self.busy = false;
-    errdefer |err| self.keepReport(err);
-    try self.decodeRetained(node, default_length, groups, 0);
-    self.complete();
+    try self.decodeNodes(&.{node}, default_length, groups);
     return self.get(0).?.values;
 }
 
@@ -162,7 +147,7 @@ pub fn decodeArrayText(self: *DecodedArrays, encoding: model.Encoding, length: u
     return self.get(0).?.values;
 }
 
-/// Returns the failure of the last decodeRecord, decodeArray, or decodeArrayText call, with
+/// Returns the failure of the last `decodeRecord`, `decodeArray`, or `decodeArrayText` call, with
 /// its stage, the failing array's position, and size or limit detail; null after a success.
 /// Decoding while reading reports through the reader's `diagnostic()` instead.
 pub fn diagnostic(self: *const DecodedArrays) ?Diagnostic {
@@ -215,6 +200,18 @@ pub fn complete(self: *DecodedArrays) void {
 // zlib payload that fits whole (most spectra) is decoded in one call, straight into its values.
 const WINDOW = 64 * 1024;
 
+fn decodeNodes(self: *DecodedArrays, nodes: []const model.Node, default_length: ?usize, groups: []const cv.Group) Error!void {
+    if (self.busy) return error.InvalidState;
+    self.report = null;
+    self.reset();
+    errdefer self.reset();
+    self.busy = true;
+    defer self.busy = false;
+    errdefer |err| self.keepReport(err);
+    for (nodes, 0..) |node, position| try self.decodeRetained(node, default_length, groups, position);
+    self.complete();
+}
+
 // Runs before the failed call's reset clears failure and the array count.
 fn keepReport(self: *DecodedArrays, err: anyerror) void {
     const stage: Diagnostic.Stage = if (self.failure) |failure| failure.stage else .array;
@@ -233,16 +230,16 @@ fn decodeRetained(
     source_position: usize,
 ) Error!void {
     self.position = source_position;
+    const retained = if (node.child(.binary)) |binary| binary.text else null;
     // Text kept in this owner's storage would be freed or overwritten as arrays are sized.
-    if (node.child(.binary)) |binary| if (binary.text) |retained| {
-        if (overlaps(self.window.allocatedSlice(), retained)) return error.OverlappingBuffers;
+    if (retained) |bytes| {
+        if (overlaps(self.window.allocatedSlice(), bytes)) return error.OverlappingBuffers;
         for (self.outputs.items) |output| {
-            if (overlaps(std.mem.sliceAsBytes(output.words.allocatedSlice()), retained)) return error.OverlappingBuffers;
+            if (overlaps(std.mem.sliceAsBytes(output.words.allocatedSlice()), bytes)) return error.OverlappingBuffers;
         }
-    };
+    }
     try self.beginArray(node, default_length, groups, source_position);
-    const binary = node.child(.binary) orelse return error.PayloadNotRetained;
-    var source = RetainedText{ .text = binary.text orelse return error.PayloadNotRetained };
+    var source = RetainedText{ .text = retained orelse return error.PayloadNotRetained };
     try self.decodeText(&source);
 }
 
@@ -344,7 +341,6 @@ fn finishArray(self: *DecodedArrays) Error!void {
     }
     if (output.encoding.pipeline.isNumpress()) return self.finishNumpress();
     if (counts.decoded_bytes != output.bytes) return error.DecodedSizeMismatch;
-    output.toNative();
 }
 
 fn finishNumpress(self: *DecodedArrays) Error!void {
@@ -421,7 +417,6 @@ fn decompressInto(self: *DecodedArrays, decompressor: *zlib.Decompressor, output
     }
     var extra: [1]u8 = undefined;
     if (try decompressor.read(&extra) != null) return error.DecodedSizeMismatch;
-    output.toNative();
 }
 
 // A reader over binary text that Base64-decodes into a window as the decompressor pulls.
@@ -537,18 +532,6 @@ const Output = struct {
 
     fn primitive(self: *const Output) model.Primitive {
         return if (self.narrowed) .float32 else self.encoding.decodedPrimitive();
-    }
-
-    // Values arrive as little-endian bytes; big-endian targets swap them in place.
-    fn toNative(self: *const Output) void {
-        if (comptime builtin.cpu.arch.endian() == .little) return;
-        switch (self.primitive()) {
-            inline else => |kind| {
-                const T = kind.Type();
-                const Bits = @Int(.unsigned, @bitSizeOf(T));
-                for (std.mem.bytesAsSlice(Bits, std.mem.sliceAsBytes(self.values(T)))) |*bits| bits.* = @byteSwap(bits.*);
-            },
-        }
     }
 
     fn values(self: *const Output, comptime T: type) []T {

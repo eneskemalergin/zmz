@@ -6,7 +6,7 @@ const builtin = @import("builtin");
 const kernel = @import("kernel_options");
 const core = @import("core.zig");
 
-/// Streaming SHA-1 with std's update and finalResult. It keeps std's state, partial block,
+/// Streaming SHA-1 with std's update and `finalResult`. It keeps std's state, partial block,
 /// and padding; only whole blocks take the SHA extension path.
 pub const Sha1 = struct {
     inner: std.crypto.hash.Sha1 = .init(.{}),
@@ -64,7 +64,7 @@ const ROUNDS = rounds: {
     break :rounds text;
 };
 
-// The CPU must have SHA and SSSE3 (core.hasSha).
+// Callers check core.hasSha first: these instructions need SHA and SSSE3.
 noinline fn compress(state: *[5]u32, data: []const u8) void {
     var abcd: [4]u32 align(16) = state[0..4].*;
     var e: [4]u32 align(16) = .{ 0, 0, 0, state[4] };
@@ -109,46 +109,4 @@ noinline fn compress(state: *[5]u32, data: []const u8) void {
         });
     state[0..4].* = abcd;
     state[4] = e[3];
-}
-
-// --- Tests ---
-
-// Without SHA extensions update is std's own, so this checks the extension path where the CPU
-// has it.
-test "[property] - [SHA-1]: matches std across lengths and splits" {
-    var source: [1200]u8 = undefined;
-    var random = std.Random.DefaultPrng.init(std.testing.random_seed);
-    random.random().bytes(&source);
-    for (0..source.len + 1) |len| {
-        var expected: [20]u8 = undefined;
-        std.crypto.hash.Sha1.hash(source[0..len], &expected, .{});
-        var whole: Sha1 = .{};
-        whole.update(source[0..len]);
-        try std.testing.expectEqualSlices(u8, &expected, &whole.finalResult());
-        for ([_]usize{ 1, 63, 64, 65, 127, 200 }) |split| {
-            if (split > len) continue;
-            var parts: Sha1 = .{};
-            parts.update(source[0..split]);
-            parts.update(source[split..len]);
-            try std.testing.expectEqualSlices(u8, &expected, &parts.finalResult());
-        }
-    }
-    var bytes: Sha1 = .{};
-    for (source) |byte| bytes.update(&.{byte});
-    var expected: [20]u8 = undefined;
-    std.crypto.hash.Sha1.hash(&source, &expected, .{});
-    try std.testing.expectEqualSlices(u8, &expected, &bytes.finalResult());
-}
-
-test "[unit] - [SHA-1]: matches the FIPS 180 vectors" {
-    const cases = .{
-        .{ "", "da39a3ee5e6b4b0d3255bfef95601890afd80709" },
-        .{ "abc", "a9993e364706816aba3e25717850c26c9cd0d89d" },
-        .{ "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq", "84983e441c3bd26ebaae4aa1f95129e5e54670f1" },
-    };
-    inline for (cases) |case| {
-        var hasher: Sha1 = .{};
-        hasher.update(case[0]);
-        try std.testing.expectEqualStrings(case[1], &std.fmt.bytesToHex(hasher.finalResult(), .lower));
-    }
 }

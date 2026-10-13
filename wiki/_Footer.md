@@ -1,0 +1,1 @@
+[zmz](https://github.com/eneskemalergin/zmz) | [Changelog](https://github.com/eneskemalergin/zmz/blob/main/CHANGELOG.md) | [Contributing](https://github.com/eneskemalergin/zmz/blob/main/CONTRIBUTING.md) | [Security](https://github.com/eneskemalergin/zmz/blob/main/SECURITY.md) | Apache License 2.0

@@ -74,21 +74,19 @@ pub const Pipeline = enum {
     }
 };
 
-pub const Term = struct { accession: []const u8, name: []const u8 };
-
 /// A recognized established encoding. Unknown metadata remains in the source node.
-pub const Descriptor = struct {
+pub const Encoding = struct {
     primitive: Primitive,
     pipeline: Pipeline,
 
     /// The primitive of decoded values: f64 for Numpress, the declared primitive otherwise.
-    pub fn decodedPrimitive(self: Descriptor) Primitive {
+    pub fn decodedPrimitive(self: Encoding) Primitive {
         return if (self.pipeline.isNumpress()) .float64 else self.primitive;
     }
 
     /// The pipeline to decode a payload with. Some producers omit the zlib stream of an
     /// empty array, so an empty zlib array without Base64 characters decodes uncompressed.
-    pub fn payloadPipeline(self: Descriptor, value_count: usize, empty_text: bool) Pipeline {
+    pub fn payloadPipeline(self: Encoding, value_count: usize, empty_text: bool) Pipeline {
         return if (value_count == 0 and self.pipeline == .zlib and empty_text) .none else self.pipeline;
     }
 };
@@ -104,7 +102,7 @@ pub const Error = cv.ExpansionError || error{
 
 /// What one CV accession declares about an array's encoding. An unsupported term says which
 /// declaration it is: a binary data type or a compression.
-pub const Declared = union(enum) {
+pub const EncodingTerm = union(enum) {
     primitive: Primitive,
     compression: Pipeline,
     unsupported: enum { primitive, compression },
@@ -116,12 +114,12 @@ pub const Terms = struct {
     primitive: ?Primitive = null,
     pipeline: ?Pipeline = null,
 
-    pub fn add(self: *Terms, params: []const cv.Entry, groups: []const cv.Group) Error!Descriptor {
+    pub fn add(self: *Terms, params: []const cv.Entry, groups: []const cv.Group) Error!Encoding {
         var iterator: cv.EffectiveIterator = .{ .entries = params, .groups = groups };
         while (try iterator.next()) |entry| {
             if (entry != .cv) continue;
             const accession = entry.cv.accession orelse continue;
-            switch (declared(accession.raw) orelse continue) {
+            switch (encodingTerm(accession.raw) orelse continue) {
                 .primitive => |selected| {
                     if (self.primitive != null and self.primitive.? != selected) return error.ConflictingPrimitive;
                     self.primitive = selected;
@@ -179,7 +177,7 @@ pub fn codecFromAccession(accession: []const u8) ?Pipeline {
 /// Returns the encoding meaning of one accession, or null when it says nothing about encoding.
 /// Recognized but unsupported encodings (16-bit floats, ASCII strings, zstd, byte shuffling,
 /// truncation, coordinate grids) are `unsupported`.
-pub fn declared(accession: []const u8) ?Declared {
+pub fn encodingTerm(accession: []const u8) ?EncodingTerm {
     if (primitiveFromAccession(accession)) |primitive| return .{ .primitive = primitive };
     if (codecFromAccession(accession)) |pipeline| return .{ .compression = pipeline };
     if (std.mem.eql(u8, accession, "MS:1000520") or std.mem.eql(u8, accession, "MS:1001479"))
@@ -194,7 +192,9 @@ pub fn declared(accession: []const u8) ?Declared {
 }
 
 // A missing term is an error, and repeated terms must agree.
-pub fn classify(params: []const cv.Entry, groups: []const cv.Group) Error!Descriptor {
+pub fn classify(params: []const cv.Entry, groups: []const cv.Group) Error!Encoding {
     var terms: Terms = .{};
     return terms.add(params, groups);
 }
+
+const Term = struct { accession: []const u8, name: []const u8 };

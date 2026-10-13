@@ -54,7 +54,7 @@ done: bool = false,
 failure: ?Diagnostic = null,
 
 /// Checks the options without consuming input; nothing is allocated until the first read.
-/// Streaming input needs buffer capacity for peekGreedy(1), otherwise InvalidOptions.
+/// Streaming input needs buffer capacity for `peekGreedy(1)`, otherwise `InvalidOptions`.
 pub fn init(allocator: std.mem.Allocator, input: *std.Io.Reader, options: Options) error{InvalidOptions}!Events {
     var cursor = try xml.Cursor.init(allocator, input, options.attributes, options.attribute_bytes);
     cursor.skip_whitespace_text = options.skip_whitespace_text;

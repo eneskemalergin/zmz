@@ -1,0 +1,46 @@
+name: Release gate
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+  # The release workflow runs it on the tagged commit.
+  workflow_call:
+
+permissions: {}
+
+concurrency:
+  group: gate-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: x86_64-linux ReleaseFast
+            runner: ubuntu-24.04
+            command: >-
+              zig build test -Doptimize=ReleaseFast --summary all &&
+              zig build test -Doptimize=ReleaseFast -Dkernel-backend=portable --summary all
+          - name: aarch64-linux ReleaseFast
+            runner: ubuntu-24.04-arm
+            command: zig build test -Doptimize=ReleaseFast --summary all
+          - name: aarch64-macos Debug
+            runner: macos-15
+            command: zig build test --summary all
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: $/.github/actions/setup-zig
+      - name: Test
+        env:
+          COMMAND: ${{ matrix.command }}
+        run: bash -c "${COMMAND}"

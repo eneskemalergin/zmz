@@ -5,7 +5,9 @@ const cv = @import("../../cv/source.zig");
 const model = @import("../model.zig");
 const schema = @import("../schema.zig");
 
-pub const Error = std.mem.Allocator.Error || error{ LimitExceeded, MissingAttribute };
+pub const Error = std.mem.Allocator.Error || error{LimitExceeded};
+// A header copy also reads each group's ID.
+pub const HeaderError = Error || error{MissingAttribute};
 
 pub const Copier = struct {
     allocator: std.mem.Allocator,
@@ -94,7 +96,7 @@ pub const Copier = struct {
 
     // Groups are derived from the copied group definitions, as the reader derives them, so their
     // entries are stored once; source.groups is not read.
-    pub fn header(self: *Copier, source: model.Header) Error!model.Header {
+    pub fn header(self: *Copier, source: model.Header) HeaderError!model.Header {
         var result = source;
         result.namespace_uri = try self.text(source.namespace_uri);
         result.document = try self.node(source.document, schema.MAX_DEPTH);

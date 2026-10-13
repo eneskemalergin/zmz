@@ -1,7 +1,7 @@
 //! Constructs one example spectrum from numeric values and writes plain or indexed mzML.
-//! The values and the encoder stay borrowed until writeRecordWithArrays returns. File output
+//! The values and the encoder stay borrowed until `writeRecordWithArrays` returns. File output
 //! streams each array through the encoder's compressor into the file and patches its
-//! encodedLength afterwards, so no buffer holds a compressed array whole.
+//! `encodedLength` afterwards, so no buffer holds a compressed array whole.
 //! Output creation is exclusive; failed writes remove only the new partial file.
 
 const std = @import("std");
@@ -49,7 +49,6 @@ pub fn main(init: std.process.Init) !void {
     } }}, &.{}, &.{ mz.array, intensity.array });
     try writer.beginList(.spectrum_list, 1, "example-processing");
     try writer.writeRecordWithArrays(record.node, &.{ mz.payload, intensity.payload });
-    builder.reset();
     try writer.endList();
     try writer.finish();
     try output.interface.flush();

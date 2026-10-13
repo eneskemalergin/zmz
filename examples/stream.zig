@@ -1,6 +1,6 @@
 //! Reads spectra and chromatograms through EOF, decoding modeled arrays or returning metadata only.
 //! The first record's metadata and header are copied so they can outlive the reader.
-//! Numeric slices belong to DecodedArrays and are consumed before its next use.
+//! Numeric slices belong to `DecodedArrays` and are consumed before its next use.
 
 const std = @import("std");
 const mzml = @import("zmz").mzml;
@@ -13,7 +13,7 @@ pub fn main(init: std.process.Init) !void {
         return error.InvalidArguments;
     }
     var output_buffer: [4096]u8 = undefined;
-    var output = std.Io.File.stdout().writer(init.io, &output_buffer);
+    var output = std.Io.File.stdout().writerStreaming(init.io, &output_buffer);
     var retained_header: ?mzml.owned.Header = null;
     defer if (retained_header) |*header| header.deinit();
     var retained_record: ?mzml.owned.Record = null;

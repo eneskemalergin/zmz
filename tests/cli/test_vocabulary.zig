@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const options = @import("vocabulary_test_options");
+const manifest = @embedFile("pinned_manifest");
 
 test "[cli] - [vocabulary]: rejects bad arguments and unreadable inputs without creating output" {
     var dir = std.testing.tmpDir(.{ .iterate = true });
@@ -9,7 +10,10 @@ test "[cli] - [vocabulary]: rejects bad arguments and unreadable inputs without 
     const executable = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, options.executable, std.testing.allocator);
     defer std.testing.allocator.free(executable);
     const cases = .{
-        .{ &[_][]const u8{ executable, "generate", "missing", "ms", "uo", "result.zig" }, "vocabulary: FileNotFound\n" },
+        .{ &[_][]const u8{ executable, "generate", "missing", "history", "ms", "uo", "result.zig" }, "vocabulary: FileNotFound\n" },
+        .{ &[_][]const u8{ executable, "candidate", "missing", "ms", "0000000000000000000000000000000000000000", "uo", "0000000000000000000000000000000000000000", "2026-01-01", "result.json" }, "vocabulary: FileNotFound\n" },
+        .{ &[_][]const u8{ executable, "history", "result.json", "psi-ms", "missing.txt" }, "vocabulary: FileNotFound\n" },
+        .{ &[_][]const u8{ executable, "extend", "missing.json", "result.json", "psi-ms", "missing.txt" }, "vocabulary: FileNotFound\n" },
         .{ &[_][]const u8{ executable, "review", "missing", "ms", "uo" }, "vocabulary: FileNotFound\n" },
         .{ &[_][]const u8{ executable, "inspect", "missing", "ms", "uo" }, "vocabulary: FileNotFound\n" },
         .{ &[_][]const u8{ executable, "scan", "missing.mzML" }, "vocabulary: FileNotFound\n" },
@@ -28,7 +32,10 @@ test "[cli] - [vocabulary]: rejects bad arguments and unreadable inputs without 
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, invalid.term);
     try std.testing.expectEqualStrings("", invalid.stdout);
     try std.testing.expectEqualStrings("usage: zig build vocabulary -- inspect|review MANIFEST.json PSI-MS.obo UO.obo\n" ++
-        "       zig build vocabulary -- generate MANIFEST.json PSI-MS.obo UO.obo OUTPUT.zig\n" ++
+        "       zig build vocabulary -- candidate MANIFEST.json PSI-MS.obo PSI-MS-COMMIT UO.obo UO-COMMIT DATE OUTPUT.json\n" ++
+        "       zig build vocabulary -- history OUTPUT.json KEY LIST.txt [KEY LIST.txt ...]\n" ++
+        "       zig build vocabulary -- extend HISTORY.json OUTPUT.json KEY LIST.txt [KEY LIST.txt ...]\n" ++
+        "       zig build vocabulary -- generate MANIFEST.json HISTORY.json PSI-MS.obo UO.obo OUTPUT.zig\n" ++
         "       zig build vocabulary -- scan FILE.mzML [FILE.mzML ...]\n" ++
         "vocabulary: InvalidArguments\n", invalid.stderr);
     var entries = dir.dir.iterate();
@@ -41,9 +48,10 @@ test "[cli] - [vocabulary scan]: reports source metadata, with or without CV dec
     const executable = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, options.executable, std.testing.allocator);
     defer std.testing.allocator.free(executable);
     const cases = .{
-        .{ @embedFile("empty_run"), "{\"format_version\":2,\"kind\":\"declaration\",\"resource\":\"input.mzML\",\"accession\":\"MS\",\"before\":{\"id\":\"MS\",\"full_name\":\"PSI-MS\",\"uri\":\"urn:test\",\"version\":null},\"after\":{\"resource\":\"psi-ms\",\"used_version\":\"4.1.258\",\"version_relationship\":\"absent\"}}\n" ++
-            "{\"format_version\":2,\"kind\":\"scan\",\"resource\":\"\",\"accession\":\"input.mzML\",\"before\":null,\"after\":{\"records\":0,\"parameters\":1,\"resolved\":0,\"missing_references\":0,\"unknown_resources\":0,\"unknown_accessions\":1,\"stale_names\":0,\"obsolete\":0,\"units\":1,\"resolved_units\":0,\"partial_units\":1,\"disallowed_units\":0}}\n" },
-        .{ "<mzML xmlns='http://psi.hupo.org/ms/mzml' version='1.1.0'><run/></mzML>", "{\"format_version\":2,\"kind\":\"scan\",\"resource\":\"\",\"accession\":\"input.mzML\",\"before\":null,\"after\":{\"records\":0,\"parameters\":0,\"resolved\":0,\"missing_references\":0,\"unknown_resources\":0,\"unknown_accessions\":0,\"stale_names\":0,\"obsolete\":0,\"units\":0,\"resolved_units\":0,\"partial_units\":0,\"disallowed_units\":0}}\n" },
+        .{ @embedFile("empty_run"), "{\"format_version\":3,\"kind\":\"declaration\",\"resource\":\"input.mzML\",\"accession\":\"MS\",\"before\":{\"id\":\"MS\",\"full_name\":\"PSI-MS\",\"uri\":\"urn:test\",\"version\":null},\"after\":{\"resource\":\"psi-ms\",\"used_version\":\"{VERSION}\",\"version_relationship\":\"absent\",\"unrecognized_uri\":true,\"unrecognized_name\":false}}\n" ++
+            "{\"format_version\":3,\"kind\":\"term\",\"resource\":\"input.mzML\",\"accession\":\"X:unknown\\tµ < & \\\"\",\"before\":null,\"after\":{\"occurrences\":1,\"unknown\":true,\"obsolete\":false,\"stale_name\":false,\"former_name\":false,\"unit_disallowed\":false}}\n" ++
+            "{\"format_version\":3,\"kind\":\"scan\",\"resource\":\"\",\"accession\":\"input.mzML\",\"before\":null,\"after\":{\"records\":0,\"parameters\":1,\"resolved\":0,\"missing_references\":0,\"unknown_resources\":0,\"unknown_accessions\":1,\"stale_names\":0,\"former_names\":0,\"obsolete\":0,\"units\":1,\"resolved_units\":0,\"partial_units\":1,\"disallowed_units\":0}}\n" },
+        .{ "<mzML xmlns='http://psi.hupo.org/ms/mzml' version='1.1.0'><run/></mzML>", "{\"format_version\":3,\"kind\":\"scan\",\"resource\":\"\",\"accession\":\"input.mzML\",\"before\":null,\"after\":{\"records\":0,\"parameters\":0,\"resolved\":0,\"missing_references\":0,\"unknown_resources\":0,\"unknown_accessions\":0,\"stale_names\":0,\"former_names\":0,\"obsolete\":0,\"units\":0,\"resolved_units\":0,\"partial_units\":0,\"disallowed_units\":0}}\n" },
     };
     inline for (cases) |case| {
         try dir.dir.writeFile(std.testing.io, .{ .sub_path = "input.mzML", .data = case[0] });
@@ -55,10 +63,36 @@ test "[cli] - [vocabulary scan]: reports source metadata, with or without CV dec
         defer std.testing.allocator.free(result.stderr);
         try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
         try std.testing.expectEqualStrings("", result.stderr);
-        try std.testing.expectEqualStrings(case[1], result.stdout);
+        const parsed = try std.json.parseFromSlice(struct { resources: []const struct { version: []const u8 } }, std.testing.allocator, manifest, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        const expected = try std.mem.replaceOwned(u8, std.testing.allocator, case[1], "{VERSION}", parsed.value.resources[0].version);
+        defer std.testing.allocator.free(expected);
+        try std.testing.expectEqualStrings(expected, result.stdout);
         var buffer: [2048]u8 = undefined;
         try std.testing.expectEqualStrings(case[0], try dir.dir.readFile(std.testing.io, "input.mzML", &buffer));
     }
+}
+
+test "[cli] - [vocabulary scan]: appends to an output file that earlier processes wrote" {
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    const executable = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, options.executable, std.testing.allocator);
+    defer std.testing.allocator.free(executable);
+    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "input.mzML", .data = "<mzML xmlns='http://psi.hupo.org/ms/mzml' version='1.1.0'><run/></mzML>" });
+    // As a shell's `{ scan; scan; } > report` shares one file between both processes.
+    const report = try dir.dir.createFile(std.testing.io, "report.jsonl", .{});
+    for (0..2) |_| {
+        var child = try std.process.spawn(std.testing.io, .{
+            .argv = &.{ executable, "scan", "input.mzML" },
+            .cwd = .{ .dir = dir.dir },
+            .stdout = .{ .file = report },
+        });
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try child.wait(std.testing.io));
+    }
+    report.close(std.testing.io);
+    var buffer: [2048]u8 = undefined;
+    const written = try dir.dir.readFile(std.testing.io, "report.jsonl", &buffer);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, written, "\"kind\":\"scan\""));
 }
 
 test "[cli] - [vocabulary scan]: reports where an unreadable file broke and exits with status 1" {

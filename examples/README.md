@@ -8,6 +8,14 @@ zig build examples -Doptimize=ReleaseFast
 
 The executables go in `zig-out/bin/`. `zig build test-examples` compiles and runs them on small fixtures; `zig build test` includes those checks. No external datasets are needed.
 
+Each example has one job:
+
+- **[stream.zig](stream.zig)** (`mzml-stream`): read a whole file forward, decoding every array or only metadata, and keep a copy of one record after the reader closes.
+- **[select.zig](select.zig)** (`mzml-select`): decode one array role per record, either after reading the record or by selecting it while reading.
+- **[indexed.zig](indexed.zig)** (`mzml-indexed`): fetch one record by ID through the embedded index or an explicitly rebuilt one.
+- **[write.zig](write.zig)** (`mzml-write`): build a spectrum from numbers and write plain or indexed mzML.
+- **[rewrite.zig](rewrite.zig)** (`mzml-rewrite`): rewrite a file record by record, keeping all surrounding XML, while copying, filtering MS1 spectra, editing user parameters, or reencoding arrays.
+
 Every program prints saved `mzml.Diagnostic` reports on failure. These include the native error, operation, and available location or size details. Indexed opening uses `buildWithDiagnostic` so its report survives cleanup; lookup, forward-reader, writer, and `DecodedArrays` reports come from `diagnostic()`.
 
 ## Read, select, and retain
@@ -60,7 +68,7 @@ zig-out/bin/mzml-indexed example-indexed.mzML 'scan=1'
 
 `Builder.prepareArray` creates metadata and a payload that borrows the values; nothing is encoded until `writeRecordWithArrays` writes the record. The writer encodes each array while writing it, with the `arrays.Encoder`'s compressor, and sets `encodedLength` from the text it writes. Keep the values and the encoder alive until the record is written.
 
-Builder reset releases its metadata. The example resets only after the header or record has been written. `Writer.finish` closes the document and emits the optional index; the caller must then flush the sink. `deinit` does neither. Output creation refuses an existing path, and a failed write removes its newly created partial output.
+Builder reset releases its metadata. The example resets once the header is written, before it builds the record; a reset is safe only after what it built has been written. `Writer.finish` closes the document and emits the optional index; the caller must then flush the sink. `deinit` does neither. Output creation refuses an existing path, and a failed write removes its newly created partial output.
 
 ## Copy, filter, or reencode
 

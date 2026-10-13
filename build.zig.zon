@@ -9,16 +9,12 @@
     },
     .fingerprint = 0xc6a4b95cef75bbdc,
     .minimum_zig_version = "0.16.0",
+    // What a dependent build needs: the library and its notices. Tests, examples, tools, and
+    // vocabulary sources stay in the repository; their build steps are never run from a package.
     .paths = .{
         "build.zig",
         "build.zig.zon",
         "src",
-        "tests",
-        "examples",
-        "tools/check_mzml.zig",
-        "tools/vocabulary.zig",
-        "tools/libm_data.py",
-        "vocabularies",
         "README.md",
         "LICENSE",
         "NOTICE",

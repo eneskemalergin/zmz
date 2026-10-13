@@ -570,12 +570,12 @@ test "[integration] - [mzML construction]: writes and decodes every declared pip
             const encoding = array.encoding;
             try std.testing.expectEqual(@as(mzml.arrays.Pipeline, @enumFromInt(count % 8)), encoding.pipeline);
             var output: [3]f64 = undefined;
-            var transport: [512]u8 = undefined;
+            var wire_buffer: [512]u8 = undefined;
             var transformed: [512]u8 = undefined;
-            _ = try array.decode(f64, &output, .{ .transport = &transport, .transformed = &transformed });
+            _ = try array.decode(f64, &output, .{ .wire = &wire_buffer, .transformed = &transformed });
             for (output, [_]f64{ 1, 2, 3 }) |value, expected| try std.testing.expectApproxEqAbs(expected, value, 0.001);
             if (encoding.pipeline == .pic or encoding.pipeline == .pic_zlib) {
-                const decoded = try mzml.base64.decode(&transport, array.node.child(.binary).?.text.?);
+                const decoded = try mzml.base64.decode(&wire_buffer, array.node.child(.binary).?.text.?);
                 const wire = if (encoding.pipeline == .pic_zlib) try mzml.zlib.decompress(&transformed, decoded) else decoded;
                 // Each PIC integer has seven leading zero nibbles, followed by 1, 2, or 3.
                 try std.testing.expectEqualSlices(u8, &.{ 0x71, 0x72, 0x73 }, wire);
@@ -617,6 +617,8 @@ test "[integration] - [mzML construction]: cleans failed allocations and keeps s
     try std.testing.expectEqualStrings("", declaration.attribute("version").?);
     const param = try builder.number(.{ .cv_ref = "MS", .accession = mzml.model.Terms.SCAN_START_TIME, .name = "scan start time" }, -0.0);
     try std.testing.expect(std.math.signbit(try mzml.cv.parseFloat(f64, param.value)));
+    for ([_]f64{ std.math.nan(f64), std.math.inf(f64), -std.math.inf(f64) }, [_][]const u8{ "NaN", "INF", "-INF" }) |value, spelling|
+        try std.testing.expectEqualStrings(spelling, (try builder.number(.{}, value)).value.?);
     var encoder = mzml.arrays.Encoder.init(std.testing.allocator, .fast);
     defer encoder.deinit();
     const options: mzml.Builder.ArrayOptions = .{ .cv_ref = "MS", .role = .{ .cv_ref = "MS", .accession = mzml.model.Terms.MZ_ARRAY, .name = "m/z array" } };

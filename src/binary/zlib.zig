@@ -68,7 +68,7 @@ pub const Decompressor = struct {
     }
 
     /// Starts decoding a stream pulled from input, which stays borrowed until the stream ends
-    /// or fails. A failed read of input is InvalidData here; its owner keeps the cause.
+    /// or fails. A failed read of input is `InvalidData` here; its owner keeps the cause.
     pub fn startReader(self: *Decompressor, input: *std.Io.Reader) void {
         self.source = .stream;
         switch (self.state) {
@@ -151,7 +151,6 @@ pub const Compressor = struct {
     // Which start began the open stream; finish needs start's output.
     open: enum { none, output, writer } = .none,
 
-    /// Allocates one zipir compressor.
     pub fn init(allocator: std.mem.Allocator, preset: Preset) std.mem.Allocator.Error!Compressor {
         return .{ .allocator = allocator, .state = try allocator.create(zipir.zlib.Compressor), .preset = preset };
     }
@@ -175,7 +174,7 @@ pub const Compressor = struct {
     /// Starts one zlib stream into output and returns the writer for its source; finish
     /// ends it. A write error on the writer means output is full. output stays borrowed
     /// until finish.
-    pub fn start(self: *Compressor, output: []u8) CompressError!*std.Io.Writer {
+    pub fn start(self: *Compressor, output: []u8) error{OutputTooSmall}!*std.Io.Writer {
         self.destination = std.Io.Writer.fixed(output);
         // zipir's only compression error is a full output writer.
         const writer = self.startWriter(&self.destination) catch return error.OutputTooSmall;
@@ -184,12 +183,12 @@ pub const Compressor = struct {
     }
 
     /// Ends the stream begun by start and returns the written prefix of its output.
-    pub fn finish(self: *Compressor) Error![]u8 {
+    pub fn finish(self: *Compressor) error{ OutputTooSmall, InvalidState }![]u8 {
         if (self.open != .output) return error.InvalidState;
         return self.finishOutput();
     }
 
-    /// Starts one zlib stream into destination, which stays borrowed until finishWriter, and
+    /// Starts one zlib stream into destination, which stays borrowed until `finishWriter`, and
     /// returns the writer for its source. Write errors are destination's.
     pub fn startWriter(self: *Compressor, destination: *std.Io.Writer) std.Io.Writer.Error!*std.Io.Writer {
         self.open = .none;
@@ -207,14 +206,14 @@ pub const Compressor = struct {
         self.open = .none;
     }
 
-    /// Ends the stream begun by startWriter. The stream is closed even when a write fails.
+    /// Ends the stream begun by `startWriter`. The stream is closed even when a write fails.
     pub fn finishWriter(self: *Compressor) (std.Io.Writer.Error || error{InvalidState})!void {
         if (self.open == .none) return error.InvalidState;
         self.open = .none;
         _ = try self.state.finish();
     }
 
-    fn finishOutput(self: *Compressor) CompressError![]u8 {
+    fn finishOutput(self: *Compressor) ![]u8 {
         self.open = .none;
         _ = self.state.finish() catch |err| switch (err) {
             error.WriteFailed => return error.OutputTooSmall,
@@ -224,7 +223,7 @@ pub const Compressor = struct {
 };
 
 /// Decodes exactly one zlib stream into output, checking its Adler-32. Trailing bytes, such as
-/// a second stream, are an error, and expanding past output's capacity is OutputTooSmall.
+/// a second stream, are an error, and expanding past output's capacity is `OutputTooSmall`.
 pub fn decompress(output: []u8, source: []const u8) DecompressError![]u8 {
     return decompressWith(useFast(), output, source);
 }
@@ -377,14 +376,7 @@ fn useFast() bool {
     return FAST_LINKED and core.hasX86_64V3();
 }
 
-fn fastResult(code: FastResult) error{
-    InvalidData,
-    TruncatedInput,
-    ChecksumMismatch,
-    TrailingInput,
-    UnsupportedDictionary,
-    OutputTooSmall,
-}!void {
+fn fastResult(code: FastResult) DecompressError!void {
     return switch (code) {
         .ok, .end => {},
         .invalid_data => error.InvalidData,

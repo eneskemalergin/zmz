@@ -30,6 +30,11 @@ test "[integration] - [mzML CV declarations]: borrows header fields across recor
         }
     }
     try std.testing.expectError(error.UnexpectedElement, header.run.cvDeclaration());
+    const misplaced: mzml.model.Header = .{
+        .document = .{ .kind = .mzml, .children = &.{.{ .kind = .cv_list, .children = &.{ nodes[0], header.run } }} },
+        .run = header.run,
+    };
+    try std.testing.expectError(error.UnexpectedElement, misplaced.cvDeclarations(std.testing.allocator));
 
     var records: usize = 0;
     while (try reader.nextRecord()) |_| {
@@ -169,7 +174,7 @@ test "[property] - [mzML scientific metadata]: preserves independent fields and 
 test "[failure] - [mzML scientific metadata]: reports each selected-ion and window field on its own" {
     const model = mzml.model;
     var ion: model.Node = .{ .kind = .selected_ion };
-    // F114727's shape: a malformed peak intensity beside a valid m/z and charge.
+    // A malformed peak intensity beside a valid m/z and charge, as some real files hold.
     ion.params = &.{
         .{ .cv = .{ .accession = model.Terms.CHARGE_STATE, .value = "1" } },
         .{ .cv = .{ .accession = model.Terms.SELECTED_ION_MZ, .value = "977.4697" } },
@@ -181,7 +186,8 @@ test "[failure] - [mzML scientific metadata]: reports each selected-ion and wind
     try std.testing.expectEqual(@as(?i32, 1), try fields.charge);
     try std.testing.expectError(error.InvalidValue, fields.intensity);
 
-    // Absent fields stay absent; the historical m/z term fills in only when the current one is absent.
+    // Absent fields stay absent; the historical m/z term fills in only when the current one is
+    // absent.
     ion.params = &.{.{ .cv = .{ .accession = model.Terms.HISTORICAL_SELECTED_ION_MZ, .value = "445.3" } }};
     const historical = try ion.selectedIonFields(&.{});
     try std.testing.expectEqual(@as(f64, 445.3), (try historical.mz).?.value);
@@ -301,7 +307,7 @@ test "[integration] - [mzML scientific metadata]: keeps all scans, ions, and win
     try std.testing.expectEqual(@as(f64, 1.25), quantity.value);
     try std.testing.expectEqual(.allowed, quantity.parameter.unit_allowed);
     try std.testing.expectEqual(.historical, quantity.parameter.term.version);
-    try std.testing.expectEqualStrings("minute", quantity.parameter.unit.match.?.term.name);
+    try std.testing.expectEqualStrings("minute", quantity.parameter.unit.match.?.term.name());
 
     const precursors = record.precursors();
     try std.testing.expectEqual(@as(usize, 2), precursors.len);

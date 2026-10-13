@@ -50,6 +50,77 @@ pub const REFERENCED_DOCUMENT = HEADER ++ "<spectrumList count='2' defaultDataPr
     "<precursor spectrumRef='scan=1'><activation/></precursor>" ++ ARRAYS ++
     "</chromatogram></chromatogramList></run></mzML>";
 
+/// Passes allocations to another allocator and tracks the bytes held and the most held at once,
+/// for footprint bounds. It never resizes or remaps in place, so every growth is a new allocation
+/// and a copy, with both buffers held: the worst case on every platform. Whether the child could
+/// grow a buffer in place depends on the operating system and its page size, and would make the
+/// peak differ between them.
+pub const PeakAllocator = struct {
+    child: std.mem.Allocator,
+    held: usize = 0,
+    peak: usize = 0,
+
+    pub fn allocator(self: *PeakAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{
+            .alloc = alloc,
+            .resize = std.mem.Allocator.noResize,
+            .remap = std.mem.Allocator.noRemap,
+            .free = free,
+        } };
+    }
+
+    fn alloc(context: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *PeakAllocator = @ptrCast(@alignCast(context));
+        const memory = self.child.rawAlloc(len, alignment, ret_addr) orelse return null;
+        self.held += len;
+        self.peak = @max(self.peak, self.held);
+        return memory;
+    }
+
+    fn free(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *PeakAllocator = @ptrCast(@alignCast(context));
+        self.child.rawFree(memory, alignment, ret_addr);
+        self.held -= memory.len;
+    }
+};
+
+// A fuzz corpus entry for a document read with sliceWeightedBytes: its length, then its bytes.
+pub fn corpusDocument(comptime document: []const u8) []const u8 {
+    return comptime std.mem.toBytes(@as(u32, document.len)) ++ document;
+}
+
+/// Runs a fuzz target on `count` inputs drawn from the test seed: each a corpus entry with a few
+/// bytes changed or cut, or random bytes when there is no corpus. Zig 0.16.0 does not build tests
+/// in fuzz mode, so this is the generated input each ordinary test run gives the target.
+pub fn fuzzSeeded(
+    context: anytype,
+    comptime testOne: fn (@TypeOf(context), *std.testing.Smith) anyerror!void,
+    corpus: []const []const u8,
+    count: usize,
+) !void {
+    var prng = std.Random.DefaultPrng.init(std.testing.random_seed);
+    const random = prng.random();
+    var bytes: [8192]u8 = undefined;
+    for (0..count) |_| {
+        var len: usize = 0;
+        if (corpus.len == 0) {
+            len = random.uintAtMost(usize, 1024);
+            random.bytes(bytes[0..len]);
+        } else {
+            const entry = corpus[random.uintLessThan(usize, corpus.len)];
+            len = entry.len;
+            @memcpy(bytes[0..len], entry);
+            // Past the 4-byte length the Smith reads first, so the entry keeps its shape.
+            if (len > 4) for (0..random.uintAtMost(usize, 8)) |_| {
+                bytes[4 + random.uintLessThan(usize, len - 4)] = random.int(u8);
+            };
+            if (random.uintLessThan(u8, 8) == 0) len = random.uintAtMost(usize, len);
+        }
+        var smith: std.testing.Smith = .{ .in = bytes[0..len] };
+        try testOne(context, &smith);
+    }
+}
+
 // Links nodes into one chain, each the only child of the one before, and returns the outermost.
 pub fn nest(nodes: []mzml.model.Node) mzml.model.Node {
     var index = nodes.len - 1;
@@ -189,6 +260,13 @@ pub fn expectWritten(expected: []const u8, actual: []const u8) !void {
         try std.testing.expectEqualStrings(found.id, listed.id);
         try std.testing.expectEqual(found.start, listed.start);
     }
+}
+
+// Spectrum and chromatogram entry counts, read through the index's public entries.
+pub fn kindCounts(index: *mzml.IndexedReader) [2]usize {
+    var counts: [2]usize = .{ 0, 0 };
+    for (0..index.entryCount()) |position| counts[if (index.entryAt(position).?.kind == .spectrum) 0 else 1] += 1;
+    return counts;
 }
 
 pub fn checksumStart(bytes: []const u8) !usize {

@@ -3,12 +3,11 @@
 //!
 //! Arguments are borrowed only until each call returns. The writer borrows its sink until
 //! deinit, and the caller flushes and closes the sink, including after finish. Failures are
-//! sticky: the first sets diagnostic() and later calls return FailedState, and partial output
+//! sticky: the first sets `diagnostic()` and later calls return `FailedState`, and partial output
 //! is never a complete document. A call made while another runs, as from the sink's drain,
-//! returns InvalidState and leaves the running call unharmed.
+//! returns `InvalidState` and leaves the running call unharmed.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const cv = @import("../cv/source.zig");
 const base64 = @import("../binary/base64.zig");
 const arrays = @import("../binary/arrays.zig");
@@ -18,7 +17,7 @@ const xml = @import("../xml/mzml_adapter.zig");
 const model = @import("model.zig");
 const schema = @import("schema.zig");
 const Diagnostic = @import("diagnostic.zig");
-const Ids = @import("internal/id_index.zig").IdIndex(IndexEntry);
+const IdIndex = @import("internal/id_index.zig").IdIndex;
 
 const Writer = @This();
 
@@ -27,23 +26,26 @@ const Writer = @This();
 /// text), not the whole output.
 pub const Limits = struct { nodes: usize = 100_000, text_bytes: usize = 256 * 1024 * 1024 };
 
-/// Indexed output: bounds on retained index entries and ID bytes (including historical
-/// native/spot IDs), and the indexedmzML element's attributes.
+/// Indexed output: bounds on retained index entries and on the bytes of their IDs (including
+/// historical native/spot IDs, counted as given), and the indexedmzML element's attributes. The
+/// index keeps about 25 bytes a record for IDs that are fixed text around integers, and about the
+/// ID's length more for others. Both bounds default to their largest values, since the index holds
+/// the caller's own records.
 pub const IndexOptions = struct {
-    records: usize = 1_000_000,
-    id_bytes: usize = 64 * 1024 * 1024,
+    records: usize = std.math.maxInt(u32),
+    id_bytes: usize = std.math.maxInt(u32),
     /// Namespaced attributes for indexedmzML, such as the index schema's `xsi:schemaLocation`,
-    /// written and checked as on the mzML root; borrowed until writeHeader. None by default.
+    /// written and checked as on the mzML root; borrowed until `writeHeader`. None by default.
     wrapper_attributes: []const model.Attribute = &.{},
 };
 
-/// One modeled array for writeRecordWithArrays. The writer sets each written array's
-/// encodedLength from the text it writes, whatever the node declares.
+/// One modeled array for `writeRecordWithArrays`. The writer sets each written array's
+/// `encodedLength` from the text it writes, whatever the node declares.
 pub const ArrayPayload = union(enum) {
     /// Finished wire bytes, written as Base64.
     wire: []const u8,
     /// Values encoded while they are written. File output streams every source, writing a
-    /// placeholder encodedLength as wide as the longest possible text and patching it after the
+    /// placeholder `encodedLength` as wide as the longest possible text and patching it after the
     /// text, so it may carry leading zeros. Other output streams sources whose length is known
     /// without encoding (primitives without zlib) or after a counting pass (Numpress without zlib),
     /// and encodes zlib sources into the source's encoder first, so a failing source writes nothing
@@ -86,6 +88,9 @@ plans: std.ArrayList(Plan) = .empty,
 source_text_length: usize = 0,
 // A call is in progress; the sink's drain runs inside it and must not call the writer.
 active: bool = false,
+// The XML writer's binding count inside mzML when its default namespace is ours: at that count
+// only mzML's own bindings are in scope, so an element needs no default declaration.
+root_bindings: ?usize = null,
 
 /// Call deinit even after a failure. Do not copy the writer: a copy and the original would free the
 /// same storage on deinit.
@@ -94,7 +99,7 @@ pub fn init(allocator: std.mem.Allocator, sink: *std.Io.Writer, limits: Limits) 
     return .{ .engine = xml.Writer.init(allocator, sink, .{}), .allocator = allocator, .limits = limits };
 }
 
-/// Writes indexedmzML, keeping each record's ID and offset (within index_options) until deinit.
+/// Writes indexedmzML, keeping each record's ID and offset (within `index_options`) until deinit.
 pub fn initIndexed(
     allocator: std.mem.Allocator,
     sink: *std.Io.Writer,
@@ -102,7 +107,7 @@ pub fn initIndexed(
     index_options: IndexOptions,
 ) (std.mem.Allocator.Error || error{InvalidOptions})!Writer {
     if (limits.nodes == 0) return error.InvalidOptions;
-    // Entry positions and ID offsets are 32 bits.
+    // Entry positions are 32 bits; the ID-byte bound has the same range.
     if (index_options.records > std.math.maxInt(u32) or index_options.id_bytes > std.math.maxInt(u32))
         return error.InvalidOptions;
     for (index_options.wrapper_attributes) |attr| if (attr.namespace_uri == null) return error.InvalidOptions;
@@ -117,7 +122,7 @@ pub fn initIndexed(
 }
 
 /// Writes to a positional file writer at offset zero on an empty file; nothing else may write
-/// through it until finish. List counts may be null. Null index_options selects plain mzML;
+/// through it until finish. List counts may be null. Null `index_options` selects plain mzML;
 /// indexed output needs a readable file, whose prefix finish rereads for the checksum.
 pub fn initFile(
     allocator: std.mem.Allocator,
@@ -144,7 +149,7 @@ pub fn deinit(self: *Writer) void {
     self.* = undefined;
 }
 
-/// Returns the first failure; later FailedState returns leave it unchanged. The caller's own
+/// Returns the first failure; later `FailedState` returns leave it unchanged. The caller's own
 /// final flush is not covered.
 pub fn diagnostic(self: *const Writer) ?Diagnostic {
     return self.failure;
@@ -183,6 +188,8 @@ pub fn writeHeader(self: *Writer, header: model.Header) Error!void {
     try self.startKnown("mzML", header.document.attributes, true);
     if (self.engine.namespaceUri("xsi") == null) try self.engine.namespace("xsi", xml.XSI);
     try self.writeAttributes(header.document.attributes);
+    if (std.mem.eql(u8, self.engine.namespaceUri("") orelse "", self.namespace_uri))
+        self.root_bindings = self.engine.namespace_bindings.items.len;
     var no_plans: []const Plan = &.{};
     var budget = self.limits.nodes;
     try self.writeContent(header.document, false, &no_plans, &budget);
@@ -196,7 +203,7 @@ pub fn writeHeader(self: *Writer, header: model.Header) Error!void {
 /// otherwise) and is filled in by `endList`; other writers require an exact count before writing
 /// (a wrong count is `CountMismatch`). Spectra precede chromatograms, and each list can occur at
 /// most once.
-pub fn beginList(self: *Writer, kind: model.Kind, count: ?usize, processing_ref: []const u8) Error!void {
+pub fn beginList(self: *Writer, kind: model.Kind, count: ?usize, processing_ref: []const u8) ListError!void {
     try self.enter();
     defer self.active = false;
     return self.openList(kind, count, &.{.{ .name = "defaultDataProcessingRef", .value = processing_ref }});
@@ -204,14 +211,14 @@ pub fn beginList(self: *Writer, kind: model.Kind, count: ?usize, processing_ref:
 
 /// Opens a list with source attributes, writing the supplied count first in place of any
 /// source count; other attributes keep their order and values, and an absent processing
-/// reference stays absent. Count and list order follow beginList.
-pub fn beginListWithAttributes(self: *Writer, kind: model.Kind, count: ?usize, attributes: []const model.Attribute) Error!void {
+/// reference stays absent. Count and list order follow `beginList`.
+pub fn beginListWithAttributes(self: *Writer, kind: model.Kind, count: ?usize, attributes: []const model.Attribute) ListError!void {
     try self.enter();
     defer self.active = false;
     return self.openList(kind, count, attributes);
 }
 
-/// Writes a record with its retained binary text, escaped as XML; the Base64 and encodedLength
+/// Writes a record with its retained binary text, escaped as XML; the Base64 and `encodedLength`
 /// are not checked.
 pub fn writeRecord(self: *Writer, node: model.Node) Error!void {
     try self.enter();
@@ -220,8 +227,8 @@ pub fn writeRecord(self: *Writer, node: model.Node) Error!void {
 }
 
 /// Writes one forward item. List openings keep their source counts; use
-/// beginListWithAttributes when filtering changes a count or leaves it unknown. Records from
-/// decoded reads have no binary text; write them with writeRecordWithArrays.
+/// `beginListWithAttributes` when filtering changes a count or leaves it unknown. Records from
+/// decoded reads have no binary text; write them with `writeRecordWithArrays`.
 pub fn writeItem(self: *Writer, item: model.Item) Error!void {
     try self.enter();
     defer self.active = false;
@@ -253,7 +260,7 @@ pub fn writeRecordWithArrays(self: *Writer, node: model.Node, payloads: []const 
     return self.writeRecordInner(node, true, payloads);
 }
 
-/// Like writeRecordWithArrays with one choice per modeled array: null keeps that array's
+/// Like `writeRecordWithArrays` with one choice per modeled array: null keeps that array's
 /// binary text, and a payload, even an empty one, replaces it. Only supplied payloads are
 /// checked.
 pub fn writeRecordWithSelectedArrays(self: *Writer, node: model.Node, payloads: []const ?ArrayPayload) Error!void {
@@ -301,7 +308,7 @@ const Plan = union(enum) {
     source: struct { payload: arrays.Source, text_length: ?usize, width: usize = 0 },
 };
 
-fn enter(self: *Writer) Error!void {
+fn enter(self: *Writer) error{InvalidState}!void {
     if (self.active) return error.InvalidState;
     self.active = true;
 }
@@ -350,7 +357,9 @@ fn ioFailure(self: *Writer, err: Error) Error!noreturn {
     return err;
 }
 
-fn openList(self: *Writer, kind: model.Kind, count: ?usize, attributes: []const model.Attribute) Error!void {
+const ListError = xml.WriterError || error{ FailedState, InvalidOptions, InvalidStructure, UnknownAttribute };
+
+fn openList(self: *Writer, kind: model.Kind, count: ?usize, attributes: []const model.Attribute) ListError!void {
     if (self.failure != null) return error.FailedState;
     errdefer |err| {
         self.fail(err, .open_list);
@@ -449,8 +458,9 @@ fn writeRecordInner(self: *Writer, node: model.Node, comptime replace_arrays: bo
             self.capture(error.MissingAttribute, .index, .{ .attribute = .id });
             return error.MissingAttribute;
         };
-        if (state.entries.items.len == state.options.records) return try self.limitError(.index, .records, state.options.records, null);
-        const id_start = try self.listId(state, id);
+        if (state.offsets.items.len == state.options.records) return try self.limitError(.index, .records, state.options.records, null);
+        try self.chargeId(state, id.len);
+        state.id_bytes += id.len;
         // Historical IDs are copied and reserved first, so they stay parallel to the entries.
         var native_id: ?[]const u8 = null;
         var spot_id: ?[]const u8 = null;
@@ -459,16 +469,11 @@ fn writeRecordInner(self: *Writer, node: model.Node, comptime replace_arrays: bo
             if (node.attribute("spotID")) |value| spot_id = try self.copyId(state, value);
             try state.historical_ids.ensureUnusedCapacity(state.allocator, 1);
         }
+        try state.offsets.ensureUnusedCapacity(state.allocator, 1);
         const ids = &state.ids[if (node.kind == .spectrum) @as(usize, 0) else 1];
-        try Ids.insert(
-            ids,
-            state.allocator,
-            &state.entries,
-            state.id_list.items,
-            .{ .id_start = id_start, .id_len = @intCast(id.len), .offset = offset },
-        );
+        try ids.add(state.allocator, id, ids.prepare(id));
+        state.offsets.appendAssumeCapacity(offset);
         if (state.historical) state.historical_ids.appendAssumeCapacity(.{ .native_id = native_id, .spot_id = spot_id });
-        if (node.kind == .spectrum) state.spectra += 1;
     }
     var remaining: []const Plan = self.plans.items;
     var budget = self.limits.nodes;
@@ -529,7 +534,7 @@ fn planSource(self: *Writer, source: arrays.Source, payloads: anytype) Error!Pla
 fn writeSource(self: *Writer, source: arrays.Source) Error!void {
     try self.engine.binaryPart(&.{});
     const start = self.engine.byteOffset() orelse return error.LimitExceeded;
-    if (source.options.pipeline == .none and builtin.cpu.arch.endian() == .little) {
+    if (source.options.pipeline == .none) {
         switch (source.values) {
             inline else => |values| try self.engine.binary(std.mem.sliceAsBytes(values)),
         }
@@ -627,6 +632,8 @@ fn writeEncodedLength(self: *Writer, text_length: ?usize, width: usize) Error!?u
     if (text_length != null) return null;
     return (self.engine.byteOffset() orelse return error.LimitExceeded) - 1 - width;
 }
+
+// --- Node writing ---
 
 fn writeNode(self: *Writer, node: model.Node, comptime replace_arrays: bool, remaining: *[]const Plan, budget: *usize) Error!void {
     errdefer |err| {
@@ -752,7 +759,7 @@ noinline fn writeXml(self: *Writer, bytes: []const u8, budget: *usize) Error!voi
     if (cursor.current != null) return error.InvalidStructure;
 }
 
-fn writeAttributes(self: *Writer, attrs: []const model.Attribute) Error!void {
+fn writeAttributes(self: *Writer, attrs: []const model.Attribute) !void {
     for (attrs) |attr| {
         if (namespacePrefix(attr) != null) continue;
         if (attr.namespace_uri) |uri| {
@@ -778,7 +785,7 @@ fn namespacePrefix(attr: model.Attribute) ?[]const u8 {
     return null;
 }
 
-fn startKnown(self: *Writer, name: []const u8, attrs: []const model.Attribute, root: bool) Error!void {
+fn startKnown(self: *Writer, name: []const u8, attrs: []const model.Attribute, root: bool) !void {
     var source_default: ?[]const u8 = null;
     var has_namespaces = false;
     for (attrs) |attr| if (namespacePrefix(attr)) |prefix| {
@@ -802,7 +809,8 @@ fn startKnown(self: *Writer, name: []const u8, attrs: []const model.Attribute, r
             try self.engine.startElement(qualified);
         } else try self.engine.startElementTrusted(name);
     } else {
-        const declare = root or !std.mem.eql(u8, self.engine.namespaceUri("") orelse "", self.namespace_uri);
+        const declare = root or (self.root_bindings != self.engine.namespace_bindings.items.len and
+            !std.mem.eql(u8, self.engine.namespaceUri("") orelse "", self.namespace_uri));
         try self.engine.startElementTrusted(name);
         if (declare) try self.engine.namespace(null, self.namespace_uri);
         if (!has_namespaces) return;
@@ -820,7 +828,7 @@ fn checkNode(self: *Writer, node: model.Node) Error!void {
     if (node.content) |content| try self.checkParts(.{ std.mem.asBytes(content), content.items });
 }
 
-fn checkParts(self: *Writer, parts: anytype) Error!void {
+fn checkParts(self: *Writer, parts: anytype) !void {
     inline for (parts) |part| {
         if (self.engine.overlapsOutput(std.mem.sliceAsBytes(part))) return error.OverlappingBuffers;
     }
@@ -882,17 +890,7 @@ fn optionalAttribute(self: *Writer, name: []const u8, value: ?[]const u8, record
     if (value) |text| try self.engine.attributeTrusted(name, text, record);
 }
 
-// Copies a record's ID into the index's ID list and returns where it starts.
-fn listId(self: *Writer, state: *Index, id: []const u8) Error!u32 {
-    try self.chargeId(state, id.len);
-    const start = state.id_list.items.len;
-    state.id_list.appendSlice(state.allocator, id) catch |err| {
-        self.capture(err, .index, .none);
-        return err;
-    };
-    state.id_bytes += id.len;
-    return @intCast(start);
-}
+// --- Indexed output ---
 
 fn copyId(self: *Writer, state: *Index, id: []const u8) Error![]const u8 {
     try self.chargeId(state, id.len);
@@ -922,24 +920,26 @@ fn writeIndex(self: *Writer, state: *Index) Error!void {
     errdefer |err| self.capture(err, .index, .none);
     const offset = self.engine.byteOffset() orelse return error.LimitExceeded;
     if (offset > std.math.maxInt(i64)) return error.LimitExceeded;
-    const spectrum = state.spectra != 0 or state.entries.items.len == 0;
-    const chromatogram = state.spectra != state.entries.items.len;
+    const spectra = state.ids[0].count();
+    const spectrum = spectra != 0 or state.offsets.items.len == 0;
+    const chromatogram = spectra != state.offsets.items.len;
     try self.engine.startElement("indexList");
     try self.engine.attribute("count", if (spectrum and chromatogram) "2" else "1");
     inline for (.{ model.Kind.spectrum, model.Kind.chromatogram }) |kind| {
         if (if (kind == .spectrum) spectrum else chromatogram) {
             try self.engine.startElement("index");
             try self.engine.attribute("name", kind.xmlName());
-            const entries = if (kind == .spectrum) state.entries.items[0..state.spectra] else state.entries.items[state.spectra..];
-            for (entries, if (kind == .spectrum) @as(usize, 0) else state.spectra..) |entry, i| {
+            const offsets = if (kind == .spectrum) state.offsets.items[0..spectra] else state.offsets.items[spectra..];
+            const ids = &state.ids[if (kind == .spectrum) @as(usize, 0) else 1];
+            for (offsets, 0.., if (kind == .spectrum) @as(usize, 0) else spectra..) |entry_offset, ordinal, i| {
                 try self.engine.startElement("offset");
-                try self.engine.attribute("idRef", Ids.idOf(entry, state.id_list.items));
+                try self.engine.attribute("idRef", ids.get(ordinal));
                 if (state.historical) {
                     try self.optionalAttribute("nativeID", state.historical_ids.items[i].native_id, false);
                     try self.optionalAttribute("spotID", state.historical_ids.items[i].spot_id, false);
                 }
                 var text: [32]u8 = undefined;
-                try self.engine.text(text[0..std.fmt.printInt(&text, entry.offset, 10, .lower, .{})]);
+                try self.engine.text(text[0..std.fmt.printInt(&text, entry_offset, 10, .lower, .{})]);
                 try self.engine.endElement();
             }
             try self.engine.endElement();
@@ -977,8 +977,6 @@ fn writeIndex(self: *Writer, state: *Index) Error!void {
     try self.engine.endElement();
 }
 
-const IndexEntry = struct { id_start: u32, id_len: u32, offset: u64 };
-
 // Indexed stream output is hashed and forwarded, and file output reread, in chunks of this
 // size. Rewrite time was flat from 8 to 256 KiB; 16 KiB kept peak RSS at the unhashed level.
 const CHUNK_BYTES = 16 * 1024;
@@ -989,17 +987,15 @@ const Index = struct {
     hashed: std.Io.Writer.Hashed(Sha1),
     arena: std.heap.ArenaAllocator,
     options: IndexOptions,
-    entries: std.ArrayList(IndexEntry) = .empty,
-    id_list: std.ArrayList(u8) = .empty,
+    // Each record's offset, spectra first; its ID is at the same position in its kind's `ids`.
+    offsets: std.ArrayList(u64) = .empty,
     historical: bool = false,
     historical_ids: std.ArrayList(struct { native_id: ?[]const u8, spot_id: ?[]const u8 }) = .empty,
-    ids: [2]Ids.Map = .{ .empty, .empty },
-    spectra: usize = 0,
+    ids: [2]IdIndex = .{ .{}, .{} },
     id_bytes: usize = 0,
 
     fn deinit(self: *Index) void {
-        self.entries.deinit(self.allocator);
-        self.id_list.deinit(self.allocator);
+        self.offsets.deinit(self.allocator);
         self.historical_ids.deinit(self.allocator);
         for (&self.ids) |*ids| ids.deinit(self.allocator);
         self.arena.deinit();

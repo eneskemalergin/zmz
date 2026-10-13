@@ -13,8 +13,8 @@ const Resolver = @This();
 /// Explicit association for a local declaration ID, including stale or custom declarations.
 pub const Binding = struct { declaration_id: []const u8, resource_key: []const u8 };
 
-/// The caller's reviewed relationship between a declared version and the selected resource;
-/// version strings are never compared to infer one.
+/// The caller's reviewed relationship between a declared version and the selected resource, beyond
+/// the releases the resource's history records; version strings are never compared to infer one.
 pub const KnownVersion = struct {
     resource_key: []const u8,
     version: []const u8,
@@ -41,6 +41,8 @@ pub const Issues = struct {
     unknown_accession: bool = false,
     namespace_mismatch: bool = false,
     stale_name: bool = false,
+    /// With `stale_name`: the name was the term's canonical name in an earlier recorded release.
+    former_name: bool = false,
     obsolete: bool = false,
     /// Known URI and name evidence disagree, or an explicit binding contradicts either.
     resource_mismatch: bool = false,
@@ -63,12 +65,12 @@ pub const Parameter = struct {
     term: Resolution,
     unit: Resolution,
     unit_fields: enum { absent, partial, complete },
-    /// `not_declared` means no direct has_units relation, not a unit prohibition.
+    /// `not_declared` means no direct `has_units` relation, not a unit prohibition.
     unit_allowed: enum { unresolved, not_declared, allowed, disallowed },
 };
 
-/// A number of the caller's chosen type with its resolved parameter. Check parameter.unit_fields,
-/// unit, and unit_allowed before interpreting its units; the value is not converted.
+/// A number of the caller's chosen type with its resolved parameter. Check `parameter.unit_fields`,
+/// unit, and `unit_allowed` before interpreting its units; the value is not converted.
 pub fn Quantity(comptime T: type) type {
     if (@typeInfo(T) != .int and T != f32 and T != f64)
         @compileError("quantity requires an integer, f32, or f64");
@@ -78,8 +80,9 @@ pub fn Quantity(comptime T: type) type {
 /// Ambiguity is an error; no first match is chosen.
 pub const Error = error{ LimitExceeded, DuplicateDeclaration, InvalidBinding, AmbiguousResource, ConflictingVersion };
 
-/// The bundled current vocabulary snapshots. Historical snapshots are not bundled.
-pub const BUNDLED: []const Vocabulary = generated_data.RESOURCES;
+/// The bundled current vocabulary snapshots, with the releases each one's history records.
+/// Historical snapshots are not bundled.
+pub const BUNDLED: []const Vocabulary = &generated_data.RESOURCES;
 
 resources: []const Vocabulary,
 declarations: []const cv.Declaration,
@@ -88,14 +91,10 @@ known_versions: []const KnownVersion = &.{},
 /// Bounds declaration, resource, binding, and version comparisons per operation.
 max_work: usize = 100_000,
 
-/// Resolves against `BUNDLED` and treats a psi-ms 4.1.248 declaration as `historical`; setting
-/// `known_versions` replaces that entry. Every resolution borrows `declarations`.
+/// Resolves against `BUNDLED`, where a declared version is `historical` when the resource's
+/// history records that release. Every resolution borrows `declarations`.
 pub fn init(declarations: []const cv.Declaration) Resolver {
-    return .{
-        .resources = BUNDLED,
-        .declarations = declarations,
-        .known_versions = &.{.{ .resource_key = "psi-ms", .version = "4.1.248", .relationship = .historical }},
-    };
+    return .{ .resources = BUNDLED, .declarations = declarations };
 }
 
 /// Resolves both references separately and checks direct allowed-unit accessions.
@@ -124,7 +123,7 @@ pub fn resolve(self: Resolver, parameter: cv.Param) Error!Parameter {
             if (unit.match) |unit_match| {
                 const expected = unit.resource.?.lookup(target);
                 if (expected) |found|
-                    allowed = allowed or std.mem.eql(u8, found.term.id, unit_match.term.id);
+                    allowed = allowed or found.term.eql(unit_match.term);
             }
         }
         result.unit_allowed = if (!has_units) .not_declared else if (unit.match == null or
@@ -208,8 +207,15 @@ fn find(
         result.match = resource.lookup(identity.raw);
         result.issues.unknown_accession = result.match == null;
         if (result.match) |match| {
-            result.issues.obsolete = match.term.obsolete;
-            if (name) |label| result.issues.stale_name = !std.mem.eql(u8, label, match.term.name);
+            result.issues.obsolete = match.term.obsolete();
+            if (name) |label| if (!std.mem.eql(u8, label, match.term.name())) {
+                result.issues.stale_name = true;
+                var former = match.term.formerNames();
+                while (former.next()) |entry| {
+                    try charge(remaining);
+                    if (std.mem.eql(u8, entry.name, label)) result.issues.former_name = true;
+                }
+            };
         }
     }
     return result;
@@ -221,6 +227,8 @@ fn version(self: Resolver, resource: Vocabulary, declared: ?[]const u8, remainin
     if (std.mem.eql(u8, text, resource.identity.version) or
         (resource.identity.source_version.len != 0 and std.mem.eql(u8, text, resource.identity.source_version)))
         return .exact;
+    try charge(remaining);
+    const recorded = resource.findRelease(text) != null;
     var known: ?Version = null;
     for (self.known_versions) |entry| {
         try charge(remaining);
@@ -232,7 +240,12 @@ fn version(self: Resolver, resource: Vocabulary, declared: ?[]const u8, remainin
             };
         }
     }
-    return known orelse .unrecognized_version;
+    if (known) |relationship| {
+        // A recorded release cannot also be a future one.
+        if (recorded and relationship != .historical) return error.ConflictingVersion;
+        return relationship;
+    }
+    return if (recorded) .historical else .unrecognized_version;
 }
 
 fn charge(remaining: *usize) Error!void {
@@ -246,18 +259,12 @@ fn matches(source: ?[]const u8, known: []const u8) bool {
 
 fn knownName(source: ?[]const u8, identity: Vocabulary.Identity) bool {
     if (matches(source, identity.full_name)) return true;
-    if (std.mem.eql(u8, identity.key, "psi-ms")) {
-        return matches(source, "Proteomics Standards Initiative Mass Spectrometry Ontology") or
-            matches(source, "Mass spectrometry ontology");
-    }
+    for (identity.declaration_names) |name| if (matches(source, name)) return true;
     return false;
 }
 
 fn knownUri(source: ?[]const u8, identity: Vocabulary.Identity) bool {
     if (matches(source, identity.uri)) return true;
-    if (std.mem.eql(u8, identity.key, "psi-ms"))
-        return matches(source, "https://raw.githubusercontent.com/HUPO-PSI/psi-ms-CV/master/psi-ms.obo");
-    if (std.mem.eql(u8, identity.key, "uo"))
-        return matches(source, "https://raw.githubusercontent.com/bio-ontology-research-group/unit-ontology/master/unit.obo");
+    for (identity.declaration_uris) |uri| if (matches(source, uri)) return true;
     return false;
 }

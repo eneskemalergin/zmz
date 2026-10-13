@@ -14,7 +14,7 @@ pub const Limits = struct {
     bytes: usize = 256 * 1024 * 1024,
 };
 
-pub const Error = copy.Error;
+pub const Error = copy.HeaderError;
 
 /// Independently owned forward item, including XML or list attributes.
 pub const Item = Owned(model.Item, copyItem);

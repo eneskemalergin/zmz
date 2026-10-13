@@ -23,7 +23,7 @@ pub const Limits = struct {
     record_bytes: usize = 256 * 1024 * 1024,
     nodes: usize = 100_000,
     list_entries: usize = 100_000,
-    /// Also bounds the text of the index's offset, indexListOffset, and fileChecksum elements.
+    /// Also bounds the text of the index's offset, `indexListOffset`, and `fileChecksum` elements.
     binary_text_bytes: usize = 256 * 1024 * 1024,
 };
 
@@ -32,18 +32,18 @@ pub const Payload = enum { retain, skip };
 
 /// What a selection callback sees. Every slice borrows only for the call.
 pub const Selection = struct {
-    /// The binaryDataArray for select, the record for select_record: its attributes and the
+    /// The `binaryDataArray` for select, the record for `select_record`: its attributes and the
     /// unexpanded parameters read so far, without children or text.
     node: model.Node,
-    /// Zero-based array position within the record; zero for select_record.
+    /// Zero-based array position within the record; zero for `select_record`.
     position: usize = 0,
-    /// The header's parameter groups, for lookups such as node.parameter.
+    /// The header's parameter groups, for lookups such as `node.parameter`.
     groups: []const cv.Group,
 };
 
 /// Chooses arrays after their leading parameters and before their binary text.
-/// Keep user_data valid while reading. Reentering the reader, or reusing the decoded output it
-/// fills, returns InvalidState and leaves the read in progress unharmed. A returned error
+/// Keep `user_data` valid while reading. Reentering the reader, or reusing the decoded output it
+/// fills, returns `InvalidState` and leaves the read in progress unharmed. A returned error
 /// fails the read with a diagnostic. Later checks can still fail a selected array.
 pub const ArraySelector = struct {
     user_data: ?*anyopaque = null,
@@ -59,7 +59,7 @@ pub const Options = struct {
     /// Chooses the arrays whose text ordinary reads keep (with payload retain) or whose
     /// values decoded reads decode.
     array_selector: ?ArraySelector = null,
-    /// Retains the index trailer within header limits for StreamReader.indexTrailer().
+    /// Retains the index trailer within header limits for `StreamReader.indexTrailer()`.
     retain_index: bool = false,
 };
 
@@ -69,16 +69,7 @@ pub const Error = xml.Error || model.MetadataError || DecodedArrays.Error || std
     FailedState,
     InvalidOptions,
 };
-pub const FragmentError = Error || error{InvalidIndex};
-
 pub const Scope = struct { start: u64, end: u64, name: []const u8 };
-pub const FragmentTarget = struct { kind: model.Kind, id: []const u8 };
-
-// Parsed indexed-wrapper children. Release its arena once.
-pub const ParsedFooter = struct {
-    arena: std.heap.ArenaAllocator,
-    nodes: [2]model.Node,
-};
 
 allocator: std.mem.Allocator,
 cursor: xml.Cursor,
@@ -529,11 +520,14 @@ pub fn readFragment(
     reuse_ancestors: bool,
     expected: FragmentTarget,
 ) FragmentError!owned.Record {
+    // IndexedReader keeps a lookup reader that never reads a header, captures at most four
+    // ancestors, and looks up only spectra and chromatograms placed after their prefix.
+    std.debug.assert(!self.header_ready and ancestors <= 4 and physical_start >= prefix_length);
+    std.debug.assert(expected.kind == .spectrum or expected.kind == .chromatogram);
     try self.enter();
     defer self.active = false;
     self.failure = null;
     self.current_kind = null;
-    if (self.header_ready or ancestors > 4 or physical_start < prefix_length) return error.InvalidOptions;
     errdefer self.fragment_ancestors = null;
     if (reuse_ancestors) {
         self.cursor.resetToAncestors(input, self.fragment_ancestors.?, prefix_length);
@@ -564,7 +558,6 @@ pub fn readFragment(
         const id = start.attributeRaw("id") orelse return try self.attributeError(error.MissingAttribute, .id);
         if (!std.mem.eql(u8, id.value, expected.id)) return error.InvalidIndex;
     }
-    if (kind_value != .spectrum and kind_value != .chromatogram) return error.InvalidStructure;
     var node = try self.parseNodeFor(&self.record_store, 1, complete, self.options.payload, .tree);
     if (complete) {
         for (0..ancestors) |_| {
@@ -591,8 +584,8 @@ pub fn parseFooter(
     prefix_length: usize,
     failure: *?Diagnostic,
 ) Error!ParsedFooter {
+    std.debug.assert(physical_start >= prefix_length);
     failure.* = null;
-    if (physical_start < prefix_length) return error.InvalidOptions;
     var input = std.Io.Reader.fixed(bytes);
     var reader = try init(allocator, &input, options);
     defer reader.deinit();
@@ -626,8 +619,9 @@ pub fn resumeFollowingList(
     physical_start: u64,
     prefix_length: usize,
 ) FragmentError!void {
-    if (self.active_list != .spectrum_list or
-        ancestors != self.scope_count + 1 or physical_start < prefix_length) return error.InvalidOptions;
+    // openEmbedded calls this on its own reader, with the spectrum list open and its context.
+    std.debug.assert(self.active_list == .spectrum_list and ancestors == self.scope_count + 1);
+    std.debug.assert(physical_start >= prefix_length);
     const replacement = try xml.Cursor.init(self.allocator, input, self.options.limits.attributes, self.options.limits.attribute_bytes);
     self.cursor.deinit();
     self.cursor = replacement;
@@ -651,12 +645,21 @@ pub fn resumeFollowingList(
 
 // For an empty spectrum list preceding chromatograms when opening an index.
 pub fn finishEmptySpectrumList(self: *Engine) FragmentError!void {
+    std.debug.assert(self.active_list == .spectrum_list);
     errdefer |err| self.fail(err, .open_index);
-    if (self.active_list != .spectrum_list) return error.InvalidOptions;
     try self.cursor.advance(false);
     try self.finishSpectrumList();
     if (self.active_list != .chromatogram_list) return error.InvalidIndex;
 }
+
+const FragmentError = Error || error{InvalidIndex};
+const FragmentTarget = struct { kind: model.Kind, id: []const u8 };
+
+// Parsed indexed-wrapper children. Release its arena once.
+const ParsedFooter = struct {
+    arena: std.heap.ArenaAllocator,
+    nodes: [2]model.Node,
+};
 
 fn skipExtraXml(self: *Engine, parent: model.Kind) Error!void {
     while (self.cursor.current) |event| {
@@ -921,11 +924,13 @@ const ParamAttributes = struct {
     unit_name: ?[]const u8 = null,
 };
 const ParamKind = std.meta.Tag(cv.Entry);
-const PARAM_ATTRIBUTES = std.StaticStringMap(std.meta.FieldEnum(ParamAttributes)).initComptime(.{
-    .{ "ref", .ref },               .{ "cvRef", .cv_ref },                 .{ "accession", .accession },
-    .{ "name", .name },             .{ "value", .value },                  .{ "type", .value_type },
-    .{ "unitCvRef", .unit_cv_ref }, .{ "unitAccession", .unit_accession }, .{ "unitName", .unit_name },
-});
+// Compared in order, each against a name of known length, so a match costs one length check per
+// earlier entry and one fixed-size comparison; the common fields come first.
+const PARAM_ATTRIBUTES = [_]struct { []const u8, std.meta.FieldEnum(ParamAttributes) }{
+    .{ "cvRef", .cv_ref },       .{ "accession", .accession },   .{ "name", .name },
+    .{ "value", .value },        .{ "unitCvRef", .unit_cv_ref }, .{ "unitAccession", .unit_accession },
+    .{ "unitName", .unit_name }, .{ "type", .value_type },       .{ "ref", .ref },
+};
 
 fn paramKind(self: *const Engine, start: xml.StartElement) ?ParamKind {
     if (!std.mem.eql(u8, start.name.expanded.namespace_uri orelse "", self.cursor.mzml_namespace)) return null;
@@ -974,41 +979,45 @@ fn parseParams(self: *Engine, storage: *Storage, comptime retain: bool, count: *
         };
         if (retain) try entries.append(self.allocator, entry);
         count.* += 1;
-        try self.cursor.advance(has_content);
-        if (has_content) {
-            var content: std.ArrayList(cv.ParameterXml.Part) = .empty;
-            defer content.deinit(self.allocator);
-            while (self.cursor.current) |current| {
-                const part: cv.ParameterXml.Part = switch (current.data) {
-                    .end_element => break,
-                    .start_element => .{ .xml = try self.readXml(storage, retain) },
-                    .text => blk: {
-                        var bytes: std.ArrayList(u8) = .empty;
-                        while (self.cursor.current) |text| {
-                            if (text.data != .text) break;
-                            if (retain) {
-                                if (text.data.text.bytes.len > storage.limit -| storage.used -| bytes.items.len)
-                                    return try storage.limitError(bytes.items.len +| text.data.text.bytes.len);
-                                try bytes.appendSlice(storage.arena.allocator(), text.data.text.bytes);
-                            }
-                            try self.cursor.advance(true);
-                        }
-                        storage.used += bytes.items.len;
-                        break :blk .{ .text = bytes.items };
-                    },
-                };
-                if (retain) {
-                    if (content.items.len == self.options.limits.list_entries)
-                        return try self.limitError(.metadata, .list_entries, self.options.limits.list_entries, null);
-                    try content.append(self.allocator, part);
-                }
-                if (part != .text) try self.cursor.advance(true);
-            }
-            if (retain) extra.?.content = try storage.copy(cv.ParameterXml.Part, content.items);
-            if (retain and !has_extra and content.items.len == 0) switch (entries.items[entries.items.len - 1]) {
-                inline else => |*param| param.xml = null,
-            };
+        if (!has_content) {
+            // An empty parameter's end event carries nothing, so the cursor closes it in place.
+            self.cursor.closeEmpty();
+            try self.cursor.advance(false);
+            continue;
         }
+        try self.cursor.advance(true);
+        var content: std.ArrayList(cv.ParameterXml.Part) = .empty;
+        defer content.deinit(self.allocator);
+        while (self.cursor.current) |current| {
+            const part: cv.ParameterXml.Part = switch (current.data) {
+                .end_element => break,
+                .start_element => .{ .xml = try self.readXml(storage, retain) },
+                .text => blk: {
+                    var bytes: std.ArrayList(u8) = .empty;
+                    while (self.cursor.current) |text| {
+                        if (text.data != .text) break;
+                        if (retain) {
+                            if (text.data.text.bytes.len > storage.limit -| storage.used -| bytes.items.len)
+                                return try storage.limitError(bytes.items.len +| text.data.text.bytes.len);
+                            try bytes.appendSlice(storage.arena.allocator(), text.data.text.bytes);
+                        }
+                        try self.cursor.advance(true);
+                    }
+                    storage.used += bytes.items.len;
+                    break :blk .{ .text = bytes.items };
+                },
+            };
+            if (retain) {
+                if (content.items.len == self.options.limits.list_entries)
+                    return try self.limitError(.metadata, .list_entries, self.options.limits.list_entries, null);
+                try content.append(self.allocator, part);
+            }
+            if (part != .text) try self.cursor.advance(true);
+        }
+        if (retain) extra.?.content = try storage.copy(cv.ParameterXml.Part, content.items);
+        if (retain and !has_extra and content.items.len == 0) switch (entries.items[entries.items.len - 1]) {
+            inline else => |*param| param.xml = null,
+        };
         const end = self.cursor.current orelse return error.UnexpectedEnd;
         if (end.data != .end_element) return error.InvalidStructure;
         try self.cursor.advance(false);
@@ -1053,7 +1062,9 @@ fn copyParamAttributes(
 
 fn parameterAttribute(name: xml.ExpandedName, selected: ParamKind) ?std.meta.FieldEnum(ParamAttributes) {
     if (name.namespace_uri != null) return null;
-    const field = PARAM_ATTRIBUTES.get(name.local) orelse return null;
+    const field = inline for (PARAM_ATTRIBUTES) |entry| {
+        if (std.mem.eql(u8, name.local, entry[0])) break entry[1];
+    } else return null;
     if (selected == .group_ref) return if (field == .ref) field else null;
     return switch (field) {
         .ref => null,

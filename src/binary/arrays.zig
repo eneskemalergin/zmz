@@ -2,9 +2,11 @@
 //!
 //! Only `Encoder` allocates. Caller buffers must be disjoint unless a function says otherwise
 //! (`OverlappingBuffers` otherwise), and their contents after a failure are unspecified.
+//!
+//! `Encoder.reuses` is internal: the writer checks with it that a payload is not in a slot the
+//! next encode reuses.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const base64 = @import("base64.zig");
 const zlib = @import("zlib.zig");
 const numpress = @import("numpress.zig");
@@ -14,17 +16,17 @@ const overlaps = @import("core.zig").overlaps;
 pub const Pipeline = encoding.Pipeline;
 
 /// Caller-owned scratch, disjoint from each other and from input and output.
-/// Decoding: transport holds the Base64-decoded bytes of any pipeline except none, and
+/// Decoding: wire holds the Base64-decoded bytes of any pipeline except none, and
 /// transformed holds zlib output for Numpress with zlib; primitive zlib expands straight
-/// into the typed output. Encoding: transformed holds Numpress or big-endian primitive bytes
-/// without zlib; with zlib they stream into the compressor and transport holds its output.
-/// Little-endian primitives without zlib borrow the values' bytes.
+/// into the typed output. Encoding: transformed holds Numpress bytes without zlib; with zlib
+/// they stream into the compressor and wire holds its output. Primitives without zlib borrow
+/// the values' bytes.
 pub const Scratch = struct {
-    transport: []u8,
+    wire: []u8,
     transformed: []u8,
 };
 
-/// Linear and SLOF need fixed_point; every other pipeline rejects one.
+/// Linear and SLOF need `fixed_point`; every other pipeline rejects one.
 pub const EncodeOptions = struct {
     pipeline: Pipeline = .none,
     fixed_point: ?f64 = null,
@@ -94,7 +96,8 @@ pub const Source = struct {
     }
 };
 
-pub const DecodeError = base64.DecodeError || zlib.DecompressError || numpress.DecodeError || error{TypeMismatch};
+pub const DecodeError = base64.DecodeError || WireDecodeError;
+pub const WireDecodeError = zlib.DecompressError || numpress.DecodeError || error{TypeMismatch};
 pub const OptionsError = error{ TypeMismatch, MissingFixedPoint, UnexpectedFixedPoint, MissingCompressor, InvalidFixedPoint };
 
 pub const EncodeError = base64.EncodeError || zlib.Compressor.Error || numpress.EncodeError || OptionsError;
@@ -103,8 +106,7 @@ pub const WriteError = OptionsError || numpress.WriteError || std.mem.Allocator.
 /// Encodes arrays with storage it owns: the zlib compressor (allocated on first use) and one output
 /// buffer per array encoded since the last reset. With zlib, primitive or Numpress bytes go
 /// straight into the compressor, so no buffer holds them whole. Do not copy an initialized encoder:
-/// a copy and the original would free the same storage on deinit. `reuses` is internal: the writer
-/// checks a reused slot with it.
+/// a copy and the original would free the same storage on deinit.
 pub const Encoder = struct {
     allocator: std.mem.Allocator,
     preset: zlib.Preset,
@@ -129,7 +131,7 @@ pub const Encoder = struct {
     }
 
     /// Encodes values into wire bytes (primitive or Numpress, then optional zlib), valid
-    /// until reset or deinit. Little-endian primitives without zlib borrow values instead.
+    /// until reset or deinit. Primitives without zlib borrow values instead.
     pub fn encode(
         self: *Encoder,
         comptime T: type,
@@ -139,16 +141,15 @@ pub const Encoder = struct {
         // Bad options fail before the compressor or an output slot is allocated.
         try checkOptions(T, values.len, options, true);
         const bound = try wireBound(T, values.len, options.pipeline);
-        const transformed = options.pipeline.isNumpress() or
-            builtin.cpu.arch.endian() == .big;
+        const transformed = options.pipeline.isNumpress();
         if (!options.pipeline.hasZlib()) {
-            if (!transformed) return encodeWire(T, values, options, .{ .transport = &.{}, .transformed = &.{} }, null);
+            if (!transformed) return encodeWire(T, values, options, .{ .wire = &.{}, .transformed = &.{} }, null);
             const output = try self.nextOutput(bound);
-            return encodeWire(T, values, options, .{ .transport = &.{}, .transformed = output }, null);
+            return encodeWire(T, values, options, .{ .wire = &.{}, .transformed = output }, null);
         }
         const state = try self.compressor();
         const output = try self.nextOutput(zlib.compressBound(bound));
-        return encodeWire(T, values, options, .{ .transport = output, .transformed = &.{} }, state);
+        return encodeWire(T, values, options, .{ .wire = output, .transformed = &.{} }, state);
     }
 
     pub fn encodeSource(self: *Encoder, source: Source) (EncodeError || std.mem.Allocator.Error)![]const u8 {
@@ -179,7 +180,7 @@ pub const Encoder = struct {
     }
 };
 
-/// Decodes exactly output.len values. T is f32, f64, i32, or i64, and Numpress needs f64.
+/// Decodes exactly `output.len` values. T is f32, f64, i32, or i64, and Numpress needs f64.
 /// Primitive bytes are little endian, and float bits are kept exactly.
 pub fn decode(
     comptime T: type,
@@ -191,13 +192,13 @@ pub fn decode(
     _ = encoding.Primitive.of(T);
     try checkBuffers(std.mem.sliceAsBytes(output), source, scratch);
     if (pipeline.isNumpress() and T != f64) return error.TypeMismatch;
-    const destination = if (pipeline == .none) std.mem.sliceAsBytes(output) else scratch.transport;
+    const destination = if (pipeline == .none) std.mem.sliceAsBytes(output) else scratch.wire;
     const wire = base64.decode(destination, source) catch |err| {
         if (err != error.OutputTooSmall) return err;
         // Filling output, or Numpress scratch as large as its bound, means the text holds more
         // than the declared values; shorter scratch is the caller's buffer.
         if (pipeline == .none) return error.DecodedSizeMismatch;
-        if (pipeline.isNumpress() and !pipeline.hasZlib() and scratch.transport.len >= try wireBound(T, output.len, pipeline))
+        if (pipeline.isNumpress() and !pipeline.hasZlib() and scratch.wire.len >= try wireBound(T, output.len, pipeline))
             return error.DecodedSizeMismatch;
         return err;
     };
@@ -212,12 +213,12 @@ pub fn decodeWire(
     source: []const u8,
     pipeline: Pipeline,
     transformed: []u8,
-) DecodeError!void {
+) WireDecodeError!void {
     _ = encoding.Primitive.of(T);
     const bytes = std.mem.sliceAsBytes(output);
     const in_place = pipeline == .none and bytes.ptr == source.ptr;
-    try checkBuffers(bytes, if (in_place) &.{} else source, .{ .transport = &.{}, .transformed = transformed });
-    if (in_place) try checkBuffers(transformed, source, .{ .transport = &.{}, .transformed = &.{} });
+    try checkBuffers(bytes, if (in_place) &.{} else source, .{ .wire = &.{}, .transformed = transformed });
+    if (in_place) try checkBuffers(transformed, source, .{ .wire = &.{}, .transformed = &.{} });
     if (pipeline.isNumpress() and T != f64) return error.TypeMismatch;
     try decodeWireInner(T, output, source, pipeline, transformed);
 }
@@ -236,8 +237,8 @@ pub fn encode(
     return base64.encode(output, try encodeWire(T, values, options, scratch, compressor));
 }
 
-/// Like encode, stopping before Base64. The result borrows values for little-endian
-/// primitives without zlib, and scratch otherwise.
+/// Like encode, stopping before Base64. The result borrows values for primitives without zlib,
+/// and scratch otherwise.
 pub fn encodeWire(
     comptime T: type,
     values: []const T,
@@ -249,7 +250,7 @@ pub fn encodeWire(
     try checkBuffers(&.{}, std.mem.sliceAsBytes(values), scratch);
     try checkOptions(T, values.len, options, compressor != null);
     if (options.pipeline.hasZlib()) {
-        const writer = try compressor.?.start(scratch.transport);
+        const writer = try compressor.?.start(scratch.wire);
         errdefer compressor.?.cancel();
         writeWire(T, values, options, writer) catch |err| switch (err) {
             error.WriteFailed => return error.OutputTooSmall,
@@ -264,12 +265,7 @@ pub fn encodeWire(
         if (T != f64 and T != f32) return error.TypeMismatch;
         return scratch.transformed[0..try numpress.encode(transform, values, options.fixed_point orelse 0, scratch.transformed)];
     }
-    if (builtin.cpu.arch.endian() == .little) return std.mem.sliceAsBytes(values);
-    const required = try wireBound(T, values.len, options.pipeline);
-    if (scratch.transformed.len < required) return error.OutputTooSmall;
-    var writer = std.Io.Writer.fixed(scratch.transformed[0..required]);
-    writePrimitives(T, values, &writer) catch unreachable;
-    return writer.buffered();
+    return std.mem.sliceAsBytes(values);
 }
 
 /// Returns the primitive or Numpress wire capacity before optional zlib compression.
@@ -279,10 +275,10 @@ pub fn wireBound(comptime T: type, count: usize, pipeline: Pipeline) error{ Leng
     const transform = pipeline.transform() orelse
         return std.math.mul(usize, count, @sizeOf(T)) catch error.LengthOverflow;
     if (T != f64 and T != f32) return error.TypeMismatch;
-    return numpress.maxEncodedLen(transform, count);
+    return numpress.encodedBound(transform, count);
 }
 
-fn decodeWireInner(comptime T: type, output: []T, source: []const u8, pipeline: Pipeline, transformed: []u8) DecodeError!void {
+fn decodeWireInner(comptime T: type, output: []T, source: []const u8, pipeline: Pipeline, transformed: []u8) WireDecodeError!void {
     const array_bytes = std.math.mul(usize, output.len, @sizeOf(T)) catch return error.LengthOverflow;
     var wire = source;
     if (pipeline.hasZlib()) {
@@ -298,16 +294,8 @@ fn decodeWireInner(comptime T: type, output: []T, source: []const u8, pipeline: 
         return numpress.decodeExact(transform, wire, output);
     }
     if (wire.len != array_bytes) return error.DecodedSizeMismatch;
-    if (builtin.cpu.arch.endian() == .little) {
-        const bytes = std.mem.sliceAsBytes(output);
-        if (bytes.ptr != wire.ptr) @memcpy(bytes, wire);
-        return;
-    }
-    const Bits = @Int(.unsigned, @bitSizeOf(T));
-    for (output, 0..) |*value, index| {
-        const offset = index * @sizeOf(T);
-        value.* = @bitCast(std.mem.readInt(Bits, wire[offset..][0..@sizeOf(T)], .little));
-    }
+    const bytes = std.mem.sliceAsBytes(output);
+    if (bytes.ptr != wire.ptr) @memcpy(bytes, wire);
 }
 
 fn writeWire(
@@ -319,13 +307,7 @@ fn writeWire(
     if (options.pipeline.transform()) |transform| {
         if (T != f64 and T != f32) return error.TypeMismatch;
         _ = try numpress.encodeTo(transform, values, options.fixed_point orelse 0, writer);
-    } else try writePrimitives(T, values, writer);
-}
-
-fn writePrimitives(comptime T: type, values: []const T, writer: *std.Io.Writer) std.Io.Writer.Error!void {
-    if (builtin.cpu.arch.endian() == .little) return writer.writeAll(std.mem.sliceAsBytes(values));
-    const Bits = @Int(.unsigned, @bitSizeOf(T));
-    for (values) |value| try writer.writeInt(Bits, @bitCast(value), .little);
+    } else try writer.writeAll(std.mem.sliceAsBytes(values));
 }
 
 fn checkOptions(comptime T: type, count: usize, options: EncodeOptions, has_compressor: bool) OptionsError!void {
@@ -338,7 +320,7 @@ fn checkOptions(comptime T: type, count: usize, options: EncodeOptions, has_comp
 }
 
 fn checkBuffers(output: []u8, source: []const u8, scratch: Scratch) error{OverlappingBuffers}!void {
-    const buffers = [_][]const u8{ output, source, scratch.transport, scratch.transformed };
+    const buffers = [_][]const u8{ output, source, scratch.wire, scratch.transformed };
     for (buffers, 0..) |a, i| {
         for (buffers[i + 1 ..]) |b| {
             if (overlaps(a, b)) return error.OverlappingBuffers;

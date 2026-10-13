@@ -1,11 +1,11 @@
 //! Verifies binary-array wire boundaries through the public package.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const mzml = @import("zmz").mzml;
 const base64 = mzml.base64;
 const zlib = mzml.zlib;
 const arrays = mzml.arrays;
+const sha1 = mzml.sha1;
 
 // Decodes text in one call: the reference for split updates.
 fn decodeWhole(text: []const u8) base64.Decoder.Error!base64.Counts {
@@ -13,6 +13,61 @@ fn decodeWhole(text: []const u8) base64.Decoder.Error!base64.Counts {
     var decoder = base64.Decoder.init(&output);
     try decoder.update(text);
     return decoder.finish();
+}
+
+fn compareBase64Updates(text: []const u8, capacity: usize) !void {
+    var bulk_output: [384]u8 = undefined;
+    var scalar_output: [384]u8 = undefined;
+    var bulk = base64.Decoder.init(bulk_output[0..capacity]);
+    var scalar = base64.Decoder.init(scalar_output[0..capacity]);
+    const bulk_error: ?base64.Decoder.Error = result: {
+        bulk.update(text) catch |err| break :result err;
+        _ = bulk.finish() catch |err| break :result err;
+        break :result null;
+    };
+    const scalar_error: ?base64.Decoder.Error = result: {
+        for (text) |byte| scalar.update(&.{byte}) catch |err| break :result err;
+        _ = scalar.finish() catch |err| break :result err;
+        break :result null;
+    };
+    try std.testing.expectEqual(scalar_error, bulk_error);
+    try std.testing.expectEqualDeep(scalar.counts, bulk.counts);
+    if (bulk_error == null) try std.testing.expectEqualSlices(u8, scalar_output[0..scalar.counts.decoded_bytes], bulk_output[0..bulk.counts.decoded_bytes]);
+}
+
+fn decompressReference(output: []u8, source: []const u8) zlib.DecompressError![]u8 {
+    if (source.len < 2) return error.TruncatedInput;
+    const header = std.mem.readInt(u16, source[0..2], .big);
+    if (source[0] & 15 != 8 or source[0] >> 4 > 7 or header % 31 != 0) return error.InvalidData;
+    if (source[1] & 32 != 0) return error.UnsupportedDictionary;
+    var input = std.Io.Reader.fixed(source);
+    var destination = std.Io.Writer.fixed(output);
+    var decoder: std.compress.flate.Decompress = .init(&input, .zlib, &.{});
+    _ = decoder.reader.streamRemaining(&destination) catch |failure| switch (failure) {
+        error.WriteFailed => return error.OutputTooSmall,
+        error.ReadFailed => {
+            if (decoder.err) |cause| if (cause == error.EndOfStream) return error.TruncatedInput;
+            return error.InvalidData;
+        },
+    };
+    if (input.seek != source.len) return error.TrailingInput;
+    const result = destination.buffered();
+    if (std.hash.Adler32.hash(result) != decoder.container_metadata.zlib.adler) return error.ChecksumMismatch;
+    return result;
+}
+
+fn expectSlofBound(expected: []const f64, actual: []const f64, fixed_point: f64) !void {
+    try std.testing.expectEqual(expected.len, actual.len);
+    const relative_bound = @exp(0.5 / fixed_point) - 1.0;
+    for (expected, actual) |value, decoded| {
+        if (value == 0) {
+            try std.testing.expectEqual(@as(f64, 0), decoded);
+        } else {
+            try std.testing.expect(
+                @abs(decoded - value) / (value + 1) <= relative_bound * 1.000001,
+            );
+        }
+    }
 }
 
 test "[property] - [base64]: encoding matches independent bytes around vector blocks" {
@@ -307,26 +362,6 @@ test "[property] - [base64]: bulk input matches quartet decoding at errors, capa
     }
 }
 
-fn compareBase64Updates(text: []const u8, capacity: usize) !void {
-    var bulk_output: [384]u8 = undefined;
-    var scalar_output: [384]u8 = undefined;
-    var bulk = base64.Decoder.init(bulk_output[0..capacity]);
-    var scalar = base64.Decoder.init(scalar_output[0..capacity]);
-    const bulk_error: ?base64.Decoder.Error = result: {
-        bulk.update(text) catch |err| break :result err;
-        _ = bulk.finish() catch |err| break :result err;
-        break :result null;
-    };
-    const scalar_error: ?base64.Decoder.Error = result: {
-        for (text) |byte| scalar.update(&.{byte}) catch |err| break :result err;
-        _ = scalar.finish() catch |err| break :result err;
-        break :result null;
-    };
-    try std.testing.expectEqual(scalar_error, bulk_error);
-    try std.testing.expectEqualDeep(scalar.counts, bulk.counts);
-    if (bulk_error == null) try std.testing.expectEqualSlices(u8, scalar_output[0..scalar.counts.decoded_bytes], bulk_output[0..bulk.counts.decoded_bytes]);
-}
-
 // --- Zlib ---
 
 test "[unit] - [zlib]: decodes independent stored and fixed Huffman streams" {
@@ -383,6 +418,13 @@ test "[edge] - [zlib]: treats empty slices inside the other buffer as disjoint" 
     try std.testing.expectError(error.OutputTooSmall, zlib.decompress(buffer[4..4], buffer[0..stored.len]));
 }
 
+fn expectExactDecode(plain: []const u8, wire: []const u8, output: []u8, reference: []u8) !void {
+    try std.testing.expectEqualSlices(u8, plain, try decompressReference(reference, wire));
+    try std.testing.expectEqualSlices(u8, plain, try zlib.decompress(output[0..plain.len], wire));
+    try std.testing.expectEqualSlices(u8, plain, try zlib.decompress(output[0 .. plain.len + 1], wire));
+    try std.testing.expectError(error.OutputTooSmall, zlib.decompress(output[0 .. plain.len - 1], wire));
+}
+
 test "[property] - [zlib]: decodes exact outputs around loop, staging, and window boundaries" {
     var compressor = try zlib.Compressor.init(std.testing.allocator, .even);
     defer compressor.deinit();
@@ -406,13 +448,6 @@ test "[property] - [zlib]: decodes exact outputs around loop, staging, and windo
     }
 }
 
-fn expectExactDecode(plain: []const u8, wire: []const u8, output: []u8, reference: []u8) !void {
-    try std.testing.expectEqualSlices(u8, plain, try decompressReference(reference, wire));
-    try std.testing.expectEqualSlices(u8, plain, try zlib.decompress(output[0..plain.len], wire));
-    try std.testing.expectEqualSlices(u8, plain, try zlib.decompress(output[0 .. plain.len + 1], wire));
-    try std.testing.expectError(error.OutputTooSmall, zlib.decompress(output[0 .. plain.len - 1], wire));
-}
-
 test "[property] - [zlib]: reuses compression storage after success and capacity failure" {
     var source: [70_000]u8 = undefined;
     var random = std.Random.DefaultPrng.init(std.testing.random_seed);
@@ -433,6 +468,10 @@ test "[property] - [zlib]: reuses compression storage after success and capacity
                 error.OutputTooSmall,
                 compressor.compress(compressed[0..0], source[0..len]),
             );
+            try std.testing.expectError(
+                error.OutputTooSmall,
+                compressor.compress(compressed[0 .. wire.len - 1], source[0..len]),
+            );
         }
     }
 }
@@ -451,6 +490,25 @@ test "[property] - [zlib]: incompressible input fits the compression bound" {
             _ = try compressor.compress(output[0..zlib.compressBound(len)], source[0..len]);
         }
     }
+}
+
+test "[unit] - [zlib]: each preset compresses differently, and dense output is the smallest" {
+    var source: [65536]u8 = undefined;
+    const text = "the quick brown fox jumps over the lazy dog, ";
+    for (&source, 0..) |*byte, i| byte.* = text[i % text.len];
+    var outputs: [3][1024]u8 = undefined;
+    var wires: [3][]const u8 = undefined;
+    var decoded: [source.len]u8 = undefined;
+    inline for (.{ zlib.Preset.fast, .even, .dense }, 0..) |preset, i| {
+        var compressor = try zlib.Compressor.init(std.testing.allocator, preset);
+        defer compressor.deinit();
+        wires[i] = try compressor.compress(&outputs[i], &source);
+        try std.testing.expectEqualSlices(u8, &source, try zlib.decompress(&decoded, wires[i]));
+    }
+    try std.testing.expect(!std.mem.eql(u8, wires[0], wires[1]));
+    try std.testing.expect(!std.mem.eql(u8, wires[1], wires[2]));
+    try std.testing.expect(!std.mem.eql(u8, wires[0], wires[2]));
+    try std.testing.expect(wires[2].len <= wires[0].len and wires[2].len <= wires[1].len);
 }
 
 test "[failure] - [zlib]: streaming calls out of order fail with InvalidState" {
@@ -662,27 +720,6 @@ test "[property] - [zlib]: split writer input and split reader input match one-c
     }
 }
 
-fn decompressReference(output: []u8, source: []const u8) zlib.DecompressError![]u8 {
-    if (source.len < 2) return error.TruncatedInput;
-    const header = std.mem.readInt(u16, source[0..2], .big);
-    if (source[0] & 15 != 8 or source[0] >> 4 > 7 or header % 31 != 0) return error.InvalidData;
-    if (source[1] & 32 != 0) return error.UnsupportedDictionary;
-    var input = std.Io.Reader.fixed(source);
-    var destination = std.Io.Writer.fixed(output);
-    var decoder: std.compress.flate.Decompress = .init(&input, .zlib, &.{});
-    _ = decoder.reader.streamRemaining(&destination) catch |failure| switch (failure) {
-        error.WriteFailed => return error.OutputTooSmall,
-        error.ReadFailed => {
-            if (decoder.err) |cause| if (cause == error.EndOfStream) return error.TruncatedInput;
-            return error.InvalidData;
-        },
-    };
-    if (input.seek != source.len) return error.TrailingInput;
-    const result = destination.buffered();
-    if (std.hash.Adler32.hash(result) != decoder.container_metadata.zlib.adler) return error.ChecksumMismatch;
-    return result;
-}
-
 // --- Array composition ---
 
 test "[integration] - [arrays]: matches fixed little-endian Base64 vectors" {
@@ -693,16 +730,16 @@ test "[integration] - [arrays]: matches fixed little-endian Base64 vectors" {
         .{ i32, [_]i32{0x01020304}, "BAMCAQ==" },
         .{ i64, [_]i64{0x0102030405060708}, "CAcGBQQDAgE=" },
     };
-    var transport: [128]u8 = undefined;
+    var wire_buffer: [128]u8 = undefined;
     var transformed: [128]u8 = undefined;
-    const scratch: arrays.Scratch = .{ .transport = &transport, .transformed = &transformed };
+    const scratch: arrays.Scratch = .{ .wire = &wire_buffer, .transformed = &transformed };
     var encoded: [128]u8 = undefined;
 
     inline for (cases) |case| {
         const T = case[0];
         const expected = case[1];
         var output: [expected.len]T = undefined;
-        try arrays.decode(T, &output, case[2], .none, .{ .transport = &.{}, .transformed = &.{} });
+        try arrays.decode(T, &output, case[2], .none, .{ .wire = &.{}, .transformed = &.{} });
         try std.testing.expectEqualSlices(
             u8,
             std.mem.sliceAsBytes(&expected),
@@ -710,7 +747,7 @@ test "[integration] - [arrays]: matches fixed little-endian Base64 vectors" {
         );
         const wire = try arrays.encode(T, &encoded, &expected, .{}, scratch, null);
         try std.testing.expectEqualStrings(case[2], wire);
-        const prepared = try arrays.encodeWire(T, &expected, .{}, .{ .transport = &.{}, .transformed = &transformed }, null);
+        const prepared = try arrays.encodeWire(T, &expected, .{}, .{ .wire = &.{}, .transformed = &transformed }, null);
         try std.testing.expectEqualStrings(case[2], try base64.encode(&encoded, prepared));
         @memset(std.mem.sliceAsBytes(&output), 0xa5);
         try arrays.decodeWire(T, &output, prepared, .none, &.{});
@@ -718,15 +755,13 @@ test "[integration] - [arrays]: matches fixed little-endian Base64 vectors" {
         @memcpy(std.mem.sliceAsBytes(&output), prepared);
         try arrays.decodeWire(T, &output, std.mem.sliceAsBytes(&output), .none, &.{});
         try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&expected), std.mem.sliceAsBytes(&output));
-        if (builtin.cpu.arch.endian() == .little) {
-            const borrowed = try arrays.encodeWire(T, &expected, .{}, .{ .transport = &.{}, .transformed = &.{} }, null);
-            try std.testing.expectEqual(@intFromPtr(expected[0..].ptr), @intFromPtr(borrowed.ptr));
-        }
+        const borrowed = try arrays.encodeWire(T, &expected, .{}, .{ .wire = &.{}, .transformed = &.{} }, null);
+        try std.testing.expectEqual(@intFromPtr(expected[0..].ptr), @intFromPtr(borrowed.ptr));
         // A zlib envelope can decode into typed output without transformed scratch.
         var compressor = try zlib.Compressor.init(std.testing.allocator, .even);
         defer compressor.deinit();
         const compressed = try arrays.encode(T, &encoded, &expected, .{ .pipeline = .zlib }, scratch, &compressor);
-        try arrays.decode(T, &output, compressed, .zlib, .{ .transport = &transport, .transformed = &.{} });
+        try arrays.decode(T, &output, compressed, .zlib, .{ .wire = &wire_buffer, .transformed = &.{} });
         try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&expected), std.mem.sliceAsBytes(&output));
     }
 }
@@ -745,24 +780,10 @@ test "[failure] - [arrays]: rejects overlap, type, size, and limit errors" {
     try std.testing.expectError(error.TypeMismatch, arrays.decodeWire(i32, &values, &source, .pic, &.{}));
 }
 
-fn expectSlofBound(expected: []const f64, actual: []const f64, fixed_point: f64) !void {
-    try std.testing.expectEqual(expected.len, actual.len);
-    const relative_bound = @exp(0.5 / fixed_point) - 1.0;
-    for (expected, actual) |value, decoded| {
-        if (value == 0) {
-            try std.testing.expectEqual(@as(f64, 0), decoded);
-        } else {
-            try std.testing.expect(
-                @abs(decoded - value) / (value + 1) <= relative_bound * 1.000001,
-            );
-        }
-    }
-}
-
 test "[integration] - [arrays]: decodes a frozen zlib envelope" {
-    var transport: [128]u8 = undefined;
+    var wire_buffer: [128]u8 = undefined;
     var transformed: [128]u8 = undefined;
-    const scratch: arrays.Scratch = .{ .transport = &transport, .transformed = &transformed };
+    const scratch: arrays.Scratch = .{ .wire = &wire_buffer, .transformed = &transformed };
     var output: [3]f64 = undefined;
 
     // Frozen Numpress vector with fixed point 4000, wrapped by Python zlib and Base64.
@@ -771,9 +792,9 @@ test "[integration] - [arrays]: decodes a frozen zlib envelope" {
 }
 
 test "[property] - [arrays]: preserves single-bit patterns, zeros, and all-one bits" {
-    var transport: [2048]u8 = undefined;
+    var wire_buffer: [2048]u8 = undefined;
     var transformed: [2048]u8 = undefined;
-    const scratch: arrays.Scratch = .{ .transport = &transport, .transformed = &transformed };
+    const scratch: arrays.Scratch = .{ .wire = &wire_buffer, .transformed = &transformed };
     var encoded: [4096]u8 = undefined;
     var compressor = try zlib.Compressor.init(std.testing.allocator, .even);
     defer compressor.deinit();
@@ -799,9 +820,9 @@ test "[property] - [arrays]: preserves single-bit patterns, zeros, and all-one b
 }
 
 test "[integration] - [arrays]: composes all Numpress modes with optional zlib" {
-    var transport: [256]u8 = undefined;
+    var wire_buffer: [256]u8 = undefined;
     var transformed: [256]u8 = undefined;
-    const scratch: arrays.Scratch = .{ .transport = &transport, .transformed = &transformed };
+    const scratch: arrays.Scratch = .{ .wire = &wire_buffer, .transformed = &transformed };
     var encoded: [512]u8 = undefined;
     var output: [4]f64 = undefined;
     const values = [_]f64{ 0, 1.25, 10.5, 100.125 };
@@ -838,9 +859,9 @@ test "[integration] - [arrays]: composes all Numpress modes with optional zlib" 
 }
 
 test "[failure] - [arrays]: rejects invalid configuration and aliasing" {
-    var transport: [128]u8 = undefined;
+    var wire_buffer: [128]u8 = undefined;
     var transformed: [128]u8 = undefined;
-    const scratch: arrays.Scratch = .{ .transport = &transport, .transformed = &transformed };
+    const scratch: arrays.Scratch = .{ .wire = &wire_buffer, .transformed = &transformed };
     var encoded: [128]u8 = undefined;
     const values = [_]f64{1};
 
@@ -858,7 +879,7 @@ test "[failure] - [arrays]: rejects invalid configuration and aliasing" {
     );
     try std.testing.expectError(
         error.OverlappingBuffers,
-        arrays.encode(f64, &transport, &values, .{}, scratch, null),
+        arrays.encode(f64, &wire_buffer, &values, .{}, scratch, null),
     );
     var floats: [4]f32 = undefined;
     try std.testing.expectError(
@@ -868,16 +889,16 @@ test "[failure] - [arrays]: rejects invalid configuration and aliasing" {
 }
 
 test "[failure] - [arrays]: rejects short scratch and mismatched counts" {
-    var transport: [128]u8 = undefined;
+    var wire_buffer: [128]u8 = undefined;
     var transformed: [128]u8 = undefined;
     var output: [3]f64 = undefined;
     const source = "eJxzWO/AAAFXuSpUARP4Aqw=";
     try std.testing.expectError(error.OutputTooSmall, arrays.decode(f64, &output, source, .slof_zlib, .{
-        .transport = transport[0..1],
+        .wire = wire_buffer[0..1],
         .transformed = &transformed,
     }));
     try std.testing.expectError(error.OutputTooSmall, arrays.decode(f64, &output, source, .slof_zlib, .{
-        .transport = &transport,
+        .wire = &wire_buffer,
         .transformed = transformed[0..1],
     }));
 }
@@ -885,15 +906,15 @@ test "[failure] - [arrays]: rejects short scratch and mismatched counts" {
 test "[failure] - [arrays]: returns DecodedSizeMismatch when a stream outgrows its declared values" {
     // Python's zlib.compress of the little-endian doubles 1 and 2.
     const two = "eJxjYACBD/YMEOAAAAvnAXA=";
-    var transport: [64]u8 = undefined;
+    var wire_buffer: [64]u8 = undefined;
     var transformed: [64]u8 = undefined;
-    const scratch: arrays.Scratch = .{ .transport = &transport, .transformed = &transformed };
+    const scratch: arrays.Scratch = .{ .wire = &wire_buffer, .transformed = &transformed };
     var output: [3]f64 = undefined;
     try arrays.decode(f64, output[0..2], two, .zlib, scratch);
     try std.testing.expectEqualSlices(f64, &.{ 1, 2 }, output[0..2]);
     try std.testing.expectError(error.DecodedSizeMismatch, arrays.decode(f64, output[0..1], two, .zlib, scratch));
     try std.testing.expectError(error.DecodedSizeMismatch, arrays.decode(f64, &output, two, .zlib, scratch));
-    try std.testing.expectError(error.DecodedSizeMismatch, arrays.decodeWire(f64, output[0..1], try base64.decode(&transport, two), .zlib, &.{}));
+    try std.testing.expectError(error.DecodedSizeMismatch, arrays.decodeWire(f64, output[0..1], try base64.decode(&wire_buffer, two), .zlib, &.{}));
     // Three SLOF values exceed the wire bound of one.
     try std.testing.expectError(error.DecodedSizeMismatch, arrays.decode(f64, output[0..1], "eJxzWO/AAAFXuSpUARP4Aqw=", .slof_zlib, scratch));
 }
@@ -930,12 +951,12 @@ test "[failure] - [arrays]: too many Numpress values are the file's fault at any
     const text = try base64.encode(&encoded, wire[0..try mzml.numpress.encodePic(&many, &wire)]);
     var output: [1]f64 = undefined;
     const bound = try arrays.wireBound(f64, output.len, .pic);
-    var transport: [64]u8 = undefined;
-    for ([_]usize{ bound, bound + 1, transport.len }) |size| {
-        try std.testing.expectError(error.DecodedSizeMismatch, arrays.decode(f64, &output, text, .pic, .{ .transport = transport[0..size], .transformed = &.{} }));
+    var wire_buffer: [64]u8 = undefined;
+    for ([_]usize{ bound, bound + 1, wire_buffer.len }) |size| {
+        try std.testing.expectError(error.DecodedSizeMismatch, arrays.decode(f64, &output, text, .pic, .{ .wire = wire_buffer[0..size], .transformed = &.{} }));
     }
     // Scratch below the bound is the caller's.
-    try std.testing.expectError(error.OutputTooSmall, arrays.decode(f64, &output, text, .pic, .{ .transport = transport[0 .. bound - 1], .transformed = &.{} }));
+    try std.testing.expectError(error.OutputTooSmall, arrays.decode(f64, &output, text, .pic, .{ .wire = wire_buffer[0 .. bound - 1], .transformed = &.{} }));
 }
 
 test "[integration] - [array encoder]: keeps every wire until reset for all pipelines" {
@@ -962,8 +983,7 @@ test "[integration] - [array encoder]: keeps every wire until reset for all pipe
             for (values, output) |value, decoded| try std.testing.expectApproxEqAbs(value, decoded, 0.5 / 1000.0);
         if (pipeline == .slof or pipeline == .slof_zlib) try expectSlofBound(&values, &output, 10000);
     }
-    if (builtin.cpu.arch.endian() == .little)
-        try std.testing.expectEqual(@intFromPtr(&values), @intFromPtr(wires[0].ptr));
+    try std.testing.expectEqual(@intFromPtr(&values), @intFromPtr(wires[0].ptr));
     encoder.reset();
     inline for (.{ f32, i32, i64 }) |T| {
         const typed = [_]T{ 1, 2, 3 };
@@ -987,8 +1007,8 @@ test "[property] - [array encoder]: streamed zlib matches encoding whole then co
     }
     const transformed = try std.testing.allocator.alloc(u8, 8 * values.len + 32);
     defer std.testing.allocator.free(transformed);
-    const transport = try std.testing.allocator.alloc(u8, zlib.compressBound(transformed.len));
-    defer std.testing.allocator.free(transport);
+    const wire_buffer = try std.testing.allocator.alloc(u8, zlib.compressBound(transformed.len));
+    defer std.testing.allocator.free(wire_buffer);
     const pairs = [_][2]arrays.Pipeline{
         .{ .zlib, .none }, .{ .linear_zlib, .linear }, .{ .pic_zlib, .pic }, .{ .slof_zlib, .slof },
     };
@@ -998,9 +1018,9 @@ test "[property] - [array encoder]: streamed zlib matches encoding whole then co
             for ([_]?f64{ null, 1000 }) |fixed_point| {
                 encoder.reset();
                 const actual = encoder.encode(f64, &values, .{ .pipeline = pair[0], .fixed_point = fixed_point });
-                const plain = arrays.encodeWire(f64, &values, .{ .pipeline = pair[1], .fixed_point = fixed_point }, .{ .transport = &.{}, .transformed = transformed }, null);
+                const plain = arrays.encodeWire(f64, &values, .{ .pipeline = pair[1], .fixed_point = fixed_point }, .{ .wire = &.{}, .transformed = transformed }, null);
                 if (plain) |bytes| {
-                    try std.testing.expectEqualSlices(u8, try compressor.compress(transport, bytes), try actual);
+                    try std.testing.expectEqualSlices(u8, try compressor.compress(wire_buffer, bytes), try actual);
                 } else |err| try std.testing.expectError(err, actual);
             }
         }
@@ -1060,13 +1080,6 @@ test "[property] - [array encoder]: round trips incompressible random arrays thr
     try std.testing.expectEqualSlices(i64, numbers, output);
 }
 
-fn encodeAllocated(allocator: std.mem.Allocator) !void {
-    var encoder = arrays.Encoder.init(allocator, .fast);
-    defer encoder.deinit();
-    _ = try encoder.encode(f64, &.{ 1, 2, 3 }, .{ .pipeline = .slof_zlib, .fixed_point = 10000 });
-    _ = try encoder.encode(f64, &.{ 1, 2, 3 }, .{ .pipeline = .linear, .fixed_point = 1000 });
-}
-
 test "[failure] - [array encoder]: refuses bad options before allocating" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     var encoder = arrays.Encoder.init(failing.allocator(), .fast);
@@ -1077,12 +1090,19 @@ test "[failure] - [array encoder]: refuses bad options before allocating" {
     try std.testing.expectEqual(0, failing.allocations);
 }
 
+fn encodeAllocated(allocator: std.mem.Allocator) !void {
+    var encoder = arrays.Encoder.init(allocator, .fast);
+    defer encoder.deinit();
+    _ = try encoder.encode(f64, &.{ 1, 2, 3 }, .{ .pipeline = .slof_zlib, .fixed_point = 10000 });
+    _ = try encoder.encode(f64, &.{ 1, 2, 3 }, .{ .pipeline = .linear, .fixed_point = 1000 });
+}
+
 test "[failure] - [array encoder]: releases storage after allocation failures" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, encodeAllocated, .{});
 }
 
 test "[integration] - [arrays]: reports the first decode error without rescanning" {
-    const scratch: arrays.Scratch = .{ .transport = &.{}, .transformed = &.{} };
+    const scratch: arrays.Scratch = .{ .wire = &.{}, .transformed = &.{} };
     var output: [2]i32 = undefined;
     try arrays.decode(i32, output[0..1], " B\tAMC\rAQ==\n", .none, scratch);
     try std.testing.expectEqual(@as(i32, 0x01020304), output[0]);
@@ -1097,14 +1117,14 @@ test "[integration] - [arrays]: reports the first decode error without rescannin
     try std.testing.expectError(error.TruncatedInput, arrays.decode(i32, output[0..1], "BAM", .none, scratch));
     try std.testing.expectError(error.NonCanonicalTail, arrays.decode(i32, output[0..1], "BR==", .none, scratch));
     try std.testing.expectError(error.OverlappingBuffers, arrays.decode(i32, &output, std.mem.sliceAsBytes(&output), .none, scratch));
-    try std.testing.expectError(error.OverlappingBuffers, arrays.decode(i32, &output, "BAMCAQ==", .none, .{ .transport = std.mem.sliceAsBytes(&output), .transformed = &.{} }));
+    try std.testing.expectError(error.OverlappingBuffers, arrays.decode(i32, &output, "BAMCAQ==", .none, .{ .wire = std.mem.sliceAsBytes(&output), .transformed = &.{} }));
 }
 
 test "[integration] - [arrays]: round trips every established pipeline" {
-    var transport: [128]u8 = undefined;
+    var wire_buffer: [128]u8 = undefined;
     var transformed: [128]u8 = undefined;
     var output: [0]f64 = .{};
-    const scratch: arrays.Scratch = .{ .transport = &transport, .transformed = &transformed };
+    const scratch: arrays.Scratch = .{ .wire = &wire_buffer, .transformed = &transformed };
     var encoded: [256]u8 = undefined;
     var compressor = try zlib.Compressor.init(std.testing.allocator, .even);
     defer compressor.deinit();
@@ -1118,5 +1138,45 @@ test "[integration] - [arrays]: round trips every established pipeline" {
             .fixed_point = fixed_point,
         }, scratch, &compressor);
         try arrays.decode(f64, output[0..0], wire, pipeline, scratch);
+    }
+}
+
+// Without SHA extensions update is std's own, so this checks the extension path where the CPU
+// has it.
+test "[property] - [SHA-1]: matches std across lengths and splits" {
+    var source: [1200]u8 = undefined;
+    var random = std.Random.DefaultPrng.init(std.testing.random_seed);
+    random.random().bytes(&source);
+    for (0..source.len + 1) |len| {
+        var expected: [20]u8 = undefined;
+        std.crypto.hash.Sha1.hash(source[0..len], &expected, .{});
+        var whole: sha1.Sha1 = .{};
+        whole.update(source[0..len]);
+        try std.testing.expectEqualSlices(u8, &expected, &whole.finalResult());
+        for ([_]usize{ 1, 63, 64, 65, 127, 200 }) |split| {
+            if (split > len) continue;
+            var parts: sha1.Sha1 = .{};
+            parts.update(source[0..split]);
+            parts.update(source[split..len]);
+            try std.testing.expectEqualSlices(u8, &expected, &parts.finalResult());
+        }
+    }
+    var bytes: sha1.Sha1 = .{};
+    for (source) |byte| bytes.update(&.{byte});
+    var expected: [20]u8 = undefined;
+    std.crypto.hash.Sha1.hash(&source, &expected, .{});
+    try std.testing.expectEqualSlices(u8, &expected, &bytes.finalResult());
+}
+
+test "[unit] - [SHA-1]: matches the FIPS 180 vectors" {
+    const cases = .{
+        .{ "", "da39a3ee5e6b4b0d3255bfef95601890afd80709" },
+        .{ "abc", "a9993e364706816aba3e25717850c26c9cd0d89d" },
+        .{ "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq", "84983e441c3bd26ebaae4aa1f95129e5e54670f1" },
+    };
+    inline for (cases) |case| {
+        var hasher: sha1.Sha1 = .{};
+        hasher.update(case[0]);
+        try std.testing.expectEqualStrings(case[1], &std.fmt.bytesToHex(hasher.finalResult(), .lower));
     }
 }

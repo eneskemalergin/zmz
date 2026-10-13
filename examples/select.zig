@@ -35,7 +35,7 @@ pub fn main(init: std.process.Init) !void {
     defer decoded.deinit();
     errdefer if (decoded.diagnostic()) |report| std.debug.print("{s}: {f}\n", .{ args[1], report });
     var output_buffer: [4096]u8 = undefined;
-    var output = std.Io.File.stdout().writer(init.io, &output_buffer);
+    var output = std.Io.File.stdout().writerStreaming(init.io, &output_buffer);
     while (if (streaming) try reader.nextDecodedRecord(&decoded) else try reader.nextRecord()) |record| {
         if (streaming) {
             if (decoded.len() > 1) return error.RepeatedArray;

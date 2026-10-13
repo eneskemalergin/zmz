@@ -9,7 +9,7 @@ const cv = @import("../cv/source.zig");
 const encoding = @import("../binary/encoding.zig");
 const arrays = @import("../binary/arrays.zig");
 
-/// mzML element identities; cvParam, userParam, and group references live in Node.params.
+/// mzML element identities; `cvParam`, `userParam`, and group references live in `Node.params`.
 pub const Kind = enum {
     mzml,
     cv_list,
@@ -138,7 +138,7 @@ pub const Node = struct {
         return null;
     }
 
-    /// Reads the retained declared list count. The observed count is children.len.
+    /// Reads the retained declared list count. The observed count is `children.len`.
     pub fn declaredCount(self: Node) cv.ValueError!?usize {
         const value = self.attribute("count") orelse return null;
         return try cv.parseInteger(usize, value);
@@ -156,7 +156,7 @@ pub const Node = struct {
     }
 
     /// Returns the one parameter with this accession, looking through group references: null
-    /// when absent, RepeatedParameter when there are several. Text borrows from node and groups.
+    /// when absent, `RepeatedParameter` when there are several. Text borrows from node and groups.
     pub fn parameter(self: Node, groups: []const cv.Group, accession: cv.Accession) ParameterError!?cv.Param {
         return switch (try cv.findOne(self.params, groups, accession)) {
             .missing => null,
@@ -185,7 +185,7 @@ pub const Node = struct {
         return self.number(groups, Terms.SCAN_START_TIME);
     }
 
-    /// Returns the selected ions of the first selectedIonList in source order; empty without one.
+    /// Returns the selected ions of the first `selectedIonList` in source order; empty without one.
     pub fn selectedIons(self: Node) error{UnexpectedElement}![]const Node {
         if (self.kind != .precursor) return error.UnexpectedElement;
         return listItems(self, .selected_ion_list);
@@ -301,7 +301,7 @@ pub const Header = struct {
     spectrum_list: ?RecordList = null,
     chromatogram_list: ?RecordList = null,
 
-    /// Returns the cvList declarations in order, for `cv.Resolver.init`. The caller frees the
+    /// Returns the `cvList` declarations in order, for `cv.Resolver.init`. The caller frees the
     /// slice.
     pub fn cvDeclarations(
         self: Header,
@@ -315,7 +315,7 @@ pub const Header = struct {
     }
 };
 
-/// declared_count is the source count attribute (null when absent); observed_count counts the
+/// `declared_count` is the source count attribute (null when absent); `observed_count` counts the
 /// records consumed so far. The two are not compared.
 pub const RecordList = struct {
     attributes: []const Attribute,
@@ -324,9 +324,9 @@ pub const RecordList = struct {
 };
 
 /// A spectrum or chromatogram with its complete child hierarchy. id, index, and
-/// default_array_length are parsed copies of node attributes (null when absent): writers use
+/// `default_array_length` are parsed copies of node attributes (null when absent): writers use
 /// node, so edit node to change output and keep these fields consistent when reading the
-/// edited record. Helpers read modeled children, not extra containers kept in Node.content.
+/// edited record. Helpers read modeled children, not extra containers kept in `Node.content`.
 pub const Record = struct {
     node: Node,
     id: []const u8,
@@ -334,7 +334,7 @@ pub const Record = struct {
     default_array_length: ?usize,
 
     /// Parses the spectrum's MS level (xs:int range); null when absent. Chromatograms return
-    /// UnexpectedElement.
+    /// `UnexpectedElement`.
     pub fn msLevel(self: Record, groups: []const cv.Group) FieldError!?i32 {
         if (self.node.kind != .spectrum) return error.UnexpectedElement;
         return self.node.integer(i32, groups, Terms.MS_LEVEL);
@@ -342,7 +342,7 @@ pub const Record = struct {
 
     /// Reads record polarity, or the single scan's polarity in an mzML 1.0 description.
     /// Absence of both flags returns null; repeats and opposing flags return distinct errors.
-    pub fn polarity(self: Record, groups: []const cv.Group) (FieldError || error{ConflictingParameter})!?Polarity {
+    pub fn polarity(self: Record, groups: []const cv.Group) (ParameterError || error{ UnexpectedElement, ConflictingParameter })!?Polarity {
         if (self.node.kind != .spectrum and self.node.kind != .chromatogram)
             return error.UnexpectedElement;
         const node = if (self.node.child(.spectrum_description)) |description| description.child(.scan) orelse return null else self.node;
@@ -351,7 +351,10 @@ pub const Record = struct {
     }
 
     /// Reads centroid/profile flags from the record or its mzML 1.0 description.
-    pub fn representation(self: Record, groups: []const cv.Group) (FieldError || error{ConflictingParameter})!?Representation {
+    pub fn representation(
+        self: Record,
+        groups: []const cv.Group,
+    ) (ParameterError || error{ UnexpectedElement, ConflictingParameter })!?Representation {
         if (self.node.kind != .spectrum) return error.UnexpectedElement;
         const node = self.node.child(.spectrum_description) orelse self.node;
         const centroid = try exclusiveFlags(node, groups, Terms.CENTROID_SPECTRUM, Terms.PROFILE_SPECTRUM) orelse return null;
@@ -404,9 +407,9 @@ pub const Record = struct {
 };
 
 pub const Primitive = encoding.Primitive;
-pub const Encoding = encoding.Descriptor;
-pub const EncodingTerm = encoding.Declared;
-pub const encodingTerm = encoding.declared;
+pub const Encoding = encoding.Encoding;
+pub const EncodingTerm = encoding.EncodingTerm;
+pub const encodingTerm = encoding.encodingTerm;
 /// What an array holds, from its array-type term.
 pub const ArrayRole = enum { mz, intensity, time, other };
 
@@ -419,7 +422,7 @@ pub const BinaryArray = struct {
     length: usize,
 
     /// Classifies one binary array and reads its explicit or record-default value count.
-    /// MissingAttribute means neither arrayLength nor a default length was supplied.
+    /// `MissingAttribute` means neither `arrayLength` nor a default length was supplied.
     pub fn init(
         node: Node,
         default_length: ?usize,
@@ -434,7 +437,7 @@ pub const BinaryArray = struct {
     }
 
     /// Decodes the declared values into the start of a caller-owned typed buffer and returns
-    /// them; a buffer shorter than length is OutputTooSmall. Ordinary arrays require the
+    /// them; a buffer shorter than length is `OutputTooSmall`. Ordinary arrays require the
     /// declared primitive. Numpress arrays decode into f64 because Numpress does not carry a
     /// primitive-width wire representation.
     pub fn decode(
@@ -494,7 +497,7 @@ pub fn arrayEncoding(node: Node, groups: []const cv.Group) EncodingError!Encodin
 }
 
 /// Decodes one array into the start of a caller buffer without allocating, whatever its role,
-/// and returns the values, as BinaryArray.decode does.
+/// and returns the values, as `BinaryArray.decode` does.
 /// Values keep their declared primitive and units.
 pub fn decodeArray(
     comptime T: type,
@@ -543,7 +546,7 @@ fn exclusiveFlags(
     groups: []const cv.Group,
     first: cv.Accession,
     second: cv.Accession,
-) (FieldError || error{ConflictingParameter})!?bool {
+) (ParameterError || error{ConflictingParameter})!?bool {
     const a = try node.parameter(groups, first);
     const b = try node.parameter(groups, second);
     if (a != null and b != null) return error.ConflictingParameter;

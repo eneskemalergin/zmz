@@ -1,0 +1,56 @@
+name: Wiki
+
+# Publishes wiki/ to the GitHub wiki from main. The wiki's history gets one commit per change,
+# whose tree is exactly wiki/ at main's head, so pages removed here are removed there too.
+# GitHub creates the wiki repository only once its first page exists: create any page by hand
+# once, and the first run replaces it.
+
+on:
+  push:
+    branches: [main]
+    paths: ["wiki/**", ".github/workflows/wiki-sync.yml"]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: wiki
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write # push to the wiki repository
+    steps:
+      # main's current head, not the commit that started the run: a run that starts late, or a
+      # rerun of an old one, still publishes the newest wiki/ and never an older one.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Push wiki/ to the wiki repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          wiki="https://github.com/${GITHUB_REPOSITORY}.wiki.git"
+          source="$(git rev-parse HEAD)"
+          gh auth setup-git
+          branch="$(git ls-remote --symref "${wiki}" HEAD | sed -n 's|^ref: refs/heads/\(.*\)\tHEAD$|\1|p')"
+          [ -n "${branch}" ] || { echo "::error::no wiki repository yet: create its first page by hand"; exit 1; }
+          git fetch --quiet --depth 1 "${wiki}" "refs/heads/${branch}"
+          tree="$(git rev-parse "${source}:wiki")"
+          if [ "$(git rev-parse 'FETCH_HEAD^{tree}')" = "${tree}" ]; then
+            echo "The wiki already matches wiki/ at ${source}"
+            exit 0
+          fi
+          export GIT_AUTHOR_NAME="github-actions[bot]" GIT_COMMITTER_NAME="github-actions[bot]"
+          export GIT_AUTHOR_EMAIL="41898282+github-actions[bot]@users.noreply.github.com"
+          export GIT_COMMITTER_EMAIL="${GIT_AUTHOR_EMAIL}"
+          commit="$(git commit-tree "${tree}" -p FETCH_HEAD -m "docs: publish the wiki from ${source::7}")"
+          git push --quiet "${wiki}" "${commit}:refs/heads/${branch}"
+          echo "Published wiki/ at ${source} to ${branch}"

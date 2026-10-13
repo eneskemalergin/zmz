@@ -3,8 +3,8 @@
 const std = @import("std");
 const options = @import("check_test_options");
 
-// One MS2 spectrum whose peak intensity (as in ProteoWizard's F114727) and lower isolation
-// offset are malformed, beside a valid m/z, charge, and target.
+// One MS2 spectrum whose peak intensity and lower isolation offset are malformed, beside a valid
+// m/z, charge, and target.
 const MALFORMED_FIELDS =
     "<?xml version='1.0' encoding='UTF-8'?><mzML xmlns='http://psi.hupo.org/ms/mzml' version='1.1.0'>" ++
     "<cvList count='1'><cv id='MS' fullName='PSI-MS' URI='urn:test'/></cvList>" ++

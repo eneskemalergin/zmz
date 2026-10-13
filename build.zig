@@ -1,6 +1,6 @@
-//! Defines the zmz module and its `-Dkernel_backend` option (`dispatch` also builds a separate
-//! x86-64-v3 zlib decoder object), the example programs, the `check-mzml` and `vocabulary` tool
-//! steps, and the test steps.
+//! Defines the zmz module and its `-Dkernel-backend` option (`dispatch` also builds a separate
+//! x86-64-v3 zlib decoder object), the example programs, the `check-mzml`, `vocabulary`, and
+//! `libm-data` tool steps, the `bench` step, and the test steps.
 
 const std = @import("std");
 
@@ -10,7 +10,7 @@ pub fn build(b: *std.Build) void {
     const strip = optimize == .ReleaseFast or optimize == .ReleaseSmall;
     const kernel_backend = b.option(
         KernelBackend,
-        "kernel_backend",
+        "kernel-backend",
         "dispatch: pick CPU-specific code for the running CPU; portable: never use it",
     ) orelse .dispatch;
     const library_kernels = buildKernels(b, target, optimize, kernel_backend);
@@ -20,20 +20,18 @@ pub fn build(b: *std.Build) void {
     });
     configureLibraryModule(zmz, library_kernels);
 
-    const test_step = b.step("test", "Run the library, example, and tool tests");
+    const test_step = b.step("test", "Run the library, example, tool, and benchmark tests");
     const empty_run = b.path("tests/data/gates/empty_run.mzML");
-    for (LIBRARY_TESTS) |root_source_file| {
-        const test_module = b.createModule(.{
-            .root_source_file = b.path(root_source_file),
-            .target = target,
-            .optimize = optimize,
-            .strip = strip,
-        });
-        test_module.addImport("zmz", zmz);
-        test_module.addAnonymousImport("empty_run", .{ .root_source_file = empty_run });
-        const library_test_artifact = b.addTest(.{ .root_module = test_module });
-        test_step.dependOn(&b.addRunArtifact(library_test_artifact).step);
-    }
+    const library_tests_module = b.createModule(.{
+        .root_source_file = b.path("tests/library.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = strip,
+    });
+    library_tests_module.addImport("zmz", zmz);
+    library_tests_module.addAnonymousImport("empty_run", .{ .root_source_file = empty_run });
+    const library_tests = b.addTest(.{ .root_module = library_tests_module });
+    test_step.dependOn(&b.addRunArtifact(library_tests).step);
 
     const package_tests_module = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
@@ -100,6 +98,49 @@ pub fn build(b: *std.Build) void {
     }) });
     test_step.dependOn(&b.addRunArtifact(check_cli_tests).step);
 
+    // Always ReleaseFast, the library and its dependency included: the numbers describe release
+    // builds whatever -Doptimize says.
+    const bench_zmz = b.createModule(.{ .root_source_file = b.path("src/root.zig"), .target = target, .optimize = .ReleaseFast });
+    configureLibraryModule(bench_zmz, buildKernels(b, target, .ReleaseFast, kernel_backend));
+    const bench = b.addExecutable(.{
+        .name = "zmz-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/bench.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .strip = true,
+            .imports = &.{.{ .name = "zmz", .module = bench_zmz }},
+        }),
+    });
+    // The generator and cases are checked like the rest, in the requested mode, on tiny inputs.
+    const bench_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("bench/bench.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = strip,
+        .imports = &.{.{ .name = "zmz", .module = zmz }},
+    }) });
+    test_step.dependOn(&b.addRunArtifact(bench_tests).step);
+    const bench_run = b.addRunArtifact(bench);
+    bench_run.addArg(b.cache_root.join(b.allocator, &.{"zmz-bench"}) catch @panic("OOM"));
+    b.step("bench", "Generate inputs and time reading, decoding, lookup, copying, and writing (ReleaseFast)").dependOn(&bench_run.step);
+
+    // Generates source, so it runs on the build machine whatever the target.
+    const libm_data = b.addExecutable(.{ .name = "libm-data", .root_module = b.createModule(.{
+        .root_source_file = b.path("tools/libm_data.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    }) });
+    const libm_data_run = b.addRunArtifact(libm_data);
+    if (b.args) |args| libm_data_run.addArgs(args);
+    b.step("libm-data", "Generate SLOF's exp and log tables from a musl source tree's src/math").dependOn(&libm_data_run.step);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("tools/libm_data.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = strip,
+    }) })).step);
+
     const vocabulary_module = b.createModule(.{
         .root_source_file = b.path("tools/vocabulary.zig"),
         .target = target,
@@ -113,7 +154,7 @@ pub fn build(b: *std.Build) void {
     const vocabulary = b.addExecutable(.{ .name = "vocabulary", .root_module = vocabulary_module });
     const vocabulary_run = b.addRunArtifact(vocabulary);
     if (b.args) |args| vocabulary_run.addArgs(args);
-    b.step("vocabulary", "Inspect, review, or generate vocabulary resources, or scan explicit mzML files, offline").dependOn(&vocabulary_run.step);
+    b.step("vocabulary", "Prepare, review, and generate vocabulary tables and their release history, or scan explicit mzML files, offline").dependOn(&vocabulary_run.step);
     const vocabulary_tests = b.addTest(.{ .root_module = vocabulary_module });
     test_step.dependOn(&b.addRunArtifact(vocabulary_tests).step);
 
@@ -127,6 +168,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "vocabulary_test_options", .module = vocabulary_test_options.createModule() }},
     });
     vocabulary_cli_test_module.addAnonymousImport("empty_run", .{ .root_source_file = empty_run });
+    vocabulary_cli_test_module.addAnonymousImport("pinned_manifest", .{ .root_source_file = b.path("vocabularies/manifest.json") });
     const vocabulary_cli_tests = b.addTest(.{ .root_module = vocabulary_cli_test_module });
     test_step.dependOn(&b.addRunArtifact(vocabulary_cli_tests).step);
 }
@@ -136,18 +178,6 @@ const KernelBackend = enum { dispatch, portable };
 // module's own decoder is that fast), a separate object chosen at run time, or not at all.
 const FastZlib = enum { direct, object, absent };
 const V3_FEATURES = [_]std.Target.x86.Feature{ .avx, .avx2, .bmi, .bmi2, .f16c, .fma, .lzcnt, .movbe };
-const LIBRARY_TESTS = [_][]const u8{
-    "tests/binary/test_numpress.zig",
-    "tests/binary/test_codecs.zig",
-    "tests/cv/test_cv.zig",
-    "tests/mzml/test_metadata.zig",
-    "tests/mzml/test_construction.zig",
-    "tests/mzml/test_indexing.zig",
-    "tests/mzml/test_ownership.zig",
-    "tests/mzml/test_writing.zig",
-    "tests/mzml/test_reader.zig",
-    "tests/mzml/test_events.zig",
-};
 
 const Kernels = struct {
     options: *std.Build.Step.Options,
@@ -186,8 +216,6 @@ fn buildKernels(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.b
         const v3_target = b.resolveTargetQuery(query);
         // zlib.zig again, built for x86-64-v3, exporting its fast decoder (see zlib.zig).
         const object_options = b.addOptions();
-        object_options.addOption(bool, "dispatch", true);
-        object_options.addOption(FastZlib, "zlib_fast", .absent);
         object_options.addOption(bool, "as_object", true);
         const module = b.createModule(.{
             .root_source_file = b.path("src/binary/zlib.zig"),
