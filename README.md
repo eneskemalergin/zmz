@@ -9,74 +9,114 @@
 </p>
 
 <p align="center">
-  <a href="#what-zmz-is"><img src="https://img.shields.io/badge/first%20format-mzML-0066CC?style=flat-square" alt="First format: mzML"></a>
+  <a href="https://github.com/eneskemalergin/zmz/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/eneskemalergin/zmz/ci.yml?branch=main&amp;style=flat-square&amp;logo=github&amp;label=CI" alt="CI"></a>
   <a href="https://ziglang.org/download/"><img src="https://img.shields.io/badge/Zig-0.16.0-F7A41D?style=flat-square&amp;logo=zig&amp;logoColor=white" alt="Zig 0.16.0"></a>
-  <a href="#direction"><img src="https://img.shields.io/badge/status-early%20development-C17D10?style=flat-square" alt="Status: early development"></a>
+  <a href="#status-and-limits"><img src="https://img.shields.io/badge/status-early%20development-C17D10?style=flat-square" alt="Status: early development"></a>
   <a href="#license"><img src="https://img.shields.io/badge/license-Apache%202.0-0066CC?style=flat-square" alt="License: Apache 2.0"></a>
+</p>
+
+<p align="center">
+  <a href="#install">Install</a> | <a href="#example">Example</a> | <a href="#documentation">Documentation</a> | <a href="#benchmarks">Benchmarks</a> | <a href="#status-and-limits">Status</a>
 </p>
 
 <!-- markdownlint-enable MD041 -->
 
 ---
 
-`zmz` is a Zig library for mass-spectrometry data, inspired by [`mzdata`](https://github.com/mobiusklein/mzdata), a Rust library and data model for reading several mass-spectrometry file formats. It starts as the mzML dependency for my other Zig projects. The near-term work stays focused on mzML while leaving room for more mass-spectrometry file formats later.
+zmz reads and writes mass-spectrometry data in Zig, starting with mzML. It streams files of any size in flat memory, looks records up through their index, decodes and encodes binary arrays, and writes plain or indexed mzML. I built it as the mzML layer for my own Zig tools; it takes its model ideas from [mzdata](https://github.com/mobiusklein/mzdata), a Rust library for the same formats.
 
-## What zmz is
+- **Reading:** forward streaming, with or without array decoding; `Events` for every XML event with its source offsets; indexed lookup by ID or position through an embedded or rebuilt index.
+- **Writing:** plain and indexed mzML, from records you read, edited, or built.
+- **Arrays:** 32- and 64-bit floats and integers; zlib; MS-Numpress Linear, PIC, and SLOF, alone or with zlib.
+- **Metadata:** every parameter kept as written, scientific fields (MS level, scan time, precursors), and optional PSI-MS and Unit Ontology lookup, bundled or loaded from a newer OBO release.
+- **Files:** mzML 1.1 and the original 1.0, in UTF-8, UTF-16, or ISO-8859-1.
 
-The first version brings the pieces needed for mzML into one package:
+## Install
 
-- forward and indexed reading for sequential workflows and targeted record access;
-- plain and indexed writing for generated or transformed files;
-- checked metadata construction;
-- records and metadata that callers can retain beyond the next read;
-- binary-array decoding and encoding with Base64, zlib, and MS-Numpress;
-- scientific metadata and controlled-vocabulary access.
+zmz needs Zig 0.16.0 and nothing else; zlib comes from [zipir](https://github.com/eneskemalergin/zipir), fetched by hash.
 
-The package imports as `zmz`. The mzML API is available under `@import("zmz").mzml`.
+```sh
+zig fetch --save git+https://github.com/eneskemalergin/zmz
+```
 
-zlib arrays are decoded and encoded by [zipir](https://github.com/eneskemalergin/zipir), a Zig package pinned by hash in `build.zig.zon`; building needs only Zig. Compression takes zipir's presets, `fast`, `even`, and `dense`.
-
-## Direction
-
-The near-term design aims for:
-
-- a small, fast reader and writer for large mzML files;
-- keeping up with mzML format revisions while retaining backward compatibility with historical mzML files;
-- clear rules for borrowed data, retained data, and who frees allocated memory;
-- an XML engine focused on the forms required by mzML;
-- separate modules for additional mass-spectrometry file formats if the project grows in that direction;
-- release builds that stay fast and small without unnecessary runtime dependencies.
-
-The project stays centered on mzML for the foreseeable future. Once that work is stable, it can follow the example set by `mzdata` and add readers for other mass-spectrometry file formats. Format-specific types should stay in their own modules, while shared XML, binary, and common data types remain reusable.
-
-## Start
-
-Use Zig 0.16.0. Add zmz to a project with `zig fetch --save git+https://github.com/eneskemalergin/zmz`, then import its module in `build.zig`:
+Then import the module in `build.zig`:
 
 ```zig
 const zmz = b.dependency("zmz", .{ .target = target, .optimize = optimize });
 executable.root_module.addImport("zmz", zmz.module("zmz"));
 ```
 
-The package holds the library and its notices; tests, examples, tools, and the benchmark stay in this repository. The public entry point is [`src/root.zig`](src/root.zig).
+## Example
 
-CPU-specific code is chosen at run time (`-Dkernel-backend=dispatch`, the default): Base64 uses AVX2, SHA-1 the SHA extensions, and zlib decoding a second zipir build for x86-64-v3, each only when the CPU has the features; `-Dkernel-backend=portable` uses none of them. Builds default to the baseline CPU; `-Dcpu=native` explicitly targets the build machine. Zig 0.16's self-hosted Debug backend uses scalar; ReleaseFast uses LLVM and runtime selection.
+This program prints each record's ID, MS level, and number of decoded arrays:
 
-The build steps in this repository:
+```zig
+const std = @import("std");
+const mzml = @import("zmz").mzml;
 
-- `zig build test --summary all`: the library, example, tool, and benchmark tests. Add `-Doptimize=ReleaseFast` to test release builds.
-- `zig build examples -Doptimize=ReleaseFast`: [complete, compiled examples](examples/README.md) of streamed reading, selected decoding, indexed access, array construction, and payload rewriting, with cleanup and buffer lifetimes. `zig build test-examples` runs them on small fixtures.
-- `zig build check-mzml -Doptimize=ReleaseFast -- FILE.mzML [FILE.mzML ...]`: reads each file whole, resolves its scientific metadata, decodes every array, rebuilds its index and compares the first, middle, and last records looked up through it with the forward read, then prints totals. Malformed selected-ion and isolation-window fields are counted, not fatal; any other failure names the file and exits with status 1.
-- `zig build bench`: times zmz on generated data (below).
-- `zig build vocabulary -- ...`: prepares, reviews, and generates the bundled PSI-MS and Unit Ontology tables, or scans explicit files' vocabulary use; see [`vocabularies/README.md`](vocabularies/README.md).
-- `zig build libm-data -- MUSL_MATH_DIR OUTPUT.zig`: regenerates `src/binary/libm_data.zig`, the `exp` and `log` tables SLOF uses, from `src/math` of a musl source tree that has `exp_data.c` and `log_data.c`.
+pub fn main(init: std.process.Init) !void {
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
+    const file = try std.Io.Dir.cwd().openFile(init.io, args[1], .{});
+    defer file.close(init.io);
+    var buffer: [64 * 1024]u8 = undefined;
+    var input = file.reader(init.io, &buffer);
 
-`zig build bench` needs nothing to download. It writes mzML of five shapes (metadata-heavy, centroid, profile, zlib, and MS-Numpress) at two sizes into `.zig-cache/zmz-bench/` (about 200 MiB, reused by later runs), then times forward reading, full decoding, XML events, indexed lookup, copying, and writing, each in its own process, always in ReleaseFast. It reports wall time, throughput, peak memory, and a checksum of what each case read, and uses `zebrac`, a perf-counter benchmark runner, for instruction counts when it is on the `PATH`. Peak memory stays near 1 to 2 MiB from the small inputs to the four-times-larger ones.
+    var reader = try mzml.StreamReader.init(init.gpa, &input.interface, .{});
+    defer reader.deinit();
+    const header = try reader.readHeader();
+    var arrays = mzml.DecodedArrays.init(init.gpa, .{});
+    defer arrays.deinit();
+
+    while (try reader.nextDecodedRecord(&arrays)) |record| {
+        const level = if (record.node.kind == .spectrum) try record.msLevel(header.groups) else null;
+        std.debug.print("{s} ms_level={?d} arrays={d}\n", .{ record.id, level, arrays.len() });
+    }
+}
+```
+
+## Documentation
+
+[The wiki](https://github.com/eneskemalergin/zmz/wiki) explains each part in depth: getting started, reading, writing, indexed access, binary arrays, vocabulary, errors and diagnostics, limits and safety, performance, and development.
+
+In this repository:
+
+- [Examples](examples/README.md): complete programs for streamed reading, selected decoding, indexed access, building arrays, and rewriting files, each with its cleanup and lifetime rules.
+- [Vocabulary](vocabularies/README.md): the bundled PSI-MS and Unit Ontology tables, lookup, release history, and how they are updated.
+
+## Benchmarks
+
+<!-- Summary figure: assets/benchmark-summary.svg, from the release candidate's numbers. -->
+
+`zig build bench` measures zmz on its own, with nothing to download. It generates about 200 MiB of mzML in five shapes (metadata-heavy, centroid, profile, zlib, and MS-Numpress) at two sizes, then times forward reading, full decoding, XML events, indexed lookup, copying, and writing, each case in its own process, always in ReleaseFast. It reports wall time, throughput, peak memory, and a checksum of what each case read, with instruction counts when `zebrac` is on the `PATH`. Peak memory stays near 1 to 2 MiB from the small inputs to the four-times-larger ones.
+
+Comparisons with other mzML readers on real files, correctness first and then speed and memory, come from a separate benchmark project, linked here when it is published.
+
+## Status and limits
+
+zmz is in early development. Until 1.0 the API can change between versions. CI runs the tests on x86_64 and aarch64 Linux and on aarch64 macOS; big-endian targets are refused at build time.
+
+Not supported yet:
+
+- formats other than mzML;
+- whole-file gzip (planned for 0.2.0) and Zstandard-compressed arrays;
+- pre-release mzML drafts (0.93 and 0.99), which use their own namespaces.
+
+zmz checks what it needs to read and write correctly. Validating a file against the mzML schema and its vocabulary rules is [mzValidate](https://github.com/eneskemalergin/mzValidate)'s job.
+
+## Development
+
+- `zig build test --summary all`: every test; add `-Doptimize=ReleaseFast` for release builds.
+- `zig build examples`: builds the example programs; `zig build test-examples` runs them on small fixtures.
+- `zig build bench`: the benchmark above.
+- `zig build check-mzml -- FILE.mzML ...`: reads, decodes, and index-checks real files, then prints totals.
+- `zig build vocabulary -- ...` and `zig build libm-data -- ...`: maintain the generated vocabulary and SLOF tables.
+
+CPU-specific code (AVX2 Base64, SHA-1 extensions, an x86-64-v3 zlib decoder) is chosen at run time; `-Dkernel-backend=portable` leaves it out. Builds target the baseline CPU unless you pass `-Dcpu=native`.
 
 ## License
 
-zmz is licensed under the [Apache License, Version 2.0](LICENSE). The third-party notices are in [`NOTICE`](NOTICE): zlib support uses zipir under the MIT license, and SLOF's `exp` and `log` tables (`src/binary/libm_data.zig`) come from Arm's optimized-routines under the MIT license. Include `LICENSE` and `NOTICE` with source and binary distributions. The bundled PSI-MS and Unit Ontology tables are under Creative Commons Attribution 4.0; `NOTICE` carries their attribution, and [`vocabularies/README.md`](vocabularies/README.md) describes the sources.
+zmz is licensed under the [Apache License, Version 2.0](LICENSE). [`NOTICE`](NOTICE) carries the third-party notices: zipir and Arm's `exp` and `log` tables (both MIT), and the bundled PSI-MS and Unit Ontology tables (Creative Commons Attribution 4.0). Include `LICENSE` and `NOTICE` with source and binary distributions.
 
 ---
 
-<p align="center"><sub>Built in Zig for practical mass-spectrometry data work.</sub></p>
+<p align="center"><sub>Ions fly, then rest<br>as peaks in angle brackets,<br>read in one long pass.</sub></p>
