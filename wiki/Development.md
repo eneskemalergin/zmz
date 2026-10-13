@@ -64,6 +64,8 @@ For each file it rebuilds the index, streams every record, reads its metadata, d
 - **Pull requests to `main`:** the release gate adds ReleaseFast on x86_64 Linux (once with CPU-specific code and once without), ReleaseFast on aarch64 Linux, and Debug on aarch64 macOS.
 - **Weekly:** the vocabulary workflow checks for new PSI-MS and Unit Ontology releases and opens a pull request when there is one.
 - **Workflow changes:** actionlint and zizmor check the workflow files themselves.
+- **Changes to `wiki/` on `main`:** published to this wiki from `main`'s head, so the wiki always matches `main`.
+- **Version tags (`vX.Y.Z`):** nothing runs unless the tag matches the version in `build.zig.zon` and a dated `CHANGELOG.md` entry, sits on `main`, and `main`'s CI passed on that commit. Then the release gate runs again on the tagged commit, and the source archive is built from the package's `.paths` and used as a fresh dependency. Only when both pass is the release published, with the changelog entry as its notes, plus the archive, its SHA-256, and a build attestation. A release runs only from a tag push, or by hand with the tag as its ref.
 
 ## Style
 
