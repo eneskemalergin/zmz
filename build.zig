@@ -1,4 +1,4 @@
-//! Defines the zmz module and its `-Dkernel_backend` option (`dispatch` also builds a separate
+//! Defines the zmz module and its `-Dkernel-backend` option (`dispatch` also builds a separate
 //! x86-64-v3 zlib decoder object), the example programs, the `check-mzml`, `vocabulary`, and
 //! `libm-data` tool steps, and the test steps.
 
@@ -10,7 +10,7 @@ pub fn build(b: *std.Build) void {
     const strip = optimize == .ReleaseFast or optimize == .ReleaseSmall;
     const kernel_backend = b.option(
         KernelBackend,
-        "kernel_backend",
+        "kernel-backend",
         "dispatch: pick CPU-specific code for the running CPU; portable: never use it",
     ) orelse .dispatch;
     const library_kernels = buildKernels(b, target, optimize, kernel_backend);

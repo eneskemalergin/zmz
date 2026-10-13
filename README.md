@@ -56,7 +56,7 @@ zig build test --summary all
 zig build test -Doptimize=ReleaseFast --summary all
 ```
 
-CPU-specific code is chosen at run time (`-Dkernel_backend=dispatch`, the default): Base64 uses AVX2, SHA-1 the SHA extensions, and zlib decoding a second zipir build for x86-64-v3, each only when the CPU has the features; `-Dkernel_backend=portable` uses none of them. Builds default to the baseline CPU; `-Dcpu=native` explicitly targets the build machine. Zig 0.16's self-hosted Debug backend uses scalar; ReleaseFast uses LLVM and runtime selection.
+CPU-specific code is chosen at run time (`-Dkernel-backend=dispatch`, the default): Base64 uses AVX2, SHA-1 the SHA extensions, and zlib decoding a second zipir build for x86-64-v3, each only when the CPU has the features; `-Dkernel-backend=portable` uses none of them. Builds default to the baseline CPU; `-Dcpu=native` explicitly targets the build machine. Zig 0.16's self-hosted Debug backend uses scalar; ReleaseFast uses LLVM and runtime selection.
 
 The public entry point is [`src/root.zig`](src/root.zig). Vocabulary resources and their source notices are described in [`vocabularies/README.md`](vocabularies/README.md).
 
