@@ -1669,6 +1669,65 @@ test "[property] - [mzML streamed writing]: every pipeline round trips through s
     }
 }
 
+// The most writing one record of `values` held at once, through stream output or a file.
+fn writingPeak(header: *const mzml.model.Header, values: []const f64, pipeline: mzml.arrays.Pipeline, dir: std.Io.Dir) !usize {
+    var tracker: support.PeakAllocator = .{ .child = std.testing.allocator };
+    const allocator = tracker.allocator();
+    {
+        var encoder = mzml.arrays.Encoder.init(allocator, .fast);
+        defer encoder.deinit();
+        var builder = mzml.Builder.init(allocator, .{});
+        defer builder.deinit();
+        const options: mzml.arrays.EncodeOptions = .{
+            .pipeline = pipeline,
+            .fixed_point = if (pipeline.transform() != null) try mzml.numpress.optimalLinearFixedPoint(values) else null,
+        };
+        const array = try builder.prepareArray(f64, values, .{
+            .cv_ref = "MS",
+            .encoding = options,
+            .role = .{ .cv_ref = "MS", .accession = mzml.model.Terms.MZ_ARRAY, .name = "m/z array" },
+        }, &encoder);
+        const record = try builder.record(.spectrum, "scan=1", 0, values.len, &.{}, &.{}, &.{array.array});
+        if (pipeline == .zlib) {
+            // Stream output would compress into the encoder first; file output streams it.
+            const file = try dir.createFile(std.testing.io, "footprint.mzML", .{ .read = true });
+            defer file.close(std.testing.io);
+            var buffer: [16 * 1024]u8 = undefined;
+            var sink = file.writer(std.testing.io, &buffer);
+            var writer = try mzml.Writer.initFile(allocator, &sink, .{}, .{});
+            defer writer.deinit();
+            try writeStreamedRecord(&writer, header.*, record.node, &.{array.payload});
+            try sink.interface.flush();
+        } else {
+            var sink: std.Io.Writer.Discarding = .init(&.{});
+            var writer = try mzml.Writer.initIndexed(allocator, &sink.writer, .{}, .{});
+            defer writer.deinit();
+            try writeStreamedRecord(&writer, header.*, record.node, &.{array.payload});
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), tracker.held);
+    return tracker.peak;
+}
+
+test "[property] - [mzML streamed writing]: holds no more memory for twenty times the values" {
+    var input = std.Io.Reader.fixed(support.DOCUMENT);
+    var reader = try mzml.StreamReader.init(std.testing.allocator, &input, .{});
+    defer reader.deinit();
+    const header = try reader.readHeader();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    const values = try std.testing.allocator.alloc(f64, 200_000);
+    defer std.testing.allocator.free(values);
+    for (values, 0..) |*value, i| value.* = 100 + @as(f64, @floatFromInt(i)) * 0.013 + @as(f64, @floatFromInt(i % 7)) * 1e-5;
+    // Uncompressed and Numpress text streams on any output; zlib streams on file output.
+    for ([_]mzml.arrays.Pipeline{ .none, .linear, .zlib }) |pipeline| {
+        const few = try writingPeak(header, values[0..10_000], pipeline, dir.dir);
+        const many = try writingPeak(header, values, pipeline, dir.dir);
+        // 190,000 more values are 1.5 MB of f64 and 2 MB of Base64; none of it is held.
+        try std.testing.expect(many <= few + 4096);
+    }
+}
+
 fn writtenArraysReadBack(header: *const mzml.model.Header, smith: *std.testing.Smith) !void {
     const allocator = std.testing.allocator;
     var bits: [256]u64 = undefined;

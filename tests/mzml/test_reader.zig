@@ -3305,3 +3305,38 @@ test "[fuzz] - [mzML decoded arrays]: any array text decodes to the same values 
     try std.testing.fuzz({}, arrayTextInAnyRuns, .{ .corpus = &ARRAY_TEXT_CORPUS });
     try support.fuzzSeeded({}, arrayTextInAnyRuns, &ARRAY_TEXT_CORPUS, 400);
 }
+
+// A document of `count` spectra shaped like support's, each with its own ID and index.
+fn repeatedSpectra(allocator: std.mem.Allocator, count: usize) ![]u8 {
+    var document: std.Io.Writer.Allocating = .init(allocator);
+    errdefer document.deinit();
+    const body = support.SPECTRUM["<spectrum id='native=a&amp;b' index='0' defaultArrayLength='1'>".len..];
+    try document.writer.print("{s}<spectrumList count='{d}' defaultDataProcessingRef='dp'>", .{ support.HEADER, count });
+    for (0..count) |i| try document.writer.print("<spectrum id='scan={d}' index='{d}' defaultArrayLength='1'>{s}", .{ i + 1, i, body });
+    try document.writer.writeAll("</spectrumList></run></mzML>");
+    return document.toOwnedSlice();
+}
+
+test "[property] - [mzML reader]: holds no more memory for ten times the records" {
+    var peaks: [2]usize = undefined;
+    for ([_]usize{ 300, 3_000 }, &peaks) |count, *peak| {
+        const document = try repeatedSpectra(std.testing.allocator, count);
+        defer std.testing.allocator.free(document);
+        var tracker: support.PeakAllocator = .{ .child = std.testing.allocator };
+        const allocator = tracker.allocator();
+        {
+            var input = std.Io.Reader.fixed(document);
+            var reader = try mzml.StreamReader.init(allocator, &input, .{});
+            defer reader.deinit();
+            var output = mzml.DecodedArrays.init(allocator, .{});
+            defer output.deinit();
+            var records: usize = 0;
+            while (try reader.nextDecodedRecord(&output)) |_| records += 1;
+            try std.testing.expectEqual(count, records);
+        }
+        try std.testing.expectEqual(@as(usize, 0), tracker.held);
+        peak.* = tracker.peak;
+    }
+    // Longer IDs may round one buffer up; nothing grows with the record count.
+    try std.testing.expect(peaks[1] <= peaks[0] + 256);
+}
