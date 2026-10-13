@@ -16,6 +16,7 @@ __pycache__/
 *.pyo
 
 # Ignored folders (dev only)
+assets/idea/
 tmp/
 plan/
 vendor/
