@@ -85,6 +85,9 @@ plans: std.ArrayList(Plan) = .empty,
 source_text_length: usize = 0,
 // A call is in progress; the sink's drain runs inside it and must not call the writer.
 active: bool = false,
+// The XML writer's binding count inside mzML when its default namespace is ours: at that count
+// only mzML's own bindings are in scope, so an element needs no default declaration.
+root_bindings: ?usize = null,
 
 /// Call deinit even after a failure. Do not copy the writer: a copy and the original would free the
 /// same storage on deinit.
@@ -182,6 +185,8 @@ pub fn writeHeader(self: *Writer, header: model.Header) Error!void {
     try self.startKnown("mzML", header.document.attributes, true);
     if (self.engine.namespaceUri("xsi") == null) try self.engine.namespace("xsi", xml.XSI);
     try self.writeAttributes(header.document.attributes);
+    if (std.mem.eql(u8, self.engine.namespaceUri("") orelse "", self.namespace_uri))
+        self.root_bindings = self.engine.namespace_bindings.items.len;
     var no_plans: []const Plan = &.{};
     var budget = self.limits.nodes;
     try self.writeContent(header.document, false, &no_plans, &budget);
@@ -805,7 +810,8 @@ fn startKnown(self: *Writer, name: []const u8, attrs: []const model.Attribute, r
             try self.engine.startElement(qualified);
         } else try self.engine.startElementTrusted(name);
     } else {
-        const declare = root or !std.mem.eql(u8, self.engine.namespaceUri("") orelse "", self.namespace_uri);
+        const declare = root or (self.root_bindings != self.engine.namespace_bindings.items.len and
+            !std.mem.eql(u8, self.engine.namespaceUri("") orelse "", self.namespace_uri));
         try self.engine.startElementTrusted(name);
         if (declare) try self.engine.namespace(null, self.namespace_uri);
         if (!has_namespaces) return;
