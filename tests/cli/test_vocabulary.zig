@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const options = @import("vocabulary_test_options");
-const manifest = @embedFile("manifest");
+const manifest = @embedFile("pinned_manifest");
 
 test "[cli] - [vocabulary]: rejects bad arguments and unreadable inputs without creating output" {
     var dir = std.testing.tmpDir(.{ .iterate = true });

@@ -154,7 +154,7 @@ pub fn build(b: *std.Build) void {
     const vocabulary = b.addExecutable(.{ .name = "vocabulary", .root_module = vocabulary_module });
     const vocabulary_run = b.addRunArtifact(vocabulary);
     if (b.args) |args| vocabulary_run.addArgs(args);
-    b.step("vocabulary", "Inspect, review, or generate vocabulary resources, or scan explicit mzML files, offline").dependOn(&vocabulary_run.step);
+    b.step("vocabulary", "Prepare, review, and generate vocabulary tables and their release history, or scan explicit mzML files, offline").dependOn(&vocabulary_run.step);
     const vocabulary_tests = b.addTest(.{ .root_module = vocabulary_module });
     test_step.dependOn(&b.addRunArtifact(vocabulary_tests).step);
 
@@ -168,7 +168,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "vocabulary_test_options", .module = vocabulary_test_options.createModule() }},
     });
     vocabulary_cli_test_module.addAnonymousImport("empty_run", .{ .root_source_file = empty_run });
-    vocabulary_cli_test_module.addAnonymousImport("manifest", .{ .root_source_file = b.path("vocabularies/manifest.json") });
+    vocabulary_cli_test_module.addAnonymousImport("pinned_manifest", .{ .root_source_file = b.path("vocabularies/manifest.json") });
     const vocabulary_cli_tests = b.addTest(.{ .root_module = vocabulary_cli_test_module });
     test_step.dependOn(&b.addRunArtifact(vocabulary_cli_tests).step);
 }
