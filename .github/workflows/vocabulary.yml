@@ -139,7 +139,9 @@ jobs:
             echo "Changes to existing terms:"
             echo
             echo '```json'
-            jq -c 'select(.kind | IN("missing", "name", "newly_obsolete", "restored", "parents", "has_units", "has_value_type", "binary_xrefs", "alternate_ids", "replaced_by", "active_family"))' "${report}" | head -n 200
+            # limit() stops jq itself; cutting its output with head would end jq with SIGPIPE,
+            # which fails the step under pipefail once the output outgrows the pipe buffer.
+            jq -c -n 'limit(200; inputs | select(.kind | IN("missing", "name", "newly_obsolete", "restored", "parents", "has_units", "has_value_type", "binary_xrefs", "alternate_ids", "replaced_by", "active_family")))' "${report}"
             echo '```'
             echo
             echo "Before merging: read the full review (\`zig build vocabulary -- review\` on these files), update the snapshot facts in \`vocabularies/README.md\`, and run the release-gate checks. Pull requests opened by this workflow do not start other workflows; close and reopen it to run them."
