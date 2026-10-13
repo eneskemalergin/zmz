@@ -307,7 +307,7 @@ test "[integration] - [mzML scientific metadata]: keeps all scans, ions, and win
     try std.testing.expectEqual(@as(f64, 1.25), quantity.value);
     try std.testing.expectEqual(.allowed, quantity.parameter.unit_allowed);
     try std.testing.expectEqual(.historical, quantity.parameter.term.version);
-    try std.testing.expectEqualStrings("minute", quantity.parameter.unit.match.?.term.name);
+    try std.testing.expectEqualStrings("minute", quantity.parameter.unit.match.?.term.name());
 
     const precursors = record.precursors();
     try std.testing.expectEqual(@as(usize, 2), precursors.len);

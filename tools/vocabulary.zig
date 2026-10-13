@@ -1,11 +1,14 @@
 //! Generates pinned vocabulary tables and reviews explicit local OBO candidates offline.
 //!
 //! `inspect` checks a manifest and the digests of its two OBO files, then prints their counts and
-//! monitored terms. `review` also checks the manifest's expected counts and compares the candidates
-//! with the bundled tables, failing on changes nobody reviewed. `generate` reviews, generates the
-//! tables twice, and writes `OUTPUT.zig` atomically only when both runs match. `scan` resolves the
-//! parameters of explicit mzML files. Nothing uses the network; a failure prints its error and
-//! exits with status 1.
+//! monitored terms. `candidate` writes the manifest for two new OBO files and their upstream
+//! commits: digests, versions, and counts filled in. `review` compares candidates with the
+//! bundled tables, failing on changes nobody reviewed. `history` records each resource's releases
+//! from lists of its OBO files, oldest first: when each term first appeared, became obsolete, and
+//! what it was called before. `generate` reviews, generates the tables twice, and writes
+//! `OUTPUT.zig` atomically only when both runs match. `scan` resolves the parameters of explicit
+//! mzML files and lists each term finding.
+//! Nothing uses the network; a failure prints its error and exits with status 1.
 
 const std = @import("std");
 const zmz = @import("zmz");
@@ -15,86 +18,137 @@ const Vocabulary = mzml.cv.Vocabulary;
 pub fn main(init: std.process.Init) void {
     run(init) catch |err| {
         var buffer: [256]u8 = undefined;
-        var stderr = std.Io.File.stderr().writer(init.io, &buffer);
+        var stderr = std.Io.File.stderr().writerStreaming(init.io, &buffer);
         stderr.interface.print("vocabulary: {s}\n", .{@errorName(err)}) catch {};
         stderr.interface.flush() catch {};
         std.process.exit(1);
     };
 }
 
-fn run(init: std.process.Init) !void {
-    const args = try init.minimal.args.toSlice(init.arena.allocator());
-    if (args.len < 2) return usage(init.io);
-    const command = std.meta.stringToEnum(Command, args[1]) orelse return usage(init.io);
-    if (command == .scan) {
-        if (args.len < 3) return usage(init.io);
-        var buffer: [8192]u8 = undefined;
-        var stdout = std.Io.File.stdout().writer(init.io, &buffer);
-        for (args[2..]) |path| {
-            const counts = try scan(init.gpa, init.io, path, &stdout.interface);
-            try event(&stdout.interface, "scan", "", path, null, counts);
-            try stdout.interface.flush();
-        }
-        return;
-    }
-    if (args.len != (if (command == .generate) @as(usize, 6) else 5)) return usage(init.io);
-    const allocator = init.arena.allocator();
-    const manifest_bytes = try readFile(allocator, init.io, args[2]);
-    const manifest = try std.json.parseFromSlice(Manifest, allocator, manifest_bytes, .{});
-    defer manifest.deinit();
-    try checkManifest(manifest.value);
-    var parsed: [2]Parsed = undefined;
-    var count: usize = 0;
-    defer for (parsed[0..count]) |*resource| resource.deinit();
-    for (&parsed, manifest.value.resources, args[3..5]) |*resource, identity, path| {
-        const bytes = try readFile(allocator, init.io, path);
-        try verifyDigest(bytes, identity.sha256);
-        resource.* = try parse(allocator, bytes, identity);
-        count += 1;
-        if (command != .inspect and !std.meta.eql(identity.counts, resourceCounts(resource.resource)))
-            return error.SnapshotCountMismatch;
-    }
-    const resources = [_]Vocabulary{ parsed[0].resource, parsed[1].resource };
-    var stdout_buffer: [8192]u8 = undefined;
-    var stdout = std.Io.File.stdout().writer(init.io, &stdout_buffer);
-    if (command == .inspect) {
-        for (resources) |resource| {
-            try event(&stdout.interface, "counts", resource.identity.key, "", null, resourceCounts(resource));
-            for (resource.terms) |term| if (!term.obsolete) {
-                const families = try monitored(resource, term);
-                if (families != 0) try event(&stdout.interface, "monitored", resource.identity.key, term.id, families, term.name);
-            };
-        }
-        try stdout.interface.flush();
-        return;
-    }
-    const baseline = mzml.cv.Resolver.BUNDLED;
-    const blocked = try review(&stdout.interface, baseline, &resources);
-    try stdout.interface.flush();
-    if (blocked) return error.UnreviewedUpdate;
-    if (command == .review) return;
-    var generated: std.Io.Writer.Allocating = .init(allocator);
-    defer generated.deinit();
-    try generate(allocator, &generated.writer, &resources);
-    var repeated: std.Io.Writer.Allocating = .init(allocator);
-    defer repeated.deinit();
-    try generate(allocator, &repeated.writer, &resources);
-    if (!std.mem.eql(u8, generated.written(), repeated.written()))
-        return error.NonDeterministicGeneration;
-    try publish(init.io, std.Io.Dir.cwd(), args[5], generated.written());
-}
-
-const Command = enum { generate, inspect, review, scan };
+const Command = enum { inspect, candidate, review, history, extend, generate, scan };
 
 fn usage(io: std.Io) !void {
     try std.Io.File.stderr().writeStreamingAll(io, "usage: zig build vocabulary -- inspect|review MANIFEST.json PSI-MS.obo UO.obo\n" ++
-        "       zig build vocabulary -- generate MANIFEST.json PSI-MS.obo UO.obo OUTPUT.zig\n" ++
+        "       zig build vocabulary -- candidate MANIFEST.json PSI-MS.obo PSI-MS-COMMIT UO.obo UO-COMMIT DATE OUTPUT.json\n" ++
+        "       zig build vocabulary -- history OUTPUT.json KEY LIST.txt [KEY LIST.txt ...]\n" ++
+        "       zig build vocabulary -- extend HISTORY.json OUTPUT.json KEY LIST.txt [KEY LIST.txt ...]\n" ++
+        "       zig build vocabulary -- generate MANIFEST.json HISTORY.json PSI-MS.obo UO.obo OUTPUT.zig\n" ++
         "       zig build vocabulary -- scan FILE.mzML [FILE.mzML ...]\n");
     return error.InvalidArguments;
 }
 
+fn run(init: std.process.Init) !void {
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
+    if (args.len < 2) return usage(init.io);
+    const command = std.meta.stringToEnum(Command, args[1]) orelse return usage(init.io);
+    const allocator = init.arena.allocator();
+    var stdout_buffer: [8192]u8 = undefined;
+    var stdout = std.Io.File.stdout().writerStreaming(init.io, &stdout_buffer);
+    const out = &stdout.interface;
+    defer out.flush() catch {};
+    switch (command) {
+        .scan => {
+            if (args.len < 3) return usage(init.io);
+            for (args[2..]) |path| {
+                const counts = try scan(init.gpa, init.io, path, out);
+                try event(out, "scan", "", path, null, counts);
+                try out.flush();
+            }
+        },
+        .history, .extend => {
+            const first: usize = if (command == .extend) 4 else 3;
+            if (args.len < first + 2 or (args.len - first) % 2 != 0) return usage(init.io);
+            var history: History = if (command == .extend) try History.parse(allocator, try readFile(allocator, init.io, args[2])) else .{};
+            var pair = first;
+            while (pair < args.len) : (pair += 2) {
+                const list = try readFile(allocator, init.io, args[pair + 1]);
+                var paths: std.ArrayList([]const u8) = .empty;
+                var lines = std.mem.tokenizeAny(u8, list, "\r\n");
+                while (lines.next()) |line| try paths.append(allocator, line);
+                try recordReleases(allocator, init.io, &history, args[pair], paths.items);
+            }
+            try publish(init.io, std.Io.Dir.cwd(), args[first - 1], try history.render(allocator));
+        },
+        .candidate => {
+            if (args.len != 9) return usage(init.io);
+            const manifest = try readManifest(allocator, init.io, args[2]);
+            var next = manifest;
+            for (&next.resources, [_][]const u8{ args[3], args[5] }, [_][]const u8{ args[4], args[6] }) |*identity, path, commit| {
+                const bytes = try readFile(allocator, init.io, path);
+                identity.sha256 = try digestHex(allocator, bytes);
+                identity.commit = commit;
+                identity.retrieved = args[7];
+                var probe = identity.*;
+                probe.source_version = "";
+                const parsed = try parseResource(allocator, bytes, probe);
+                defer parsed.deinit();
+                identity.source_version = try allocator.dupe(u8, dataVersion(&parsed.vocabulary));
+                identity.version = try allocator.dupe(u8, releaseName(identity.key, identity.source_version));
+                identity.counts = resourceCounts(&parsed.vocabulary);
+            }
+            try checkManifest(next);
+            var written: std.Io.Writer.Allocating = .init(allocator);
+            try std.json.Stringify.value(next, .{ .whitespace = .indent_2 }, &written.writer);
+            try written.writer.writeByte('\n');
+            try publish(init.io, std.Io.Dir.cwd(), args[8], written.written());
+        },
+        .inspect, .review, .generate => {
+            const offset: usize = @intFromBool(command == .generate);
+            const expected: usize = 5 + 2 * offset;
+            if (args.len != expected) return usage(init.io);
+            const manifest = try readManifest(allocator, init.io, args[2]);
+            var owned: [2]*Vocabulary.Owned = undefined;
+            var loaded: usize = 0;
+            defer for (owned[0..loaded]) |resource| resource.deinit();
+            for (&owned, manifest.resources, args[3 + offset ..][0..2]) |*resource, identity, path| {
+                const bytes = try readFile(allocator, init.io, path);
+                try verifyDigest(bytes, identity.sha256);
+                resource.* = try parseResource(init.gpa, bytes, identity);
+                loaded += 1;
+                if (command != .inspect and !std.meta.eql(identity.counts, resourceCounts(&resource.*.vocabulary)))
+                    return error.SnapshotCountMismatch;
+            }
+            const resources = [_]*const Vocabulary{ &owned[0].vocabulary, &owned[1].vocabulary };
+            if (command == .inspect) {
+                for (resources) |resource| {
+                    try event(out, "counts", resource.identity.key, "", null, resourceCounts(resource));
+                    for (0..resource.count()) |index| {
+                        const term = resource.term(index);
+                        if (term.obsolete()) continue;
+                        const families = try monitored(resource, term);
+                        if (families != 0) try event(out, "monitored", resource.identity.key, term.id(), families, term.name());
+                    }
+                }
+                return;
+            }
+            const baseline = mzml.cv.Resolver.BUNDLED;
+            const blocked = try review(allocator, out, baseline, &resources);
+            try out.flush();
+            if (blocked) return error.UnreviewedUpdate;
+            if (command == .review) return;
+            const history = try History.parse(allocator, try readFile(allocator, init.io, args[3]));
+            var generated: std.Io.Writer.Allocating = .init(allocator);
+            try generate(allocator, &generated.writer, &resources, &history);
+            var repeated: std.Io.Writer.Allocating = .init(allocator);
+            try generate(allocator, &repeated.writer, &resources, &history);
+            if (!std.mem.eql(u8, generated.written(), repeated.written()))
+                return error.NonDeterministicGeneration;
+            try publish(init.io, std.Io.Dir.cwd(), args[6], generated.written());
+        },
+    }
+}
+
+// --- Manifest and sources ---
+
 const Manifest = struct { format_version: u32, resources: [2]Vocabulary.Identity };
 const MAX_SOURCE_BYTES = 32 * 1024 * 1024;
+
+fn readManifest(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Manifest {
+    const bytes = try readFile(allocator, io, path);
+    const manifest = try std.json.parseFromSliceLeaky(Manifest, allocator, bytes, .{});
+    try checkManifest(manifest);
+    return manifest;
+}
 
 fn readFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
     const file = try std.Io.Dir.cwd().openFile(io, path, .{});
@@ -112,9 +166,9 @@ fn publish(io: std.Io, dir: std.Io.Dir, path: []const u8, bytes: []const u8) !vo
 }
 
 fn checkManifest(manifest: Manifest) !void {
-    if (manifest.format_version != 1) return error.UnsupportedManifestVersion;
+    if (manifest.format_version != 2) return error.UnsupportedManifestVersion;
     for (manifest.resources, [_][]const u8{ "psi-ms", "uo" }) |identity, key| {
-        if (!std.mem.eql(u8, identity.key, key) or identity.artifact_version != 1)
+        if (!std.mem.eql(u8, identity.key, key) or identity.artifact_version != 2)
             return error.InvalidManifest;
         if (identity.commit.len != 40 or identity.sha256.len != 64)
             return error.InvalidManifest;
@@ -136,6 +190,40 @@ fn verifyDigest(bytes: []const u8, expected: []const u8) !void {
         return error.SourceDigestMismatch;
 }
 
+fn digestHex(allocator: std.mem.Allocator, bytes: []const u8) ![]const u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    return allocator.dupe(u8, &std.fmt.bytesToHex(digest, .lower));
+}
+
+// Parses a resource and checks that the file names the ontology its key expects.
+fn parseResource(allocator: std.mem.Allocator, bytes: []const u8, identity: Vocabulary.Identity) !*Vocabulary.Owned {
+    const owned = try Vocabulary.parseObo(allocator, bytes, identity);
+    errdefer owned.deinit();
+    const ontology = headerValue(&owned.vocabulary, "ontology") orelse return error.MissingField;
+    const expected: ?[]const u8 = if (std.mem.eql(u8, identity.key, "psi-ms")) "ms" else if (std.mem.eql(u8, identity.key, "uo")) "uo" else null;
+    if (expected) |name| if (!std.mem.eql(u8, ontology, name)) return error.SourceOntologyMismatch;
+    return owned;
+}
+
+fn headerValue(resource: *const Vocabulary, tag: []const u8) ?[]const u8 {
+    var index: usize = 0;
+    while (resource.header(index)) |field| : (index += 1)
+        if (std.mem.eql(u8, field.tag, tag)) return field.value;
+    return null;
+}
+
+fn dataVersion(resource: *const Vocabulary) []const u8 {
+    return headerValue(resource, "data-version") orelse "";
+}
+
+// The release name a manifest records: UO's data-version is `releases/DATE`.
+fn releaseName(key: []const u8, source_version: []const u8) []const u8 {
+    if (std.mem.eql(u8, key, "uo") and std.mem.startsWith(u8, source_version, "releases/"))
+        return source_version["releases/".len..];
+    return source_version;
+}
+
 // --- External mzML inspection ---
 
 const ScanCounts = struct {
@@ -146,6 +234,7 @@ const ScanCounts = struct {
     unknown_resources: usize = 0,
     unknown_accessions: usize = 0,
     stale_names: usize = 0,
+    former_names: usize = 0,
     obsolete: usize = 0,
     units: usize = 0,
     resolved_units: usize = 0,
@@ -171,19 +260,43 @@ fn scan(allocator: std.mem.Allocator, io: std.Io, path: []const u8, output: *std
             .resource = if (found.term.resource) |resource| resource.identity.key else null,
             .used_version = if (found.term.resource) |resource| resource.identity.version else null,
             .version_relationship = found.term.version,
+            .unrecognized_uri = found.term.issues.unrecognized_uri,
+            .unrecognized_name = found.term.issues.unrecognized_declaration_name,
         });
     }
     var counts: ScanCounts = .{};
-    try scanNode(resolver, header.document, &counts);
-    try scanNode(resolver, header.run, &counts);
+    var findings: std.StringArrayHashMapUnmanaged(Finding) = .empty;
+    defer {
+        for (findings.keys()) |key| allocator.free(key);
+        findings.deinit(allocator);
+    }
+    try scanNode(allocator, resolver, header.document, &counts, &findings);
+    try scanNode(allocator, resolver, header.run, &counts, &findings);
     while (try reader.nextRecord()) |record| {
         counts.records += 1;
-        try scanNode(resolver, record.node, &counts);
+        try scanNode(allocator, resolver, record.node, &counts, &findings);
     }
+    for (findings.keys(), findings.values()) |key, finding| try event(output, "term", path, key, null, finding);
     return counts;
 }
 
-fn scanNode(resolver: mzml.cv.Resolver, node: mzml.model.Node, counts: *ScanCounts) !void {
+// One accession and name pair the file uses with a finding: how often, and what was found.
+const Finding = struct {
+    occurrences: usize = 0,
+    unknown: bool = false,
+    obsolete: bool = false,
+    stale_name: bool = false,
+    former_name: bool = false,
+    unit_disallowed: bool = false,
+};
+
+fn scanNode(
+    allocator: std.mem.Allocator,
+    resolver: mzml.cv.Resolver,
+    node: mzml.model.Node,
+    counts: *ScanCounts,
+    findings: *std.StringArrayHashMapUnmanaged(Finding),
+) !void {
     for (node.params) |entry| {
         const parameter: mzml.cv.Param = switch (entry) {
             .cv => |param| param,
@@ -192,331 +305,51 @@ fn scanNode(resolver: mzml.cv.Resolver, node: mzml.model.Node, counts: *ScanCoun
         };
         const found = try resolver.resolve(parameter);
         if (entry == .cv) {
+            const issues = found.term.issues;
             counts.parameters += 1;
             counts.resolved += @intFromBool(found.term.match != null);
-            counts.missing_references += @intFromBool(found.term.issues.missing_reference or found.term.issues.missing_declaration);
-            counts.unknown_resources += @intFromBool(found.term.issues.unrecognized_resource);
-            counts.unknown_accessions += @intFromBool(found.term.issues.unknown_accession);
-            counts.stale_names += @intFromBool(found.term.issues.stale_name);
-            counts.obsolete += @intFromBool(found.term.issues.obsolete);
+            counts.missing_references += @intFromBool(issues.missing_reference or issues.missing_declaration);
+            counts.unknown_resources += @intFromBool(issues.unrecognized_resource);
+            counts.unknown_accessions += @intFromBool(issues.unknown_accession);
+            counts.stale_names += @intFromBool(issues.stale_name);
+            counts.former_names += @intFromBool(issues.former_name);
+            counts.obsolete += @intFromBool(issues.obsolete);
+            const disallowed = found.unit_allowed == .disallowed;
+            if (issues.unknown_accession or issues.obsolete or issues.stale_name or disallowed) {
+                const key = try std.fmt.allocPrint(allocator, "{s}\t{s}", .{
+                    if (parameter.accession) |accession| accession.raw else "",
+                    parameter.name orelse "",
+                });
+                const slot = try findings.getOrPut(allocator, key);
+                if (slot.found_existing) allocator.free(key) else slot.value_ptr.* = .{
+                    .unknown = issues.unknown_accession,
+                    .obsolete = issues.obsolete,
+                    .stale_name = issues.stale_name,
+                    .former_name = issues.former_name,
+                    .unit_disallowed = disallowed,
+                };
+                slot.value_ptr.occurrences += 1;
+            }
         }
         counts.units += @intFromBool(found.unit_fields != .absent);
         counts.resolved_units += @intFromBool(found.unit.match != null);
         counts.partial_units += @intFromBool(found.unit_fields == .partial);
         counts.disallowed_units += @intFromBool(found.unit_allowed == .disallowed);
     }
-    for (node.children) |child| try scanNode(resolver, child, counts);
-}
-
-// --- OBO ingestion ---
-
-const Parsed = struct {
-    arena: std.heap.ArenaAllocator,
-    resource: Vocabulary,
-
-    fn deinit(self: *Parsed) void {
-        self.arena.deinit();
-        self.* = undefined;
-    }
-};
-
-fn parse(allocator: std.mem.Allocator, bytes: []const u8, identity: Vocabulary.Identity) !Parsed {
-    if (!std.unicode.utf8ValidateSlice(bytes) or std.mem.indexOfScalar(u8, bytes, 0) != null)
-        return error.InvalidObo;
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    errdefer arena.deinit();
-    const storage = arena.allocator();
-    const source = try storage.dupe(u8, bytes);
-    var terms: std.ArrayList(Vocabulary.Term) = .empty;
-    var aliases: std.ArrayList(Vocabulary.Alias) = .empty;
-    var headers: std.ArrayList(Vocabulary.Field) = .empty;
-    var fields: std.ArrayList(Vocabulary.Field) = .empty;
-    var ids: std.StringHashMapUnmanaged(void) = .empty;
-    var stanza: ?[]const u8 = null;
-    var lines = std.mem.splitScalar(u8, source, '\n');
-    while (lines.next()) |physical| {
-        var line = trimUnescapedEnd(std.mem.trimStart(u8, std.mem.trimEnd(u8, physical, "\r"), " \t"));
-        if (line.len == 0 or line[0] == '!') continue;
-        var continuation: std.ArrayList(u8) = .empty;
-        while (continued(line)) {
-            try continuation.appendSlice(storage, line[0 .. line.len - 1]);
-            line = std.mem.trimEnd(u8, lines.next() orelse return error.InvalidObo, "\r");
-        }
-        if (continuation.items.len != 0) {
-            try continuation.appendSlice(storage, line);
-            line = continuation.items;
-        }
-        line = try content(line);
-        if (line.len == 0) continue;
-        if (line[0] == '[') {
-            if (line[line.len - 1] != ']') return error.InvalidObo;
-            if (stanza) |kind| try finishStanza(storage, kind, fields.items, &terms, &ids);
-            fields = .empty;
-            stanza = line[1 .. line.len - 1];
-            if (!std.mem.eql(u8, stanza.?, "Term") and !std.mem.eql(u8, stanza.?, "Typedef"))
-                return error.UnsupportedStanza;
-            continue;
-        }
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.InvalidObo;
-        if (colon == 0) return error.InvalidObo;
-        const tag = line[0..colon];
-        for (tag) |byte| if (!std.ascii.isAlphanumeric(byte) and byte != '_' and byte != '-')
-            return error.InvalidObo;
-        const value = trimUnescapedEnd(std.mem.trimStart(u8, line[colon + 1 ..], " \t\r"));
-        if (value.len == 0) return error.InvalidObo;
-        const field: Vocabulary.Field = .{ .tag = tag, .value = value };
-        if (stanza == null) try headers.append(storage, field) else try fields.append(storage, field);
-    }
-    if (stanza) |kind| try finishStanza(storage, kind, fields.items, &terms, &ids);
-    const format = try required(headers.items, "format-version");
-    if (!std.mem.eql(u8, format, "1.2") and !std.mem.eql(u8, format, "1.4"))
-        return error.UnsupportedOboVersion;
-    const version = try required(headers.items, "data-version");
-    const ontology = try required(headers.items, "ontology");
-    if (std.mem.eql(u8, identity.key, "psi-ms") and !std.mem.eql(u8, ontology, "ms"))
-        return error.SourceOntologyMismatch;
-    if (std.mem.eql(u8, identity.key, "uo") and !std.mem.eql(u8, ontology, "uo"))
-        return error.SourceOntologyMismatch;
-    if (!std.mem.eql(u8, version, identity.source_version)) return error.SourceVersionMismatch;
-    if (terms.items.len == 0) return error.MissingTerms;
-    std.mem.sort(Vocabulary.Term, terms.items, {}, struct {
-        fn less(_: void, a: Vocabulary.Term, b: Vocabulary.Term) bool {
-            return std.mem.lessThan(u8, a.id, b.id);
-        }
-    }.less);
-    for (terms.items, 0..) |term, index| for (term.alternate_ids) |alias| {
-        const entry = try ids.getOrPut(storage, alias);
-        if (entry.found_existing) return error.DuplicateId;
-        try aliases.append(storage, .{ .id = alias, .term_index = index });
-    };
-    std.mem.sort(Vocabulary.Alias, aliases.items, {}, struct {
-        fn less(_: void, a: Vocabulary.Alias, b: Vocabulary.Alias) bool {
-            return std.mem.lessThan(u8, a.id, b.id);
-        }
-    }.less);
-    return .{ .arena = arena, .resource = .{
-        .identity = identity,
-        .headers = headers.items,
-        .terms = terms.items,
-        .aliases = aliases.items,
-    } };
-}
-
-fn continued(line: []const u8) bool {
-    var backslashes: usize = 0;
-    var i = line.len;
-    while (i > 0 and line[i - 1] == '\\') : (i -= 1) backslashes += 1;
-    return backslashes % 2 != 0;
-}
-
-fn trimUnescapedEnd(raw: []const u8) []const u8 {
-    var end = raw.len;
-    while (end != 0 and std.mem.indexOfScalar(u8, " \t\r", raw[end - 1]) != null) {
-        if (continued(raw[0 .. end - 1])) break;
-        end -= 1;
-    }
-    return raw[0..end];
-}
-
-fn content(line: []const u8) ![]const u8 {
-    var quoted = false;
-    var escaped = false;
-    var braces: usize = 0;
-    var brackets: usize = 0;
-    for (line, 0..) |byte, i| {
-        if (escaped) {
-            escaped = false;
-        } else if (byte == '\\') {
-            escaped = true;
-        } else if (byte == '"') {
-            quoted = !quoted;
-        } else if (!quoted) {
-            switch (byte) {
-                '!' => {
-                    if (braces != 0 or brackets != 0) return error.InvalidObo;
-                    return trimUnescapedEnd(line[0..i]);
-                },
-                '{' => braces += 1,
-                '}' => if (braces == 0) {
-                    return error.InvalidObo;
-                } else {
-                    braces -= 1;
-                },
-                '[' => brackets += 1,
-                ']' => if (brackets == 0) {
-                    return error.InvalidObo;
-                } else {
-                    brackets -= 1;
-                },
-                else => {},
-            }
-        }
-    }
-    if (escaped or quoted or braces != 0 or brackets != 0) return error.InvalidObo;
-    return trimUnescapedEnd(line);
-}
-
-fn escape(byte: u8) u8 {
-    return switch (byte) {
-        'n' => '\n',
-        't' => '\t',
-        'W' => ' ',
-        // OBO permits escaping any character; PSI-MS uses this in regexp definitions.
-        else => byte,
-    };
-}
-
-fn decode(allocator: std.mem.Allocator, bytes: []const u8) ![]const u8 {
-    var result: std.ArrayList(u8) = .empty;
-    var i: usize = 0;
-    while (i < bytes.len) : (i += 1) {
-        if (bytes[i] == '\\') {
-            i += 1;
-            if (i == bytes.len) return error.InvalidEscape;
-            try result.append(allocator, escape(bytes[i]));
-        } else try result.append(allocator, bytes[i]);
-    }
-    return result.items;
-}
-
-fn required(fields: []const Vocabulary.Field, tag: []const u8) ![]const u8 {
-    var found: ?[]const u8 = null;
-    for (fields) |field| if (std.mem.eql(u8, field.tag, tag)) {
-        if (found != null) return error.DuplicateField;
-        found = field.value;
-    };
-    return found orelse error.MissingField;
-}
-
-fn quotedText(allocator: std.mem.Allocator, raw: []const u8) !Vocabulary.Text {
-    if (raw.len < 2 or raw[0] != '"') return error.InvalidObo;
-    var i: usize = 1;
-    while (i < raw.len) : (i += 1) {
-        if (raw[i] == '\\') {
-            i += 1;
-            continue;
-        }
-        if (raw[i] == '"') return .{
-            .value = try decode(allocator, raw[1..i]),
-            .suffix = trimUnescapedEnd(std.mem.trimStart(u8, raw[i + 1 ..], " \t")),
-        };
-    }
-    return error.InvalidObo;
-}
-
-fn token(raw: []const u8) Vocabulary.Text {
-    var i: usize = 0;
-    while (i < raw.len) : (i += 1) {
-        if (raw[i] == '\\') {
-            i += 1;
-            continue;
-        }
-        if (raw[i] == ' ' or raw[i] == '\t' or raw[i] == '{') break;
-    }
-    return .{ .value = raw[0..i], .suffix = trimUnescapedEnd(std.mem.trimStart(u8, raw[i..], " \t")) };
-}
-
-fn targetToken(raw: []const u8) !Vocabulary.Text {
-    const parsed = token(raw);
-    if (parsed.value.len == 0 or (parsed.suffix.len != 0 and parsed.suffix[0] != '{'))
-        return error.InvalidObo;
-    return parsed;
-}
-
-fn nameText(raw: []const u8) []const u8 {
-    var i: usize = 0;
-    while (i < raw.len) : (i += 1) {
-        if (raw[i] == '\\') {
-            i += 1;
-            continue;
-        }
-        if (raw[i] == '{') return trimUnescapedEnd(raw[0..i]);
-    }
-    return raw;
-}
-
-fn finishStanza(
-    allocator: std.mem.Allocator,
-    kind: []const u8,
-    fields: []const Vocabulary.Field,
-    terms: *std.ArrayList(Vocabulary.Term),
-    ids: *std.StringHashMapUnmanaged(void),
-) !void {
-    const id = try decode(allocator, (try targetToken(try required(fields, "id"))).value);
-    if ((try ids.getOrPut(allocator, id)).found_existing) return error.DuplicateId;
-    if (!std.mem.eql(u8, kind, "Term")) return;
-    var term: Vocabulary.Term = .{
-        .id = id,
-        .name = try decode(allocator, nameText(try required(fields, "name"))),
-        .fields = fields,
-    };
-    if (term.name.len == 0) return error.InvalidObo;
-    var synonyms: std.ArrayList(Vocabulary.Text) = .empty;
-    var xrefs: std.ArrayList(Vocabulary.Text) = .empty;
-    var parents: std.ArrayList([]const u8) = .empty;
-    var aliases: std.ArrayList([]const u8) = .empty;
-    var replacements: std.ArrayList([]const u8) = .empty;
-    var considerations: std.ArrayList([]const u8) = .empty;
-    var relationships: std.ArrayList(Vocabulary.Relationship) = .empty;
-    var obsolete_seen = false;
-    for (fields) |field| {
-        const tag = field.tag;
-        const raw = field.value;
-        if (std.mem.eql(u8, tag, "def")) {
-            if (term.definition != null) return error.DuplicateField;
-            term.definition = try quotedText(allocator, raw);
-            if (!std.mem.startsWith(u8, term.definition.?.suffix, "[")) return error.InvalidObo;
-        } else if (std.mem.eql(u8, tag, "synonym")) {
-            const text = try quotedText(allocator, raw);
-            const scope = token(text.suffix);
-            if (!std.mem.eql(u8, scope.value, "EXACT") and !std.mem.eql(u8, scope.value, "BROAD") and
-                !std.mem.eql(u8, scope.value, "NARROW") and !std.mem.eql(u8, scope.value, "RELATED"))
-                return error.InvalidObo;
-            if (std.mem.indexOfScalar(u8, scope.suffix, '[') == null) return error.InvalidObo;
-            try synonyms.append(allocator, text);
-        } else if (std.mem.eql(u8, tag, "is_obsolete")) {
-            if (obsolete_seen) return error.DuplicateField;
-            obsolete_seen = true;
-            const flag = try targetToken(raw);
-            if (!std.mem.eql(u8, flag.value, "true") and !std.mem.eql(u8, flag.value, "false")) return error.InvalidObo;
-            term.obsolete = std.mem.eql(u8, flag.value, "true");
-        } else if (std.mem.eql(u8, tag, "relationship")) {
-            const relation = token(raw);
-            const target = try targetToken(relation.suffix);
-            try relationships.append(allocator, .{
-                .kind = try decode(allocator, relation.value),
-                .target = try decode(allocator, target.value),
-                .modifiers = target.suffix,
-            });
-        } else if (std.mem.eql(u8, tag, "xref")) {
-            const text = token(raw);
-            try xrefs.append(allocator, .{ .value = try decode(allocator, text.value), .suffix = text.suffix });
-        } else {
-            const list = if (std.mem.eql(u8, tag, "is_a")) &parents else if (std.mem.eql(u8, tag, "alt_id")) &aliases else if (std.mem.eql(u8, tag, "replaced_by")) &replacements else if (std.mem.eql(u8, tag, "consider")) &considerations else continue;
-            const target = try targetToken(raw);
-            try list.append(allocator, try decode(allocator, target.value));
-        }
-    }
-    term.synonyms = synonyms.items;
-    term.xrefs = xrefs.items;
-    term.parents = parents.items;
-    term.alternate_ids = aliases.items;
-    term.replaced_by = replacements.items;
-    term.consider = considerations.items;
-    term.relationships = relationships.items;
-    try terms.append(allocator, term);
+    for (node.children) |child| try scanNode(allocator, resolver, child, counts, findings);
 }
 
 // --- Update review ---
 
 const FAMILY_ROOTS = [_][]const u8{ "MS:1000513", "MS:1000518", "MS:1000572" };
 
-fn monitored(resource: Vocabulary, term: Vocabulary.Term) !u3 {
-    if (!std.mem.eql(u8, resource.identity.key, "psi-ms") or term.obsolete) return 0;
+fn monitored(resource: *const Vocabulary, term: Vocabulary.Term) !u3 {
+    if (!std.mem.eql(u8, resource.identity.key, "psi-ms") or term.obsolete()) return 0;
     var families: u3 = 0;
     for (FAMILY_ROOTS, 0..) |root, index| {
-        if (std.mem.eql(u8, term.id, root)) continue;
-        if (try resource.isA(term.id, root, 100_000))
+        if (std.mem.eql(u8, term.id(), root)) continue;
+        if (resource.lookup(root) == null) continue;
+        if (try resource.isA(term.id(), root))
             families |= @as(u3, 1) << @intCast(index);
     }
     return families;
@@ -524,7 +357,7 @@ fn monitored(resource: Vocabulary, term: Vocabulary.Term) !u3 {
 
 fn event(writer: *std.Io.Writer, kind: []const u8, resource: []const u8, accession: []const u8, before: anytype, after: anytype) !void {
     try std.json.Stringify.value(.{
-        .format_version = @as(u32, 2),
+        .format_version = @as(u32, 3),
         .kind = kind,
         .resource = resource,
         .accession = accession,
@@ -532,6 +365,54 @@ fn event(writer: *std.Io.Writer, kind: []const u8, resource: []const u8, accessi
         .after = after,
     }, .{}, writer);
     try writer.writeByte('\n');
+}
+
+const RelationView = struct { kind: []const u8, target: []const u8, modifiers: []const u8 };
+
+// A term's modeled metadata as plain values, for comparison and reports.
+const TermView = struct {
+    id: []const u8,
+    name: []const u8,
+    obsolete: bool,
+    definition: ?Vocabulary.Text,
+    synonyms: []const Vocabulary.Text,
+    alternate_ids: []const []const u8,
+    replaced_by: []const []const u8,
+    consider: []const []const u8,
+    parents: []const []const u8,
+    relationships: []const RelationView,
+    xrefs: []const Vocabulary.Text,
+    subsets: []const []const u8,
+};
+
+fn view(allocator: std.mem.Allocator, term: Vocabulary.Term) !TermView {
+    var parents: std.ArrayList([]const u8) = .empty;
+    var targets = term.targets("is_a");
+    while (targets.next()) |parent| try parents.append(allocator, parent);
+    var relationships: std.ArrayList(RelationView) = .empty;
+    var edges = term.relationships();
+    while (edges.next()) |edge| try relationships.append(allocator, .{ .kind = edge.kind, .target = edge.target.id, .modifiers = edge.modifiers });
+    return .{
+        .id = term.id(),
+        .name = term.name(),
+        .obsolete = term.obsolete(),
+        .definition = term.definition(),
+        .synonyms = try collect(allocator, Vocabulary.Text, term.synonyms()),
+        .alternate_ids = try collect(allocator, []const u8, term.alternateIds()),
+        .replaced_by = try collect(allocator, []const u8, term.replacedBy()),
+        .consider = try collect(allocator, []const u8, term.consider()),
+        .parents = parents.items,
+        .relationships = relationships.items,
+        .xrefs = try collect(allocator, Vocabulary.Text, term.xrefs()),
+        .subsets = try collect(allocator, []const u8, term.subsets()),
+    };
+}
+
+fn collect(allocator: std.mem.Allocator, comptime T: type, iterator: anytype) ![]const T {
+    var items: std.ArrayList(T) = .empty;
+    var all = iterator;
+    while (all.next()) |item| try items.append(allocator, item);
+    return items.items;
 }
 
 fn equal(a: anytype, b: @TypeOf(a)) bool {
@@ -551,24 +432,18 @@ fn equal(a: anytype, b: @TypeOf(a)) bool {
     }
 }
 
-fn termEqual(a: Vocabulary.Term, b: Vocabulary.Term) bool {
-    inline for (std.meta.fields(Vocabulary.Term)) |field| {
-        if (comptime std.mem.eql(u8, field.name, "fields")) continue;
-        if (!equal(@field(a, field.name), @field(b, field.name))) return false;
-    }
-    return true;
-}
-
-fn review(writer: *std.Io.Writer, baseline: []const Vocabulary, candidate: []const Vocabulary) !bool {
+fn review(allocator: std.mem.Allocator, writer: *std.Io.Writer, baseline: []const Vocabulary, candidate: []const *const Vocabulary) !bool {
     if (baseline.len != candidate.len) return error.InvalidManifest;
     var blocked = false;
-    for (baseline, candidate) |old, new| {
+    for (baseline, candidate) |*old, new| {
         if (!std.mem.eql(u8, old.identity.key, new.identity.key)) return error.InvalidManifest;
         const key = new.identity.key;
         if (!equal(old.identity, new.identity))
             try event(writer, "resource", key, "", old.identity, new.identity);
-        if (!equal(old.headers, new.headers))
-            try event(writer, "headers", key, "", old.headers, new.headers);
+        const old_headers = try headerList(allocator, old);
+        const new_headers = try headerList(allocator, new);
+        if (!equal(old_headers, new_headers))
+            try event(writer, "headers", key, "", old_headers, new_headers);
         if (!std.mem.eql(u8, old.identity.full_name, new.identity.full_name) or
             !std.mem.eql(u8, old.identity.uri, new.identity.uri) or
             !std.mem.eql(u8, old.identity.version, new.identity.version))
@@ -579,45 +454,52 @@ fn review(writer: *std.Io.Writer, baseline: []const Vocabulary, candidate: []con
             blocked = blocked or !approved(new.identity, "", .license);
             try event(writer, "blocked_license", key, "", old.identity.license, new.identity.license);
         }
-        for (old.terms) |previous| {
-            const matched = new.lookup(previous.id);
+        for (0..old.count()) |index| {
+            const previous = old.term(index);
+            const matched = new.lookup(previous.id());
+            const before = try view(allocator, previous);
             if (matched == null or matched.?.alternate_id) {
-                try event(writer, "missing", key, previous.id, previous, null);
-                blocked = blocked or !approved(new.identity, previous.id, .missing);
+                try event(writer, "missing", key, before.id, before, null);
+                blocked = blocked or !approved(new.identity, before.id, .missing);
                 continue;
             }
-            const current = matched.?.term.*;
-            inline for (std.meta.fields(Vocabulary.Term)) |field| {
-                if (!equal(@field(previous, field.name), @field(current, field.name)))
-                    try event(writer, field.name, key, current.id, @field(previous, field.name), @field(current, field.name));
+            const current = matched.?.term;
+            const after = try view(allocator, current);
+            inline for (std.meta.fields(TermView)) |field| {
+                if (!equal(@field(before, field.name), @field(after, field.name)))
+                    try event(writer, field.name, key, after.id, @field(before, field.name), @field(after, field.name));
             }
-            if (previous.obsolete != current.obsolete)
-                try event(writer, if (current.obsolete) "newly_obsolete" else "restored", key, current.id, previous.obsolete, current.obsolete);
+            if (before.obsolete != after.obsolete)
+                try event(writer, if (after.obsolete) "newly_obsolete" else "restored", key, after.id, before.obsolete, after.obsolete);
             inline for (.{ "has_value_type", "has_units" }) |relation| {
                 if (!sameTargets(previous, current, relation))
-                    try event(writer, relation, key, current.id, previous.relationships, current.relationships);
+                    try event(writer, relation, key, after.id, before.relationships, after.relationships);
             }
-            if (!sameBinaryXrefs(previous, current))
-                try event(writer, "binary_xrefs", key, current.id, previous.xrefs, current.xrefs);
-            if (!equal(previous, current) and isKernel(current.id)) {
-                blocked = blocked or !approved(new.identity, current.id, .kernel);
-                try event(writer, "blocked_kernel", key, current.id, previous.name, current.name);
+            if (!sameBinaryXrefs(before.xrefs, after.xrefs))
+                try event(writer, "binary_xrefs", key, after.id, before.xrefs, after.xrefs);
+            // Subsets group terms for distribution; the format kernel never reads them.
+            var kernel_after = after;
+            kernel_after.subsets = before.subsets;
+            if (!equal(before, kernel_after) and isKernel(after.id)) {
+                blocked = blocked or !approved(new.identity, after.id, .kernel);
+                try event(writer, "blocked_kernel", key, after.id, before.name, after.name);
             }
         }
-        for (new.terms) |term| {
-            const previous = old.lookup(term.id);
+        for (0..new.count()) |index| {
+            const term = new.term(index);
+            const previous = old.lookup(term.id());
             if (previous == null or previous.?.alternate_id)
-                try event(writer, "added", key, term.id, null, term);
-            const colon = std.mem.indexOfScalar(u8, term.id, ':') orelse term.id.len;
-            if (!std.mem.eql(u8, term.id[0..colon], new.identity.namespace))
-                try event(writer, "foreign", key, term.id, null, term.name);
+                try event(writer, "added", key, term.id(), null, try view(allocator, term));
+            const colon = std.mem.indexOfScalar(u8, term.id(), ':') orelse term.id().len;
+            if (!std.mem.eql(u8, term.id()[0..colon], new.identity.namespace))
+                try event(writer, "foreign", key, term.id(), null, term.name());
             const families = try monitored(new, term);
             if (families == 0) continue;
-            const before_families = if (previous) |found| try monitored(old, found.term.*) else 0;
+            const before_families = if (previous) |found| try monitored(old, found.term) else 0;
             if (families != before_families)
-                try event(writer, "active_family", key, term.id, before_families, families);
-            if (try disposition(term.id, families)) |entry| {
-                try event(writer, "disposition", key, term.id, null, .{
+                try event(writer, "active_family", key, term.id(), before_families, families);
+            if (try disposition(term.id(), families)) |entry| {
+                try event(writer, "disposition", key, term.id(), null, .{
                     .read = entry.read,
                     .write = entry.write,
                     .preservation = entry.preservation,
@@ -625,19 +507,29 @@ fn review(writer: *std.Io.Writer, baseline: []const Vocabulary, candidate: []con
                 });
             } else {
                 blocked = true;
-                try event(writer, "blocked_disposition", key, term.id, null, families);
+                try event(writer, "blocked_disposition", key, term.id(), null, families);
             }
         }
     }
     for (candidate, 0..) |resource, index| {
-        for (candidate[index + 1 ..]) |other| for (resource.terms) |term| {
-            if (other.lookup(term.id)) |found| {
-                try event(writer, if (termEqual(term, found.term.*)) "duplicate_resource_id" else "resource_conflict", resource.identity.key, term.id, term, found.term.*);
+        for (candidate[index + 1 ..]) |other| for (0..resource.count()) |position| {
+            const term = resource.term(position);
+            if (other.lookup(term.id())) |found| {
+                const mine = try view(allocator, term);
+                const theirs = try view(allocator, found.term);
+                try event(writer, if (equal(mine, theirs)) "duplicate_resource_id" else "resource_conflict", resource.identity.key, mine.id, mine, theirs);
             }
         };
     }
     try event(writer, "acceptance", "", "", null, .{ .blocked = blocked });
     return blocked;
+}
+
+fn headerList(allocator: std.mem.Allocator, resource: *const Vocabulary) ![]const Vocabulary.Field {
+    var fields: std.ArrayList(Vocabulary.Field) = .empty;
+    var index: usize = 0;
+    while (resource.header(index)) |field| : (index += 1) try fields.append(allocator, field);
+    return fields.items;
 }
 
 fn isKernel(id: []const u8) bool {
@@ -686,15 +578,15 @@ fn sameTargets(a: Vocabulary.Term, b: Vocabulary.Term, relation: []const u8) boo
     return right.next() == null;
 }
 
-fn sameBinaryXrefs(a: Vocabulary.Term, b: Vocabulary.Term) bool {
+fn sameBinaryXrefs(a: []const Vocabulary.Text, b: []const Vocabulary.Text) bool {
     var position: usize = 0;
-    for (a.xrefs) |xref| {
+    for (a) |xref| {
         if (!std.mem.startsWith(u8, xref.value, "binary-data-type:")) continue;
-        while (position < b.xrefs.len and !std.mem.startsWith(u8, b.xrefs[position].value, "binary-data-type:")) position += 1;
-        if (position == b.xrefs.len or !equal(xref, b.xrefs[position])) return false;
+        while (position < b.len and !std.mem.startsWith(u8, b[position].value, "binary-data-type:")) position += 1;
+        if (position == b.len or !equal(xref, b[position])) return false;
         position += 1;
     }
-    for (b.xrefs[position..]) |xref| if (std.mem.startsWith(u8, xref.value, "binary-data-type:")) return false;
+    for (b[position..]) |xref| if (std.mem.startsWith(u8, xref.value, "binary-data-type:")) return false;
     return true;
 }
 
@@ -738,52 +630,373 @@ fn disposition(id: []const u8, families: u3) !?Disposition {
     return found;
 }
 
-// --- Deterministic tables ---
-
-fn resourceCounts(resource: Vocabulary) Vocabulary.Counts {
-    var counts: Vocabulary.Counts = .{ .terms = resource.terms.len };
-    for (resource.terms) |term| {
-        const colon = std.mem.indexOfScalar(u8, term.id, ':') orelse term.id.len;
-        counts.native_terms += @intFromBool(std.mem.eql(u8, term.id[0..colon], resource.identity.namespace));
-        counts.obsolete += @intFromBool(term.obsolete);
-        counts.alternate_ids += term.alternate_ids.len;
-        counts.replacements += term.replaced_by.len;
-        counts.considerations += term.consider.len;
-        counts.synonyms += term.synonyms.len;
-        for (term.relationships) |edge| {
+fn resourceCounts(resource: *const Vocabulary) Vocabulary.Counts {
+    var counts: Vocabulary.Counts = .{ .terms = resource.count() };
+    for (0..resource.count()) |index| {
+        const term = resource.term(index);
+        const colon = std.mem.indexOfScalar(u8, term.id(), ':') orelse term.id().len;
+        counts.native_terms += @intFromBool(std.mem.eql(u8, term.id()[0..colon], resource.identity.namespace));
+        counts.obsolete += @intFromBool(term.obsolete());
+        counts.alternate_ids += countOf(term.alternateIds());
+        counts.replacements += countOf(term.replacedBy());
+        counts.considerations += countOf(term.consider());
+        counts.synonyms += countOf(term.synonyms());
+        var edges = term.relationships();
+        while (edges.next()) |edge| {
             counts.value_types += @intFromBool(std.mem.eql(u8, edge.kind, "has_value_type"));
             counts.units += @intFromBool(std.mem.eql(u8, edge.kind, "has_units"));
         }
-        for (term.xrefs) |xref|
+        var xrefs = term.xrefs();
+        while (xrefs.next()) |xref|
             counts.binary_xrefs += @intFromBool(std.mem.startsWith(u8, xref.value, "binary-data-type:"));
     }
     return counts;
 }
 
-fn generate(allocator: std.mem.Allocator, writer: *std.Io.Writer, resources: []const Vocabulary) !void {
+fn countOf(iterator: anytype) usize {
+    var all = iterator;
+    var total: usize = 0;
+    while (all.next()) |_| total += 1;
+    return total;
+}
+
+// --- Release history ---
+
+// Per resource: the releases recorded, oldest first, and per term the release it first appeared
+// in (absent: present in the first recorded release), the release it became obsolete in, and its
+// former canonical names with the last release using each.
+const History = struct {
+    resources: std.ArrayList(Resource) = .empty,
+
+    const Resource = struct {
+        key: []const u8,
+        releases: std.ArrayList([]const u8) = .empty,
+        first: std.StringArrayHashMapUnmanaged(u16) = .empty,
+        obsolete_since: std.StringArrayHashMapUnmanaged(u16) = .empty,
+        former: std.StringArrayHashMapUnmanaged(std.ArrayList(Former)) = .empty,
+    };
+    const Former = struct { name: []const u8, last: u16 };
+
+    const Json = struct {
+        format_version: u32,
+        resources: []const struct {
+            key: []const u8,
+            releases: []const []const u8,
+            first: std.json.ArrayHashMap(u16),
+            obsolete_since: std.json.ArrayHashMap(u16),
+            former_names: std.json.ArrayHashMap([]const struct { name: []const u8, last: u16 }),
+        },
+    };
+
+    fn parse(allocator: std.mem.Allocator, bytes: []const u8) !History {
+        const json = try std.json.parseFromSliceLeaky(Json, allocator, bytes, .{});
+        if (json.format_version != 1) return error.UnsupportedHistoryVersion;
+        var history: History = .{};
+        for (json.resources) |entry| {
+            var resource: Resource = .{ .key = entry.key };
+            try resource.releases.appendSlice(allocator, entry.releases);
+            for (entry.first.map.keys(), entry.first.map.values()) |id, release| {
+                if (release >= entry.releases.len) return error.InvalidHistory;
+                try resource.first.put(allocator, id, release);
+            }
+            for (entry.obsolete_since.map.keys(), entry.obsolete_since.map.values()) |id, release| {
+                if (release >= entry.releases.len) return error.InvalidHistory;
+                try resource.obsolete_since.put(allocator, id, release);
+            }
+            for (entry.former_names.map.keys(), entry.former_names.map.values()) |id, names| {
+                var list: std.ArrayList(Former) = .empty;
+                for (names) |name| {
+                    if (name.last >= entry.releases.len) return error.InvalidHistory;
+                    try list.append(allocator, .{ .name = name.name, .last = name.last });
+                }
+                try resource.former.put(allocator, id, list);
+            }
+            try history.resources.append(allocator, resource);
+        }
+        return history;
+    }
+
+    fn render(self: *const History, allocator: std.mem.Allocator) ![]const u8 {
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        const writer = &out.writer;
+        try writer.writeAll("{\n  \"format_version\": 1,\n  \"resources\": [");
+        for (self.resources.items, 0..) |resource, index| {
+            try writer.writeAll(if (index == 0) "\n    {\n" else ",\n    {\n");
+            try writer.print("      \"key\": {f},\n      \"releases\": [", .{std.json.fmt(resource.key, .{})});
+            for (resource.releases.items, 0..) |release, i|
+                try writer.print("{s}{f}", .{ if (i == 0) "" else ", ", std.json.fmt(release, .{}) });
+            try writer.writeAll("],\n");
+            inline for (.{ "first", "obsolete_since" }) |name| {
+                try writer.print("      \"{s}\": {{", .{name});
+                const map = @field(resource, name);
+                for (map.keys(), map.values(), 0..) |id, release, i|
+                    try writer.print("{s}\n        {f}: {d}", .{ if (i == 0) "" else ",", std.json.fmt(id, .{}), release });
+                try writer.writeAll(if (map.count() == 0) "},\n" else "\n      },\n");
+            }
+            try writer.writeAll("      \"former_names\": {");
+            for (resource.former.keys(), resource.former.values(), 0..) |id, names, i| {
+                try writer.print("{s}\n        {f}: [", .{ if (i == 0) "" else ",", std.json.fmt(id, .{}) });
+                for (names.items, 0..) |name, k|
+                    try writer.print("{s}{{\"name\": {f}, \"last\": {d}}}", .{ if (k == 0) "" else ", ", std.json.fmt(name.name, .{}), name.last });
+                try writer.writeAll("]");
+            }
+            try writer.writeAll(if (resource.former.count() == 0) "}\n    }" else "\n      }\n    }");
+        }
+        try writer.writeAll("\n  ]\n}\n");
+        return out.written();
+    }
+
+    fn findConst(self: *const History, key: []const u8) ?*const Resource {
+        for (self.resources.items) |*resource| if (std.mem.eql(u8, resource.key, key)) return resource;
+        return null;
+    }
+
+    // Records one more release: new terms, newly obsolete terms, and renames since `old`, the
+    // release at index `old_release`.
+    fn record(allocator: std.mem.Allocator, resource: *Resource, old: ?*const Release, old_release: u16, new: *const Release) !u16 {
+        for (resource.releases.items) |known| if (std.mem.eql(u8, known, new.version)) return error.ReleaseAlreadyRecorded;
+        if (resource.releases.items.len == std.math.maxInt(u16) - 1) return error.InvalidHistory;
+        const index: u16 = @intCast(resource.releases.items.len);
+        try resource.releases.append(allocator, try allocator.dupe(u8, new.version));
+        const previous = old orelse return index;
+        for (new.terms.keys(), new.terms.values()) |key, term| {
+            const was = previous.terms.get(key) orelse {
+                const id = try allocator.dupe(u8, key);
+                if (!resource.first.contains(id)) try resource.first.put(allocator, id, index);
+                continue;
+            };
+            const id = try allocator.dupe(u8, key);
+            if (term.obsolete and !was.obsolete and !resource.obsolete_since.contains(id))
+                try resource.obsolete_since.put(allocator, id, index);
+            if (!std.mem.eql(u8, term.name, was.name)) {
+                const slot = try resource.former.getOrPut(allocator, id);
+                if (!slot.found_existing) slot.value_ptr.* = .empty;
+                try slot.value_ptr.append(allocator, .{ .name = try allocator.dupe(u8, was.name), .last = old_release });
+            }
+        }
+        return index;
+    }
+};
+
+// What history needs from one release: its version, and each term's name and obsolete flag.
+// Read tolerantly, because old releases repeat IDs and fields the library parser refuses: the
+// first stanza for an ID wins. Names decode as the library decodes them. A file without a
+// `data-version` is named by the day of its `date:` header, as documents declare such releases
+// (Unit Ontology files before 2023 say `date: 09:04:2014 13:37`, and documents `09:04:2014`).
+const Release = struct {
+    version: []const u8,
+    terms: std.StringArrayHashMapUnmanaged(State) = .empty,
+
+    const State = struct { name: []const u8, obsolete: bool };
+
+    fn read(allocator: std.mem.Allocator, bytes: []const u8) !Release {
+        var release: Release = .{ .version = "" };
+        var day: []const u8 = "";
+        var in_term = false;
+        var id: ?[]const u8 = null;
+        var state: State = .{ .name = "", .obsolete = false };
+        var lines = std.mem.splitScalar(u8, bytes, '\n');
+        while (true) {
+            const next = lines.next();
+            const line = if (next) |physical| fieldText(physical) else "";
+            if (next == null or (line.len != 0 and line[0] == '[')) {
+                if (id) |key| if (!release.terms.contains(key)) try release.terms.put(allocator, key, state);
+                id = null;
+                state = .{ .name = "", .obsolete = false };
+                if (next == null) break;
+                in_term = std.mem.eql(u8, line, "[Term]");
+                continue;
+            }
+            const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+            const tag = line[0..colon];
+            const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+            if (!in_term) {
+                if (std.mem.eql(u8, tag, "data-version") and release.version.len == 0) release.version = value;
+                if (std.mem.eql(u8, tag, "date") and day.len == 0) day = std.mem.sliceTo(value, ' ');
+            } else if (std.mem.eql(u8, tag, "id")) {
+                if (id == null) id = value;
+            } else if (std.mem.eql(u8, tag, "name")) {
+                if (state.name.len == 0) state.name = try decodeName(allocator, value);
+            } else if (std.mem.eql(u8, tag, "is_obsolete")) {
+                state.obsolete = std.mem.eql(u8, value, "true");
+            }
+        }
+        if (release.version.len == 0) release.version = day;
+        if (release.version.len == 0) return error.MissingField;
+        return release;
+    }
+
+    // A line without its trailing comment and surrounding blanks.
+    fn fieldText(physical: []const u8) []const u8 {
+        const line = std.mem.trim(u8, physical, " \t\r");
+        var i: usize = 0;
+        while (i < line.len) : (i += 1) switch (line[i]) {
+            '\\' => i += 1,
+            '!' => return std.mem.trimEnd(u8, line[0..i], " \t"),
+            else => {},
+        };
+        return line;
+    }
+
+    // The name before any `{...}` modifiers, with OBO escapes decoded.
+    fn decodeName(allocator: std.mem.Allocator, raw: []const u8) ![]const u8 {
+        var result: std.ArrayList(u8) = .empty;
+        var i: usize = 0;
+        while (i < raw.len) : (i += 1) switch (raw[i]) {
+            '\\' => {
+                i += 1;
+                if (i == raw.len) return error.InvalidEscape;
+                try result.append(allocator, switch (raw[i]) {
+                    'n' => '\n',
+                    't' => '\t',
+                    'W' => ' ',
+                    else => raw[i],
+                });
+            },
+            '{' => break,
+            else => try result.append(allocator, raw[i]),
+        };
+        return std.mem.trimEnd(u8, result.items, " \t");
+    }
+};
+
+// Records one resource's releases from its OBO files, oldest first; a file repeating a recorded
+// release adds nothing. A resource the history already holds is extended: its list starts with
+// the last recorded release, the baseline the next release is compared with.
+fn recordReleases(allocator: std.mem.Allocator, io: std.Io, history: *History, key: []const u8, paths: []const []const u8) !void {
+    const resource = for (history.resources.items) |*found| {
+        if (std.mem.eql(u8, found.key, key)) break found;
+    } else added: {
+        try history.resources.append(allocator, .{ .key = try allocator.dupe(u8, key) });
+        break :added &history.resources.items[history.resources.items.len - 1];
+    };
+    var previous: ?Release = null;
+    var previous_release: u16 = 0;
+    for (paths) |path| {
+        const release = try Release.read(allocator, try readFile(allocator, io, path));
+        const recorded = for (resource.releases.items, 0..) |item, index| {
+            if (std.mem.eql(u8, item, release.version)) break index;
+        } else null;
+        if (recorded) |index| {
+            if (index + 1 == resource.releases.items.len) {
+                previous = release;
+                previous_release = @intCast(index);
+            }
+            continue;
+        }
+        if (previous == null and resource.releases.items.len != 0) return error.MissingBaselineRelease;
+        previous_release = try History.record(allocator, resource, if (previous) |*old| old else null, previous_release, &release);
+        previous = release;
+    }
+}
+
+// --- Generated tables ---
+
+fn generate(allocator: std.mem.Allocator, writer: *std.Io.Writer, resources: []const *const Vocabulary, history: *const History) !void {
+    // A history ends at the release it describes, or its first releases and names would be stale.
+    for (resources) |resource| if (history.findConst(resource.identity.key)) |recorded| {
+        const releases = recorded.releases.items;
+        if (releases.len == 0 or !std.mem.eql(u8, releases[releases.len - 1], dataVersion(resource)))
+            return error.HistoryNotCurrent;
+    };
     var raw: std.Io.Writer.Allocating = .init(allocator);
-    defer raw.deinit();
-    try raw.writer.writeAll("//! Generated vocabulary metadata. Artifact format 1; regenerate with the vocabulary command.\n\nconst Vocabulary = @import(\"vocabulary.zig\");\n\npub const RESOURCES: []const Vocabulary = ");
-    try writeZig(&raw.writer, resources);
-    try raw.writer.writeAll(";\n");
+    const w = &raw.writer;
+    try w.writeAll("//! Generated vocabulary tables, artifact format 2; regenerate with the vocabulary command.\n\n" ++
+        "const Vocabulary = @import(\"vocabulary.zig\");\n\npub const RESOURCES = [_]Vocabulary{\n");
+    for (resources, 0..) |resource, index| {
+        try w.writeAll(".{ .identity = ");
+        try writeZig(w, resource.identity);
+        try w.print(", .core = &CORE_{d}, .tiers = .{{ .bundled = {d} }} }},\n", .{ index, index });
+    }
+    try w.writeAll("};\n\npub const CLOSURES = [_]Vocabulary.Closure{");
+    for (0..resources.len) |index| try w.print("CLOSURE_{d},", .{index});
+    try w.writeAll("};\n\npub const DETAILS = [_]Vocabulary.Details{");
+    for (0..resources.len) |index| try w.print("DETAILS_{d},", .{index});
+    try w.writeAll("};\n\npub const HISTORIES = [_]?Vocabulary.History{");
+    for (resources, 0..) |resource, index| {
+        if (history.findConst(resource.identity.key) != null) try w.print("HISTORY_{d},", .{index}) else try w.writeAll("null,");
+    }
+    try w.writeAll("};\n");
+    for (resources, 0..) |resource, index| {
+        const parsed = resource.tiers.parsed;
+        try w.print("\nconst CORE_{d}: Vocabulary.Core = ", .{index});
+        try writeZig(w, resource.core.*);
+        try w.print(";\n\nconst CLOSURE_{d}: Vocabulary.Closure = ", .{index});
+        try writeZig(w, parsed.closure);
+        try w.print(";\n\nconst DETAILS_{d}: Vocabulary.Details = ", .{index});
+        try writeZig(w, parsed.details);
+        try w.writeAll(";\n");
+        if (history.findConst(resource.identity.key)) |recorded| {
+            try w.print("\nconst HISTORY_{d}: Vocabulary.History = ", .{index});
+            try writeZig(w, try historyTables(allocator, recorded, resource));
+            try w.writeAll(";\n");
+        }
+    }
     const source = try allocator.dupeZ(u8, raw.written());
-    defer allocator.free(source);
     var tree = try std.zig.Ast.parse(allocator, source, .zig);
     defer tree.deinit(allocator);
     if (tree.errors.len != 0) return error.InvalidGeneratedSource;
-    const formatted = try tree.renderAlloc(allocator);
-    defer allocator.free(formatted);
-    try writer.writeAll(formatted);
+    try writer.writeAll(try tree.renderAlloc(allocator));
+}
+
+// The history tables in the resource's term order.
+fn historyTables(allocator: std.mem.Allocator, recorded: *const History.Resource, resource: *const Vocabulary) !Vocabulary.History {
+    const terms = resource.count();
+    const first = try allocator.alloc(u16, terms);
+    const obsolete_since = try allocator.alloc(u16, terms);
+    var starts: std.ArrayList(u32) = .empty;
+    var items: std.ArrayList(Vocabulary.FormerName) = .empty;
+    var names: std.ArrayList([]const u8) = .empty;
+    try starts.append(allocator, 0);
+    for (0..terms) |index| {
+        const id = resource.term(index).id();
+        first[index] = recorded.first.get(id) orelse Vocabulary.NO_RELEASE;
+        obsolete_since[index] = recorded.obsolete_since.get(id) orelse Vocabulary.NO_RELEASE;
+        if (recorded.former.get(id)) |list| for (list.items) |former| {
+            try items.append(allocator, .{ .release = former.last, .name = @intCast(names.items.len) });
+            try names.append(allocator, former.name);
+        };
+        try starts.append(allocator, @intCast(items.items.len));
+    }
+    const by_text = try allocator.alloc(u16, recorded.releases.items.len);
+    for (by_text, 0..) |*slot, index| slot.* = @intCast(index);
+    std.mem.sort(u16, by_text, recorded.releases.items, struct {
+        fn less(releases: []const []const u8, a: u16, b: u16) bool {
+            return std.mem.lessThan(u8, releases[a], releases[b]);
+        }
+    }.less);
+    return .{
+        .releases = try stringsOf(allocator, recorded.releases.items),
+        .by_text = by_text,
+        .first = first,
+        .obsolete_since = obsolete_since,
+        .former = .{ .starts = starts.items, .items = items.items },
+        .former_names = try stringsOf(allocator, names.items),
+    };
+}
+
+fn stringsOf(allocator: std.mem.Allocator, items: []const []const u8) !Vocabulary.Strings {
+    var text: std.ArrayList(u8) = .empty;
+    var starts: std.ArrayList(u32) = .empty;
+    try starts.append(allocator, 0);
+    for (items) |item| {
+        try text.appendSlice(allocator, item);
+        try starts.append(allocator, @intCast(text.items.len));
+    }
+    return .{ .text = text.items, .starts = starts.items };
 }
 
 fn writeZig(writer: *std.Io.Writer, value: anytype) std.Io.Writer.Error!void {
-    switch (@typeInfo(@TypeOf(value))) {
+    const T = @TypeOf(value);
+    switch (@typeInfo(T)) {
         .pointer => |pointer| {
-            if (pointer.child == u8) return std.zon.stringify.serialize(value, .{}, writer);
+            if (pointer.child == u8) return writeString(writer, value);
             try writer.writeAll("&.{");
-            for (value) |item| {
+            const numbers = @typeInfo(pointer.child) == .int or pointer.child == bool;
+            for (value, 0..) |item, i| {
+                if (numbers and i % 24 == 0) try writer.writeByte('\n');
                 try writeZig(writer, item);
-                try writer.writeAll(",\n");
+                try writer.writeAll(if (numbers) "," else ",\n");
             }
             try writer.writeAll("}");
         },
@@ -806,6 +1019,20 @@ fn writeZig(writer: *std.Io.Writer, value: anytype) std.Io.Writer.Error!void {
     }
 }
 
+// A Zig string literal: printable bytes as they are, others escaped.
+fn writeString(writer: *std.Io.Writer, bytes: []const u8) std.Io.Writer.Error!void {
+    try writer.writeByte('"');
+    for (bytes) |byte| switch (byte) {
+        '"' => try writer.writeAll("\\\""),
+        '\\' => try writer.writeAll("\\\\"),
+        '\n' => try writer.writeAll("\\n"),
+        '\t' => try writer.writeAll("\\t"),
+        0...8, 11...31, 127 => try writer.print("\\x{x:0>2}", .{byte}),
+        else => try writer.writeByte(byte),
+    };
+    try writer.writeByte('"');
+}
+
 // --- Tests ---
 
 const EXAMPLE_IDENTITY: Vocabulary.Identity = .{
@@ -825,6 +1052,7 @@ const EXAMPLE_OBO =
     \\synonym: "alias" EXACT []
     \\is_a: X:1 ! root
     \\alt_id: X:02
+    \\subset: core
     \\relationship: has_value_type xsd:integer
     \\relationship: has_units UO:0000010
     \\xref: binary-data-type:MS\:1000523 "64-bit float"
@@ -836,15 +1064,13 @@ const EXAMPLE_OBO =
     \\consider: X:3
 ;
 
-test "[unit] - [vocabulary generation]: retains metadata and emits repeatable sorted tables" {
-    var parsed = try parse(std.testing.allocator, EXAMPLE_OBO, EXAMPLE_IDENTITY);
-    defer parsed.deinit();
-    const resource = parsed.resource;
-    try std.testing.expectEqualStrings("X:1", resource.terms[0].id);
-    const term = resource.lookup("X:02").?.term;
-    try std.testing.expectEqualStrings("child name", term.name);
-    try std.testing.expectEqualStrings("Quoted \"name\" and colon: here", term.definition.?.value);
-    try std.testing.expectEqualStrings("binary-data-type:MS:1000523", term.xrefs[0].value);
+test "[unit] - [vocabulary generation]: emits repeatable tables that parse back as Zig" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const owned = try Vocabulary.parseObo(std.testing.allocator, EXAMPLE_OBO, EXAMPLE_IDENTITY);
+    defer owned.deinit();
+    const resource = &owned.vocabulary;
     try std.testing.expectEqualDeep(Vocabulary.Counts{
         .terms = 2,
         .native_terms = 2,
@@ -857,114 +1083,129 @@ test "[unit] - [vocabulary generation]: retains metadata and emits repeatable so
         .units = 1,
         .binary_xrefs = 1,
     }, resourceCounts(resource));
-    var first: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer first.deinit();
-    var second: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer second.deinit();
-    try generate(std.testing.allocator, &first.writer, &.{resource});
-    try generate(std.testing.allocator, &second.writer, &.{resource});
+    var history: History = .{};
+    try history.resources.append(allocator, .{ .key = "example" });
+    _ = try History.record(allocator, &history.resources.items[0], null, 0, &try Release.read(allocator, EXAMPLE_OBO));
+    var first: std.Io.Writer.Allocating = .init(allocator);
+    var second: std.Io.Writer.Allocating = .init(allocator);
+    try generate(allocator, &first.writer, &.{resource}, &history);
+    try generate(allocator, &second.writer, &.{resource}, &history);
     try std.testing.expectEqualStrings(first.written(), second.written());
+    try std.testing.expect(std.mem.indexOf(u8, first.written(), "child name") != null);
     var short = std.Io.Writer.fixed(&.{});
-    try std.testing.expectError(error.WriteFailed, generate(std.testing.allocator, &short, &.{resource}));
+    try std.testing.expectError(error.WriteFailed, generate(allocator, &short, &.{resource}, &history));
+    var stale: History = .{};
+    try stale.resources.append(allocator, .{ .key = "example" });
+    try stale.resources.items[0].releases.append(allocator, "older");
+    try std.testing.expectError(error.HistoryNotCurrent, generate(allocator, &first.writer, &.{resource}, &stale));
 }
 
-test "[failure] - [OBO ingestion]: rejects malformed required fields and duplicate identities" {
-    const prefix = "format-version: 1.2\ndata-version: current\nontology: example\n";
-    const cases = .{
-        .{ "", error.MissingField },
-        .{ prefix ++ "[Term]\nid: X:1\n", error.MissingField },
-        .{ prefix ++ "[Term]\nid: X:1\nname: one\nname: two\n", error.DuplicateField },
-        .{ prefix ++ "[Term]\nid: X:1\nname: one\n[Term]\nid: X:1\nname: two\n", error.DuplicateId },
-        .{ prefix ++ "[Term]\nid: X:1\nname: one\nalt_id: X:1\n", error.DuplicateId },
-        .{ prefix ++ "[Term]\nid: X:1\nname: bad\\", error.InvalidObo },
-        .{ prefix ++ "[Term]\nid: X:1\nname: one\ndef: \"unfinished\n", error.InvalidObo },
-        .{ prefix ++ "[Term]\nid: X:1\nname: one\ndef: \"text\" [X:ref ! comment\n", error.InvalidObo },
-        .{ prefix ++ "[Term]\nid: X:1\nname: one\nis_a: X:2 {key=value ! comment\n", error.InvalidObo },
-        .{ prefix ++ "[Term]\nid: X:1\nname: one\nrelationship: has_units\n", error.InvalidObo },
-        .{ prefix ++ "[Term]\nid: X:1\nname: one\nis_obsolete: yes\n", error.InvalidObo },
+test "[unit] - [vocabulary history]: records new, newly obsolete, and renamed terms by release" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const header = "format-version: 1.2\nontology: example\n";
+    const releases = [_][]const u8{
+        header ++ "data-version: 1\n[Term]\nid: X:1\nname: one\n",
+        header ++ "data-version: 2\n[Term]\nid: X:1\nname: uno\n[Term]\nid: X:2\nname: two\n",
+        header ++ "data-version: 3\n[Term]\nid: X:1\nname: uno\nis_obsolete: true\n[Term]\nid: X:2\nname: two\n",
     };
-    inline for (cases) |case| {
-        if (parse(std.testing.allocator, case[0], EXAMPLE_IDENTITY)) |value| {
-            var unexpected = value;
-            defer unexpected.deinit();
-            return error.TestExpectedError;
-        } else |err| try std.testing.expectEqual(case[1], err);
+    var history: History = .{};
+    try history.resources.append(allocator, .{ .key = "example" });
+    var previous: ?Release = null;
+    var previous_release: u16 = 0;
+    for (releases) |bytes| {
+        const release = try Release.read(allocator, bytes);
+        previous_release = try History.record(allocator, &history.resources.items[0], if (previous) |*old| old else null, previous_release, &release);
+        previous = release;
     }
+    const recorded = &history.resources.items[0];
+    try std.testing.expectEqual(@as(?u16, 1), recorded.first.get("X:2"));
+    try std.testing.expectEqual(@as(?u16, null), recorded.first.get("X:1"));
+    try std.testing.expectEqual(@as(?u16, 2), recorded.obsolete_since.get("X:1"));
+    try std.testing.expectEqualStrings("one", recorded.former.get("X:1").?.items[0].name);
+    try std.testing.expectEqual(@as(u16, 0), recorded.former.get("X:1").?.items[0].last);
+    const round_trip = try History.parse(allocator, try history.render(allocator));
+    try std.testing.expectEqualStrings(try history.render(allocator), try round_trip.render(allocator));
+    try std.testing.expectError(error.ReleaseAlreadyRecorded, History.record(allocator, &history.resources.items[0], null, 0, &previous.?));
 }
 
-test "[failure] - [OBO ingestion]: cleans up each failed allocation" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
-        fn run(allocator: std.mem.Allocator) !void {
-            var parsed = try parse(allocator, EXAMPLE_OBO, EXAMPLE_IDENTITY);
-            defer parsed.deinit();
-        }
-    }.run, .{});
-}
-
-test "[property] - [OBO ingestion]: preserves escaping and equivalent line endings" {
-    const bytes = "format-version: 1.2\ndata-version: current\nontology: example\n" ++
-        "[Term]\nid: X:001\nname: escaped\\Wspace\\:colon\\ \n" ++
-        "def: \"a\\n\\t\\!\\q\\\\b\" [] ! ignored\\q\n" ++
-        "comment: continued\\\nline\n";
-    var parsed = try parse(std.testing.allocator, bytes, EXAMPLE_IDENTITY);
-    defer parsed.deinit();
-    try std.testing.expectEqualStrings("X:001", parsed.resource.terms[0].id);
-    try std.testing.expectEqualStrings("escaped space:colon ", parsed.resource.terms[0].name);
-    try std.testing.expectEqualStrings("a\n\t!q\\b", parsed.resource.terms[0].definition.?.value);
-    const comment = try required(parsed.resource.terms[0].fields, "comment");
-    try std.testing.expectEqualStrings("continuedline", comment);
-    const crlf = try std.mem.replaceOwned(u8, std.testing.allocator, bytes, "\n", "\r\n");
-    defer std.testing.allocator.free(crlf);
-    var windows = try parse(std.testing.allocator, crlf, EXAMPLE_IDENTITY);
-    defer windows.deinit();
-    try std.testing.expectEqualDeep(parsed.resource, windows.resource);
-    var no_newline = try parse(std.testing.allocator, bytes[0 .. bytes.len - 1], EXAMPLE_IDENTITY);
-    defer no_newline.deinit();
-    try std.testing.expectEqualDeep(parsed.resource, no_newline.resource);
-
-    const names = .{
-        .{ "space\\  ", "space " },
-        .{ "space\\ \t", "space " },
-        .{ "space\\  ! comment", "space " },
-        .{ "tab\\\t", "tab\t" },
-        .{ "slash\\\\ ", "slash\\" },
-        .{ "both\\\\\\ ", "both\\ " },
-        .{ "modifier\\ {source=\"fixture\"}", "modifier " },
+test "[unit] - [vocabulary history]: extending a history from its last release equals one replay" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    const header = "format-version: 1.2\nontology: example\n";
+    const files = [_][]const u8{ "1.obo", "2.obo", "3.obo" };
+    const contents = [_][]const u8{
+        header ++ "data-version: 1\n[Term]\nid: X:1\nname: one\n",
+        header ++ "data-version: 2\n[Term]\nid: X:1\nname: uno\n[Term]\nid: X:2\nname: two\n",
+        header ++ "data-version: 3\n[Term]\nid: X:1\nname: eins\nis_obsolete: true\n[Term]\nid: X:2\nname: two\n[Term]\nid: X:3\nname: three\n",
     };
-    inline for (names) |case| {
-        var named = try parse(std.testing.allocator, "format-version: 1.2\ndata-version: current\nontology: example\n" ++
-            "[Term]\nid: X:1\nname: " ++ case[0] ++ "\n", EXAMPLE_IDENTITY);
-        defer named.deinit();
-        try std.testing.expectEqualStrings(case[1], named.resource.terms[0].name);
+    var paths: [3][]const u8 = undefined;
+    for (files, contents, &paths) |name, bytes, *path| {
+        try dir.dir.writeFile(std.testing.io, .{ .sub_path = name, .data = bytes });
+        path.* = try dir.dir.realPathFileAlloc(std.testing.io, name, allocator);
     }
+    var whole: History = .{};
+    try recordReleases(allocator, std.testing.io, &whole, "example", &paths);
+    var extended: History = .{};
+    try recordReleases(allocator, std.testing.io, &extended, "example", paths[0..2]);
+    var resumed = try History.parse(allocator, try extended.render(allocator));
+    try recordReleases(allocator, std.testing.io, &resumed, "example", paths[1..3]);
+    try std.testing.expectEqualStrings(try whole.render(allocator), try resumed.render(allocator));
+    // Without the last recorded release there is nothing to compare the next one with.
+    var missing = try History.parse(allocator, try extended.render(allocator));
+    try std.testing.expectError(error.MissingBaselineRelease, recordReleases(allocator, std.testing.io, &missing, "example", paths[2..3]));
+}
+
+test "[unit] - [vocabulary history]: reads names as the library does, from releases it refuses" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const owned = try Vocabulary.parseObo(std.testing.allocator, EXAMPLE_OBO, EXAMPLE_IDENTITY);
+    defer owned.deinit();
+    const release = try Release.read(allocator, EXAMPLE_OBO);
+    try std.testing.expectEqual(owned.vocabulary.count(), release.terms.count());
+    for (0..owned.vocabulary.count()) |index| {
+        const term = owned.vocabulary.term(index);
+        const state = release.terms.get(term.id()).?;
+        try std.testing.expectEqualStrings(term.name(), state.name);
+        try std.testing.expectEqual(term.obsolete(), state.obsolete);
+    }
+    // A repeated ID and a repeated field: the first stanza and the first name win.
+    const repeated = try Release.read(allocator, "format-version: 1.2\ndata-version: 7 ! comment\n" ++
+        "[Term]\nid: X:1\nname: first\\Wname {source=\"x\"} ! note\nname: second\n[Typedef]\nid: part_of\nname: part of\n" ++
+        "[Term]\nid: X:1\nname: again\nis_obsolete: true\n");
+    try std.testing.expectEqualStrings("7", repeated.version);
+    try std.testing.expectEqual(@as(usize, 1), repeated.terms.count());
+    try std.testing.expectEqualStrings("first name", repeated.terms.get("X:1").?.name);
+    try std.testing.expect(!repeated.terms.get("X:1").?.obsolete);
+    try std.testing.expectEqualStrings("09:04:2014", (try Release.read(allocator, "format-version: 1.2\ndate: 09:04:2014 13:37\n[Term]\nid: X:1\n")).version);
+    try std.testing.expectError(error.MissingField, Release.read(allocator, "format-version: 1.2\n[Term]\nid: X:1\n"));
 }
 
 test "[unit] - [vocabulary update]: reports each metadata change without changing source objects" {
-    const old: Vocabulary = .{ .identity = EXAMPLE_IDENTITY, .terms = &.{.{ .id = "X:1", .name = "old" }} };
-    var next = old;
-    next.headers = &.{.{ .tag = "remark", .value = "changed source notice" }};
-    next.terms = &.{.{
-        .id = "X:1",
-        .name = "new",
-        .obsolete = true,
-        .definition = .{ .value = "definition" },
-        .synonyms = &.{.{ .value = "synonym" }},
-        .alternate_ids = &.{"X:alias"},
-        .replaced_by = &.{"X:2"},
-        .consider = &.{"X:3"},
-        .parents = &.{"X:parent"},
-        .relationships = &.{
-            .{ .kind = "has_value_type", .target = "xsd:integer" },
-            .{ .kind = "has_units", .target = "UO:0000010" },
-        },
-        .xrefs = &.{.{ .value = "binary-data-type:MS:1000523" }},
-    }};
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const header = "format-version: 1.2\ndata-version: current\nontology: example\n";
+    const old = try Vocabulary.parseObo(std.testing.allocator, header ++ "[Term]\nid: X:1\nname: old\n", EXAMPLE_IDENTITY);
+    defer old.deinit();
+    const next = try Vocabulary.parseObo(std.testing.allocator, header ++ "remark: changed source notice\n" ++
+        "[Term]\nid: X:1\nname: new\nis_obsolete: true\ndef: \"definition\" []\nsynonym: \"synonym\" EXACT []\n" ++
+        "alt_id: X:alias\nreplaced_by: X:2\nconsider: X:3\nis_a: X:parent\n" ++
+        "relationship: has_value_type xsd:integer\nrelationship: has_units UO:0000010\n" ++
+        "xref: binary-data-type:MS\\:1000523\nsubset: core\n", EXAMPLE_IDENTITY);
+    defer next.deinit();
     var report: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer report.deinit();
-    try std.testing.expect(!try review(&report.writer, &.{old}, &.{next}));
+    try std.testing.expect(!try review(allocator, &report.writer, &.{old.vocabulary}, &.{&next.vocabulary}));
     const expected = [_][]const u8{
-        "headers", "name",          "obsolete", "definition",     "synonyms",       "alternate_ids", "replaced_by",  "consider",
-        "parents", "relationships", "xrefs",    "newly_obsolete", "has_value_type", "has_units",     "binary_xrefs", "acceptance",
+        "headers",    "name",          "obsolete", "definition", "synonyms",       "alternate_ids",  "replaced_by", "consider",
+        "parents",    "relationships", "xrefs",    "subsets",    "newly_obsolete", "has_value_type", "has_units",   "binary_xrefs",
+        "acceptance",
     };
     var lines = std.mem.tokenizeScalar(u8, report.written(), '\n');
     for (expected) |kind| {
@@ -973,66 +1214,69 @@ test "[unit] - [vocabulary update]: reports each metadata change without changin
         try std.testing.expectEqualStrings(kind, line.value.object.get("kind").?.string);
     }
     try std.testing.expectEqual(null, lines.next());
-    try std.testing.expectEqualStrings("old", old.terms[0].name);
+    try std.testing.expectEqualStrings("old", old.vocabulary.term(0).name());
     report.clearRetainingCapacity();
-    try std.testing.expect(!try review(&report.writer, &.{next}, &.{old}));
+    try std.testing.expect(!try review(allocator, &report.writer, &.{next.vocabulary}, &.{&old.vocabulary}));
     try std.testing.expect(std.mem.indexOf(u8, report.written(), "\"kind\":\"restored\"") != null);
 }
 
 test "[failure] - [vocabulary update]: blocks removals, kernel changes, and new family terms" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
     const baseline = mzml.cv.Resolver.BUNDLED;
-    var next = [_]Vocabulary{ baseline[0], baseline[1] };
-    const terms = try std.testing.allocator.dupe(Vocabulary.Term, baseline[0].terms);
-    defer std.testing.allocator.free(terms);
-    next[0].terms = terms;
+    const header = "format-version: 1.2\ndata-version: current\nontology: ms\n";
+    const identity = baseline[0].identity;
+    var probe = identity;
+    probe.source_version = "";
+    // A candidate changing one kernel term's name, and one without a monitored term.
+    const kernel = try Vocabulary.parseObo(std.testing.allocator, header ++ "[Term]\nid: MS:1000523\nname: changed kernel label\n", probe);
+    defer kernel.deinit();
     var report: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer report.deinit();
-    for ([_][]const u8{ "MS:1000523", "MS:1000127", "MS:1000128", "MS:1000129", "MS:1000130" }) |id| {
-        const index = for (terms, 0..) |term, i| {
-            if (std.mem.eql(u8, term.id, id)) break i;
-        } else return error.TestUnexpectedResult;
-        terms[index].name = "changed kernel label";
-        report.clearRetainingCapacity();
-        try std.testing.expect(try review(&report.writer, baseline, &next));
-        try std.testing.expect(std.mem.indexOf(u8, report.written(), "\"kind\":\"blocked_kernel\"") != null);
-        terms[index] = baseline[0].terms[index];
-    }
-    next[0].terms = terms[1..];
-    next[0].aliases = &.{};
-    report.clearRetainingCapacity();
-    try std.testing.expect(try review(&report.writer, baseline, &next));
+    try std.testing.expect(try review(allocator, &report.writer, baseline[0..1], &.{&kernel.vocabulary}));
+    try std.testing.expect(std.mem.indexOf(u8, report.written(), "\"kind\":\"blocked_kernel\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, report.written(), "\"kind\":\"missing\"") != null);
-    const small: Vocabulary = .{ .identity = baseline[0].identity, .terms = &.{
-        .{ .id = "MS:1000513", .name = "roles" },
-        .{ .id = "MS:1000518", .name = "primitives" },
-        .{ .id = "MS:1000572", .name = "codecs" },
-        .{ .id = "MS:future", .name = "new", .parents = &.{"MS:1000572"} },
-    } };
-    var before = small;
-    before.terms = small.terms[0..3];
+    const before = try Vocabulary.parseObo(std.testing.allocator, header ++
+        "[Term]\nid: MS:1000513\nname: roles\n[Term]\nid: MS:1000518\nname: primitives\n[Term]\nid: MS:1000572\nname: codecs\n", probe);
+    defer before.deinit();
+    const after = try Vocabulary.parseObo(std.testing.allocator, header ++
+        "[Term]\nid: MS:1000513\nname: roles\n[Term]\nid: MS:1000518\nname: primitives\n[Term]\nid: MS:1000572\nname: codecs\n" ++
+        "[Term]\nid: MS:future\nname: new\nis_a: MS:1000572\n", probe);
+    defer after.deinit();
     report.clearRetainingCapacity();
-    try std.testing.expect(try review(&report.writer, &.{before}, &.{small}));
+    try std.testing.expect(try review(allocator, &report.writer, &.{before.vocabulary}, &.{&after.vocabulary}));
     try std.testing.expect(std.mem.indexOf(u8, report.written(), "\"kind\":\"blocked_disposition\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, report.written(), "\"kind\":\"active_family\"") != null);
+    // A kernel term that only joins a subset is reported, not blocked.
+    const plain = try Vocabulary.parseObo(std.testing.allocator, header ++ "[Term]\nid: MS:1000523\nname: 64-bit float\n", probe);
+    defer plain.deinit();
+    const grouped = try Vocabulary.parseObo(std.testing.allocator, header ++ "[Term]\nid: MS:1000523\nname: 64-bit float\nsubset: core\n", probe);
+    defer grouped.deinit();
+    report.clearRetainingCapacity();
+    try std.testing.expect(!try review(allocator, &report.writer, &.{plain.vocabulary}, &.{&grouped.vocabulary}));
+    try std.testing.expect(std.mem.indexOf(u8, report.written(), "\"kind\":\"subsets\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, report.written(), "\"kind\":\"blocked_kernel\"") == null);
 }
 
 test "[property] - [vocabulary coverage]: every active monitored term has one reviewed disposition" {
-    const resources = mzml.cv.Resolver.BUNDLED;
+    const resource = &mzml.cv.Resolver.BUNDLED[0];
     var counts = [_]usize{ 0, 0, 0 };
-    for (resources[0].terms) |term| {
-        const families = try monitored(resources[0], term);
+    for (0..resource.count()) |index| {
+        const term = resource.term(index);
+        const families = try monitored(resource, term);
         if (families == 0) continue;
-        try std.testing.expect((try disposition(term.id, families)) != null);
+        try std.testing.expect((try disposition(term.id(), families)) != null);
         for (&counts, 0..) |*count, i| if (families & (@as(u3, 1) << @intCast(i)) != 0) {
             count.* += 1;
         };
     }
     try std.testing.expectEqualSlices(usize, &.{ 31, 5, 18 }, &counts);
     for (DISPOSITIONS) |entry| for (entry.terms) |id| {
-        const term = resources[0].lookup(id).?.term;
-        try std.testing.expectEqual(entry.family, try monitored(resources[0], term.*));
+        const term = resource.lookup(id).?.term;
+        try std.testing.expectEqual(entry.family, try monitored(resource, term));
     };
-    for (resources) |resource| try std.testing.expectEqualDeep(resource.identity.counts, resourceCounts(resource));
+    for (mzml.cv.Resolver.BUNDLED) |*bundled| try std.testing.expectEqualDeep(bundled.identity.counts, resourceCounts(bundled));
 }
 
 test "[property] - [vocabulary manifest]: matches pinned identities and rejects invalid metadata" {
@@ -1042,12 +1286,12 @@ test "[property] - [vocabulary manifest]: matches pinned identities and rejects 
     try checkManifest(pinned.value);
     for (pinned.value.resources, resources) |identity, resource|
         try std.testing.expectEqualDeep(identity, resource.identity);
-    var manifest: Manifest = .{ .format_version = 1, .resources = .{ resources[0].identity, resources[1].identity } };
+    var manifest: Manifest = .{ .format_version = 2, .resources = .{ resources[0].identity, resources[1].identity } };
     try checkManifest(manifest);
-    manifest.format_version = 2;
-    try std.testing.expectError(error.UnsupportedManifestVersion, checkManifest(manifest));
     manifest.format_version = 1;
-    manifest.resources[0].artifact_version = 2;
+    try std.testing.expectError(error.UnsupportedManifestVersion, checkManifest(manifest));
+    manifest.format_version = 2;
+    manifest.resources[0].artifact_version = 1;
     try std.testing.expectError(error.InvalidManifest, checkManifest(manifest));
     manifest.resources[0] = resources[0].identity;
     manifest.resources[0].commit = "main";

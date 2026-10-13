@@ -1,49 +1,58 @@
 {
-  "format_version": 1,
+  "format_version": 2,
   "resources": [
     {
       "key": "psi-ms",
-      "version": "4.1.258",
-      "source_version": "4.1.258",
+      "version": "4.2.5",
       "namespace": "MS",
       "full_name": "PSI-MS",
       "uri": "http://purl.obolibrary.org/obo/ms/psi-ms.obo",
+      "source_version": "4.2.5",
       "repository": "https://github.com/HUPO-PSI/psi-ms-CV",
-      "commit": "6081b684002e06484e74774975bc056caaf8927f",
-      "path": "psi-ms.obo",
-      "retrieved": "2026-09-09",
+      "commit": "bfc95f2a1cd1ab104d265b15910f153bfcfeac86",
+      "path": "psi-ms-core.obo",
+      "retrieved": "2026-10-13",
       "license": "CC-BY-4.0",
       "attribution": "HUPO Proteomics Standards Initiative Mass Spectrometry Standards Working Group and Proteomics Informatics Working Group",
-      "sha256": "2346128b4ac445229f204f6edc225b81c4b4afa6846cf95968bde0b17bf8825d",
-      "artifact_version": 1,
+      "sha256": "c70b8dafd736e8215055f161b8a43d6f0aa1ceaac0d5cc7e47edb2ef3ed49970",
+      "artifact_version": 2,
       "counts": {
-        "terms": 4114,
-        "native_terms": 3986,
+        "terms": 4154,
+        "native_terms": 4026,
         "obsolete": 284,
         "alternate_ids": 2,
         "replacements": 19,
         "considerations": 0,
         "synonyms": 514,
-        "value_types": 1378,
-        "units": 327,
+        "value_types": 1413,
+        "units": 354,
         "binary_xrefs": 39
-      }
+      },
+      "declaration_uris": [
+        "https://raw.githubusercontent.com/HUPO-PSI/psi-ms-CV/master/psi-ms.obo",
+        "http://psidev.cvs.sourceforge.net/*checkout*/psidev/psi/psi-ms/mzML/controlledVocabulary/psi-ms.obo"
+      ],
+      "declaration_names": [
+        "Proteomics Standards Initiative Mass Spectrometry Ontology",
+        "Proteomics Standards Initiative Mass Spectrometry Vocabularies",
+        "Mass spectrometry ontology"
+      ]
     },
     {
       "key": "uo",
-      "version": "2026-07-31",
-      "source_version": "releases/2026-07-31",
+      "version": "2026-10-12",
       "namespace": "UO",
       "full_name": "Unit Ontology",
-      "uri": "https://raw.githubusercontent.com/bio-ontology-research-group/unit-ontology/c706cc712ae884d72642bb2b70f917e37511f269/uo.obo",
+      "uri": "http://purl.obolibrary.org/obo/uo.obo",
+      "source_version": "releases/2026-10-12",
       "repository": "https://github.com/bio-ontology-research-group/unit-ontology",
-      "commit": "c706cc712ae884d72642bb2b70f917e37511f269",
+      "commit": "311f3d222444fcf8adf032dfa58f3c1b55bd22af",
       "path": "uo.obo",
-      "retrieved": "2026-09-09",
+      "retrieved": "2026-10-13",
       "license": "CC-BY-4.0",
       "attribution": "Unit Ontology contributors, bio-ontology-research-group/unit-ontology",
-      "sha256": "6e77b0a59ab5eddf8296f88f3355dcec429b7391dfc001d778e0b2841251b6bf",
-      "artifact_version": 1,
+      "sha256": "ade7be5a515551d3d653bda8ad256563df322e83c96b41da4f848e8a470c2846",
+      "artifact_version": 2,
       "counts": {
         "terms": 574,
         "native_terms": 574,
@@ -55,7 +64,17 @@
         "value_types": 0,
         "units": 0,
         "binary_xrefs": 0
-      }
+      },
+      "declaration_uris": [
+        "https://raw.githubusercontent.com/bio-ontology-research-group/unit-ontology/master/unit.obo",
+        "https://raw.githubusercontent.com/bio-ontology-research-group/unit-ontology/master/uo.obo",
+        "http://obo.cvs.sourceforge.net/*checkout*/obo/obo/ontology/phenotype/unit.obo",
+        "http://ontologies.berkeleybop.org/uo.obo"
+      ],
+      "declaration_names": [
+        "UNIT-ONTOLOGY",
+        "unit"
+      ]
     }
   ]
 }

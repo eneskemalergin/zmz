@@ -94,6 +94,11 @@ pub const PeakAllocator = struct {
     }
 };
 
+// A fuzz corpus entry for a document read with sliceWeightedBytes: its length, then its bytes.
+pub fn corpusDocument(comptime document: []const u8) []const u8 {
+    return comptime std.mem.toBytes(@as(u32, document.len)) ++ document;
+}
+
 /// Runs a fuzz target on `count` inputs drawn from the test seed: each a corpus entry with a few
 /// bytes changed or cut, or random bytes when there is no corpus. Zig 0.16.0 does not build tests
 /// in fuzz mode, so this is the generated input each ordinary test run gives the target.

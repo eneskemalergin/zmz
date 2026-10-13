@@ -26,7 +26,7 @@ pub fn main(init: std.process.Init) !void {
     var decoded = mzml.DecodedArrays.init(init.gpa, .{});
     defer decoded.deinit();
     var output_buffer: [4096]u8 = undefined;
-    var output = std.Io.File.stdout().writer(init.io, &output_buffer);
+    var output = std.Io.File.stdout().writerStreaming(init.io, &output_buffer);
     if (try index.byIdDecoded(init.gpa, args[2], &decoded)) |found| {
         var record = found;
         defer record.deinit();

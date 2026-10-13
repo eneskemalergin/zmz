@@ -1,0 +1,170 @@
+name: Vocabulary update
+
+# Weekly, and on demand: when PSI-MS or the Unit Ontology has released since the bundled snapshots,
+# review the new releases, regenerate the tables and their history, test, and open a pull request.
+# A review that blocks fails the run and lists the blocking events in the job summary.
+
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: vocabulary-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    name: PSI-MS and Unit Ontology
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: $/.github/actions/setup-zig
+      - name: Collect releases since the bundled snapshots
+        id: releases
+        run: |
+          set -euo pipefail
+          work="${RUNNER_TEMP}/vocabulary"
+          mkdir -p "${work}"
+          # The data-version a file's header names, or the day of its date header.
+          version() {
+            local named
+            named="$(sed -n '/^\[/q; s/^data-version:[[:space:]]*//p' "$1" | head -n 1 | tr -d '\r')"
+            [ -n "${named}" ] || named="$(sed -n '/^\[/q; s/^date:[[:space:]]*\([^[:space:]]*\).*/\1/p' "$1" | head -n 1)"
+            printf '%s' "${named}"
+          }
+          # Lists one resource's releases after the bundled one, oldest first, preceded by the
+          # bundled one: the first commit naming each release, or the commit its tag names. A
+          # commit with under half the previous release's terms is a broken intermediate state.
+          collect() {
+            local key="$1" url="$2" index="$3"
+            local repo="${work}/${key}.git" dir="${work}/${key}"
+            local path base current
+            path="$(jq -r ".resources[${index}].path" vocabularies/manifest.json)"
+            base="$(jq -r ".resources[${index}].commit" vocabularies/manifest.json)"
+            current="$(jq -r ".resources[${index}].source_version" vocabularies/manifest.json)"
+            git clone --quiet --bare "${url}" "${repo}"
+            mkdir -p "${dir}"
+            git -C "${repo}" show "${base}:${path}" > "${dir}/0.obo"
+            [ "$(version "${dir}/0.obo")" = "${current}" ] || { echo "::error::${key}: ${base}:${path} is not ${current}"; exit 1; }
+            printf '%s\n' "${dir}/0.obo" > "${dir}.txt"
+            local last="${current}" terms count=1 commit file named tag tagged latest_commit="${base}"
+            terms="$(grep -c '^\[Term\]' "${dir}/0.obo")"
+            for commit in $(git -C "${repo}" rev-list --reverse "${base}..HEAD" -- "${path}"); do
+              file="${dir}/${count}.obo"
+              git -C "${repo}" show "${commit}:${path}" > "${file}" 2>/dev/null || { rm -f "${file}"; continue; }
+              named="$(version "${file}")"
+              if [ -z "${named}" ] || [ "${named}" = "${last}" ] || grep -qxF "${named}" "${dir}.names" 2>/dev/null ||
+                [ "$(grep -c '^\[Term\]' "${file}")" -lt $((terms / 2)) ]; then
+                rm "${file}"
+                continue
+              fi
+              for tag in "v${named#releases/}" "${named}"; do
+                tagged="$(git -C "${repo}" rev-parse -q --verify "refs/tags/${tag}^{commit}" || true)"
+                [ -n "${tagged}" ] || continue
+                if git -C "${repo}" show "${tagged}:${path}" > "${file}.tag" 2>/dev/null &&
+                  [ "$(version "${file}.tag")" = "${named}" ]; then
+                  mv "${file}.tag" "${file}"
+                  commit="${tagged}"
+                fi
+                rm -f "${file}.tag"
+                break
+              done
+              printf '%s\n' "${file}" >> "${dir}.txt"
+              printf '%s\n' "${named}" >> "${dir}.names"
+              last="${named}"
+              latest_commit="${commit}"
+              terms="$(grep -c '^\[Term\]' "${file}")"
+              count=$((count + 1))
+            done
+            {
+              echo "${key}_file=$(tail -n 1 "${dir}.txt")"
+              echo "${key}_commit=${latest_commit}"
+              echo "${key}_version=${last}"
+              echo "${key}_changed=$([ "${last}" = "${current}" ] && echo false || echo true)"
+            } >> "${GITHUB_OUTPUT}"
+            echo "${key}: ${current} -> ${last}, $((count - 1)) new releases"
+          }
+          collect psi-ms https://github.com/HUPO-PSI/psi-ms-CV 0
+          collect uo https://github.com/bio-ontology-research-group/unit-ontology 1
+          echo "work=${work}" >> "${GITHUB_OUTPUT}"
+      - name: Review and generate
+        id: generate
+        if: steps.releases.outputs.psi-ms_changed == 'true' || steps.releases.outputs.uo_changed == 'true'
+        env:
+          WORK: ${{ steps.releases.outputs.work }}
+          PSI_MS_FILE: ${{ steps.releases.outputs.psi-ms_file }}
+          PSI_MS_COMMIT: ${{ steps.releases.outputs.psi-ms_commit }}
+          UO_FILE: ${{ steps.releases.outputs.uo_file }}
+          UO_COMMIT: ${{ steps.releases.outputs.uo_commit }}
+        run: |
+          set -euo pipefail
+          vocabulary() { zig build vocabulary -Doptimize=ReleaseFast -- "$@"; }
+          vocabulary candidate vocabularies/manifest.json "${PSI_MS_FILE}" "${PSI_MS_COMMIT}" \
+            "${UO_FILE}" "${UO_COMMIT}" "$(date -u +%F)" "${WORK}/manifest.json"
+          report="${WORK}/review.jsonl"
+          if ! vocabulary review "${WORK}/manifest.json" "${PSI_MS_FILE}" "${UO_FILE}" > "${report}"; then
+            {
+              echo "## Vocabulary review blocked"
+              echo
+              echo '```json'
+              jq -c 'select(.kind | startswith("blocked") or . == "missing")' "${report}"
+              echo '```'
+            } >> "${GITHUB_STEP_SUMMARY}"
+            exit 1
+          fi
+          vocabulary extend vocabularies/history.json "${WORK}/history.json" \
+            psi-ms "${WORK}/psi-ms.txt" uo "${WORK}/uo.txt"
+          vocabulary generate "${WORK}/manifest.json" "${WORK}/history.json" \
+            "${PSI_MS_FILE}" "${UO_FILE}" "${WORK}/generated_data.zig" > /dev/null
+          cp "${WORK}/manifest.json" vocabularies/manifest.json
+          cp "${WORK}/history.json" vocabularies/history.json
+          cp "${WORK}/generated_data.zig" src/cv/generated_data.zig
+          zig build test --summary all
+          {
+            echo "Regenerated from the releases upstream git holds since the bundled snapshots."
+            echo
+            echo "| Event | Count |"
+            echo "| --- | ---: |"
+            jq -r '.kind' "${report}" | sort | uniq -c | awk '{ printf "| %s | %s |\n", $2, $1 }'
+            echo
+            echo "Changes to existing terms:"
+            echo
+            echo '```json'
+            jq -c 'select(.kind | IN("missing", "name", "newly_obsolete", "restored", "parents", "has_units", "has_value_type", "binary_xrefs", "alternate_ids", "replaced_by", "active_family"))' "${report}" | head -n 200
+            echo '```'
+            echo
+            echo "Before merging: read the full review (\`zig build vocabulary -- review\` on these files), update the snapshot facts in \`vocabularies/README.md\`, and run the release-gate checks. Pull requests opened by this workflow do not start other workflows; close and reopen it to run them."
+          } > "${WORK}/body.md"
+      - name: Open a pull request
+        if: steps.generate.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WORK: ${{ steps.releases.outputs.work }}
+          PSI_MS_VERSION: ${{ steps.releases.outputs.psi-ms_version }}
+          UO_VERSION: ${{ steps.releases.outputs.uo_version }}
+        run: |
+          set -euo pipefail
+          uo="${UO_VERSION#releases/}"
+          branch="vocabulary/psi-ms-${PSI_MS_VERSION}-uo-${uo}"
+          if git ls-remote --exit-code --heads origin "${branch}" > /dev/null; then
+            echo "${branch} is already proposed"
+            exit 0
+          fi
+          gh auth setup-git
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "${branch}"
+          git add vocabularies/manifest.json vocabularies/history.json src/cv/generated_data.zig
+          git commit -m "chore: update to PSI-MS ${PSI_MS_VERSION} and UO ${uo}"
+          git push origin "${branch}"
+          gh pr create --base main --head "${branch}" \
+            --title "chore: update to PSI-MS ${PSI_MS_VERSION} and UO ${uo}" --body-file "${WORK}/body.md"

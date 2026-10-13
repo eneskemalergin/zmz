@@ -380,11 +380,6 @@ const XML_BYTES = [_]std.testing.Smith.Weight{
     .value(u8, '\n', 3),             .value(u8, '\r', 2),           .value(u8, '#', 1),
 };
 
-// A fuzz corpus entry for a document read with sliceWeightedBytes: its length, then its bytes.
-fn corpusDocument(comptime document: []const u8) []const u8 {
-    return comptime std.mem.toBytes(@as(u32, document.len)) ++ document;
-}
-
 fn eventsAtAnySplit(_: void, smith: *std.testing.Smith) !void {
     var source: [768]u8 = undefined;
     const bytes = source[0..smith.sliceWeightedBytes(&source, &XML_BYTES)];
@@ -403,11 +398,11 @@ fn eventsAtAnySplit(_: void, smith: *std.testing.Smith) !void {
 }
 
 const EVENTS_CORPUS = [_][]const u8{
-    corpusDocument("<r xmlns:p='urn:p'><a x='1'/><p:b p:y='&lt;'>t&#x41;u<![CDATA[]]>]]></p:b><!-- c --><?pi x?></r>"),
-    corpusDocument("<?xml version='1.0' encoding='UTF-8'?>\r\n<r>\r\n\t<a>one\ttwo\r\nthree</a>\n</r>\n"),
-    corpusDocument("\xff\xfe<\x00r\x00/\x00>\x00"),
-    corpusDocument("<r><a></b></r>"),
-    corpusDocument(support.DOCUMENT),
+    support.corpusDocument("<r xmlns:p='urn:p'><a x='1'/><p:b p:y='&lt;'>t&#x41;u<![CDATA[]]>]]></p:b><!-- c --><?pi x?></r>"),
+    support.corpusDocument("<?xml version='1.0' encoding='UTF-8'?>\r\n<r>\r\n\t<a>one\ttwo\r\nthree</a>\n</r>\n"),
+    support.corpusDocument("\xff\xfe<\x00r\x00/\x00>\x00"),
+    support.corpusDocument("<r><a></b></r>"),
+    support.corpusDocument(support.DOCUMENT),
 };
 
 test "[fuzz] - [mzML events]: any bytes give the same events and failure at any split" {
@@ -524,13 +519,14 @@ test "[property] - [mzML encoding terms]: classify encoding terms with the reade
         if (std.mem.eql(u8, vocabulary.identity.key, "psi-ms")) break vocabulary;
     } else return error.TestUnexpectedResult;
     var classified: usize = 0;
-    for (ms.terms) |term| {
-        if (term.obsolete) continue;
-        const data_type = try ms.isA(term.id, "MS:1000518", 1000) and !std.mem.eql(u8, term.id, "MS:1000518");
-        const compression = try ms.isA(term.id, "MS:1000572", 1000) and !std.mem.eql(u8, term.id, "MS:1000572");
+    for (0..ms.count()) |index| {
+        const term = ms.term(index);
+        if (term.obsolete()) continue;
+        const data_type = try ms.isA(term.id(), "MS:1000518") and !std.mem.eql(u8, term.id(), "MS:1000518");
+        const compression = try ms.isA(term.id(), "MS:1000572") and !std.mem.eql(u8, term.id(), "MS:1000572");
         const Declaration = enum { primitive, compression };
         const expected: ?Declaration = if (data_type) .primitive else if (compression) .compression else null;
-        const kind: ?Declaration = if (mzml.model.encodingTerm(term.id)) |found| switch (found) {
+        const kind: ?Declaration = if (mzml.model.encodingTerm(term.id())) |found| switch (found) {
             .primitive => .primitive,
             .compression => .compression,
             .unsupported => |declaration| switch (declaration) {
@@ -539,7 +535,7 @@ test "[property] - [mzML encoding terms]: classify encoding terms with the reade
             },
         } else null;
         std.testing.expectEqual(expected, kind) catch |err| {
-            std.debug.print("{s} {s}\n", .{ term.id, term.name });
+            std.debug.print("{s} {s}\n", .{ term.id(), term.name() });
             return err;
         };
         classified += @intFromBool(kind != null);
