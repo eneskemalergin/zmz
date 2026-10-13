@@ -341,6 +341,14 @@ pub const Cursor = struct {
         return error.UnexpectedEnd;
     }
 
+    // Closes the current start element, written as <name/>, without producing its end event,
+    // for a reader that keeps nothing from that event.
+    pub fn closeEmpty(self: *Cursor) void {
+        std.debug.assert(self.pending_empty and self.depth != 0);
+        self.pending_empty = false;
+        self.popFrame(self.frames[self.depth - 1]);
+    }
+
     // Starts at a current start element and leaves the subtree's end event current.
     pub fn skipElement(self: *Cursor, remaining_nodes: *usize) (AdvanceError || error{UnexpectedEnd})!void {
         std.debug.assert(self.current.?.data == .start_element);
@@ -465,8 +473,7 @@ pub const Cursor = struct {
         const reader = self.source.reader orelse return;
         const bytes = reader.buffered();
         const bound = @min(bytes.len, TEXT_CHUNK_BYTES);
-        var length: usize = 0;
-        while (length < bound and isXmlWhitespace(bytes[length])) : (length += 1) {}
+        const length = whitespaceRun(bytes[0..bound]);
         // A complete run preserves the original text event's failure order.
         if (length == 0 or length == bound or bytes[length] != '<') return;
         const end = std.math.add(u64, self.source.position, length) catch return;
@@ -491,6 +498,7 @@ pub const Cursor = struct {
                 continue;
             }
             if (ignore_whitespace) self.skipBufferedWhitespace();
+            var buffered_text = false;
             if (self.source.bytesAreCharacters()) if (self.source.reader) |reader| {
                 // A start or end tag opening in the buffer skips the codepoint reads; comments,
                 // processing instructions, and CDATA keep them.
@@ -510,8 +518,10 @@ pub const Cursor = struct {
                     if (try self.readBufferedStartElement(opening_start)) |event| return event;
                     return try self.readStartElement(opening_start);
                 }
+                // Buffered text needs no codepoint read before the text reader either.
+                buffered_text = bytes.len != 0 and bytes[0] != '<';
             };
-            const first = self.source.peekCodepoint() catch |err| switch (err) {
+            const first: u21 = if (buffered_text) 0 else (self.source.peekCodepoint() catch |err| switch (err) {
                 error.EndOfStream => {
                     if (self.root_seen and self.root_closed and self.depth == 0) {
                         self.document_ended = true;
@@ -520,8 +530,8 @@ pub const Cursor = struct {
                     return self.malformed(.unexpected_end);
                 },
                 else => |other| return other,
-            };
-            if (first.value != '<') {
+            }).value;
+            if (buffered_text or first != '<') {
                 if (try self.readScalarText()) |event| return event;
                 continue;
             }
@@ -1146,11 +1156,33 @@ pub const Cursor = struct {
         while (self.text_bytes.items.len < TEXT_CHUNK_BYTES) {
             if (self.normal_text_brackets == 0) {
                 if (try self.source.peekSingleByte()) |bytes| {
-                    const length = ordinaryTextRun(bytes, TEXT_CHUNK_BYTES - self.text_bytes.items.len);
+                    const room = TEXT_CHUNK_BYTES - self.text_bytes.items.len;
+                    var length = ordinaryTextRun(bytes, room);
+                    // Line feeds and tabs stay as they are in text, so a run continues past them.
+                    while (length < @min(bytes.len, room) and (bytes[length] == '\n' or bytes[length] == '\t'))
+                        length += 1 + ordinaryTextRun(bytes[length + 1 ..], room - length - 1);
                     if (length != 0) {
+                        // A whole event already buffered, ending at markup or the chunk size, is
+                        // returned in place: its bytes stay in the reader until the next event.
+                        if (self.text_bytes.items.len == 0 and
+                            (length == TEXT_CHUNK_BYTES or (length < bytes.len and bytes[length] == '<')))
+                        {
+                            self.source.borrowed_len = length;
+                            return .{
+                                .span = .{ .start = start, .end = start + length },
+                                .data = .{ .text = .{ .bytes = bytes[0..length] } },
+                            };
+                        }
                         // Keep logical text chunks unchanged across input refills.
                         try self.text_bytes.appendSlice(self.allocator, bytes[0..length]);
                         self.source.borrowed_len = length;
+                        try self.source.commitBorrowed();
+                        continue;
+                    }
+                    // A buffered CR LF line end becomes one line feed without a codepoint read.
+                    if (bytes.len >= 2 and bytes[0] == '\r' and bytes[1] == '\n') {
+                        try self.text_bytes.append(self.allocator, '\n');
+                        self.source.borrowed_len = 2;
                         try self.source.commitBorrowed();
                         continue;
                     }
@@ -1456,6 +1488,25 @@ fn isXmlWhitespace(value: u21) bool {
     return value == ' ' or value == '\t' or value == '\r' or value == '\n';
 }
 
+// The length of the leading run of XML whitespace; indentation runs are long, so 16 bytes at
+// a time.
+fn whitespaceRun(bytes: []const u8) usize {
+    // Unindented markup has no run at all; one byte decides that.
+    if (bytes.len == 0 or !isXmlWhitespace(bytes[0])) return 0;
+    const Vector = @Vector(16, u8);
+    var length: usize = 0;
+    while (bytes.len - length >= 16) {
+        const run: Vector = bytes[length..][0..16].*;
+        const space = (run == @as(Vector, @splat(' '))) | (run == @as(Vector, @splat('\n'))) |
+            (run == @as(Vector, @splat('\r'))) | (run == @as(Vector, @splat('\t')));
+        const mask: u16 = @bitCast(space);
+        if (mask != 0xffff) return length + @ctz(~mask);
+        length += 16;
+    }
+    while (length < bytes.len and isXmlWhitespace(bytes[length])) : (length += 1) {}
+    return length;
+}
+
 fn isXmlWhitespaceRun(bytes: []const u8) bool {
     for (bytes) |byte| if (!isXmlWhitespace(byte)) return false;
     return true;
@@ -1475,10 +1526,15 @@ fn isAsciiNameStart(value: u8) bool {
 }
 
 fn isAsciiNameChar(value: u8) bool {
-    return isAsciiNameStart(value) or
-        (value >= '0' and value <= '9') or
-        value == '-' or value == '.';
+    return NAME_CHARS[value];
 }
+
+// One table entry per byte, so a name scan tests each byte once instead of by ranges.
+const NAME_CHARS = blk: {
+    var table: [256]bool = @splat(false);
+    for (0..256) |byte| table[byte] = isAsciiNameStart(byte) or (byte >= '0' and byte <= '9') or byte == '-' or byte == '.';
+    break :blk table;
+};
 
 fn isNameDelimiter(value: u21) bool {
     return isXmlWhitespace(value) or value == '/' or value == '>' or value == '=' or value == '?';
@@ -1501,7 +1557,10 @@ fn ordinaryRun(comptime max_width: usize, bytes: []const u8, stops: [3]u8) usize
         const run: Vector = bytes[length..][0..width].*;
         var exceptional = (run < @as(Vector, @splat(0x20))) | (run >= @as(Vector, @splat(0x80)));
         inline for (stops) |stop| exceptional |= run == @as(Vector, @splat(stop));
-        if (std.simd.firstTrue(exceptional)) |lane| return length + lane;
+        // A lane mask finds the first exceptional byte with one bit count, where std.simd.firstTrue
+        // takes a horizontal minimum.
+        const mask: std.meta.Int(.unsigned, width) = @bitCast(exceptional);
+        if (mask != 0) return length + @ctz(mask);
         length += width;
     }
     while (length < bytes.len) : (length += 1) {
@@ -1871,8 +1930,7 @@ pub const Writer = struct {
         self.frame_count += 1;
         if (self.frame_count == 1) self.root_written = true;
         self.state = .start_tag;
-        try self.writeByte('<');
-        try self.writeBytes(name);
+        try self.writeParts(.{ "<", name });
     }
 
     pub fn namespace(self: *Writer, prefix: ?[]const u8, uri: []const u8) WriterError!void {
@@ -2003,9 +2061,7 @@ pub const Writer = struct {
             try self.checkOpeningName();
             try self.writeBytes("/>");
         } else {
-            try self.writeBytes("</");
-            try self.writeBytes(name);
-            try self.writeByte('>');
+            try self.writeParts(.{ "</", name, ">" });
         }
         self.frame_count -= 1;
         self.open_names.items.len = frame.name_start;
@@ -2104,6 +2160,8 @@ pub const Writer = struct {
             self.attribute_names.appendSlice(self.allocator, std.mem.asBytes(&name.len)) catch return self.fail(error.OutOfMemory);
             self.attribute_names.appendSlice(self.allocator, name) catch return self.fail(error.OutOfMemory);
         }
+        // A value with nothing to escape is written with its name in one step.
+        if (ordinaryAttributeRun(value, '"') == value.len) return self.writeParts(.{ " ", name, "=\"", value, "\"" });
         try self.writeByte(' ');
         try self.writeBytes(name);
         try self.writeBytes("=\"");
@@ -2126,6 +2184,26 @@ pub const Writer = struct {
     fn writeBytes(self: *Writer, bytes: []const u8) WriterError!void {
         const next = std.math.add(u64, self.logical_offset, @intCast(bytes.len)) catch return self.fail(error.LimitExceeded);
         self.sink.writeAll(bytes) catch return self.fail(error.WriteFailed);
+        self.logical_offset = next;
+    }
+
+    // Copies the parts straight into the sink's free buffer when they all fit, so a tag or an
+    // attribute costs one capacity check instead of one write per part.
+    fn writeParts(self: *Writer, parts: anytype) WriterError!void {
+        var total: usize = 0;
+        inline for (parts) |part| total += part.len;
+        const available = self.sink.unusedCapacitySlice();
+        if (available.len < total) {
+            inline for (parts) |part| try self.writeBytes(part);
+            return;
+        }
+        const next = std.math.add(u64, self.logical_offset, total) catch return self.fail(error.LimitExceeded);
+        var position: usize = 0;
+        inline for (parts) |part| {
+            @memcpy(available[position..][0..part.len], part);
+            position += part.len;
+        }
+        self.sink.advance(total);
         self.logical_offset = next;
     }
 
@@ -2928,6 +3006,58 @@ test "[failure] - [mzML XML writer]: keeps duplicate-attribute failures sticky" 
     try writer.attribute("id", "one");
     try std.testing.expectError(error.DuplicateAttribute, writer.attribute("id", "two"));
     try std.testing.expectError(error.DuplicateAttribute, writer.text("later"));
+}
+
+test "[property] - [mzML XML writer]: gives the same bytes and offsets at every sink buffer size" {
+    // A sink whose small buffer drains into one list, so writes stop fitting at every point.
+    const Collect = struct {
+        writer: std.Io.Writer,
+        bytes: std.ArrayList(u8) = .empty,
+
+        fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+            const self: *@This() = @alignCast(@fieldParentPtr("writer", w));
+            self.bytes.appendSlice(std.testing.allocator, w.buffered()) catch return error.WriteFailed;
+            w.end = 0;
+            var written: usize = 0;
+            for (data[0 .. data.len - 1]) |bytes| {
+                self.bytes.appendSlice(std.testing.allocator, bytes) catch return error.WriteFailed;
+                written += bytes.len;
+            }
+            for (0..splat) |_| self.bytes.appendSlice(std.testing.allocator, data[data.len - 1]) catch return error.WriteFailed;
+            return written + data[data.len - 1].len * splat;
+        }
+
+        fn write(sink: *std.Io.Writer) !u64 {
+            var writer = Writer.init(std.testing.allocator, sink, .{});
+            defer writer.deinit();
+            try writer.startDocument();
+            try writer.startElement("mzML");
+            try writer.namespace(null, NAMESPACE);
+            try writer.attributeTrusted("id", "plain value", false);
+            try writer.attribute("note", "needs <escaping> & \"quotes\"");
+            try writer.startElementTrusted("cvParam");
+            try writer.attributeTrusted("accession", "MS:1000511", false);
+            try writer.endElement();
+            try writer.startElementTrusted("run");
+            try writer.text("text\n");
+            try writer.endElement();
+            try writer.endElement();
+            try writer.endDocument();
+            return writer.byteOffset().?;
+        }
+    };
+    var whole: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer whole.deinit();
+    const length = try Collect.write(&whole.writer);
+    try std.testing.expectEqual(@as(u64, whole.written().len), length);
+    var buffer: [256]u8 = undefined;
+    for (1..whole.written().len + 2) |size| {
+        var collect: Collect = .{ .writer = .{ .vtable = &.{ .drain = Collect.drain }, .buffer = buffer[0..size] } };
+        defer collect.bytes.deinit(std.testing.allocator);
+        try std.testing.expectEqual(length, try Collect.write(&collect.writer));
+        try collect.writer.flush();
+        try std.testing.expectEqualStrings(whole.written(), collect.bytes.items);
+    }
 }
 
 test "[property] - [mzML XML writer]: copies attribute names and permits reuse on child and sibling tags" {

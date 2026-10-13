@@ -336,6 +336,8 @@ fn traceWith(allocator: std.mem.Allocator, input: *std.Io.Reader, out: *std.Io.W
 test "[property] - [mzML events]: every input split gives the same tags, spans, and failures" {
     const document = "<r xmlns:p='urn:p'><a/><a></a><b x='1' y='2'></b ><p:c p:z='3'></p:c>" ++
         "<d>t</d><!-- c --><?pi x?><e><![CDATA[<]]></e><f\n/><g><?pi y?></g></r>";
+    // Text with tabs, line ends, an entity, brackets, and runs past one 64-byte block.
+    const text = "<r>\n\t <a>one\ttwo\nthree\r\nfour&amp;five]]six</a>\r\n" ++ " " ** 40 ++ "<b>" ++ "x" ** 70 ++ "</b>\n</r>";
     const cases = [_][]const u8{
         document,
         "<r><a></ab></r>",
@@ -345,13 +347,15 @@ test "[property] - [mzML events]: every input split gives the same tags, spans, 
         "<r></r></r>",
         "<r><a/ ></r>",
         "<r><p:a></p:a></r>",
+        text,
     };
     for (cases) |source| {
         var whole: std.Io.Writer.Allocating = .init(std.testing.allocator);
         defer whole.deinit();
         var fixed = std.Io.Reader.fixed(source);
         try trace(std.testing.allocator, &fixed, &whole.writer);
-        try std.testing.expectEqual(source.ptr != document.ptr, std.mem.indexOf(u8, whole.written(), "InvalidXml") != null);
+        const valid = source.ptr == document.ptr or source.ptr == text.ptr;
+        try std.testing.expectEqual(!valid, std.mem.indexOf(u8, whole.written(), "InvalidXml") != null);
         var buffer: [256]u8 = undefined;
         for (1..source.len + 1) |size| {
             var split: std.Io.Writer.Allocating = .init(std.testing.allocator);
@@ -370,9 +374,11 @@ test "[property] - [mzML events]: skipping whitespace text drops exactly the bla
         "<r>   <a/>  t  <b/>   </r>",
         "<r>\n  <a></b>\n</r>",
         "<r> x </r> y",
+        // Indentation across 16-byte steps, and a long blank run before text.
+        "<r>\n" ++ " " ** 15 ++ "<a/>\r\n" ++ " " ** 16 ++ "<b/>\n" ++ "\t" ** 33 ++ "<c/>" ++ " " ** 47 ++ "x</r>",
     };
     for (cases) |source| {
-        var buffer: [128]u8 = undefined;
+        var buffer: [256]u8 = undefined;
         for (1..source.len + 1) |size| {
             var expected: std.Io.Writer.Allocating = .init(std.testing.allocator);
             defer expected.deinit();

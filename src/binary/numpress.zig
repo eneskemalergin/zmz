@@ -105,12 +105,15 @@ pub fn optimalLinearFixedPoint(input: anytype) error{ InvalidFixedPoint, Invalid
 
     if (values.len == 1) return fixedPointForMaximum(valueAt(values, 0));
 
-    var maximum = @max(valueAt(values, 0), valueAt(values, 1));
+    // The reference takes the ceiling of each residual bound; ceil is monotonic, so the ceiling
+    // of the largest bound is the same maximum.
+    var residual: f64 = 0;
     var index: usize = 2;
     if (values.len >= 64) {
-        maximum = try linearMaximumVector(values, index, maximum, &index);
+        residual = try linearMaximumVector(values, index, residual, &index);
     }
-    return fixedPointForMaximum(try linearMaximumScalar(values, index, maximum));
+    residual = try linearMaximumScalar(values, index, residual);
+    return fixedPointForMaximum(@max(@max(valueAt(values, 0), valueAt(values, 1)), @ceil(residual)));
 }
 
 /// Selects a Linear fixed point that bounds rounding error by `max_abs_error`.
@@ -167,8 +170,7 @@ fn linearMaximumVector(
         if (!@reduce(.And, @abs(extrapolated) <= finite_limit)) {
             return error.ValueOutOfRange;
         }
-        const candidates = @ceil(@abs(current - extrapolated) + one);
-        maximum = @max(maximum, @reduce(.Max, candidates));
+        maximum = @max(maximum, @reduce(.Max, @abs(current - extrapolated) + one));
     }
     end.* = index;
     return maximum;
@@ -183,7 +185,7 @@ fn linearMaximumScalar(
     for (start..values.len) |index| {
         const extrapolated = valueAt(values, index - 1) + (valueAt(values, index - 1) - valueAt(values, index - 2));
         if (!std.math.isFinite(extrapolated)) return error.ValueOutOfRange;
-        maximum = @max(maximum, @ceil(@abs(valueAt(values, index) - extrapolated) + 1.0));
+        maximum = @max(maximum, @abs(valueAt(values, index) - extrapolated) + 1.0);
     }
     return maximum;
 }

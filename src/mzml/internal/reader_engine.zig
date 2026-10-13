@@ -924,11 +924,13 @@ const ParamAttributes = struct {
     unit_name: ?[]const u8 = null,
 };
 const ParamKind = std.meta.Tag(cv.Entry);
-const PARAM_ATTRIBUTES = std.StaticStringMap(std.meta.FieldEnum(ParamAttributes)).initComptime(.{
-    .{ "ref", .ref },               .{ "cvRef", .cv_ref },                 .{ "accession", .accession },
-    .{ "name", .name },             .{ "value", .value },                  .{ "type", .value_type },
-    .{ "unitCvRef", .unit_cv_ref }, .{ "unitAccession", .unit_accession }, .{ "unitName", .unit_name },
-});
+// Compared in order, each against a name of known length, so a match costs one length check per
+// earlier entry and one fixed-size comparison; the common fields come first.
+const PARAM_ATTRIBUTES = [_]struct { []const u8, std.meta.FieldEnum(ParamAttributes) }{
+    .{ "cvRef", .cv_ref },       .{ "accession", .accession },   .{ "name", .name },
+    .{ "value", .value },        .{ "unitCvRef", .unit_cv_ref }, .{ "unitAccession", .unit_accession },
+    .{ "unitName", .unit_name }, .{ "type", .value_type },       .{ "ref", .ref },
+};
 
 fn paramKind(self: *const Engine, start: xml.StartElement) ?ParamKind {
     if (!std.mem.eql(u8, start.name.expanded.namespace_uri orelse "", self.cursor.mzml_namespace)) return null;
@@ -977,41 +979,45 @@ fn parseParams(self: *Engine, storage: *Storage, comptime retain: bool, count: *
         };
         if (retain) try entries.append(self.allocator, entry);
         count.* += 1;
-        try self.cursor.advance(has_content);
-        if (has_content) {
-            var content: std.ArrayList(cv.ParameterXml.Part) = .empty;
-            defer content.deinit(self.allocator);
-            while (self.cursor.current) |current| {
-                const part: cv.ParameterXml.Part = switch (current.data) {
-                    .end_element => break,
-                    .start_element => .{ .xml = try self.readXml(storage, retain) },
-                    .text => blk: {
-                        var bytes: std.ArrayList(u8) = .empty;
-                        while (self.cursor.current) |text| {
-                            if (text.data != .text) break;
-                            if (retain) {
-                                if (text.data.text.bytes.len > storage.limit -| storage.used -| bytes.items.len)
-                                    return try storage.limitError(bytes.items.len +| text.data.text.bytes.len);
-                                try bytes.appendSlice(storage.arena.allocator(), text.data.text.bytes);
-                            }
-                            try self.cursor.advance(true);
-                        }
-                        storage.used += bytes.items.len;
-                        break :blk .{ .text = bytes.items };
-                    },
-                };
-                if (retain) {
-                    if (content.items.len == self.options.limits.list_entries)
-                        return try self.limitError(.metadata, .list_entries, self.options.limits.list_entries, null);
-                    try content.append(self.allocator, part);
-                }
-                if (part != .text) try self.cursor.advance(true);
-            }
-            if (retain) extra.?.content = try storage.copy(cv.ParameterXml.Part, content.items);
-            if (retain and !has_extra and content.items.len == 0) switch (entries.items[entries.items.len - 1]) {
-                inline else => |*param| param.xml = null,
-            };
+        if (!has_content) {
+            // An empty parameter's end event carries nothing, so the cursor closes it in place.
+            self.cursor.closeEmpty();
+            try self.cursor.advance(false);
+            continue;
         }
+        try self.cursor.advance(true);
+        var content: std.ArrayList(cv.ParameterXml.Part) = .empty;
+        defer content.deinit(self.allocator);
+        while (self.cursor.current) |current| {
+            const part: cv.ParameterXml.Part = switch (current.data) {
+                .end_element => break,
+                .start_element => .{ .xml = try self.readXml(storage, retain) },
+                .text => blk: {
+                    var bytes: std.ArrayList(u8) = .empty;
+                    while (self.cursor.current) |text| {
+                        if (text.data != .text) break;
+                        if (retain) {
+                            if (text.data.text.bytes.len > storage.limit -| storage.used -| bytes.items.len)
+                                return try storage.limitError(bytes.items.len +| text.data.text.bytes.len);
+                            try bytes.appendSlice(storage.arena.allocator(), text.data.text.bytes);
+                        }
+                        try self.cursor.advance(true);
+                    }
+                    storage.used += bytes.items.len;
+                    break :blk .{ .text = bytes.items };
+                },
+            };
+            if (retain) {
+                if (content.items.len == self.options.limits.list_entries)
+                    return try self.limitError(.metadata, .list_entries, self.options.limits.list_entries, null);
+                try content.append(self.allocator, part);
+            }
+            if (part != .text) try self.cursor.advance(true);
+        }
+        if (retain) extra.?.content = try storage.copy(cv.ParameterXml.Part, content.items);
+        if (retain and !has_extra and content.items.len == 0) switch (entries.items[entries.items.len - 1]) {
+            inline else => |*param| param.xml = null,
+        };
         const end = self.cursor.current orelse return error.UnexpectedEnd;
         if (end.data != .end_element) return error.InvalidStructure;
         try self.cursor.advance(false);
@@ -1056,7 +1062,9 @@ fn copyParamAttributes(
 
 fn parameterAttribute(name: xml.ExpandedName, selected: ParamKind) ?std.meta.FieldEnum(ParamAttributes) {
     if (name.namespace_uri != null) return null;
-    const field = PARAM_ATTRIBUTES.get(name.local) orelse return null;
+    const field = inline for (PARAM_ATTRIBUTES) |entry| {
+        if (std.mem.eql(u8, name.local, entry[0])) break entry[1];
+    } else return null;
     if (selected == .group_ref) return if (field == .ref) field else null;
     return switch (field) {
         .ref => null,
