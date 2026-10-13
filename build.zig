@@ -98,6 +98,33 @@ pub fn build(b: *std.Build) void {
     }) });
     test_step.dependOn(&b.addRunArtifact(check_cli_tests).step);
 
+    // Always ReleaseFast, the library and its dependency included: the numbers describe release
+    // builds whatever -Doptimize says.
+    const bench_zmz = b.createModule(.{ .root_source_file = b.path("src/root.zig"), .target = target, .optimize = .ReleaseFast });
+    configureLibraryModule(bench_zmz, buildKernels(b, target, .ReleaseFast, kernel_backend));
+    const bench = b.addExecutable(.{
+        .name = "zmz-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/bench.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .strip = true,
+            .imports = &.{.{ .name = "zmz", .module = bench_zmz }},
+        }),
+    });
+    // The generator and cases are checked like the rest, in the requested mode, on tiny inputs.
+    const bench_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("bench/bench.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = strip,
+        .imports = &.{.{ .name = "zmz", .module = zmz }},
+    }) });
+    test_step.dependOn(&b.addRunArtifact(bench_tests).step);
+    const bench_run = b.addRunArtifact(bench);
+    bench_run.addArg(b.cache_root.join(b.allocator, &.{"zmz-bench"}) catch @panic("OOM"));
+    b.step("bench", "Generate inputs and time reading, decoding, lookup, copying, and writing (ReleaseFast)").dependOn(&bench_run.step);
+
     const vocabulary_module = b.createModule(.{
         .root_source_file = b.path("tools/vocabulary.zig"),
         .target = target,
