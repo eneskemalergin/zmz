@@ -16,7 +16,7 @@
 </p>
 
 <p align="center">
-  <a href="#install">Install</a> | <a href="#example">Example</a> | <a href="#documentation">Documentation</a> | <a href="#benchmarks">Benchmarks</a> | <a href="#status-and-limits">Status</a>
+  <a href="#install">Install</a> | <a href="#example">Example</a> | <a href="#documentation">Documentation</a> | <a href="#benchmarks">Benchmarks</a> | <a href="#built-with-zmz">Built with zmz</a> | <a href="#status-and-limits">Status</a>
 </p>
 
 <!-- markdownlint-enable MD041 -->
@@ -108,6 +108,19 @@ Six mzML libraries read the same real files through their own public APIs. Every
 - [Benchmarks](https://github.com/eneskemalergin/zmz/wiki/Benchmarks) in the wiki has the method, machine, versions, per-file numbers, and what each library got wrong.
 
 `zig build bench` measures zmz on its own, with nothing to download: forward reading, full decoding, XML events, indexed lookup, copying, and writing, on generated files in five shapes.
+
+## Built with zmz
+
+<p align="center">
+  <a href="https://github.com/eneskemalergin/mzValidate"><img src="https://raw.githubusercontent.com/eneskemalergin/mzValidate/main/assets/mzvalidate-icon.svg" alt="mzValidate" width="72"></a>
+  &nbsp;
+  <a href="https://github.com/eneskemalergin/mzarc"><img src="https://raw.githubusercontent.com/eneskemalergin/mzarc/main/assets/mzarc-orbit-mark.svg" alt="mzarc" width="72"></a>
+</p>
+
+- **[mzValidate](https://github.com/eneskemalergin/mzValidate)** validates mzML files in one streaming pass, on zmz's XML events, Base64, zlib, and SHA-1.
+- **[mzarc](https://github.com/eneskemalergin/mzarc)** compresses mass-spectrometry spectra with domain-specific codecs, decoding only the arrays it archives.
+
+Both move to zmz in their next releases. [Built with zmz](https://github.com/eneskemalergin/zmz/wiki/Built-with-zmz) says what each one uses; open an issue to add yours.
 
 ## Status and limits
 
