@@ -117,6 +117,8 @@ zig build vocabulary -- generate candidate-manifest.json history.json psi-ms-cor
 
 `generate` runs the review checks, generates twice, compares the results, and formats the Zig output. It publishes a new file atomically and refuses to replace an existing path. It does not install or accept an update automatically.
 
+The [vocabulary update workflow](../.github/workflows/vocabulary.yml) runs these steps every week. When either resource has released since the bundled snapshot, it collects every release from upstream git, reviews the newest, extends the history, generates, tests, and opens a pull request with a summary of the review. A blocked review fails the run and lists the blocking events. The pull request still needs a maintainer: read the full review, update the snapshot facts above, and run the release-gate checks. GitHub does not start other workflows for pull requests a workflow opens, and the repository must allow workflows to open pull requests.
+
 `review` and `generate` reject incorrect digests, required fields, duplicate primary or alternate IDs, unsupported manifest or artifact versions, and count mismatches. Input files are limited to 32 MiB each. The ingestion profile accepts OBO 1.2 and 1.4 term and typedef stanzas and requires `format-version`, `data-version`, and `ontology` headers.
 
 The update policy lives in [tools/vocabulary.zig](../tools/vocabulary.zig), separate from generated data:
