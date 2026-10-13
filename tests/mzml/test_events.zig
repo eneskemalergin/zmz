@@ -524,13 +524,14 @@ test "[property] - [mzML encoding terms]: classify encoding terms with the reade
         if (std.mem.eql(u8, vocabulary.identity.key, "psi-ms")) break vocabulary;
     } else return error.TestUnexpectedResult;
     var classified: usize = 0;
-    for (ms.terms) |term| {
-        if (term.obsolete) continue;
-        const data_type = try ms.isA(term.id, "MS:1000518", 1000) and !std.mem.eql(u8, term.id, "MS:1000518");
-        const compression = try ms.isA(term.id, "MS:1000572", 1000) and !std.mem.eql(u8, term.id, "MS:1000572");
+    for (0..ms.count()) |index| {
+        const term = ms.term(index);
+        if (term.obsolete()) continue;
+        const data_type = try ms.isA(term.id(), "MS:1000518") and !std.mem.eql(u8, term.id(), "MS:1000518");
+        const compression = try ms.isA(term.id(), "MS:1000572") and !std.mem.eql(u8, term.id(), "MS:1000572");
         const Declaration = enum { primitive, compression };
         const expected: ?Declaration = if (data_type) .primitive else if (compression) .compression else null;
-        const kind: ?Declaration = if (mzml.model.encodingTerm(term.id)) |found| switch (found) {
+        const kind: ?Declaration = if (mzml.model.encodingTerm(term.id())) |found| switch (found) {
             .primitive => .primitive,
             .compression => .compression,
             .unsupported => |declaration| switch (declaration) {
@@ -539,7 +540,7 @@ test "[property] - [mzML encoding terms]: classify encoding terms with the reade
             },
         } else null;
         std.testing.expectEqual(expected, kind) catch |err| {
-            std.debug.print("{s} {s}\n", .{ term.id, term.name });
+            std.debug.print("{s} {s}\n", .{ term.id(), term.name() });
             return err;
         };
         classified += @intFromBool(kind != null);

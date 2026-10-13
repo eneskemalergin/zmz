@@ -1,5 +1,5 @@
 {
-  "format_version": 1,
+  "format_version": 2,
   "resources": [
     {
       "key": "psi-ms",
@@ -15,7 +15,7 @@
       "license": "CC-BY-4.0",
       "attribution": "HUPO Proteomics Standards Initiative Mass Spectrometry Standards Working Group and Proteomics Informatics Working Group",
       "sha256": "2346128b4ac445229f204f6edc225b81c4b4afa6846cf95968bde0b17bf8825d",
-      "artifact_version": 1,
+      "artifact_version": 2,
       "counts": {
         "terms": 4114,
         "native_terms": 3986,
@@ -27,7 +27,16 @@
         "value_types": 1378,
         "units": 327,
         "binary_xrefs": 39
-      }
+      },
+      "declaration_uris": [
+        "https://raw.githubusercontent.com/HUPO-PSI/psi-ms-CV/master/psi-ms.obo",
+        "http://psidev.cvs.sourceforge.net/*checkout*/psidev/psi/psi-ms/mzML/controlledVocabulary/psi-ms.obo"
+      ],
+      "declaration_names": [
+        "Proteomics Standards Initiative Mass Spectrometry Ontology",
+        "Proteomics Standards Initiative Mass Spectrometry Vocabularies",
+        "Mass spectrometry ontology"
+      ]
     },
     {
       "key": "uo",
@@ -43,7 +52,7 @@
       "license": "CC-BY-4.0",
       "attribution": "Unit Ontology contributors, bio-ontology-research-group/unit-ontology",
       "sha256": "6e77b0a59ab5eddf8296f88f3355dcec429b7391dfc001d778e0b2841251b6bf",
-      "artifact_version": 1,
+      "artifact_version": 2,
       "counts": {
         "terms": 574,
         "native_terms": 574,
@@ -55,7 +64,17 @@
         "value_types": 0,
         "units": 0,
         "binary_xrefs": 0
-      }
+      },
+      "declaration_uris": [
+        "https://raw.githubusercontent.com/bio-ontology-research-group/unit-ontology/master/unit.obo",
+        "https://raw.githubusercontent.com/bio-ontology-research-group/unit-ontology/master/uo.obo",
+        "http://purl.obolibrary.org/obo/uo.obo",
+        "http://obo.cvs.sourceforge.net/*checkout*/obo/obo/ontology/phenotype/unit.obo",
+        "http://ontologies.berkeleybop.org/uo.obo"
+      ],
+      "declaration_names": [
+        "UNIT-ONTOLOGY"
+      ]
     }
   ]
 }

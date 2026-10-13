@@ -3,57 +3,151 @@
 const std = @import("std");
 const cv = @import("zmz").mzml.cv;
 
-const GRAPH: cv.Vocabulary = .{
-    .identity = .{ .key = "example", .version = "current", .namespace = "X" },
-    .terms = &.{
-        .{ .id = "X:1", .name = "root" },
-        .{ .id = "X:2", .name = "child", .parents = &.{"X:1"} },
-        .{ .id = "X:3", .name = "cycle", .parents = &.{"X:3"} },
-        .{ .id = "X:4", .name = "dangling", .parents = &.{"X:missing"} },
-        .{ .id = "X:5", .name = "typed", .relationships = &.{
-            .{ .kind = "has_value_type", .target = "X:6" },
-            .{ .kind = "has_units", .target = "UO:0000010" },
-        } },
-        .{ .id = "X:6", .name = "integer", .relationships = &.{
-            .{ .kind = "has_value_type", .target = "xsd:integer" },
-        } },
-        .{ .id = "X:7", .name = "cyclic type", .relationships = &.{
-            .{ .kind = "has_value_type", .target = "X:7" },
-        } },
-    },
-    .aliases = &.{.{ .id = "X:02", .term_index = 1 }},
-};
+// A small resource with every modeled field, parsed as a newer release would be at run time.
+const GRAPH_OBO =
+    \\format-version: 1.2
+    \\data-version: current
+    \\ontology: example
+    \\remark: example resource
+    \\[Term]
+    \\id: X:1
+    \\name: root
+    \\[Term]
+    \\id: X:2
+    \\name: child
+    \\def: "A child term." [X:ref]
+    \\synonym: "kid" EXACT []
+    \\is_a: X:1 ! root
+    \\alt_id: X:02
+    \\subset: core
+    \\xref: binary-data-type:MS\:1000523 "64-bit float"
+    \\[Term]
+    \\id: X:4
+    \\name: dangling
+    \\is_a: X:missing
+    \\[Term]
+    \\id: X:5
+    \\name: typed
+    \\relationship: has_value_type X:6
+    \\relationship: has_units UO:0000010 {cardinality="1"}
+    \\[Term]
+    \\id: X:6
+    \\name: integer
+    \\relationship: has_value_type xsd:integer
+    \\[Term]
+    \\id: X:7
+    \\name: cyclic type
+    \\relationship: has_value_type X:7
+    \\[Term]
+    \\id: X:8
+    \\name: retired
+    \\is_obsolete: true
+    \\replaced_by: X:2
+    \\consider: X:5
+;
+const GRAPH_IDENTITY: cv.Vocabulary.Identity = .{ .key = "example", .version = "current", .namespace = "X", .source_version = "current" };
 
-test "[unit] - [CV vocabulary]: resolves exact identities and bounded graph queries" {
-    const alias = GRAPH.lookup("X:02").?;
+test "[unit] - [CV vocabulary]: resolves exact identities, the graph, and term metadata" {
+    const graph = try cv.Vocabulary.parseObo(std.testing.allocator, GRAPH_OBO, GRAPH_IDENTITY);
+    defer graph.deinit();
+    const resource = &graph.vocabulary;
+    const alias = resource.lookup("X:02").?;
     try std.testing.expect(alias.alternate_id);
-    try std.testing.expectEqualStrings("X:2", alias.term.id);
-    try std.testing.expectEqual(null, GRAPH.lookup("x:2"));
-    var invalid_alias = GRAPH;
-    invalid_alias.aliases = &.{.{ .id = "X:02", .term_index = GRAPH.terms.len }};
-    try std.testing.expectEqual(null, invalid_alias.lookup("X:02"));
-    try std.testing.expect(try GRAPH.isA("X:02", "X:1", 2));
-    try std.testing.expect(try GRAPH.isA("X:02", "X:2", 1));
-    try std.testing.expect(!try GRAPH.isA("X:1", "X:2", 2));
-    try std.testing.expectError(error.TraversalLimit, GRAPH.isA("X:2", "X:1", 1));
-    try std.testing.expectError(error.Cycle, GRAPH.isA("X:3", "X:1", 10));
-    try std.testing.expectError(error.UnknownTerm, GRAPH.isA("X:4", "X:1", 10));
-    try std.testing.expectError(error.UnknownTerm, GRAPH.isA("X:2", "X:missing", 10));
+    try std.testing.expectEqualStrings("X:2", alias.term.id());
+    try std.testing.expectEqual(null, resource.lookup("x:2"));
+    try std.testing.expect(try resource.isA("X:02", "X:1"));
+    try std.testing.expect(try resource.isA("X:02", "X:2"));
+    try std.testing.expect(!try resource.isA("X:1", "X:2"));
+    try std.testing.expect(!try resource.isA("X:4", "X:1"));
+    try std.testing.expectError(error.UnknownTerm, resource.isA("X:2", "X:missing"));
 
     var types: [2][]const u8 = undefined;
-    const resolved = try GRAPH.valueTypes("X:5", &types, 3);
+    const resolved = try resource.valueTypes("X:5", &types, 3);
     try std.testing.expectEqual(@as(usize, 1), resolved.len);
     try std.testing.expectEqualStrings("xsd:integer", resolved[0]);
-    try std.testing.expectError(error.TraversalLimit, GRAPH.valueTypes("X:5", &types, 2));
-    try std.testing.expectError(error.OutputTooSmall, GRAPH.valueTypes("X:5", &.{}, 3));
-    try std.testing.expectError(error.Cycle, GRAPH.valueTypes("X:7", &types, 10));
-    try std.testing.expectEqual(@as(usize, 0), (try GRAPH.valueTypes("X:1", &types, 1)).len);
-    var units = GRAPH.lookup("X:5").?.term.targets("has_units");
-    try std.testing.expectEqualStrings("UO:0000010", units.next().?);
+    try std.testing.expectError(error.TraversalLimit, resource.valueTypes("X:5", &types, 2));
+    try std.testing.expectError(error.OutputTooSmall, resource.valueTypes("X:5", &.{}, 3));
+    try std.testing.expectError(error.Cycle, resource.valueTypes("X:7", &types, 10));
+    try std.testing.expectEqual(@as(usize, 0), (try resource.valueTypes("X:1", &types, 1)).len);
+
+    const typed = resource.lookup("X:5").?.term;
+    var units = typed.targets("has_units");
+    const unit = units.nextTarget().?;
+    try std.testing.expectEqualStrings("UO:0000010", unit.id);
+    try std.testing.expectEqual(null, unit.term);
     try std.testing.expectEqual(null, units.next());
-    var parents = GRAPH.lookup("X:02").?.term.targets("is_a");
-    try std.testing.expectEqualStrings("X:1", parents.next().?);
-    try std.testing.expectEqual(null, parents.next());
+    var edges = typed.relationships();
+    try std.testing.expectEqualStrings("X:6", edges.next().?.target.term.?.id());
+    try std.testing.expectEqualStrings("{cardinality=\"1\"}", edges.next().?.modifiers);
+    // A parent the resource has no term for is a target, not a term.
+    var dangling = resource.lookup("X:4").?.term.targets("is_a");
+    try std.testing.expectEqualStrings("X:missing", dangling.next().?);
+    var no_terms = resource.lookup("X:4").?.term.parents();
+    try std.testing.expectEqual(null, no_terms.next());
+
+    const child = alias.term;
+    try std.testing.expectEqualStrings("child", child.name());
+    try std.testing.expectEqualStrings("A child term.", child.definition().?.value);
+    try std.testing.expectEqualStrings("[X:ref]", child.definition().?.suffix);
+    var synonyms = child.synonyms();
+    try std.testing.expectEqualStrings("kid", synonyms.next().?.value);
+    var xrefs = child.xrefs();
+    try std.testing.expectEqualStrings("binary-data-type:MS:1000523", xrefs.next().?.value);
+    var alternates = child.alternateIds();
+    try std.testing.expectEqualStrings("X:02", alternates.next().?);
+    try std.testing.expect(child.inSubset("core"));
+    try std.testing.expect(!child.inSubset("mzQC"));
+    var ancestors = child.ancestors();
+    try std.testing.expectEqualStrings("X:1", ancestors.next().?.id());
+    try std.testing.expectEqual(null, ancestors.next());
+    const retired = resource.lookup("X:8").?.term;
+    try std.testing.expect(retired.obsolete());
+    var replacement = retired.replacedBy();
+    try std.testing.expectEqualStrings("X:2", replacement.next().?);
+    var consider = retired.consider();
+    try std.testing.expectEqualStrings("X:5", consider.next().?);
+    // A parsed resource keeps its source fields and headers; it records no release history.
+    var fields = child.fields();
+    try std.testing.expectEqualStrings("id", fields.next().?.tag);
+    try std.testing.expectEqualStrings("remark", resource.header(3).?.tag);
+    try std.testing.expectEqual(null, resource.header(4));
+    try std.testing.expectEqual(null, child.firstRelease());
+    try std.testing.expectEqual(@as(usize, 0), resource.releases().count());
+    try std.testing.expectEqual(@as(?usize, null), resource.findRelease("current"));
+}
+
+test "[failure] - [CV vocabulary]: refuses an is_a cycle and a version that differs from the expected" {
+    const cycle = "format-version: 1.2\ndata-version: current\n[Term]\nid: X:1\nname: a\nis_a: X:2\n[Term]\nid: X:2\nname: b\nis_a: X:1\n";
+    try std.testing.expectError(error.Cycle, cv.Vocabulary.parseObo(std.testing.allocator, cycle, GRAPH_IDENTITY));
+    var newer = GRAPH_IDENTITY;
+    newer.source_version = "next";
+    try std.testing.expectError(error.SourceVersionMismatch, cv.Vocabulary.parseObo(std.testing.allocator, GRAPH_OBO, newer));
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            const owned = try cv.Vocabulary.parseObo(allocator, GRAPH_OBO, GRAPH_IDENTITY);
+            owned.deinit();
+        }
+    }.run, .{});
+}
+
+test "[unit] - [CV vocabulary]: bundled resources carry subsets and release history" {
+    const ms = &cv.Resolver.BUNDLED[0];
+    try std.testing.expect(ms.releases().count() > 200);
+    try std.testing.expectEqualStrings("3.80.0_rc1", ms.releases().get(0));
+    try std.testing.expectEqualStrings(ms.identity.source_version, ms.releases().get(ms.releases().count() - 1));
+    try std.testing.expectEqual(@as(?usize, 0), ms.findRelease("3.80.0_rc1"));
+    try std.testing.expectEqualStrings("4.1.204", ms.releases().get(ms.findRelease("4.1.204").?));
+    try std.testing.expectEqual(@as(?usize, null), ms.findRelease("4.1"));
+    try std.testing.expectEqual(@as(?usize, null), ms.findRelease("1.18.2"));
+    // Present in the first recorded release: no recorded first release.
+    try std.testing.expectEqual(null, ms.lookup("MS:1000514").?.term.firstRelease());
+    try std.testing.expectEqualStrings("3.84.0", ms.lookup("MS:1002631").?.term.firstRelease().?);
+    try std.testing.expectEqualStrings("3.89.0", ms.lookup("MS:1002455").?.term.obsoleteSince().?);
+    var former = ms.lookup("MS:1000189").?.term.formerNames();
+    try std.testing.expectEqualStrings("Q-Tof ultima", former.next().?.name);
+    var fields = ms.lookup("MS:1000514").?.term.fields();
+    try std.testing.expectEqual(null, fields.next());
+    try std.testing.expectEqualStrings("format-version", ms.header(0).?.tag);
 }
 
 test "[unit] - [CV resolver]: separates source metadata from current vocabulary interpretation" {
@@ -73,7 +167,7 @@ test "[unit] - [CV resolver]: separates source metadata from current vocabulary 
     try std.testing.expectEqualDeep(source, result.source);
     try std.testing.expectEqual(.exact, result.term.version);
     try std.testing.expectEqual(.exact, result.unit.version);
-    try std.testing.expectEqualStrings("scan start time", result.term.match.?.term.name);
+    try std.testing.expectEqualStrings("scan start time", result.term.match.?.term.name());
     try std.testing.expect(result.term.issues.stale_name);
     try std.testing.expect(!result.term.issues.namespace_mismatch);
     try std.testing.expectEqual(.allowed, result.unit_allowed);
@@ -94,15 +188,18 @@ test "[unit] - [CV resolver]: separates source metadata from current vocabulary 
     changed.cv_ref = "undeclared";
     try std.testing.expect((try resolver.resolve(changed)).term.issues.missing_declaration);
 
-    const ms = resolver.resources[0];
-    const uo = resolver.resources[1];
-    try std.testing.expectEqual(@as(usize, 4114), ms.terms.len);
-    try std.testing.expectEqual(@as(usize, 574), uo.terms.len);
-    try std.testing.expectEqualStrings("UO:0000001", ms.lookup("UO:0000008").?.term.parents[0]);
-    try std.testing.expectEqualStrings("UO:1000008", uo.lookup("UO:0000008").?.term.parents[1]);
+    const ms = &resolver.resources[0];
+    const uo = &resolver.resources[1];
+    try std.testing.expectEqual(ms.identity.counts.terms, ms.count());
+    try std.testing.expectEqual(uo.identity.counts.terms, uo.count());
+    var ms_parents = ms.lookup("UO:0000008").?.term.targets("is_a");
+    try std.testing.expectEqualStrings("UO:0000001", ms_parents.next().?);
+    var uo_parents = uo.lookup("UO:0000008").?.term.targets("is_a");
+    _ = uo_parents.next();
+    try std.testing.expectEqualStrings("UO:1000008", uo_parents.next().?);
     try std.testing.expect(ms.lookup("UO:0000149").?.alternate_id);
-    try std.testing.expectEqualStrings("UO:0000003", ms.lookup("UO:0000149").?.term.id);
-    try std.testing.expect(try ms.isA("MS:1003870", "MS:1000513", 1000));
+    try std.testing.expectEqualStrings("UO:0000003", ms.lookup("UO:0000149").?.term.id());
+    try std.testing.expect(try ms.isA("MS:1003870", "MS:1000513"));
     var types: [3][]const u8 = undefined;
     const resolved_types = try ms.valueTypes("MS:1003163", &types, 10);
     try std.testing.expectEqual(@as(usize, 1), resolved_types.len);
@@ -111,7 +208,8 @@ test "[unit] - [CV resolver]: separates source metadata from current vocabulary 
     const obsolete = try resolver.resolve(.{ .cv_ref = "mass-spec", .accession = .{ .raw = "MS:1000266" } });
     try std.testing.expect(obsolete.term.issues.obsolete);
     try std.testing.expectEqualStrings("MS:1000266", obsolete.source.accession.?.raw);
-    try std.testing.expectEqualStrings("MS:1000393", obsolete.term.match.?.term.replaced_by[0]);
+    var replacement = obsolete.term.match.?.term.replacedBy();
+    try std.testing.expectEqualStrings("MS:1000393", replacement.next().?);
     const mz = try resolver.resolve(.{
         .cv_ref = "mass-spec",
         .accession = .{ .raw = "MS:1000744" },
@@ -162,9 +260,12 @@ test "[property] - [CV quantities]: parses source values without converting or h
 }
 
 test "[edge] - [CV resolver]: classifies only explicitly catalogued historical and future versions" {
+    const graph = try cv.Vocabulary.parseObo(std.testing.allocator, GRAPH_OBO, GRAPH_IDENTITY);
+    defer graph.deinit();
+    const resources = [_]cv.Vocabulary{graph.vocabulary};
     var declarations = [_]cv.Declaration{.{ .id = "local", .version = null }};
     var resolver: cv.Resolver = .{
-        .resources = &.{GRAPH},
+        .resources = &resources,
         .declarations = &declarations,
         .bindings = &.{.{ .declaration_id = "local", .resource_key = "example" }},
         .known_versions = &.{
@@ -194,8 +295,11 @@ test "[edge] - [CV resolver]: classifies only explicitly catalogued historical a
 }
 
 test "[failure] - [CV resolver]: rejects exhausted work, duplicate declarations, and missing bindings" {
+    const graph = try cv.Vocabulary.parseObo(std.testing.allocator, GRAPH_OBO, GRAPH_IDENTITY);
+    defer graph.deinit();
+    const resources = [_]cv.Vocabulary{graph.vocabulary};
     const declarations = [_]cv.Declaration{.{ .id = "local", .version = null }};
-    var resolver: cv.Resolver = .{ .resources = &.{GRAPH}, .declarations = &declarations, .max_work = 0 };
+    var resolver: cv.Resolver = .{ .resources = &resources, .declarations = &declarations, .max_work = 0 };
     const parameter: cv.Param = .{ .cv_ref = "local", .accession = .{ .raw = "X:02" }, .name = "old label" };
     try std.testing.expectError(error.LimitExceeded, resolver.resolve(parameter));
     resolver.max_work = 100;
@@ -222,27 +326,100 @@ test "[failure] - [CV resolver]: reports namespace conflicts and refuses ambiguo
     resolver.bindings = &.{};
     resolver.declarations = &.{.{ .id = "local", .full_name = "PSI-MS", .version = "4.1.248" }};
     try std.testing.expectEqual(.historical, (try resolver.resolve(parameter)).term.version);
-    resolver.known_versions = &.{ resolver.known_versions[0], resolver.known_versions[0] };
+    const repeated: cv.Resolver.KnownVersion = .{ .resource_key = "psi-ms", .version = "4.1.248", .relationship = .historical };
+    resolver.known_versions = &.{ repeated, repeated };
+    try std.testing.expectError(error.ConflictingVersion, resolver.resolve(parameter));
+    // A recorded release cannot be declared future.
+    resolver.known_versions = &.{.{ .resource_key = "psi-ms", .version = "4.1.248", .relationship = .future }};
     try std.testing.expectError(error.ConflictingVersion, resolver.resolve(parameter));
 }
 
-test "[edge] - [CV vocabulary graph]: bounds depth and identifies dangling datatype targets" {
-    var terms: [65]cv.Vocabulary.Term = undefined;
-    var names: [65][8]u8 = undefined;
-    var parents: [65][1][]const u8 = undefined;
-    for (&terms, &names, 0..) |*term, *name, index| {
-        term.* = .{ .id = try std.fmt.bufPrint(name, "X:{d:0>3}", .{index}), .name = "term" };
+test "[unit] - [CV resolver]: resolves against a release parsed at run time" {
+    const bundled = cv.Resolver.BUNDLED[0].identity;
+    const owned = try cv.Vocabulary.parseObo(std.testing.allocator,
+        \\format-version: 1.2
+        \\data-version: 9.0.0
+        \\ontology: ms
+        \\[Term]
+        \\id: MS:1000016
+        \\name: scan start time
+        \\relationship: has_units UO:0000031
+        \\[Term]
+        \\id: MS:9999999
+        \\name: a term from a newer release
+        \\
+    , .{
+        .key = bundled.key,
+        .version = "9.0.0",
+        .namespace = bundled.namespace,
+        .full_name = bundled.full_name,
+        .uri = bundled.uri,
+        .declaration_uris = bundled.declaration_uris,
+        .declaration_names = bundled.declaration_names,
+        .source_version = "9.0.0",
+    });
+    defer owned.deinit();
+    const resources = [_]cv.Vocabulary{ owned.vocabulary, cv.Resolver.BUNDLED[1] };
+    const declarations = [_]cv.Declaration{
+        .{ .id = "MS", .full_name = "Proteomics Standards Initiative Mass Spectrometry Ontology", .uri = "https://raw.githubusercontent.com/HUPO-PSI/psi-ms-CV/master/psi-ms.obo", .version = "9.0.0" },
+        .{ .id = "UO", .full_name = "Unit Ontology", .uri = "https://raw.githubusercontent.com/bio-ontology-research-group/unit-ontology/master/unit.obo" },
+    };
+    const resolver: cv.Resolver = .{ .resources = &resources, .declarations = &declarations };
+    const newer = try resolver.resolve(.{ .cv_ref = "MS", .accession = .{ .raw = "MS:9999999" }, .name = "a term from a newer release" });
+    try std.testing.expectEqual(.exact, newer.term.version);
+    try std.testing.expectEqualStrings("a term from a newer release", newer.term.match.?.term.name());
+    const time = try resolver.resolve(.{
+        .cv_ref = "MS",
+        .accession = .{ .raw = "MS:1000016" },
+        .name = "scan start time",
+        .unit = .{ .cv_ref = "UO", .accession = .{ .raw = "UO:0000031" }, .name = "minute" },
+    });
+    try std.testing.expectEqual(.allowed, time.unit_allowed);
+    try std.testing.expect(!time.term.issues.unrecognized_uri);
+}
+
+test "[unit] - [CV resolver]: recognizes recorded releases, earlier spellings, and former names" {
+    const declarations = [_]cv.Declaration{
+        // As converters wrote them: an older release, and SourceForge-era locations and names.
+        .{ .id = "MS", .full_name = "Proteomics Standards Initiative Mass Spectrometry Ontology", .uri = "http://psidev.cvs.sourceforge.net/*checkout*/psidev/psi/psi-ms/mzML/controlledVocabulary/psi-ms.obo", .version = "4.1.204" },
+        .{ .id = "UO", .full_name = "Unit Ontology", .uri = "http://obo.cvs.sourceforge.net/*checkout*/obo/obo/ontology/phenotype/unit.obo", .version = "09:04:2014" },
+    };
+    const resolver = cv.Resolver.init(&declarations);
+    const renamed = try resolver.resolve(.{
+        .cv_ref = "MS",
+        .accession = .{ .raw = "MS:1000189" },
+        .name = "Q-Tof ultima",
+        .unit = .{ .cv_ref = "UO", .accession = .{ .raw = "UO:0000031" }, .name = "minute" },
+    });
+    try std.testing.expectEqual(.historical, renamed.term.version);
+    try std.testing.expect(!renamed.term.issues.unrecognized_uri);
+    try std.testing.expect(!renamed.term.issues.unrecognized_declaration_name);
+    try std.testing.expect(renamed.term.issues.stale_name);
+    try std.testing.expect(renamed.term.issues.former_name);
+    // A release before the recorded history is not guessed from its spelling.
+    try std.testing.expectEqual(.unrecognized_version, renamed.unit.version);
+    try std.testing.expect(!renamed.unit.issues.unrecognized_uri);
+    const wrong = try resolver.resolve(.{ .cv_ref = "MS", .accession = .{ .raw = "MS:1000189" }, .name = "not a name" });
+    try std.testing.expect(wrong.term.issues.stale_name);
+    try std.testing.expect(!wrong.term.issues.former_name);
+}
+
+test "[edge] - [CV vocabulary graph]: answers ancestry at any depth and identifies dangling datatype targets" {
+    var source: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer source.deinit();
+    try source.writer.writeAll("format-version: 1.2\ndata-version: current\n");
+    // A chain of 200 terms, each the child of the next, and a datatype nobody defines.
+    for (0..200) |index| {
+        try source.writer.print("[Term]\nid: X:{d:0>3}\nname: term\n", .{index});
+        if (index < 199) try source.writer.print("is_a: X:{d:0>3}\n", .{index + 1});
     }
-    for (terms[0..64], parents[0..64], 0..) |*term, *parent, index| {
-        parent[0] = terms[index + 1].id;
-        term.parents = parent;
-    }
-    const resource: cv.Vocabulary = .{ .identity = GRAPH.identity, .terms = &terms };
-    try std.testing.expect(try resource.isA("X:001", "X:064", 64));
-    try std.testing.expectError(error.TraversalLimit, resource.isA("X:000", "X:064", 65));
-    terms[0].relationships = &.{.{ .kind = "has_value_type", .target = "X:missing" }};
+    try source.writer.writeAll("relationship: has_value_type X:missing\n");
+    const chain = try cv.Vocabulary.parseObo(std.testing.allocator, source.written(), GRAPH_IDENTITY);
+    defer chain.deinit();
+    try std.testing.expect(try chain.vocabulary.isA("X:000", "X:199"));
+    try std.testing.expect(!try chain.vocabulary.isA("X:199", "X:000"));
     var destination: [1][]const u8 = undefined;
-    try std.testing.expectError(error.UnknownTerm, resource.valueTypes("X:000", &destination, 10));
+    try std.testing.expectError(error.UnknownTerm, chain.vocabulary.valueTypes("X:199", &destination, 10));
 }
 
 test "[unit] - [CV identity]: keeps exact accessions and optional numeric local parts" {
