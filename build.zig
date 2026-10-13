@@ -1,6 +1,6 @@
 //! Defines the zmz module and its `-Dkernel_backend` option (`dispatch` also builds a separate
-//! x86-64-v3 zlib decoder object), the example programs, the `check-mzml` and `vocabulary` tool
-//! steps, and the test steps.
+//! x86-64-v3 zlib decoder object), the example programs, the `check-mzml`, `vocabulary`, and
+//! `libm-data` tool steps, and the test steps.
 
 const std = @import("std");
 
@@ -124,6 +124,22 @@ pub fn build(b: *std.Build) void {
     const bench_run = b.addRunArtifact(bench);
     bench_run.addArg(b.cache_root.join(b.allocator, &.{"zmz-bench"}) catch @panic("OOM"));
     b.step("bench", "Generate inputs and time reading, decoding, lookup, copying, and writing (ReleaseFast)").dependOn(&bench_run.step);
+
+    // Generates source, so it runs on the build machine whatever the target.
+    const libm_data = b.addExecutable(.{ .name = "libm-data", .root_module = b.createModule(.{
+        .root_source_file = b.path("tools/libm_data.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    }) });
+    const libm_data_run = b.addRunArtifact(libm_data);
+    if (b.args) |args| libm_data_run.addArgs(args);
+    b.step("libm-data", "Generate SLOF's exp and log tables from a musl source tree's src/math").dependOn(&libm_data_run.step);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("tools/libm_data.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = strip,
+    }) })).step);
 
     const vocabulary_module = b.createModule(.{
         .root_source_file = b.path("tools/vocabulary.zig"),
