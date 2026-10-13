@@ -498,6 +498,7 @@ pub const Cursor = struct {
                 continue;
             }
             if (ignore_whitespace) self.skipBufferedWhitespace();
+            var buffered_text = false;
             if (self.source.bytesAreCharacters()) if (self.source.reader) |reader| {
                 // A start or end tag opening in the buffer skips the codepoint reads; comments,
                 // processing instructions, and CDATA keep them.
@@ -517,8 +518,10 @@ pub const Cursor = struct {
                     if (try self.readBufferedStartElement(opening_start)) |event| return event;
                     return try self.readStartElement(opening_start);
                 }
+                // Buffered text needs no codepoint read before the text reader either.
+                buffered_text = bytes.len != 0 and bytes[0] != '<';
             };
-            const first = self.source.peekCodepoint() catch |err| switch (err) {
+            const first: u21 = if (buffered_text) 0 else (self.source.peekCodepoint() catch |err| switch (err) {
                 error.EndOfStream => {
                     if (self.root_seen and self.root_closed and self.depth == 0) {
                         self.document_ended = true;
@@ -527,8 +530,8 @@ pub const Cursor = struct {
                     return self.malformed(.unexpected_end);
                 },
                 else => |other| return other,
-            };
-            if (first.value != '<') {
+            }).value;
+            if (buffered_text or first != '<') {
                 if (try self.readScalarText()) |event| return event;
                 continue;
             }
@@ -1153,11 +1156,33 @@ pub const Cursor = struct {
         while (self.text_bytes.items.len < TEXT_CHUNK_BYTES) {
             if (self.normal_text_brackets == 0) {
                 if (try self.source.peekSingleByte()) |bytes| {
-                    const length = ordinaryTextRun(bytes, TEXT_CHUNK_BYTES - self.text_bytes.items.len);
+                    const room = TEXT_CHUNK_BYTES - self.text_bytes.items.len;
+                    var length = ordinaryTextRun(bytes, room);
+                    // Line feeds and tabs stay as they are in text, so a run continues past them.
+                    while (length < @min(bytes.len, room) and (bytes[length] == '\n' or bytes[length] == '\t'))
+                        length += 1 + ordinaryTextRun(bytes[length + 1 ..], room - length - 1);
                     if (length != 0) {
+                        // A whole event already buffered, ending at markup or the chunk size, is
+                        // returned in place: its bytes stay in the reader until the next event.
+                        if (self.text_bytes.items.len == 0 and
+                            (length == TEXT_CHUNK_BYTES or (length < bytes.len and bytes[length] == '<')))
+                        {
+                            self.source.borrowed_len = length;
+                            return .{
+                                .span = .{ .start = start, .end = start + length },
+                                .data = .{ .text = .{ .bytes = bytes[0..length] } },
+                            };
+                        }
                         // Keep logical text chunks unchanged across input refills.
                         try self.text_bytes.appendSlice(self.allocator, bytes[0..length]);
                         self.source.borrowed_len = length;
+                        try self.source.commitBorrowed();
+                        continue;
+                    }
+                    // A buffered CR LF line end becomes one line feed without a codepoint read.
+                    if (bytes.len >= 2 and bytes[0] == '\r' and bytes[1] == '\n') {
+                        try self.text_bytes.append(self.allocator, '\n');
+                        self.source.borrowed_len = 2;
                         try self.source.commitBorrowed();
                         continue;
                     }
