@@ -113,6 +113,10 @@ zmz checks what it needs to read and write correctly. Validating a file against 
 
 CPU-specific code (AVX2 Base64, SHA-1 extensions, an x86-64-v3 zlib decoder) is chosen at run time; `-Dkernel-backend=portable` leaves it out. Builds target the baseline CPU unless you pass `-Dcpu=native`.
 
+## Contributing
+
+Contributions are welcome; [CONTRIBUTING.md](CONTRIBUTING.md) says what a change needs before it is merged. Report security problems privately, as [SECURITY.md](SECURITY.md) describes. [CHANGELOG.md](CHANGELOG.md) lists what each version changes, and [CITATION.cff](CITATION.cff) says how to cite zmz.
+
 ## License
 
 zmz is licensed under the [Apache License, Version 2.0](LICENSE). [`NOTICE`](NOTICE) carries the third-party notices: zipir and Arm's `exp` and `log` tables (both MIT), and the bundled PSI-MS and Unit Ontology tables (Creative Commons Attribution 4.0). Include `LICENSE` and `NOTICE` with source and binary distributions.
