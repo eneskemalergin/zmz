@@ -1981,8 +1981,8 @@ test "[property] - [mzML index]: keeps IDs that are text around integers in a fe
             index.deinit();
         }
     };
-    // At peak, with growth: about 30 bytes a record writing and 41 reading, where IDs kept whole
-    // cost 83 and 92.
+    // At peak, with every growth copied: about 34 bytes a record writing and 54 reading. IDs kept
+    // whole cost 83 and 92 even when buffers grow in place.
     const few = 1_000;
     const many = 21_000;
     const writer = (try peakFor(many, Run.indexed, "")) - (try peakFor(many, Run.plain, ""));
@@ -1992,7 +1992,7 @@ test "[property] - [mzML index]: keeps IDs that are text around integers in a fe
     for (&documents, [_]usize{ few, many }) |*document, count| try writeTemplated(std.testing.allocator, &document.writer, count, true);
     inline for (.{ Run.open, Run.rebuild }) |run| {
         const grown = (try peakFor(many, run, documents[1].written())) - (try peakFor(few, run, documents[0].written()));
-        try std.testing.expect(grown <= (many - few) * 48);
+        try std.testing.expect(grown <= (many - few) * 60);
     }
 }
 

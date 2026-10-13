@@ -51,40 +51,30 @@ pub const REFERENCED_DOCUMENT = HEADER ++ "<spectrumList count='2' defaultDataPr
     "</chromatogram></chromatogramList></run></mzML>";
 
 /// Passes allocations to another allocator and tracks the bytes held and the most held at once,
-/// for footprint bounds.
+/// for footprint bounds. It never resizes or remaps in place, so every growth is a new allocation
+/// and a copy, with both buffers held: the worst case on every platform. Whether the child could
+/// grow a buffer in place depends on the operating system and its page size, and would make the
+/// peak differ between them.
 pub const PeakAllocator = struct {
     child: std.mem.Allocator,
     held: usize = 0,
     peak: usize = 0,
 
     pub fn allocator(self: *PeakAllocator) std.mem.Allocator {
-        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
-    }
-
-    fn change(self: *PeakAllocator, old_len: usize, new_len: usize) void {
-        self.held = self.held - old_len + new_len;
-        self.peak = @max(self.peak, self.held);
+        return .{ .ptr = self, .vtable = &.{
+            .alloc = alloc,
+            .resize = std.mem.Allocator.noResize,
+            .remap = std.mem.Allocator.noRemap,
+            .free = free,
+        } };
     }
 
     fn alloc(context: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
         const self: *PeakAllocator = @ptrCast(@alignCast(context));
         const memory = self.child.rawAlloc(len, alignment, ret_addr) orelse return null;
-        self.change(0, len);
+        self.held += len;
+        self.peak = @max(self.peak, self.held);
         return memory;
-    }
-
-    fn resize(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
-        const self: *PeakAllocator = @ptrCast(@alignCast(context));
-        if (!self.child.rawResize(memory, alignment, new_len, ret_addr)) return false;
-        self.change(memory.len, new_len);
-        return true;
-    }
-
-    fn remap(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
-        const self: *PeakAllocator = @ptrCast(@alignCast(context));
-        const moved = self.child.rawRemap(memory, alignment, new_len, ret_addr) orelse return null;
-        self.change(memory.len, new_len);
-        return moved;
     }
 
     fn free(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
