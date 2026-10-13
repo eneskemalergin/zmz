@@ -119,7 +119,7 @@ Contributions are welcome; [CONTRIBUTING.md](CONTRIBUTING.md) says what a change
 
 ## License
 
-zmz is licensed under the [Apache License, Version 2.0](LICENSE). [`NOTICE`](NOTICE) carries the third-party notices: zipir and Arm's `exp` and `log` tables (both MIT), and the bundled PSI-MS and Unit Ontology tables (Creative Commons Attribution 4.0). Include `LICENSE` and `NOTICE` with source and binary distributions.
+zmz is licensed under the [Apache License, Version 2.0](LICENSE). [`NOTICE`](NOTICE) carries the third-party notices: zipir and Arm's `exp` and `log` tables (both MIT), and the bundled PSI-MS and Unit Ontology tables (Creative Commons Attribution 4.0). The logo and icons adapt the Zig logo and are licensed CC BY-SA 4.0. Include `LICENSE` and `NOTICE` with source and binary distributions.
 
 ---
 
