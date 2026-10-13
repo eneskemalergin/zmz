@@ -66,7 +66,7 @@ The public entry point is [`src/root.zig`](src/root.zig). Vocabulary resources a
 
 ## License
 
-zmz is licensed under the [Apache License, Version 2.0](LICENSE). The third-party notices are in [`NOTICE`](NOTICE): zlib support uses zipir under the MIT license, and SLOF's `exp` and `log` tables (`src/binary/libm_data.zig`) come from Arm's optimized-routines under the MIT license. Include `LICENSE` and `NOTICE` with source and binary distributions. The bundled vocabulary resources keep their own source terms and attribution requirements; see [`vocabularies/README.md`](vocabularies/README.md).
+zmz is licensed under the [Apache License, Version 2.0](LICENSE). The third-party notices are in [`NOTICE`](NOTICE): zlib support uses zipir under the MIT license, and SLOF's `exp` and `log` tables (`src/binary/libm_data.zig`) come from Arm's optimized-routines under the MIT license. Include `LICENSE` and `NOTICE` with source and binary distributions. The bundled PSI-MS and Unit Ontology tables are under Creative Commons Attribution 4.0; `NOTICE` carries their attribution, and [`vocabularies/README.md`](vocabularies/README.md) describes the sources.
 
 ---
 
