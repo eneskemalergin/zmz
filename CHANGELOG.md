@@ -44,5 +44,6 @@ The first release of zmz, a Zig library for mass-spectrometry data, starting wit
   - `zig build bench` times reading, decoding, lookup, copying, and writing on generated data, with nothing to download.
 - **Platforms:**
   - Zig 0.16.0 with no libc dependency, tested on x86_64 and aarch64 Linux and on aarch64 macOS. Big-endian targets are refused at build time.
+  - `zmz.version` reports the package version that `build.zig.zon` declares.
 
 [0.1.0]: https://github.com/eneskemalergin/zmz/releases/tag/v0.1.0

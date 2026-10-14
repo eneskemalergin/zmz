@@ -13,3 +13,12 @@ comptime {
     _ = @import("mzml/test_reader.zig");
     _ = @import("mzml/test_events.zig");
 }
+
+const std = @import("std");
+const zmz = @import("zmz");
+
+test "[unit] - [package]: reports the version build.zig.zon declares" {
+    var buffer: [64]u8 = undefined;
+    const text = try std.fmt.bufPrint(&buffer, "{f}", .{zmz.version});
+    try std.testing.expectEqualStrings(@import("declared_version").text, text);
+}
