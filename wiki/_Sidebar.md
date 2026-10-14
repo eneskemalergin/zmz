@@ -24,4 +24,6 @@
 **Under the hood**
 
 - [Performance](Performance)
+- [Benchmarks](Benchmarks)
+- [Built with zmz](Built-with-zmz)
 - [Development](Development)

@@ -1,0 +1,69 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 336" width="1200" height="336" role="img" aria-labelledby="title desc">
+<title id="title">zmz benchmark summary</title>
+<desc id="desc">zmz compared with five mzML readers. zmz 221 MB/s, mzdata 130 MB/s, OpenMS 50 MB/s, mzmlpy 28 MB/s, pymzML 23 MB/s, pyteomics 10 MB/s; zmz 2.8 MiB, mzdata 29 MiB, mzmlpy 116 MiB, pyteomics 118 MiB, pymzML 151 MiB, OpenMS 597 MiB; zmz 69 of 69, pyteomics 67 of 69, mzmlpy 65 of 69, OpenMS 64 of 69, pymzML 62 of 69, mzdata 36 of 69.</desc>
+<style>.t{font:600 20px -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;fill:#e6edf3}.h{font:600 15px -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;fill:#e6edf3}.n{font:400 12px -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;fill:#9198a1}.l,.v{font:400 13px -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;fill:#e6edf3}.f{font:400 11px -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;fill:#9198a1}</style>
+<rect width="1200" height="336" fill="#0d1117"/>
+<text x="24" y="30" class="t">Same files, same work: zmz and five other mzML readers</text>
+<text x="438" y="290" class="n">zmz peaks at 3.8 MiB on a 4.0 GB file</text>
+<text x="24" y="64" class="h">Speed</text>
+<text x="24" y="84" class="n">full decode, median over 6 files; higher is better</text>
+<text x="24" y="116" class="l" font-weight="700">zmz</text>
+<rect x="116" y="104" width="196.0" height="14" rx="3" fill="#f7a41d"/>
+<text x="318.0" y="116" class="v" font-weight="700">221 MB/s</text>
+<text x="24" y="146" class="l">mzdata</text>
+<rect x="116" y="134" width="115.6" height="14" rx="3" fill="#3d444d"/>
+<text x="237.6" y="146" class="v">130 MB/s</text>
+<text x="24" y="176" class="l">OpenMS</text>
+<rect x="116" y="164" width="44.6" height="14" rx="3" fill="#3d444d"/>
+<text x="166.6" y="176" class="v">50 MB/s</text>
+<text x="24" y="206" class="l">mzmlpy</text>
+<rect x="116" y="194" width="24.8" height="14" rx="3" fill="#3d444d"/>
+<text x="146.8" y="206" class="v">28 MB/s</text>
+<text x="24" y="236" class="l">pymzML</text>
+<rect x="116" y="224" width="20.5" height="14" rx="3" fill="#3d444d"/>
+<text x="142.5" y="236" class="v">23 MB/s</text>
+<text x="24" y="266" class="l">pyteomics</text>
+<rect x="116" y="254" width="8.7" height="14" rx="3" fill="#3d444d"/>
+<text x="130.7" y="266" class="v">10 MB/s</text>
+<text x="438" y="64" class="h">Memory</text>
+<text x="438" y="84" class="n">peak on a 672.9 MB file, log scale; lower is better</text>
+<text x="438" y="116" class="l" font-weight="700">zmz</text>
+<rect x="530" y="104" width="21.9" height="14" rx="3" fill="#f7a41d"/>
+<text x="557.9" y="116" class="v" font-weight="700">2.8 MiB</text>
+<text x="438" y="146" class="l">mzdata</text>
+<rect x="530" y="134" width="96.0" height="14" rx="3" fill="#3d444d"/>
+<text x="632.0" y="146" class="v">29 MiB</text>
+<text x="438" y="176" class="l">mzmlpy</text>
+<rect x="530" y="164" width="139.9" height="14" rx="3" fill="#3d444d"/>
+<text x="675.9" y="176" class="v">116 MiB</text>
+<text x="438" y="206" class="l">pyteomics</text>
+<rect x="530" y="194" width="140.3" height="14" rx="3" fill="#3d444d"/>
+<text x="676.3" y="206" class="v">118 MiB</text>
+<text x="438" y="236" class="l">pymzML</text>
+<rect x="530" y="224" width="148.3" height="14" rx="3" fill="#3d444d"/>
+<text x="684.3" y="236" class="v">151 MiB</text>
+<text x="438" y="266" class="l">OpenMS</text>
+<rect x="530" y="254" width="191.6" height="14" rx="3" fill="#3d444d"/>
+<text x="727.6" y="266" class="v">597 MiB</text>
+<text x="852" y="64" class="h">Hard cases</text>
+<text x="852" y="84" class="n">damaged and unusual files handled correctly</text>
+<text x="852" y="116" class="l" font-weight="700">zmz</text>
+<rect x="944" y="104" width="196.0" height="14" rx="3" fill="#f7a41d"/>
+<text x="1146.0" y="116" class="v" font-weight="700">69/69</text>
+<text x="852" y="146" class="l">pyteomics</text>
+<rect x="944" y="134" width="190.3" height="14" rx="3" fill="#3d444d"/>
+<text x="1140.3" y="146" class="v">67/69</text>
+<text x="852" y="176" class="l">mzmlpy</text>
+<rect x="944" y="164" width="184.6" height="14" rx="3" fill="#3d444d"/>
+<text x="1134.6" y="176" class="v">65/69</text>
+<text x="852" y="206" class="l">OpenMS</text>
+<rect x="944" y="194" width="181.8" height="14" rx="3" fill="#3d444d"/>
+<text x="1131.8" y="206" class="v">64/69</text>
+<text x="852" y="236" class="l">pymzML</text>
+<rect x="944" y="224" width="176.1" height="14" rx="3" fill="#3d444d"/>
+<text x="1126.1" y="236" class="v">62/69</text>
+<text x="852" y="266" class="l">mzdata</text>
+<rect x="944" y="254" width="102.3" height="14" rx="3" fill="#3d444d"/>
+<text x="1052.3" y="266" class="v">36/69</text>
+<text x="24" y="322" class="f">mzml-bench; peers: mzdata 0.67.4, OpenMS 3.6.0, pyteomics 5.0.1, pymzML 2.7.0, mzmlpy 0.10.1. Languages: zmz Zig, mzdata Rust, OpenMS C++, pyteomics Python, pymzML Python, mzmlpy Python.</text>
+</svg>
