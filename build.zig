@@ -14,11 +14,14 @@ pub fn build(b: *std.Build) void {
         "dispatch: pick CPU-specific code for the running CPU; portable: never use it",
     ) orelse .dispatch;
     const library_kernels = buildKernels(b, target, optimize, kernel_backend);
+    // `zmz.version` comes from build.zig.zon, so the library and its package cannot disagree.
+    const package_options = b.addOptions();
+    package_options.addOption([]const u8, "version", @import("build.zig.zon").version);
     const zmz = b.addModule("zmz", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
     });
-    configureLibraryModule(zmz, library_kernels);
+    configureLibraryModule(zmz, library_kernels, package_options);
 
     const test_step = b.step("test", "Run the library, example, tool, and benchmark tests");
     const empty_run = b.path("tests/data/gates/empty_run.mzML");
@@ -29,6 +32,10 @@ pub fn build(b: *std.Build) void {
         .strip = strip,
     });
     library_tests_module.addImport("zmz", zmz);
+    // build.zig.zon's version on its own, for the test that `zmz.version` matches it.
+    const declared_version = b.addOptions();
+    declared_version.addOption([]const u8, "text", @import("build.zig.zon").version);
+    library_tests_module.addOptions("declared_version", declared_version);
     library_tests_module.addAnonymousImport("empty_run", .{ .root_source_file = empty_run });
     const library_tests = b.addTest(.{ .root_module = library_tests_module });
     test_step.dependOn(&b.addRunArtifact(library_tests).step);
@@ -39,7 +46,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .strip = strip,
     });
-    configureLibraryModule(package_tests_module, library_kernels);
+    configureLibraryModule(package_tests_module, library_kernels, package_options);
     const package_tests = b.addTest(.{ .root_module = package_tests_module });
     test_step.dependOn(&b.addRunArtifact(package_tests).step);
 
@@ -101,7 +108,7 @@ pub fn build(b: *std.Build) void {
     // Always ReleaseFast, the library and its dependency included: the numbers describe release
     // builds whatever -Doptimize says.
     const bench_zmz = b.createModule(.{ .root_source_file = b.path("src/root.zig"), .target = target, .optimize = .ReleaseFast });
-    configureLibraryModule(bench_zmz, buildKernels(b, target, .ReleaseFast, kernel_backend));
+    configureLibraryModule(bench_zmz, buildKernels(b, target, .ReleaseFast, kernel_backend), package_options);
     const bench = b.addExecutable(.{
         .name = "zmz-bench",
         .root_module = b.createModule(.{
@@ -185,8 +192,9 @@ const Kernels = struct {
     fast_zlib: ?*std.Build.Step.Compile,
 };
 
-fn configureLibraryModule(module: *std.Build.Module, library_kernels: Kernels) void {
+fn configureLibraryModule(module: *std.Build.Module, library_kernels: Kernels, package_options: *std.Build.Step.Options) void {
     module.addImport("zipir", library_kernels.zipir);
+    module.addOptions("package_options", package_options);
     module.addOptions("kernel_options", library_kernels.options);
     if (library_kernels.fast_zlib) |object| module.addObject(object);
 }

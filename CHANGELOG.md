@@ -4,7 +4,7 @@
 
 All notable changes to zmz are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows [Semantic Versioning](https://semver.org/). Each version starts with a short release summary, followed by user-visible changes grouped by area. Until 1.0, any version may change the API, and every breaking change is listed under its version.
 
-## [0.1.0] - Unreleased
+## [0.1.0] - 2026-10-13
 
 The first release of zmz, a Zig library for mass-spectrometry data, starting with mzML. It streams mzML of any size in flat memory, looks records up by ID or position, decodes and encodes the standard binary-array encodings, and writes plain or indexed mzML, with optional PSI-MS and Unit Ontology lookup. It needs Zig 0.16.0 and nothing else. Not supported yet: whole-file gzip (planned for 0.2.0), Zstandard-compressed arrays, pre-release mzML drafts, and formats other than mzML.
 
@@ -44,5 +44,6 @@ The first release of zmz, a Zig library for mass-spectrometry data, starting wit
   - `zig build bench` times reading, decoding, lookup, copying, and writing on generated data, with nothing to download.
 - **Platforms:**
   - Zig 0.16.0 with no libc dependency, tested on x86_64 and aarch64 Linux and on aarch64 macOS. Big-endian targets are refused at build time.
+  - `zmz.version` reports the package version that `build.zig.zon` declares.
 
 [0.1.0]: https://github.com/eneskemalergin/zmz/releases/tag/v0.1.0

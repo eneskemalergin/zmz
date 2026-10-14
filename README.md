@@ -10,6 +10,7 @@
 
 <p align="center">
   <a href="https://github.com/eneskemalergin/zmz/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/eneskemalergin/zmz/ci.yml?branch=main&amp;style=flat-square&amp;logo=github&amp;label=CI" alt="CI"></a>
+  <a href="https://github.com/eneskemalergin/zmz/releases/latest"><img src="https://img.shields.io/github/v/release/eneskemalergin/zmz?style=flat-square&amp;label=release&amp;color=2EA043" alt="Latest release"></a>
   <a href="https://ziglang.org/download/"><img src="https://img.shields.io/badge/Zig-0.16.0-F7A41D?style=flat-square&amp;logo=zig&amp;logoColor=white" alt="Zig 0.16.0"></a>
   <a href="#status-and-limits"><img src="https://img.shields.io/badge/status-early%20development-C17D10?style=flat-square" alt="Status: early development"></a>
   <a href="#license"><img src="https://img.shields.io/badge/license-Apache%202.0-0066CC?style=flat-square" alt="License: Apache 2.0"></a>
@@ -36,7 +37,7 @@ zmz reads and writes mass-spectrometry data in Zig, starting with mzML. It strea
 zmz needs Zig 0.16.0 and nothing else; zlib comes from [zipir](https://github.com/eneskemalergin/zipir), fetched by hash.
 
 ```sh
-zig fetch --save git+https://github.com/eneskemalergin/zmz
+zig fetch --save git+https://github.com/eneskemalergin/zmz#v0.1.0
 ```
 
 Then import the module in `build.zig`:
