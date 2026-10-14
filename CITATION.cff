@@ -4,6 +4,7 @@ title: "zmz: Mass Spectrometry Open Data Format Library for Zig"
 type: software
 abstract: "zmz is a Zig library for mass-spectrometry data, starting with mzML. It streams files in flat memory, looks records up by ID or position, decodes and encodes binary arrays (zlib and MS-Numpress), writes plain and indexed mzML, and resolves PSI-MS and Unit Ontology terms."
 version: 0.1.0
+date-released: "2026-10-13"
 url: "https://github.com/eneskemalergin/zmz"
 repository-code: "https://github.com/eneskemalergin/zmz"
 authors:

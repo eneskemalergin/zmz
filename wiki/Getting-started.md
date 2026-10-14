@@ -14,10 +14,10 @@ Nothing else: no C library, no system packages. zlib support comes from [zipir](
 From your project's directory:
 
 ```sh
-zig fetch --save git+https://github.com/eneskemalergin/zmz
+zig fetch --save git+https://github.com/eneskemalergin/zmz#v0.1.0
 ```
 
-This adds zmz to your `build.zig.zon` with a content hash. Then import its module in `build.zig`:
+This adds zmz 0.1.0 to your `build.zig.zon` with a content hash. Then import its module in `build.zig`:
 
 ```zig
 const zmz = b.dependency("zmz", .{ .target = target, .optimize = optimize });
@@ -25,7 +25,7 @@ executable.root_module.addImport("zmz", zmz.module("zmz"));
 ```
 
 > [!TIP]
-> Pin a release when you can: `zig fetch --save git+https://github.com/eneskemalergin/zmz#v0.1.0`. Without a tag, `zig fetch` takes whatever the default branch holds that day.
+> Always fetch a release tag, as above. Without one, `zig fetch` takes whatever the default branch holds that day. To upgrade, run the same command with the newer tag. A program can read `zmz.version` to report which one it was built with.
 
 ## Your first program
 
