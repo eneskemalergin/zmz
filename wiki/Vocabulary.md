@@ -6,7 +6,7 @@ All of this is optional. Reading, writing, and decoding never touch the tables, 
 
 ## What gets bundled
 
-- **PSI-MS 4.2.5** (`psi-ms-core.obo`): 4,154 terms, with the release history back to 3.80.0_rc1 (December 2015).
+- **PSI-MS 4.2.17** (`psi-ms-core.obo`): 4,192 terms, with the release history back to 3.80.0_rc1 (December 2015).
 - **Unit Ontology, release 2026-10-12**: 574 terms, with releases back to March 2011.
 
 Both ship as generated Zig tables that compile into your program; nothing is downloaded or read at run time. The tables are split by use, so lookup alone adds about 0.2 MB to a stripped binary, resolution about 0.4 MB, and every definition and synonym about 1 MB. A weekly workflow in the repository proposes an update when either vocabulary has a new release.
