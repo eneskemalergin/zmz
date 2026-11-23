@@ -393,16 +393,17 @@ test "[failure] - [zlib]: rejects truncation, corruption, trailing input, and al
     try std.testing.expectError(error.OverlappingBuffers, zlib.decompress(&corrupt, &corrupt));
 }
 
-test "[edge] - [zlib]: decodes streams declaring 31 or 32 unused distance codes" {
+test "[edge] - [zlib]: rejects streams declaring 31 or 32 distance codes, as zlib does" {
     // One dynamic block holding "a", with literal lengths for 'a' and end of block and one distance
-    // code of length 1 then zeros, so only HDIST differs. Built bit by bit. zlib rejects 31 and 32
-    // as too many distance symbols; codes 30 and 31 never occur, and none is used.
+    // code of length 1 then zeros, so only HDIST differs. Built bit by bit. Only 30 distance codes
+    // exist; zlib, zlib-ng, and GNU gzip reject a header declaring 31 or 32 even when they are unused.
     const thirty = "\x78\x01\x05\xdd\x21\x01\x00\x00\x00\x00\x90\xad\xfe\x9f\x60\x89\x00\x62\x00\x62";
     const thirty_one = "\x78\x01\x05\xde\x21\x01\x00\x00\x00\x00\x90\xad\xfe\x9f\xe0\x89\x00\x62\x00\x62";
     const thirty_two = "\x78\x01\x05\xdf\x21\x01\x00\x00\x00\x00\x90\xad\xfe\x9f\x60\x8a\x00\x62\x00\x62";
     var output: [4]u8 = undefined;
-    inline for (.{ thirty, thirty_one, thirty_two }) |stream| {
-        try std.testing.expectEqualStrings("a", try zlib.decompress(&output, stream));
+    try std.testing.expectEqualStrings("a", try zlib.decompress(&output, thirty));
+    inline for (.{ thirty_one, thirty_two }) |stream| {
+        try std.testing.expectError(error.InvalidData, zlib.decompress(&output, stream));
     }
 }
 
