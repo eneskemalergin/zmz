@@ -37,7 +37,7 @@ zmz reads and writes mass-spectrometry data in Zig, starting with mzML. It strea
 zmz needs Zig 0.16.0 and nothing else; zlib comes from [zipir](https://github.com/eneskemalergin/zipir), fetched by hash.
 
 ```sh
-zig fetch --save git+https://github.com/eneskemalergin/zmz#v0.1.0
+zig fetch --save git+https://github.com/eneskemalergin/zmz#v0.1.1
 ```
 
 Then import the module in `build.zig`:

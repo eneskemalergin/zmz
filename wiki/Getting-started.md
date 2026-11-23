@@ -14,10 +14,10 @@ Nothing else: no C library, no system packages. zlib support comes from [zipir](
 From your project's directory:
 
 ```sh
-zig fetch --save git+https://github.com/eneskemalergin/zmz#v0.1.0
+zig fetch --save git+https://github.com/eneskemalergin/zmz#v0.1.1
 ```
 
-This adds zmz 0.1.0 to your `build.zig.zon` with a content hash. Then import its module in `build.zig`:
+This adds zmz 0.1.1 to your `build.zig.zon` with a content hash. Then import its module in `build.zig`:
 
 ```zig
 const zmz = b.dependency("zmz", .{ .target = target, .optimize = optimize });
