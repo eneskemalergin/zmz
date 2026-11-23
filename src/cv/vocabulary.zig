@@ -474,7 +474,7 @@ pub fn lookup(self: *const Vocabulary, accession: []const u8) ?Match {
 }
 
 /// Tests reflexive ancestry within this resource, including alternate IDs, from the precomputed
-/// closure: constant work, no walk.
+/// closure: one binary search, no walk.
 pub fn isA(self: *const Vocabulary, child: []const u8, parent: []const u8) error{UnknownTerm}!bool {
     const descendant = (self.lookup(child) orelse return error.UnknownTerm).term.index;
     const ancestor = (self.lookup(parent) orelse return error.UnknownTerm).term.index;
