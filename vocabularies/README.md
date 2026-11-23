@@ -6,7 +6,7 @@ The optional `cv.Resolver` uses bundled PSI-MS and Unit Ontology snapshots. Ordi
 
 [manifest.json](manifest.json) records each resource's version, immutable source commit, retrieval date, license, expected SHA-256, artifact version, and checked counts.
 
-- [PSI-MS 4.2.5](https://github.com/HUPO-PSI/psi-ms-CV/blob/bfc95f2a1cd1ab104d265b15910f153bfcfeac86/psi-ms-core.obo), from `psi-ms-core.obo`: 4,154 terms, including 4,026 MS terms and embedded PEFF, UO, and NCIT terms. Attribution: HUPO Proteomics Standards Initiative Mass Spectrometry Standards Working Group and Proteomics Informatics Working Group.
+- [PSI-MS 4.2.17](https://github.com/HUPO-PSI/psi-ms-CV/blob/dbdb698496fa266e3aeee8b34fb9840f308c1bca/psi-ms-core.obo), from `psi-ms-core.obo`: 4,192 terms, including 4,064 MS terms and embedded PEFF, UO, and NCIT terms. Attribution: HUPO Proteomics Standards Initiative Mass Spectrometry Standards Working Group and Proteomics Informatics Working Group.
 - [Unit Ontology 2026-10-12](https://github.com/bio-ontology-research-group/unit-ontology/blob/311f3d222444fcf8adf032dfa58f3c1b55bd22af/uo.obo): 574 terms. Its OBO `data-version` is `releases/2026-10-12`. Attribution: Unit Ontology contributors.
 
 `psi-ms-core.obo` is the curated PSI-MS source: every term of the release except the chromatographic column models (`MS:5000000` to `MS:5999999`, subset `columns`). The published `psi-ms.obo` adds those 1,928 models, which derive from the [RepoRT](https://github.com/michaelwitting/RepoRT) column database under its own license. They are not bundled; a program that needs them parses `psi-ms.obo` at run time (see below).
@@ -59,13 +59,13 @@ A name that differs from the term's current name sets `stale_name`. When it was 
 const bundled = mzml.cv.Resolver.BUNDLED[0].identity;
 const owned = try mzml.cv.Vocabulary.parseObo(allocator, bytes, .{
     .key = bundled.key,
-    .version = "4.2.5",
+    .version = "4.2.17",
     .namespace = bundled.namespace,
     .full_name = bundled.full_name,
     .uri = bundled.uri,
     .declaration_uris = bundled.declaration_uris,
     .declaration_names = bundled.declaration_names,
-    .source_version = "4.2.5",
+    .source_version = "4.2.17",
 });
 defer owned.deinit();
 const resources = [_]mzml.cv.Vocabulary{ owned.vocabulary, mzml.cv.Resolver.BUNDLED[1] };

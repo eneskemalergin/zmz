@@ -37,7 +37,7 @@ zmz reads and writes mass-spectrometry data in Zig, starting with mzML. It strea
 zmz needs Zig 0.16.0 and nothing else; zlib comes from [zipir](https://github.com/eneskemalergin/zipir), fetched by hash.
 
 ```sh
-zig fetch --save git+https://github.com/eneskemalergin/zmz#v0.1.0
+zig fetch --save git+https://github.com/eneskemalergin/zmz#v0.1.1
 ```
 
 Then import the module in `build.zig`:
@@ -151,7 +151,7 @@ Contributions are welcome; [CONTRIBUTING.md](CONTRIBUTING.md) says what a change
 
 ## License
 
-zmz is licensed under the [Apache License, Version 2.0](LICENSE). [`NOTICE`](NOTICE) carries the third-party notices: zipir and Arm's `exp` and `log` tables (both MIT), and the bundled PSI-MS and Unit Ontology tables (Creative Commons Attribution 4.0). The logo and icons adapt the Zig logo and are licensed CC BY-SA 4.0. Include `LICENSE` and `NOTICE` with source and binary distributions.
+zmz is licensed under the [Apache License, Version 2.0](LICENSE). [`NOTICE`](NOTICE) carries the third-party notices: zipir, the libdeflate code zipir's decoder derives from, and Arm's `exp` and `log` tables (all MIT), and the bundled PSI-MS and Unit Ontology tables (Creative Commons Attribution 4.0). The logo and icons adapt the Zig logo and are licensed CC BY-SA 4.0. Include `LICENSE` and `NOTICE` with source and binary distributions.
 
 ---
 

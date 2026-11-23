@@ -5,8 +5,8 @@
 //! Neither may be copied or moved: the reader keeps a pointer to the input, and a copied reader
 //! would free its storage twice. It checks XML well-formedness (names, quoting, nesting, entities
 //! and references, characters, namespace bindings, the declaration) and nothing about mzML: any
-//! root element, any structure. Input in UTF-8, UTF-16, or declared ISO-8859-1 is returned as
-//! UTF-8; spans count source bytes. Comments, processing instructions, and the XML declaration
+//! root element, any structure. Input in UTF-8, UTF-16, or declared ISO-8859-1 or US-ASCII is
+//! returned as UTF-8; spans count source bytes. Comments, processing instructions, and the XML declaration
 //! produce no events. Each event's slices last until the next call. The first failure sets
 //! `diagnostic()` and later calls return `FailedState`; a call made while another runs, as from the
 //! input reader or the allocator, returns `InvalidState` and leaves it unharmed.
