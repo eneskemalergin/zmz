@@ -343,7 +343,13 @@ fn meta(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !u64 {
     var checksum: Checksum = .{};
     while (try reader.nextRecord()) |record| {
         checksum.bytes(record.id);
-        checksum.number(try record.msLevel(groups));
+        // Only spectra have an MS level; real files also hold chromatograms. An optional's padding
+        // bytes are undefined, so its presence and its value are hashed apart.
+        if (record.node.kind == .spectrum) {
+            const level = try record.msLevel(groups);
+            checksum.number(@as(u8, @intFromBool(level != null)));
+            checksum.number(level orelse 0);
+        }
         for (record.scans()) |scan| if (try scan.scanStartTime(groups)) |time| checksum.number(time.value);
     }
     return checksum.hash.final();
@@ -647,4 +653,29 @@ test "[unit] - [zmz-bench]: generated inputs repeat, read back exactly, and open
         defer index.deinit();
         try std.testing.expectEqual(plan.spectra, index.entryCount());
     }
+}
+
+test "[regression] - [zmz-bench]: the meta case reads files that hold chromatograms" {
+    const document =
+        \\<mzML xmlns="http://psi.hupo.org/ms/mzml" version="1.1.0">
+        \\<cvList count="1"><cv id="MS" fullName="PSI-MS" URI="urn:test"/></cvList>
+        \\<run id="r"><spectrumList count="1">
+        \\<spectrum id="s" index="0" defaultArrayLength="0">
+        \\<cvParam cvRef="MS" accession="MS:1000511" name="ms level" value="2"/></spectrum>
+        \\</spectrumList><chromatogramList count="1">
+        \\<chromatogram id="tic" index="0" defaultArrayLength="0"/>
+        \\</chromatogramList></run></mzML>
+    ;
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "meta.mzML", .data = document });
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/meta.mzML", .{dir.sub_path});
+    defer std.testing.allocator.free(path);
+    // The spectrum's ID and MS level, then the chromatogram's ID alone.
+    var expected: Checksum = .{};
+    expected.bytes("s");
+    expected.number(@as(u8, 1));
+    expected.number(@as(i32, 2));
+    expected.bytes("tic");
+    try std.testing.expectEqual(expected.hash.final(), try meta(std.testing.allocator, std.testing.io, path));
 }
